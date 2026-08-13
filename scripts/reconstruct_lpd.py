@@ -1,0 +1,234 @@
+#!/usr/bin/env python3
+"""M6 + M7 -- reconstruct a competition model with the trained flow, then finish it.
+
+Six Euler steps, the operator re-applied at every one, S independent draws from x0, and the
+METRIC MEDOID of those draws as the answer. The medoid rather than the mean because the mean
+of several occupancy grids, thresholded, systematically erases concavity: a crater present in
+most samples but at slightly different positions averages to below the threshold everywhere.
+M7 demonstrates this on a sphere with a crater, where mean-then-threshold reproduces the
+crater-FREE sphere exactly.
+
+Scoring is Dice on a voxel grid after posing BOTH meshes with rescale_touch_z, so the two are
+compared in the same frame the challenge defines.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+import time
+from pathlib import Path
+
+import numpy as np
+import torch
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from hac26.conventions import cameras, psi_grid                        # noqa: E402
+from hac26.data_io import load_model_curves                            # noqa: E402
+from hac26.field import ImplicitBody, apply_constraints, extract_mesh  # noqa: E402
+from hac26.lpd_flow import CODE_DIM, N_MODES, N_STEPS, LPDFlow         # noqa: E402
+from hac26.output import (export_stl, metric_medoid, planar_snap,      # noqa: E402
+                          ransac_planes, restore_constraints)
+from hac26.recon import dice, mesh_to_sdf                              # noqa: E402
+from hac26.shapes import mesh_support, rescale_touch_z                 # noqa: E402
+from hac26.surrogate import Surrogate                                  # noqa: E402
+from train_lpd import (curves_from_code, curves_from_mesh,             # noqa: E402
+                       load_decoder, set_code)                        # noqa: E402
+
+CYLINDER_R = {1: 1.12, 2: 1.42, 3: 0.88, 4: 1.475, 5: 1.22,
+              6: 0.925, 7: 1.205, 8: 1.24, 9: 0.67, 10: 3.95}
+PUBLIC = {1: "AsteroidModel01_shape_public/asteroid1.stl",
+          2: "AsteroidModel02_shape_public/asteroid2.stl",
+          3: "AsteroidModel03_shape_public/asteroid3.stl"}
+
+
+def data_modes(curves56: np.ndarray, n_modes: int):
+    """(56, P) real curves -> (1, 28, 2, M) complex Fourier content, intensity then binary."""
+    g = np.stack([curves56[:28], curves56[28:]], axis=1)        # (28, 2, P)
+    f = torch.fft.rfft(torch.tensor(g, dtype=torch.float32), dim=-1)
+    return f[None, ..., 1:n_modes + 1]
+
+
+def geom_tag_and_mask(mask56: np.ndarray):
+    tag = torch.zeros(1, 28, 4)
+    for i, cam in enumerate(cameras()):
+        tag[0, i] = torch.tensor([np.cos(np.radians(cam.azimuth_deg)),
+                                  np.sin(np.radians(cam.azimuth_deg)),
+                                  np.sin(np.radians(cam.elevation_deg)), 1.0])
+    # a geometry counts as present only if BOTH its channels are
+    m = torch.tensor((mask56[:28] > 0) & (mask56[28:] > 0), dtype=torch.float32)[None]
+    return tag, m
+
+
+def support_from_convex(stl: str) -> torch.Tensor:
+    """h for a competition body, taken from the convex stage's own reconstruction.
+
+    The flow generates the token correction and NOT h -- that is the specification's split.
+    It does not follow that h is a sphere: it has to come from somewhere, and the convex
+    pipeline already predicts it from these same 56 curves. Evaluated on the 64 design
+    normals, which is the basis ConvexCore stores its support in.
+    """
+    import trimesh
+    m = trimesh.load(stl, process=False)
+    n = ImplicitBody(radius=1.0).core.n.detach().cpu().numpy()
+    h = mesh_support(np.asarray(m.vertices), n)
+    return torch.tensor(np.maximum(h, 1e-3), dtype=torch.float32)
+
+
+def make_resid_fn(g_dat, surro, psi, M, radius, support=None):
+    """resid_fn(code) -> (residual, convex complement), with the operator actually applied."""
+    def fn(x):
+        preds = []
+        for b in range(len(x)):
+            cur = curves_from_code(x[b].detach(), radius, surro, psi, support=support)
+            preds.append(torch.zeros(28, 2, len(psi)) if cur is None else cur)
+        g_cur = torch.fft.rfft(torch.stack(preds), dim=-1)[..., 1:M + 1]
+        r = g_dat.expand_as(g_cur) - g_cur
+        r_perp = r.clone()
+        r_perp[..., :4] = 0            # the convex operator explains the low orders best
+        B = len(x)
+        feats = torch.zeros(B, 28, N_MODES, 6)
+        perp = torch.zeros(B, 28, N_MODES, 6)
+        for ch in range(2):
+            feats[:, :, :M, 2 * ch] = r[:, :, ch].real
+            feats[:, :, :M, 2 * ch + 1] = r[:, :, ch].imag
+            perp[:, :, :M, 2 * ch] = r_perp[:, :, ch].real
+            perp[:, :, :M, 2 * ch + 1] = r_perp[:, :, ch].imag
+        feats[:, :, :M, 4] = g_dat[:, :, 0].real.expand(B, -1, -1)
+        feats[:, :, :M, 5] = g_dat[:, :, 1].real.expand(B, -1, -1)
+        return feats, perp
+    return fn
+
+
+def decode(code, radius, res=64, misfit_fn=None, eta=None, support=None):
+    """Token code -> constrained mesh. M1 extraction, M1 constraints, then M7's planar snap.
+
+    The snap is GATED ON THE DATA, not applied because a plane was found. planar_snap with
+    misfit_fn=None accepts every candidate plane unconditionally, which its own docstring
+    restricts to tests: RANSAC will always return something on a noisy mesh, and snapping to
+    it flattens real curvature into a facet that was never in the data. With the misfit wired
+    in, a plane survives only if flattening to it does not raise the residual past the model
+    error eta that M4 fitted -- so a genuinely faceted body keeps its facets and a smooth one
+    is left alone.
+    """
+    body = ImplicitBody(radius=radius)
+    body.core.set_support(torch.full((64,), 0.8 * radius) if support is None else support)
+    load_decoder(body)
+    set_code(body, code)
+    v, f = extract_mesh(lambda y: body(y), radius * 1.6, res=res, device="cpu")
+    if len(f) < 8:
+        return None, None, 0
+    v = apply_constraints(v, radius)
+    kept = 0
+    planes = ransac_planes(v, f)
+    if len(planes):
+        v, kept = planar_snap(v, f, planes,
+                              misfit_fn=(None if misfit_fn is None
+                                         else lambda w: misfit_fn(w, f)),
+                              eta=eta)
+        v = restore_constraints(v, radius)
+    return v, f, kept
+
+
+def occupancy(v, f, n=64, extent=None):
+    e = extent or float(np.abs(v).max()) * 1.05
+    return mesh_to_sdf(v, f, n, e) < 0
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--model", type=int, required=True)
+    ap.add_argument("--ckpt", default="model/lpd_flow.pt")
+    ap.add_argument("--surrogate", default="model/surrogate.pt")
+    ap.add_argument("--data-dir", default="data/raw")
+    ap.add_argument("--samples", type=int, default=8)
+    ap.add_argument("--phases", type=int, default=96)
+    ap.add_argument("--res", type=int, default=64)
+    ap.add_argument("--out", required=True)
+    ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--support-from", default=None,
+                    help="STL whose support function supplies h; defaults to the convex "
+                         "stage's reconstruction of this model")
+    a = ap.parse_args()
+    torch.manual_seed(a.seed)
+
+    R = CYLINDER_R[a.model]
+    psi = psi_grid(a.phases)
+    M = min(N_MODES, a.phases // 2)
+
+    gdev = "cuda" if torch.cuda.is_available() else "cpu"
+    surro = Surrogate(width=96, modes=8, blocks=3)
+    surro.load_state_dict(torch.load(a.surrogate, map_location="cpu"))
+    surro = surro.to(gdev).eval()
+
+    net = LPDFlow()
+    net.load_state_dict(torch.load(a.ckpt, map_location="cpu"))
+    net.eval()
+
+    sup_stl = a.support_from or f"data/eval_convex/Asteroid{a.model:02d}.stl"
+    support = support_from_convex(sup_stl)
+    print(f"  h from {sup_stl}: {float(support.min()):.3f}-{float(support.max()):.3f}",
+          flush=True)
+
+    d = load_model_curves(a.data_dir, a.model, m=a.phases)
+    g_dat = data_modes(d["curves"], M)
+    tag, mask = geom_tag_and_mask(d["mask"])
+    print(f"model {a.model}: R = {R}, {int(mask.sum())}/28 geometries present", flush=True)
+
+    t0 = time.time()
+    codes = net.sample(make_resid_fn(g_dat, surro, psi, M, R, support=support),
+                       tag.expand(a.samples, -1, -1), mask.expand(a.samples, -1),
+                       batch=a.samples)
+    print(f"  {a.samples} draws x {N_STEPS} steps in {time.time()-t0:.0f}s", flush=True)
+
+    # M7's snap is gated on the data: the misfit of a candidate mesh against the REAL curves,
+    # with the per-curve model error M4 fitted as the tolerance it may not exceed.
+    real = torch.tensor(d["curves"], dtype=torch.float32)
+    real_g = torch.stack([real[:28], real[28:]], dim=1)              # (28, 2, P)
+    eta = float(torch.nn.functional.softplus(
+        torch.load("model/calibration.pt", map_location="cpu",
+                   weights_only=False)["raw_eta"]).mean())
+
+    def misfit(w, faces):
+        c = curves_from_mesh(np.asarray(w), np.asarray(faces), surro, psi)
+        return float(((c - real_g) ** 2).mean().sqrt())
+
+    meshes, occs, snaps = [], [], []
+    for i in range(a.samples):
+        v, f, kept = decode(codes[i], R, res=a.res, misfit_fn=misfit, eta=eta,
+                            support=support)
+        if v is None:
+            print(f"  draw {i}: degenerate, dropped", flush=True); continue
+        meshes.append((v, f)); occs.append(occupancy(v, f)); snaps.append(kept)
+    if not meshes:
+        raise SystemExit("every draw was degenerate")
+    k = metric_medoid(occs)
+    v, f = meshes[k]
+    print(f"  planes accepted per draw (eta = {eta:.4f}): {snaps}", flush=True)
+    print(f"  medoid = draw {k} of {len(meshes)}; "
+          f"mean pairwise Dice {np.mean([dice(occs[k], o) for o in occs]):.4f}", flush=True)
+
+    Path(a.out).parent.mkdir(parents=True, exist_ok=True)
+    info = export_stl(a.out, v, f)
+    res = {"model": a.model, "radius": R, "draws": len(meshes), "medoid": int(k),
+           "spread": float(np.mean([dice(occs[k], o) for o in occs])),
+           "eta": eta, "planes_accepted": snaps, **info}
+
+    if a.model in PUBLIC:
+        import trimesh
+        t = trimesh.load(Path(a.data_dir) / PUBLIC[a.model], process=False)
+        tv = rescale_touch_z(np.asarray(t.vertices))
+        rv = rescale_touch_z(v)
+        e = max(float(np.abs(tv).max()), float(np.abs(rv).max())) * 1.05
+        res["dice"] = float(dice(occupancy(tv, np.asarray(t.faces), 128, e),
+                                 occupancy(rv, f, 128, e)))
+        print(f"  DICE vs truth: {res['dice']:.4f}", flush=True)
+
+    print(json.dumps(res))
+    Path(a.out).with_suffix(".json").write_text(json.dumps(res, indent=2))
+
+
+if __name__ == "__main__":
+    main()

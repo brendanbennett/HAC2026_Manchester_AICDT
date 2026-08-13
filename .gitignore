@@ -1,0 +1,33 @@
+__pycache__/
+*.pyc
+*.egg-info/
+.pytest_cache/
+checkpoints/
+checkpoints_damit_smoke/
+demo_out/
+demo_laptop/
+compare_out/
+real_compare/
+submissions/
+data/
+*.log
+.venv/
+.DS_Store
+
+# Third-party repo — clone separately, never track or push (read-only dependency)
+team-repo/
+
+# Training-run checkpoint directories: every 2000-step snapshot, ~95 MB each (97% of
+# which is the regenerable photometric operator). The shipped model is exported slim
+# to solver/model/ by solver/export_model.py; nothing here needs tracking.
+checkpoints_*/
+!solver/model/
+
+# Session scaffolding: watchdogs, orchestration, one-off diagnostics and their logs.
+solver/*.sh
+# '#' only starts a comment at the START of a line, so these must carry none
+!solver/prep_gpu_env.sh
+!solver/render_nc.sh
+!solver/rebuild_data.sh
+solver/diag_*.py
+solver/exp_*.py

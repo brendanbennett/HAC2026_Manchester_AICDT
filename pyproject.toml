@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "hac26"
+version = "0.1.0"
+description = "Learned Primal-Dual lightcurve inversion for the Helsinki Asteroid Challenge 2026"
+requires-python = ">=3.10"
+dependencies = ["numpy>=1.24", "scipy>=1.10"]
+
+[project.optional-dependencies]
+torch = ["torch>=2.1"]
+test = ["pytest>=7.0"]
+
+[tool.setuptools]
+packages = ["hac26"]
+[tool.pytest.ini_options]
+markers = ["slow: extraction-scale tests"]
