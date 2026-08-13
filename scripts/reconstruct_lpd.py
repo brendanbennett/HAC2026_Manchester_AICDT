@@ -31,6 +31,7 @@ from hac26.field import ImplicitBody, apply_constraints, extract_mesh  # noqa: E
 from solvers.lpd_flow import CODE_DIM, N_MODES, N_STEPS, LPDFlow         # noqa: E402
 from solvers.output import (export_stl, metric_medoid, planar_snap,      # noqa: E402
                           ransac_planes, restore_constraints)
+from hac26.covariance import load_covariance, whitened_misfit          # noqa: E402
 from hac26.recon import dice, mesh_to_sdf                              # noqa: E402
 from hac26.shapes import mesh_support, rescale_touch_z                 # noqa: E402
 from forward_models.learned_surrogate import Surrogate                                  # noqa: E402
@@ -185,6 +186,11 @@ def main():
 
     # The snap is gated on the data: the misfit of a candidate mesh against the real curves,
     # with the per-curve model error from the calibration as the tolerance it may not exceed.
+    cov_path = Path("pretrained/data_covariance.pt")
+    COV = load_covariance(str(cov_path)) if cov_path.exists() else None
+    if COV is None:
+        print("  no fitted covariance yet; the snap gate falls back to an unweighted RMS",
+              flush=True)
     real = torch.tensor(d["curves"], dtype=torch.float32)
     real_g = torch.stack([real[:28], real[28:]], dim=1)              # (28, 2, P)
     eta = float(torch.nn.functional.softplus(
@@ -192,8 +198,16 @@ def main():
                    weights_only=False)["raw_eta"]).mean())
 
     def misfit(w, faces):
+        """Whitened by the measured covariance, which is the only weight in play here.
+
+        An unweighted curve-space RMS would weight every curve and every rotation order
+        equally, which is a prior on the data that was never measured.
+        """
         c = curves_from_mesh(np.asarray(w), np.asarray(faces), surro, psi)
-        return float(((c - real_g) ** 2).mean().sqrt())
+        pred56 = torch.cat([c[:, 0], c[:, 1]], dim=0)
+        if COV is None:
+            return float(((c - real_g) ** 2).mean().sqrt())
+        return float(whitened_misfit(pred56, real, COV["s2"]))
 
     meshes, occs, snaps = [], [], []
     for i in range(a.samples):
