@@ -31,7 +31,7 @@ from hac26.data_io import load_model_curves  # noqa: E402
 from hac26.radial import (dice_from_radial, fibonacci_sphere, mesh_radial)  # noqa: E402
 from hac26.recon import (body_from_support, fit_to_cylinder, smooth_support)  # noqa: E402
 from hac26.geometry import project_closure  # noqa: E402
-from solvers.minkowski import solve_minkowski  # noqa: E402
+from hac26.solvers.minkowski import solve_minkowski  # noqa: E402
 from hac26.shapes import hull_mesh, mesh_support, rescale_touch_z  # noqa: E402
 from hac26.stl_io import load_stl  # noqa: E402
 from hac26.train import load_net  # noqa: E402
@@ -110,7 +110,7 @@ def main() -> None:
                              "../data/team/split_test"])
     ap.add_argument("--data-dir", default="../data/raw")
     ap.add_argument("--rays", type=int, default=4096)
-    ap.add_argument("--out", default="../data/eval")
+    ap.add_argument("--out", default="results/eval")
     args = ap.parse_args()
 
     nets, grids, prs = [], [], []

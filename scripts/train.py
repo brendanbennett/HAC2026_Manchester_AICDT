@@ -38,11 +38,6 @@ def main() -> None:
                          "omit to train on the built-in synthetic sampler")
     ap.add_argument("--mix", type=float, default=0.25,
                     help="fraction of built-in synthetic shapes mixed in (breadth reserve)")
-    ap.add_argument("--shape-source", default=None, choices=["synthetic", "damit"],
-                    help="source for the mixed-in breadth-reserve shapes; 'damit' uses "
-                         "real inversion-derived asteroid meshes instead of the "
-                         "synthetic SH/polytope sampler")
-    ap.add_argument("--damit-dir", default=None, help="root holding DAMIT shape.txt files")
     ap.add_argument("--support", action="store_true",
                     help="add the support-function head and train h(u); the body is "
                          "then a half-space intersection instead of a Minkowski solve")
@@ -96,10 +91,6 @@ def main() -> None:
         pr.gate_rank = args.gate_rank
     if args.n_rays is not None:
         pr.n_rays = args.n_rays
-    if args.shape_source is not None:
-        pr.shape_source = args.shape_source
-    if args.damit_dir is not None:
-        pr.damit_dir = args.damit_dir
     if args.steps is not None:
         pr.steps = args.steps
     if args.batch is not None:
@@ -114,7 +105,7 @@ def main() -> None:
     dataset = None
     if args.data:
         from hac26.adapter import FigurineCurves, load_pairs
-        from forward_models.convex_egi import stack_A
+        from hac26.forward.convex_egi import stack_A
         from hac26.geometry import build_cameras, make_grid
         grid = make_grid(pr.n_theta, pr.n_phi)
         A, _ = stack_A(grid, build_cameras(), pr.m, c_lambert=pr.c_lambert,

@@ -22,10 +22,10 @@ import torch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from hac26.conventions import S_LAB, cameras, psi_grid, source_directions, to_body  # noqa
-from forward_models.mesh_radiosity import RadiositySolver, emission, facet_geometry, form_factors  # noqa
+from hac26.forward.mesh.radiosity import RadiositySolver, emission, facet_geometry, form_factors  # noqa
 from hac26.calibrate import decimate                                         # noqa
-from forward_models.mesh_raster import Rasteriser                                          # noqa
-from forward_models.learned_surrogate import Surrogate, trace_features                        # noqa
+from hac26.forward.mesh.raster import Rasteriser                                          # noqa
+from hac26.forward.learned_surrogate import Surrogate, trace_features                        # noqa
 
 
 def shapes(n: int, seed: int = 0):
@@ -126,7 +126,7 @@ def features_for(v, f, psi, n_tokens=600, seed=0):
     1/sqrt(128) = 0.088 no matter how well the network fitted.
     """
     from hac26.calibrate import decimate
-    from forward_models.mesh_radiosity import facet_geometry
+    from hac26.forward.mesh.radiosity import facet_geometry
     dv, df = decimate(v, f, n_tokens)
     pts, nrm, area = facet_geometry(dv, df)
     # Features for EVERY geometry, not just camera 0. The surrogate is camera-agnostic by
@@ -215,14 +215,10 @@ def main():
         np.savez(cache, X=obj(X), Y=obj(Y), A=obj(A))
         print(f'  cached {len(X)} shapes -> {cache}', flush=True)
 
-    # PAD, never truncate. Token counts run from 12 (a cube, which cannot decimate below
-    # its own faces) to 600, so equalising by the minimum forced every shape down to 12
-    # tokens and discarded up to 98% of its surface -- and the area weights, normalised
-    # before truncation, no longer summed to one. Zero-area tokens contribute nothing to an
-    # area-weighted sum, so padding is exact.
-    # Features are (28, T, P, F): pad the TOKEN axis, which is axis 1, not axis 0. Padding
-    # by len(x) would pad the camera axis, and a 3-pair pad spec on a 4-D array is what the
-    # broadcast error was reporting.
+    # Pad, never truncate: token counts vary by two orders of magnitude between bodies, so
+    # equalising by the minimum would discard most of the surface of the detailed ones. A
+    # zero-area token contributes nothing to an area-weighted sum, so padding is exact.
+    # Features are (28, T, P, F); the token axis is axis 1.
     nt = max(x.shape[1] for x in X)
     X = [np.pad(x, ((0, 0), (0, nt - x.shape[1]), (0, 0), (0, 0))) for x in X]
     A = [np.pad(a_, (0, nt - len(a_))) for a_ in A]
@@ -302,7 +298,7 @@ def main():
     if best_state is not None:
         net.load_state_dict(best_state)
         print(f"\n  restored the checkpoint with the best VALIDATION RMS {best_val:.5f}")
-    torch.save(net.state_dict(), "model/surrogate.pt")
+    torch.save(net.state_dict(), "runs/surrogate.pt")
     with torch.no_grad():
         err = eval_rms(Xte, Ate, tte).abs()
     # sigma comes from the DATA, not from a constant. The measured replicate noise at

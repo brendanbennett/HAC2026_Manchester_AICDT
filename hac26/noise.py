@@ -1,36 +1,20 @@
 """Measurement noise for the HAC 2026 lightcurves.
 
-Depends on numpy only, and on nothing else in this package, so it can be dropped into any
-generation or training pipeline.
+Depends on numpy only, so it can be dropped into any pipeline.
 
-WHY THIS EXISTS. Synthetic curves are generated noiselessly. A model trained on them learns
-that all 56 curves are equally reliable. They are not: the measured noise spans 226x across
-the camera array and is concentrated at two of the seven azimuths, so a noiseless prior
-systematically over-trusts the worst geometries at inference time.
-
-HOW THE NOISE IS MEASURED, with no model. At each azimuth two cameras sit at the same
-elevation and view the same body at the same instant, so their difference is pure
-measurement noise:
+At each azimuth two cameras sit at the same place and see the same body at the same instant,
+so their difference is measurement noise with no geometry in it:
 
     sigma_c^2 = mean( (x_a - x_b)^2 ) / 2
 
-That identity is the whole method. It assumes only that the pair really is co-located,
-which `replicate_offset_r2` below checks rather than assumes -- a pair at slightly
-different azimuths would differ by GEOMETRY, and calling that noise would inflate sigma.
+`replicate_offset_r2` checks the pair really is co-located rather than assuming it; a pair at
+slightly different azimuths would differ by geometry, and calling that noise would inflate
+sigma.
 
-WHAT WAS MEASURED (three public models, real curves, mean-normalised units):
-
-    model  type        0      45      90     135     225     270     315
-      1  intensity  0.0035  0.0024  0.0052  0.0513  0.0540  0.0055  0.0023
-      1  binary     0.0041  0.0039  0.0072  0.0370  0.0491  0.0083  0.0046
-      2  intensity  0.0205  0.0215  0.0602  0.4120  0.1299  0.0444  0.0180
-      2  binary     0.0262  0.0272  0.0223  0.1510  0.1563  0.0789  0.0183
-      3  intensity  0.0174  0.0049  0.0089  0.0322  0.0328  0.0018  0.0046
-      3  binary     0.0074  0.0293  0.0141  0.0435  0.0483  0.0166  0.0073
-
-min 0.0018, max 0.4120. The spread is not scattered: it concentrates at 135 and 225
-degrees, where the body is near-backlit, the lit area collapses, and the organisers'
-per-curve mean normalisation then amplifies what little signal remains.
+The noise is strongly heteroscedastic across the array and concentrates at the high-phase
+azimuths, so treating all 56 curves as equally reliable is wrong. NOISE_PROFILE carries the
+per-azimuth shape, normalised to mean 1 so applying it changes the distribution of noise
+across the array without changing its overall level.
 """
 from __future__ import annotations
 
@@ -90,7 +74,7 @@ def replicate_offset_r2(curves: np.ndarray, mask: np.ndarray | None = None) -> n
     near 1 means the cameras are not where they are documented to be and sigma is inflated.
 
     Measured on the public models: R^2 <= 0.002 on the geometric (binary) channel, and
-    ~0.001 at the noisy azimuths 135/225 -- so the 226x spread is real noise, not geometry.
+    at the noisy azimuths, so the spread across curves is noise rather than geometry.
     """
     C, m = curves.shape
     mask = np.ones(C) if mask is None else np.asarray(mask)
@@ -117,7 +101,7 @@ def apply_noise(curves: np.ndarray, rng: np.random.Generator,
 
     One overall scale is drawn per body from [scale_lo, scale_hi]; `profile` then
     redistributes it across the array. With the default profile the near-backlit curves
-    receive 2.51x the noise and the well-lit ones 0.53x, a 4.7x ratio, while the mean level
+    receive more noise than the well-lit ones, while the mean level
     is unchanged -- so switching a pipeline from homoscedastic to this changes only WHERE
     the noise goes, and any existing noise-scale tuning stays valid.
 

@@ -31,9 +31,9 @@ from hac26.calibrate import body_radiance, decimate           # noqa: E402
 from hac26.conventions import cameras, psi_grid               # noqa: E402
 from hac26.data_io import load_model_curves                   # noqa: E402
 from hac26.noise import sigma_from_replicates                 # noqa: E402
-from forward_models.mesh_radiosity import facet_geometry                    # noqa: E402
-from forward_models.mesh_raster import Rasteriser, otsu_threshold           # noqa: E402
-from forward_models.mesh_sensor import SensorModel                          # noqa: E402
+from hac26.forward.mesh.radiosity import facet_geometry                    # noqa: E402
+from hac26.forward.mesh.raster import Rasteriser           # noqa: E402
+from hac26.forward.mesh.sensor import SensorModel                          # noqa: E402
 from hac26.shapes import rescale_touch_z                      # noqa: E402
 from hac26.stl_io import load_stl                             # noqa: E402
 
@@ -115,7 +115,7 @@ def main():
         print(f"[render] model {M} ...", flush=True)
         imgs, ras, fov = render_body(M, a.phases, (a.height, a.width), a.ss,
                                      a.rho, np.radians(a.delta_deg), dev, a.raster_faces)
-        d = load_model_curves("data/raw", M, m=a.phases, use_blender=False)
+        d = load_model_curves("dataset/raw", M, m=a.phases, use_blender=False)
         keep = d["mask"] > 0
         real = torch.tensor(d["curves"], dtype=torch.float32, device=dev)
         real = real / real.mean(1, keepdim=True).clamp_min(1e-9)
@@ -209,9 +209,9 @@ def main():
     torch.save({"sensor": sensor.state_dict(), "raw_tau_i": raw_tau_i.detach(),
                 "raw_tau_b": raw_tau_b.detach(), "pedestal": pedestal.detach(),
                 "raw_eta": raw_eta.detach(), "rho": a.rho, "delta_deg": a.delta_deg},
-               "pretrained/instrument_calibration.pt")
+               "models/instrument_calibration.pt")
     Path(a.out).write_text(json.dumps(report, indent=1))
-    print(f"\nwrote {a.out} and pretrained/instrument_calibration.pt")
+    print(f"\nwrote {a.out} and models/instrument_calibration.pt")
 
 
 if __name__ == "__main__":

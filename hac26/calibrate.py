@@ -1,37 +1,30 @@
 """Calibration against the real curves of models 1, 2 and 3, using their true STLs.
 
-WHAT IS FITTED, AND AT WHAT SCOPE
+Fitted, and at what scope:
 
-  shared, once, transfers to all ten   rho, source angular radius delta, PSF width,
-                                       vignetting coefficients, OETF knots, clip knee
-  per curve (56)                       tau_I, tau_B, pedestal C
-  per body                             psi0
+    shared, transfers to all ten   rho, source angular radius, PSF width, vignetting,
+                                   OETF knots, clip knee
+    per curve                      tau_I, tau_B, pedestal C
+    per body                       psi0
 
-WHY A PEDESTAL AND NOT A GAIN. With val = g L + C, the two reductions give
-I = g I_raw + C N and N = N. Mean normalisation divides each curve by its own mean, which
-removes g entirely -- a per-curve gain is unidentifiable and fitting one adds a direction
-the data cannot constrain. C does not cancel, because it enters I weighted by the pixel
-COUNT, so the intensity and binary channels together pin the ratio C/g. Keep the pedestal,
-drop the gain.
+A pedestal and not a gain. With val = g L + C the two reductions give I = g I_raw + C N and
+N = N. Mean normalisation divides each curve by its own mean and so removes g entirely, which
+makes a per-curve gain unidentifiable. C does not cancel, because it enters I weighted by the
+pixel count, so the two channels together pin C/g.
 
-WHAT IS PINNED BY MEASUREMENT AND NEVER FITTED. The mount geometry and any z-gradient in
-the beam. Under any transport model the z -> -z mirror is exact for all fourteen
-elevation-0 geometries, so those two are the only things that break the degeneracy; fitting
-them means fitting the mirror ambiguity itself, and the fit will happily choose whichever
-mirror suits the residual.
+The mount geometry and any z-gradient in the beam are pinned by measurement and never fitted.
+Under any transport model the z -> -z mirror is exact for the elevation-0 geometries, so
+fitting them would be fitting the mirror ambiguity itself.
 
-WEIGHTS ARE COMPUTED IN UNNORMALISED SPACE. Photon noise is roughly constant in absolute
-terms, so on a mean-normalised curve it becomes sigma_c = sigma_photon / mean_c, i.e. LARGE
-where the body is faint. Applying 1/sigma^2 to the normalised curves then drives azimuths
-135 and 225 to zero weight -- and those are the two most concavity-informative geometries
-in the set, being the ones at high phase where shadow dominates. The whitening therefore
-uses s^2 = sigma^2 + eta^2 with eta the fitted residual model error, which bounds the
-weight from above and keeps those geometries in the fit.
+Weights are computed in unnormalised space. Photon noise is roughly constant in absolute
+terms, so on a mean-normalised curve it becomes large where the body is faint, and applying
+1/sigma^2 there would drive the high-phase azimuths -- the most concavity-informative
+geometries -- to zero weight. The whitening therefore uses s^2 = sigma^2 + eta^2 with eta the
+fitted model error, which bounds the weight from above.
 
-RADIOSITY RUNS ON A DECIMATED MESH, of necessity: model 1's ground truth carries 800,000
-facets, and a dense form-factor matrix on that is 5,120 GB. Decimating to ~1,200 facets
-costs 0.27% in volume and 0.93% in area, and interreflection is a smooth, low-frequency
-quantity -- far smoother than the silhouette, which is still rasterised from the full mesh.
+Radiosity runs on a decimated mesh out of necessity: a dense form-factor matrix on a
+800,000-facet ground truth is not storable. Interreflection is smooth and low-frequency,
+unlike the silhouette, which is still rasterised from the full mesh.
 """
 from __future__ import annotations
 
@@ -40,9 +33,9 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .conventions import S_LAB, cameras, psi_grid, source_directions, to_body
-from forward_models.mesh_radiosity import RadiositySolver, emission, facet_geometry, form_factors
-from forward_models.mesh_sensor import SensorModel
+from .conventions import source_directions, to_body
+from hac26.forward.mesh.radiosity import RadiositySolver, emission, form_factors
+from hac26.forward.mesh.sensor import SensorModel
 
 __all__ = ["CalibrationParams", "decimate", "light_visibility", "body_radiance",
            "residual_to_noise"]

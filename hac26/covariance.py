@@ -1,41 +1,30 @@
-"""The measurement covariance: photon noise plus fitted model error, in the psi-Fourier basis.
+"""Measurement covariance: photon noise plus fitted model error, in the psi-Fourier basis.
 
-Every residual in every objective is whitened by 1/s^2 from here, and nothing else in the
-code carries a weight.
+Every data residual is whitened by 1/s^2 from here.
 
-DFT CONVENTION, fixed and used everywhere. With psi_k = 2 pi k / N,
+DFT convention, used by every caller through `psi_dft`: with psi_k = 2 pi k / N,
 
-    rhat_m = (1/N) sum_{k=0}^{N-1} r_k e^{-i m psi_k}
+    rhat_m = (1/N) sum_k r_k e^{-i m psi_k}
 
-so for white noise of variance sigma^2 per sample, Var(rhat_m) = sigma^2 / N. Getting this
-normalisation wrong rescales the entire covariance, so it is stated once here and every
-caller uses `psi_dft`.
+so white noise of variance sigma^2 per sample gives Var(rhat_m) = sigma^2 / N.
 
-PHOTON NOISE. Two horizontal cameras share each azimuth, so their difference is noise with
-no geometry in it, and sigma_c follows from the replicate identity in hac26.noise. Photon
-noise is roughly constant in absolute terms, so on a mean-normalised curve it appears as
-sigma_c = sigma_photon / mean_c, which is why the curves are whitened per curve and not by a
-single scalar.
+Photon noise: two horizontal cameras share each azimuth, so their difference carries no
+geometry and sigma_c follows from the replicate identity in hac26.noise. It appears on a
+mean-normalised curve as sigma_c = sigma_photon / mean_c, which is why whitening is per curve.
 
-MODEL ERROR, measured rather than assumed. With the calibrated nuisance parameters, the
-residual against the true STL of a public body is not noise: it is what the forward model
-cannot reproduce. Its Fourier content is fitted with the smooth parametric form
+Model error: the residual of the forward model against a body whose truth is known is not
+noise. Its Fourier content is fitted as
 
-    eta^2_{c,m} = gamma_c * tau0^2 * (1 + m/m0)^(-2p)
+    eta^2_{c,m} = gamma_c tau0^2 (1 + m/m0)^(-2p)
 
-by maximum likelihood over the 3 x 56 x 40 coefficients of the public triplet. That is 59
-parameters against several thousand residuals. The raw per-(c, m) empirical variance is not
-used: three bodies give three samples per cell, which is not an estimate.
-
-gamma_c and tau0^2 are multiplicatively degenerate, so gamma is normalised to unit geometric
-mean and tau0 carries the overall scale.
-
-WHITENING.
+by maximum likelihood. gamma_c and tau0^2 are multiplicatively degenerate, so gamma is
+normalised to unit geometric mean. A smooth parametric form is used because the empirical
+per-(c, m) variance would rest on as many samples as there are bodies.
 
     s^2_{c,m} = sigma^2_{c,m} + eta^2_{c,m}
 
-A direction of shape space that is determined only by the model error therefore appears with
-large s^2 and is automatically demoted, with no special handling anywhere.
+A direction determined only by model error therefore carries a large s^2 and is demoted
+wherever this covariance is used.
 """
 from __future__ import annotations
 

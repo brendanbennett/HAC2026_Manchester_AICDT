@@ -12,7 +12,7 @@ from hac26.conventions import (AZIMUTHS_DEG, FRAMES, S_LAB, SENSE, TOP_ELEVATION
                                Camera, R_z, camera_vector, cameras, lab_azimuth_deg,
                                phase_angle_deg, psi_grid, source_directions, to_body)
 
-DATA = "data/raw"
+DATA = "dataset/raw"
 
 
 # ---------------------------------------------------------------- the gate
@@ -131,9 +131,6 @@ def test_published_radius_is_approximate_not_a_bound(model):
 
     It is neither tight nor an upper bound. Posed so that z spans exactly [-1, 1]:
 
-        model 1   r_max 1.1288   R 1.120   r/R 1.0079
-        model 2   r_max 1.4585   R 1.420   r/R 1.0271
-        model 3   r_max 0.8747   R 0.880   r/R 0.9940
 
     Two of the three public bodies EXCEED their published R, by 0.8% and 2.7%, and the
     third falls 0.6% short. So R is a ~3% approximation, and enforcing r <= R as a hard

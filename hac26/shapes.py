@@ -11,7 +11,7 @@ from scipy.spatial import ConvexHull
 from scipy.special import gammaln, lpmv
 
 from .geometry import OMEGA0, NormalGrid, body_frame_dirs, cell_index, project_closure, psi_grid
-from forward_models.convex_egi import kernel
+from hac26.forward.convex_egi import kernel
 
 
 # ---------- icosphere ---------------------------------------------------------------
@@ -207,7 +207,7 @@ def sample_training_shape(rng: np.random.Generator, grid: NormalGrid,
     """Random body, challenge-posed; returns EGI of its convex hull + metadata.
 
     `p_flat` mixes in flat-faced / few-face bodies (see sample_flat_shape). The default
-    of 0 reproduces the original distribution exactly, so old checkpoints stay
+    of 0 reproduces the base distribution exactly, so existing checkpoints stay
     comparable; the trained presets set it explicitly.
     """
     meta = None
@@ -231,21 +231,6 @@ def sample_training_shape(rng: np.random.Generator, grid: NormalGrid,
     g = mesh_to_egi(hv, hf, grid)
     return {"kind": kind, "verts": hv, "faces": hf, "g": g,
             "p": g / max(g.sum(), 1e-12), "meta": meta}
-
-
-def sample_damit_shape(rng: np.random.Generator, grid: NormalGrid,
-                       pool: list) -> dict:
-    """Draw a random real DAMIT mesh, convex-hull it, challenge-pose it, return its EGI.
-
-    Same output contract as sample_training_shape. A random 3D rotation is applied before
-    posing so the (arbitrary) DAMIT body frame is not memorized as the pole axis."""
-    verts, faces = pool[int(rng.integers(len(pool)))]
-    v = verts @ _random_rotation(rng).T
-    v = rescale_touch_z(v)
-    hv, hf = hull_mesh(v)
-    g = mesh_to_egi(hv, hf, grid)
-    return {"kind": "damit", "verts": hv, "faces": hf, "g": g,
-            "p": g / max(g.sum(), 1e-12), "meta": None}
 
 
 def _random_rotation(rng: np.random.Generator) -> np.ndarray:

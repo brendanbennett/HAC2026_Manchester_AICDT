@@ -1,0 +1,19 @@
+{
+  "model": 7,
+  "radius": 1.205,
+  "draws": 6,
+  "medoid": 4,
+  "spread": 0.9941492076859945,
+  "eta": 0.03558938577771187,
+  "planes_accepted": [
+    12,
+    12,
+    12,
+    12,
+    12,
+    12
+  ],
+  "watertight": true,
+  "volume": 2.657492411581249,
+  "faces": 4660
+}

@@ -72,6 +72,10 @@ def r3(psi: float) -> np.ndarray:
 def psi_grid(m: int, sigma: float = 1.0, psi0: float = 0.0) -> np.ndarray:
     """Rotation angles of the m frames of one full revolution.
 
+    Not the same as hac26.conventions.psi_grid, which carries the measured turntable sense
+    and takes no phase offset. This one serves the convex operator; that one serves the
+    mesh-based models. Importing the wrong one silently reverses the rotation.
+
     psi0 is a constant phase offset (frame 0 = aligned pose has psi0 = 0; nonzero
     values model residual start-phase misalignment, and are also used in tests to
     stay off the measure-zero set {mu0 = 0} where the discontinuous binary kernel

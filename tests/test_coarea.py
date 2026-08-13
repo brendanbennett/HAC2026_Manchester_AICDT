@@ -13,7 +13,7 @@ import numpy as np
 import pytest
 import torch
 
-from hac26.coarea import contour_weights, threshold_count, threshold_sum
+from hac26.forward.shared.coarea import contour_weights, threshold_count, threshold_sum
 
 N_PARAM = 100
 H = W = 256

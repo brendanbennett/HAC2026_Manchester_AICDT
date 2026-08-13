@@ -15,7 +15,7 @@ from __future__ import annotations
 import numpy as np
 
 from .geometry import project_closure
-from solvers.minkowski import solve_minkowski
+from hac26.solvers.minkowski import solve_minkowski
 from .shapes import face_normals_areas, rescale_touch_z
 from .stl_io import save_stl
 
@@ -182,10 +182,8 @@ def dice(a: np.ndarray, b: np.ndarray) -> float:
     return float(2.0 * np.logical_and(a, b).sum() / s) if s else 1.0
 
 
-# Moved here from the volumetric renderer when that pipeline was removed: this is a
-# SCORING utility (mesh -> occupancy -> signed distance, used to voxelise both a
-# reconstruction and its ground truth onto a common grid before Dice), not part of any
-# forward model. It needs numpy, scipy and trimesh only.
+# Scoring utility: mesh -> occupancy -> signed distance, to voxelise a reconstruction and
+# a ground truth onto a common grid. numpy, scipy and trimesh only.
 
 def mesh_to_sdf(verts: np.ndarray, faces: np.ndarray, n: int, extent: float) -> np.ndarray:
     """Signed distance field of a mesh on a cubic grid, negative inside.
@@ -208,26 +206,3 @@ def mesh_to_sdf(verts: np.ndarray, faces: np.ndarray, n: int, extent: float) -> 
     d_out = distance_transform_edt(~inside) * voxel
     d_in = distance_transform_edt(inside) * voxel
     return (d_out - d_in).astype(np.float32)
-
-
-# ---------------------------------------------------------------------------------
-# Ray-marched renderer.
-#
-# The field-rotation renderer above loses 1-2% to interpolation, and that error is FLAT
-# in resolution: the transmittance is obtained by rotating the volume, scanning, and
-# rotating back, so a shell one voxel wide is bilinearly resampled twice, and since the
-# shell width scales with the voxel the error never shrinks. Widening the shell does not
-# help -- it smears the geometry instead -- so there is an optimum near one voxel and an
-# irreducible error sitting on it. That error was enough to fail the fidelity gate.
-#
-# The fix is to stop resampling the sharp field. Two changes:
-#
-#   * sigma and the normals are sampled at ray sample points on their NATIVE grid, so
-#     they are interpolated once and then INTEGRATED along the ray, which averages the
-#     interpolation error instead of exposing it pointwise;
-#   * the sun transmittance is left in the frame it was computed in, and queried by
-#     transforming the sample COORDINATES into that frame -- one interpolation, no
-#     resampling of the field back.
-#
-# View transmittance needs no field at all: marching front to back accumulates it exactly.
-# ---------------------------------------------------------------------------------

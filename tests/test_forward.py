@@ -6,13 +6,13 @@ must be >= 0 everywhere, and exactly zero at azimuth 0 elevation 0. Both are ass
 never clamped: a clamp would turn a broken transport model into a plausible-looking one,
 which is the failure mode this test exists to catch.
 
-WHY D >= 0 IS A THEOREM AND NOT A HOPE. Setting every visibility to 1 can only raise the
+D >= 0 is a theorem. Setting every visibility to 1 can only raise the
 emission, so e_novis >= e_vis componentwise. The transport operator inherits that ordering:
 (I - rho F)^-1 = I + rho F + rho^2 F^2 + ... has non-negative entries, since F >= 0 and the
 spectral radius is below 1. So B_novis >= B_vis, and therefore every pixel, every summed
 intensity and every pixel count is >= as well.
 
-WHY IT IS EXACTLY ZERO AT ZERO PHASE, AND UNDER WHAT CONDITION. At azimuth 0 elevation 0
+Zero at zero phase. At azimuth 0 elevation 0
 the camera looks along the light, so a surface point is shadowed exactly when it is blocked
 along the view direction, i.e. exactly when it is invisible. Removing shadows therefore
 changes only pixels that were never seen. That argument is about DIRECT light. With
@@ -25,8 +25,8 @@ import numpy as np
 import pytest
 import torch
 
-from hac26.conventions import S_LAB, cameras, source_directions
-from forward_models.mesh_radiosity import RadiositySolver, emission, facet_geometry, form_factors
+from hac26.conventions import cameras, source_directions
+from hac26.forward.mesh.radiosity import RadiositySolver, emission, form_factors
 
 cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
 H, W, SS = 128, 128, 2          # small on purpose; the gate is about signs, not resolution
@@ -58,7 +58,7 @@ def flat_shade(verts, faces, facet_value):
 
 def _curves(rho, occlude_light, cam, dev="cuda"):
     """Reduced (I, N) for one camera, with light visibility on or off."""
-    from forward_models.mesh_raster import Rasteriser, reduce_curves
+    from hac26.forward.mesh.raster import Rasteriser, reduce_curves
     verts, faces = contact_binary()
     F, area, nrm, cen = form_factors(verts, faces, occlusion=(rho > 0))
     solver = RadiositySolver(F, rho=max(rho, 1e-12))

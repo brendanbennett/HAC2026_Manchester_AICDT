@@ -1,19 +1,21 @@
-"""-- geometry representation.
+"""Implicit shape representation: a convex core plus a signed token correction.
 
-    f(y) = max_j (n_j . y - h_j)  +  s * Delta(y),        s = 0.15 R  (fixed)
+    f(y) = max_j (n_j . y - h_j) + s * Delta(y)
 
-A convex core carried by 64 support values h >= 0 on fixed normals, plus a signed token
-correction that both carves and grows.
+The core is an intersection of half-spaces on fixed design normals, so its zero level set is a
+convex polytope whose faces are exactly the planes n_j . y = h_j. Delta is a signed, zero-mean
+correction decoded from tokens by cross-attention, which is what carries non-convexity.
 
-WHY plain max AND NOT log-sum-exp. Autodiff routes the subgradient of a max to the argmax,
-which is exactly right here: the active halfspace is the one that owns the surface at that
-point. Log-sum-exp instead biases the zero set inward by log(J)/beta, which at J = 64 and
-beta = 50/R is log(64)/(50/R) = 0.083 R -- a systematic 8% shrink of every body, applied
-silently.
+Plain max, not log-sum-exp. Autodiff routes the subgradient of a max to the argmax, which is
+the half-space that owns the surface at that point; log-sum-exp instead biases the zero set
+inward by log(J)/beta, shrinking every body.
 
-WHY Delta must stay signed. A one-sided activation would make the correction able only to
-carve or only to grow. The concavity sought is a deficit, but the same field has to
-be able to push out a lobe; forcing the sign turns the representation into a bias.
+Delta stays signed. A one-sided activation could only carve or only grow. Concavity is a
+deficit, but the same field must also be able to push out a lobe, so forcing the sign would
+turn the representation into a bias.
+
+The token kernel width and the correction scale are fixed fractions of the radius, so the
+finest feature Delta can express is set by the kernel, and the coarsest by the design density.
 """
 from __future__ import annotations
 
@@ -28,9 +30,14 @@ __all__ = ["spherical_design", "DESIGN_N", "DESIGN_T", "ConvexCore", "TokenField
            "ImplicitBody", "extract_mesh", "apply_constraints", "CORE_SCALE",
            "TOKEN_SIGMA_FRAC"]
 
-DESIGN_N = 64          # number of fixed normals
+DESIGN_N = 64          # a design of N normals gives facets ~4/sqrt(N) across and leaves a
+                       # bulge ~2/N of the support distance at each face centre, so the
+                       # count has to be large before the faceting drops below the
+                       # resolution of either scoring measure. scripts/make_design.py
+                       # builds larger ones.
 DESIGN_T = 10          # spherical design strength
 CORE_SCALE = 0.15      # s = CORE_SCALE * R
+CORE_CHUNK_ELEMS = 6e7 # cap on the (points x normals) intermediate, ~240 MB in float32
 TOKEN_SIGMA_FRAC = 0.25   # sigma = TOKEN_SIGMA_FRAC * R
 N_TOKENS = 32
 TOKEN_DIM = 16
@@ -139,8 +146,21 @@ class ConvexCore(nn.Module):
         with torch.no_grad():
             self.raw_h.copy_(h + torch.log(-torch.expm1(-h)))   # stable softplus inverse
 
-    def forward(self, y: torch.Tensor) -> torch.Tensor:
-        return (y @ self.n.T - self.h).amax(dim=-1)             # plain max, not LSE
+    def forward(self, y: torch.Tensor, chunk: int | None = None) -> torch.Tensor:
+        """max_j (n_j . y - h_j), evaluated in chunks over query points.
+
+        The intermediate is (points x normals). At a 64^3 extraction grid that is 275k
+        points, so it is 0.07 GB at 64 normals and 4.50 GB at 4096 -- the term that decides
+        whether a large design is usable at all. Chunking bounds it without changing the
+        result: the max is taken per point, so points never interact.
+        """
+        n_norm = self.n.shape[0]
+        if chunk is None:
+            chunk = max(4096, int(CORE_CHUNK_ELEMS // max(n_norm, 1)))
+        if y.shape[0] <= chunk:
+            return (y @ self.n.T - self.h).amax(dim=-1)         # plain max, not LSE
+        return torch.cat([(y[i:i + chunk] @ self.n.T - self.h).amax(dim=-1)
+                          for i in range(0, y.shape[0], chunk)], dim=0)
 
 
 class TokenField(nn.Module):
@@ -178,10 +198,11 @@ class TokenField(nn.Module):
 class ImplicitBody(nn.Module):
     """f(y) = core(y) + s * Delta(y), s = 0.15 R fixed."""
 
-    def __init__(self, radius: float, normals: np.ndarray | None = None):
+    def __init__(self, radius: float, normals: np.ndarray | None = None,
+                 n_normals: int = DESIGN_N):
         super().__init__()
         if normals is None:
-            normals = spherical_design()
+            normals = spherical_design(n_normals)
         self.radius = float(radius)
         self.s = CORE_SCALE * float(radius)
         self.core = ConvexCore(normals)
@@ -220,10 +241,9 @@ def apply_constraints(verts: np.ndarray, radius: float, tol: float = 0.03) -> np
     z is rescaled affinely so the body touches -1 and +1 exactly, which the challenge states
     as equalities. The radius is then brought inside R only if it exceeds it.
 
-    Posed this way the three public bodies measure r/R = 1.0079, 1.0271 and 0.9940, so two
-    of the three exceed their published R. The published radius is therefore treated as an
-    approximation with tolerance `tol` rather than as a hard bound, which would shrink the
-    true geometry.
+    The published radius is treated as an approximation with tolerance `tol` rather than a
+    hard bound: two of the three public bodies exceed their own published R when posed this
+    way, so clamping would shrink true geometry.
     """
     v = np.asarray(verts, dtype=np.float64).copy()
     zmin, zmax = v[:, 2].min(), v[:, 2].max()

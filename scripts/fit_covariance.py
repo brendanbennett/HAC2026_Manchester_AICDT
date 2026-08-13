@@ -32,7 +32,7 @@ from hac26.covariance import (fit_model_error, photon_modes,   # noqa: E402
                               psi_dft, save_covariance)
 from hac26.data_io import load_model_curves                    # noqa: E402
 from hac26.noise import sigma_from_replicates                  # noqa: E402
-from forward_models.mesh_sensor import SensorModel             # noqa: E402
+from hac26.forward.mesh.sensor import SensorModel             # noqa: E402
 
 
 def predicted_curves(imgs, ras, cal, dev, chunk: int = 4) -> torch.Tensor:
@@ -70,9 +70,9 @@ def main():
     ap.add_argument("--width", type=int, default=192)
     ap.add_argument("--ss", type=int, default=2)
     ap.add_argument("--raster-faces", type=int, default=120000)
-    ap.add_argument("--calibration", default="pretrained/instrument_calibration.pt")
-    ap.add_argument("--data-dir", default="data/raw")
-    ap.add_argument("--out", default="pretrained/data_covariance.pt")
+    ap.add_argument("--calibration", default="models/instrument_calibration.pt")
+    ap.add_argument("--data-dir", default="dataset/raw")
+    ap.add_argument("--out", default="models/data_covariance.pt")
     ap.add_argument("--steps", type=int, default=3000)
     a = ap.parse_args()
     dev = "cuda" if torch.cuda.is_available() else "cpu"

@@ -22,9 +22,9 @@ from pathlib import Path
 
 import numpy as np
 
-from forward_models.convex_egi import normalize_np
+from hac26.forward.convex_egi import normalize_np
 from .geometry import build_cameras
-from .shapes import hull_mesh, mesh_curves_convex, mesh_to_egi
+from .shapes import hull_mesh, mesh_curves_convex
 
 N_CAMS = 28
 

@@ -1,54 +1,18 @@
 """Conventions: frames, light, cameras, rotation, geometric constraints.
 
-Everything downstream depends on these being right, so each one is stated with the check
-that pins it.
+Everything is computed in the body frame: the mesh never moves and the camera and light
+directions are carried into it, which makes the transport phase-independent since body, mount
+and turntable are mutually rigid.
 
-FRAME. z is the rotation axis. Everything is computed in the body frame: the mesh never moves, and the
-light and cameras rotate around it. That is what makes the radiosity form-factor matrix of
-phase-independent: body, mount and turntable are mutually rigid in this frame.
+Tabulated camera azimuths are measured from the light direction, so the lab azimuth is
+180 + az. psi0 is one fitted scalar per body.
 
-LIGHT. The source is at (-inf, 0, 0), so the direction from the body toward it is
+SENSE is fixed by correlating forward-modelled curves for the public bodies against the real
+ones, not by the published wording, which is ambiguous about the direction of rotation.
 
-    s_lab = (-1, 0, 0)
-
-with finite angular radius delta, represented as K = 8 directions on a disc about s_lab
-each carrying E0/K.
-
-CAMERAS. Tabulated azimuths are measured FROM THE LIGHT DIRECTION, so the lab azimuth is
-phi_c = 180 deg + azimuth, and
-
-    v_c = (cos e_c cos phi_c,  cos e_c sin phi_c,  sin e_c)
-
-Expanding phi_c = 180 + a gives v_c = (-cos e cos a, -cos e sin a, sin e), hence
-
-    cos alpha = v_c . s_lab = cos(e_c) cos(azimuth)
-
-which is the identity the whole convention hangs on: azimuth 0 elevation 0 gives alpha = 0
-(coaxial, which is why a beam splitter sits there), azimuth 135 elevation 26 gives
-alpha = 129.4 deg, and azimuth 180 would give alpha = 180 deg -- the camera staring into
-the beam, which is why that azimuth is absent from the table.
-
-ROTATION. Directions are carried into the body frame by
-
-    s_body(psi) = R_z(-psi - psi0) s_lab        v_body(psi) = R_z(-psi - psi0) v_c
-
-psi0 is one fitted scalar per body (measured near -2 deg).
-
-SENSE is fixed against the data. The published convention gives psi_k = +2 pi k / FRAMES. The
-turntable runs the other way. Forward-modelling the three public STLs through this exact
-convention and correlating against the real curves, each allowed its own best phase origin
-so that only the SENSE is being compared:
-
-    model      psi_k = +2 pi k/F      psi_k = -2 pi k/F
-      1              0.2951                 0.5669
-      2              0.2955                 0.7837
-      3              0.2211                 0.8240
-
-The negative sense wins on all three by 0.27 to 0.60 in correlation, which is far outside
-anything a phase origin or a photometric detail could produce. It also agrees with the
-rotation sense independently fitted on these same bodies earlier in the project. So SENSE
-is -1 and psi_grid returns psi_k = -2 pi k / FRAMES; the R_z(-psi - psi0) formula above is
-used exactly as written.
+The published bounding-cylinder radius is treated as an approximation rather than a hard
+bound: posed to z in [-1, 1], two of the three public bodies exceed their own published R, so
+clamping to it would shrink true geometry.
 """
 from __future__ import annotations
 

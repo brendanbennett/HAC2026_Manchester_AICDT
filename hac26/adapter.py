@@ -20,8 +20,7 @@ import torch
 from torch.utils.data import IterableDataset, get_worker_info
 
 from hac26.data_io import _resample
-from forward_models.convex_egi import normalize_np
-from hac26.geometry import make_grid
+from hac26.forward.convex_egi import normalize_np
 from hac26.radial import fibonacci_sphere, mesh_radial
 from hac26.shapes import (canonicalize_r, hull_mesh, mesh_support, mesh_to_egi,
                           rescale_touch_z)
@@ -121,20 +120,13 @@ class FigurineCurves(IterableDataset):
                      if getattr(pr, "dice_weight", 0.0) else None)
 
     def __iter__(self):
-        from hac26.shapes import sample_damit_shape, sample_training_shape
+        from hac26.shapes import sample_training_shape
         wi = get_worker_info()
         rng = np.random.default_rng(self.pr.seed + (wi.id + 1) * 9973 if wi else self.pr.seed)
-        pool = None
-        if getattr(self.pr, "shape_source", "synthetic") == "damit":
-            from hac26.damit import load_damit_pool
-            pool = load_damit_pool(self.pr.damit_dir, max_models=self.pr.damit_max_models)
-            if not pool:
-                raise RuntimeError(f"no DAMIT shape.txt found under {self.pr.damit_dir}")
         while True:
             if self.mix > 0 and rng.random() < self.mix:  # breadth reserve
-                s = (sample_damit_shape(rng, self.grid, pool) if pool is not None
-                     else sample_training_shape(rng, self.grid,
-                                                p_flat=getattr(self.pr, "p_flat", 0.0)))
+                s = sample_training_shape(rng, self.grid,
+                                          p_flat=getattr(self.pr, "p_flat", 0.0))
                 raw = np.einsum("cmn,n->cm", self.A, s["g"])
                 d0 = normalize_np(raw, eps=self.pr.eps_norm).astype(np.float32)
                 mask, p = np.ones(len(d0), np.float32), s["p"].astype(np.float32)

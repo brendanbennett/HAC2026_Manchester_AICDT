@@ -1,8 +1,8 @@
 """hac26 -- shared library for the Helsinki Asteroid Challenge 2026 solver.
 
-Forward models live in `forward_models/`, reconstruction algorithms in `solvers/`.
-This package holds what both depend on: conventions, geometry, data IO, shape
-representation, calibration and scoring utilities.
+Sub-packages: `forward` (forward models), `solvers` (reconstruction algorithms),
+`scoring` (the two challenge measures). The top level holds what they share:
+conventions, geometry, data IO, the shape representation, calibration and noise.
 """
 
 __version__ = "0.1.0"

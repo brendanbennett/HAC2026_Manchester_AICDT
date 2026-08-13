@@ -1,15 +1,13 @@
 #!/usr/bin/env python3
 """Reconstruct a competition model with the trained flow, then finish it.
 
-Six Euler steps, the operator re-applied at every one, S independent draws from x0, and the
-METRIC MEDOID of those draws as the answer. The medoid rather than the mean because the mean
-of several occupancy grids, thresholded, systematically erases concavity: a crater present in
-most samples but at slightly different positions averages to below the threshold everywhere.
-On a sphere with a crater, mean-then-threshold reproduces the
-crater-FREE sphere exactly.
+Six Euler steps with the operator re-applied at each, several independent draws from x0, and
+the metric medoid of those draws as the answer. The medoid rather than the mean because
+thresholding a mean of occupancy grids erases concavity: a feature present in most samples but
+at slightly different places averages to below the threshold everywhere.
 
-Scoring is Dice on a voxel grid after posing BOTH meshes with rescale_touch_z, so the two are
-compared in the same frame the challenge defines.
+Dice is measured on a voxel grid after posing both meshes with rescale_touch_z, so they are
+compared in the frame the challenge defines.
 """
 from __future__ import annotations
 
@@ -28,13 +26,14 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from hac26.conventions import cameras, psi_grid                        # noqa: E402
 from hac26.data_io import load_model_curves                            # noqa: E402
 from hac26.field import ImplicitBody, apply_constraints, extract_mesh  # noqa: E402
-from solvers.lpd_flow import CODE_DIM, N_MODES, N_STEPS, LPDFlow         # noqa: E402
-from solvers.output import (export_stl, metric_medoid, planar_snap,      # noqa: E402
+from hac26.solvers.lpd_flow import N_MODES, N_STEPS, LPDFlow         # noqa: E402
+from hac26.solvers.output import (export_stl, metric_medoid, planar_snap,      # noqa: E402
                           ransac_planes, restore_constraints)
 from hac26.covariance import load_covariance, whitened_misfit          # noqa: E402
-from hac26.recon import dice, mesh_to_sdf                              # noqa: E402
+from hac26.recon import dice                                           # noqa: E402
+from hac26.scoring.voxel import occupancy as _occupancy           # noqa: E402
 from hac26.shapes import mesh_support, rescale_touch_z                 # noqa: E402
-from forward_models.learned_surrogate import Surrogate                                  # noqa: E402
+from hac26.forward.learned_surrogate import Surrogate                                  # noqa: E402
 from train_lpd import (curves_from_code, curves_from_mesh,             # noqa: E402
                        load_decoder, set_code)                        # noqa: E402
 
@@ -68,8 +67,8 @@ def support_from_convex(stl: str) -> torch.Tensor:
 
     The flow generates the token correction, not h.
     It does not follow that h is a sphere: it has to come from somewhere, and the convex
-    pipeline already predicts it from these same 56 curves. Evaluated on the 64 design
-    normals, which is the basis ConvexCore stores its support in.
+    stage already predicts it from these same 56 curves. Evaluated on the design normals,
+    which is the basis ConvexCore stores its support in.
     """
     import trimesh
     m = trimesh.load(stl, process=False)
@@ -106,16 +105,14 @@ def make_resid_fn(g_dat, surro, psi, M, radius, support=None):
 def decode(code, radius, res=64, misfit_fn=None, eta=None, support=None):
     """Token code -> constrained mesh: field extraction, constraints, then the planar snap.
 
-    The snap is GATED ON THE DATA, not applied because a plane was found. planar_snap with
-    misfit_fn=None accepts every candidate plane unconditionally, which its own docstring
-    restricts to tests: RANSAC will always return something on a noisy mesh, and snapping to
-    it flattens real curvature into a facet that was never in the data. With the misfit wired
-    in, a plane survives only if flattening to it does not raise the residual past the model
-    model error eta from the calibration, so a faceted body keeps its facets and a smooth one
-    is left alone.
+    The snap is gated on the data rather than applied because a plane was found: RANSAC will
+    always return something on a noisy mesh, and snapping to it flattens curvature that was
+    never measured. A plane survives only if flattening to it does not raise the residual past
+    the model error from the calibration.
     """
     body = ImplicitBody(radius=radius)
-    body.core.set_support(torch.full((64,), 0.8 * radius) if support is None else support)
+    body.core.set_support(torch.full((body.core.n.shape[0],), 0.8 * radius)
+                          if support is None else support)
     load_decoder(body)
     set_code(body, code)
     v, f = extract_mesh(lambda y: body(y), radius * 1.6, res=res, device="cpu")
@@ -134,16 +131,15 @@ def decode(code, radius, res=64, misfit_fn=None, eta=None, support=None):
 
 
 def occupancy(v, f, n=64, extent=None):
-    e = extent or float(np.abs(v).max()) * 1.05
-    return mesh_to_sdf(v, f, n, e) < 0
+    return _occupancy(v, f, n, extent or float(np.abs(v).max()) * 1.05)
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", type=int, required=True)
-    ap.add_argument("--ckpt", default="model/lpd_flow.pt")
-    ap.add_argument("--surrogate", default="model/surrogate.pt")
-    ap.add_argument("--data-dir", default="data/raw")
+    ap.add_argument("--ckpt", default="runs/lpd_flow.pt")
+    ap.add_argument("--surrogate", default="runs/surrogate.pt")
+    ap.add_argument("--data-dir", default="dataset/raw")
     ap.add_argument("--samples", type=int, default=8)
     ap.add_argument("--phases", type=int, default=96)
     ap.add_argument("--res", type=int, default=64)
@@ -168,7 +164,7 @@ def main():
     net.load_state_dict(torch.load(a.ckpt, map_location="cpu"))
     net.eval()
 
-    sup_stl = a.support_from or f"data/eval_convex/Asteroid{a.model:02d}.stl"
+    sup_stl = a.support_from or f"results/convex/Asteroid{a.model:02d}.stl"
     support = support_from_convex(sup_stl)
     print(f"  h from {sup_stl}: {float(support.min()):.3f}-{float(support.max()):.3f}",
           flush=True)
@@ -186,7 +182,7 @@ def main():
 
     # The snap is gated on the data: the misfit of a candidate mesh against the real curves,
     # with the per-curve model error from the calibration as the tolerance it may not exceed.
-    cov_path = Path("pretrained/data_covariance.pt")
+    cov_path = Path("models/data_covariance.pt")
     COV = load_covariance(str(cov_path)) if cov_path.exists() else None
     if COV is None:
         print("  no fitted covariance yet; the snap gate falls back to an unweighted RMS",
@@ -194,7 +190,7 @@ def main():
     real = torch.tensor(d["curves"], dtype=torch.float32)
     real_g = torch.stack([real[:28], real[28:]], dim=1)              # (28, 2, P)
     eta = float(torch.nn.functional.softplus(
-        torch.load("pretrained/instrument_calibration.pt", map_location="cpu",
+        torch.load("models/instrument_calibration.pt", map_location="cpu",
                    weights_only=False)["raw_eta"]).mean())
 
     def misfit(w, faces):

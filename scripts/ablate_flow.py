@@ -23,14 +23,14 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from hac26.conventions import cameras, psi_grid          # noqa: E402
-from solvers.lpd_flow import N_MODES, N_STEPS, LPDFlow     # noqa: E402
-from forward_models.learned_surrogate import Surrogate                    # noqa: E402
+from hac26.solvers.lpd_flow import N_MODES, N_STEPS, LPDFlow     # noqa: E402
+from hac26.forward.learned_surrogate import Surrogate                    # noqa: E402
 from train_lpd import curves_from_code                   # noqa: E402
 
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--ckpt", default="model/lpd_flow.pt")
+    ap.add_argument("--ckpt", default="runs/lpd_flow.pt")
     ap.add_argument("--corpus", default="/tmp/lpd_corpus_96_g28_h.npz")
     ap.add_argument("--draws", type=int, default=24)
     ap.add_argument("--phases", type=int, default=96)
@@ -43,7 +43,7 @@ def main():
 
     gdev = "cuda" if torch.cuda.is_available() else "cpu"
     surro = Surrogate(width=96, modes=8, blocks=3)
-    surro.load_state_dict(torch.load("model/surrogate.pt", map_location="cpu"))
+    surro.load_state_dict(torch.load("runs/surrogate.pt", map_location="cpu"))
     surro = surro.to(gdev).eval()
     net = LPDFlow(); net.load_state_dict(torch.load(a.ckpt, map_location="cpu")); net.eval()
 

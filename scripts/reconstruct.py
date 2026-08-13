@@ -6,7 +6,7 @@ written -- the two previous shipping bugs in this project were both cases of the
 evaluated configuration and the written configuration silently diverging.
 
     python reconstruct_final.py --ckpt a.pt b.pt --ensemble --smooth 1 --fit-cylinder \
-        --model 4 --out ../data/eval_final/Asteroid04.stl
+        --model 4 --out results/lpd/Asteroid04.stl
 """
 import argparse
 import json

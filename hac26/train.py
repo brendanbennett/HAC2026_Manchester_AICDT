@@ -20,13 +20,13 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader, IterableDataset, get_worker_info
 
-from forward_models.convex_egi import ConvexPhotometricOperator, stack_A
+from hac26.forward.convex_egi import ConvexPhotometricOperator, stack_A
 from .geometry import build_cameras, make_grid
-from solvers.lpd_convex import LPDNet
+from hac26.solvers.lpd_convex import LPDNet
 from .radial import (fibonacci_sphere, mesh_radial, support_ray_matrix,
                      torch_dice_loss)
 from .shapes import (canonicalize_r, hull_mesh, mesh_support, mesh_to_egi,
-                     sample_damit_shape, sample_training_shape)
+                     sample_training_shape)
 
 
 from .noise import NOISE_PROFILE, apply_noise
@@ -63,15 +63,12 @@ class Preset:
     seed: int = 0
     amp: bool = True
     amp_dtype: str = "bf16"   # "bf16" | "fp16"; see the note in train()
-    shape_source: str = "synthetic"   # "synthetic" | "damit"
-    damit_dir: str = "data/damit"
-    damit_max_models: int | None = None
     support_head: bool = False   # predict h(u) instead of scoring only the EGI
     canonical_r: bool = False    # train on the r_max=1 canonical shape (see shapes.canonicalize_r)
     r_cond: bool = False         # feed the bounding radius R to the network as an input
     r_jitter: float = 0.05       # lognormal jitter on R during training, so a slightly
                                  # mis-specified R at test time does not derail the model
-    egi_weight: float = 1.0      # auxiliary weight on the original EGI objective
+    egi_weight: float = 1.0      # weight on the EGI objective
     dice_weight: float = 0.0     # weight on the EXACT Dice metric (hac26.radial); this is
                                  # the scoring function itself, not a surrogate
     h_mse_weight: float = 1.0    # weight on the support MSE (kept small but non-zero when
@@ -90,9 +87,6 @@ PRESETS = {
                     num_workers=0, ckpt_every=100, amp=False),
     "laptop": Preset(name="laptop", steps=5_000, batch=8, ch=32, n_iter=10,
                      n_primal=5, n_dual=5, num_workers=2, amp=False),
-    "laptop_damit": Preset(name="laptop_damit", steps=5_000, batch=8, ch=32, n_iter=10,
-                           n_primal=5, n_dual=5, num_workers=2, amp=False,
-                           shape_source="damit", damit_max_models=5000),
     "gpu": Preset(name="gpu"),
 }
 
@@ -111,12 +105,6 @@ class SyntheticCurves(IterableDataset):
     def __init__(self, A: np.ndarray, grid, pr: Preset):
         self.A, self.grid, self.pr = A, grid, pr
         self.rays = fibonacci_sphere(pr.n_rays) if pr.dice_weight else None
-        self.pool = None
-        if pr.shape_source == "damit":
-            from .damit import load_damit_pool
-            self.pool = load_damit_pool(pr.damit_dir, max_models=pr.damit_max_models)
-            if not self.pool:
-                raise RuntimeError(f"no DAMIT shape.txt found under {pr.damit_dir}")
 
     def __iter__(self):
         wi = get_worker_info()
@@ -124,10 +112,7 @@ class SyntheticCurves(IterableDataset):
         rng = np.random.default_rng(seed)
         C, m, _ = self.A.shape
         while True:
-            if self.pool is not None:
-                s = sample_damit_shape(rng, self.grid, self.pool)
-            else:
-                s = sample_training_shape(rng, self.grid, p_flat=self.pr.p_flat)
+            s = sample_training_shape(rng, self.grid, p_flat=self.pr.p_flat)
             raw = np.einsum("cmn,n->cm", self.A, s["g"])
             prof = None if self.pr.noise_profile_mode == "measured" \
                 else np.ones_like(NOISE_PROFILE)

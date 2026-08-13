@@ -1,32 +1,17 @@
 #!/usr/bin/env python3
-"""Fit the corpus as an AUTODECODER: one shared token decoder, per-body codes.
+"""Fit the shape library as an autodecoder: one shared token decoder, per-body codes.
 
-WHY THIS EXISTS. The code the LPD generates is (p, z) -- 32 token positions and 32 token
-latents, 608 numbers. It is NOT the whole token field: the cross-attention weights q, k, v
-and the output MLP also live in TokenField, and fitting each body independently gives every
-body its OWN decoder. A code is then meaningless anywhere else, and `curves_from_code` built
-a fresh ImplicitBody with RANDOM decoder weights, so the operator decoded every code with a
-decoder it was never fitted against -- a different random one on every call, which also made
-A(x) non-deterministic.
+The code the LPD generates is (p, z) -- token positions and latents. That is not the whole
+token field: the cross-attention weights and the output MLP live in TokenField too, so a code
+only means something together with the decoder it was fitted against. Fitting each body
+separately would give every body its own decoder and leave the codes mutually meaningless.
 
-The consequence was measured rather than assumed. Decoding a fitted code with a fresh
-decoder reproduces the body with its tokens switched OFF, to four decimals:
+The decoder is therefore shared across the library and trained jointly with the per-body
+codes, then saved beside them and loaded by the operator. Freezing a decoder at a fixed seed
+would also make codes portable, but a random decoder is not reliably expressive: its features
+happen to span what one body needs and not another's.
 
-    body 0    fitted decoder 0.9228    fresh decoder 0.9228    tokens off 0.9228
-    body 1    fitted decoder 0.9307    fresh decoder 0.9055    tokens off 0.9054
-
-and sweeping the code amplitude against a fixed h moved the geometry by Dice 1.0000 at the
-scale the corpus actually uses. The flow's entire output channel was inert.
-
-WHY NOT SIMPLY FREEZE THE DECODER at a fixed seed, which would also make codes portable:
-a random decoder is not reliably expressive. Fitting with it frozen, the tokens were worth
-+0.0142 Dice on a cratered sphere but exactly -0.0000 on a contact binary, against +0.1103
-when the decoder was fitted. Random features happen to span what one body needs and not the
-other.
-
-So the decoder is shared across the corpus AND trained, jointly with the per-body codes.
-That is what makes a code mean the same thing for every body, which is the precondition for
-generating one. It is saved beside the codes and loaded by the operator.
+Public bodies are never in the library.
 """
 from __future__ import annotations
 
@@ -62,8 +47,8 @@ def main():
     ap.add_argument("--bodies", type=int, default=40)
     ap.add_argument("--steps", type=int, default=3000)
     ap.add_argument("--batch", type=int, default=4, help="bodies per step")
-    ap.add_argument("--out", default="model/corpus_codes.npz")
-    ap.add_argument("--decoder", default="model/token_decoder.pt")
+    ap.add_argument("--out", default="runs/corpus_codes.npz")
+    ap.add_argument("--decoder", default="runs/token_decoder.pt")
     a = ap.parse_args()
 
     from train_surrogate import shapes
