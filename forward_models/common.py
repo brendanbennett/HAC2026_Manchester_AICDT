@@ -1,35 +1,29 @@
-"""The contract every forward model in this folder obeys, and the two reductions.
+"""Shared contract for the forward models in this package, and the two reductions.
 
-A forward model here answers ONE question: given a body and a viewing/lighting geometry,
-what are the two numbers the challenge measures? Everything else -- how the body is
-parameterised, whether the surface is a mesh, a level set or a density -- is the model's own
-business, and the models differ precisely there.
+Each model answers one question: given a body and a viewing/lighting geometry, what are the
+two numbers the challenge measures. How the body is parameterised is the model's own concern.
 
     render(shape, view, sun, **kw) -> (intensity, lit_area)
 
-`view` is omega_c, the direction from the BODY TO THE CAMERA, and `sun` is the direction from
-the body to the source. Both are unit vectors already carried into the BODY frame; use
-hac26.conventions.to_body to get them there, which is where the rotation sense lives.
+`view` is omega_c, the direction from the body to the camera; `sun` is the direction from the
+body to the source. Both are unit vectors already carried into the body frame by
+hac26.conventions.to_body, which is where the rotation sense is defined.
 
-THE TWO REDUCTIONS, and why they are not the same integral. The organisers' pipeline
-thresholds the image and then
+The two reductions are different integrals:
 
-    intensity  I = sum over pixels of val * 1[val > tau_I]        a SUM of values
-    lit area   N = count of pixels with  val > tau_B              a COUNT of pixels
+    intensity  I = sum over pixels of val * 1[val > tau_I]      a sum of values
+    lit area   N = count of pixels with val > tau_B             a count of pixels
 
-so the two differ by more than a constant: I carries the radiance, N carries only the
-geometry of the lit region. Writing them as one integral with different weights is the single
-most common way to get this wrong.
+I carries the radiance, N carries only the geometry of the lit region.
 
-RADIANCE, NOT RADIANCE x mu. A Lambertian facet's radiance is (rho/pi) mu0 and carries no mu:
-the viewing obliquity enters through the PROJECTED AREA of the pixel, mu dA, which the
-image-plane sum already supplies. Writing mu0 * mu in the shader double-counts it. With
-val = mu0 the two sums come out as
+The shader emits radiance, not radiance times mu. A Lambertian facet's radiance is
+(rho/pi) mu0 and carries no mu; the viewing obliquity enters through the projected area of
+the pixel, mu dA, which the image-plane sum already supplies. With val = mu0,
 
-    I = INT mu0+ mu+ dA      the Lambert kernel
-    N = INT_lit mu+ dA       the binary kernel, mu+ alone
+    I = INT mu0+ mu+ dA        Lambert kernel
+    N = INT_lit mu+ dA         binary kernel, mu+ alone
 
-which is exactly the pair the convex analytic operator uses.
+which is the pair the convex analytic operator uses.
 """
 from __future__ import annotations
 
@@ -60,10 +54,9 @@ def camera_basis(view: torch.Tensor) -> tuple:
 def pixel_rays(view: torch.Tensor, extent: float, res: int) -> tuple:
     """Ray origins on a plane in front of the body, all travelling along -view.
 
-    Rays START on the camera side and travel along -view. Starting at -extent*view and
-    marching along +view instead renders the FAR surface, which shows up as the near and far
-    cameras swapping values -- 0.98 against 0.00 at one camera and 0.05 against 0.73 at its
-    opposite. That failure is silent unless you look at both members of an opposed pair.
+    Rays start on the camera side and travel along -view. Starting at -extent*view and
+    marching along +view renders the far surface instead, which appears as opposed cameras
+    exchanging values.
     """
     ex, ey = camera_basis(view)
     a = torch.linspace(-extent, extent, res, device=view.device, dtype=view.dtype)
@@ -75,8 +68,8 @@ def pixel_rays(view: torch.Tensor, extent: float, res: int) -> tuple:
 def curves_over_psi(render_fn, shape, cam_dir, sun_lab, psi, psi0: float = 0.0, **kw):
     """Both curves over a full rotation, for one camera.
 
-    The body spins about z and the source is FIXED in the lab, so both directions are carried
-    into the body frame at each phase. Everything else is the model's own.
+    The body spins about z and the source is fixed in the lab, so both directions are carried
+    into the body frame at each phase.
     """
     from hac26.conventions import to_body
     cam = to_body(np.asarray(cam_dir, dtype=float), np.asarray(psi, dtype=float), psi0)

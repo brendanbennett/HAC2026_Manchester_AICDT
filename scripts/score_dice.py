@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Voxel Dice of a reconstructed STL against the public ground truth.
 
-ONE scorer for every method in the repository. The two shipping bugs this project has had
-were both the evaluated configuration and the written configuration quietly diverging, so
-the convex baseline and the LPD flow are scored by the same code path on the same grid.
+One scorer for every method in the repository, so that the evaluated configuration and the
+written configuration cannot diverge: every method is scored by the same code path on the
+same grid.
 
 Both meshes are posed with rescale_touch_z first -- the challenge fixes z to [-1, 1], and
 comparing before that pose is comparing two different frames.

@@ -1,4 +1,4 @@
-"""M3 -- exact derivatives of the thresholded reductions, by the coarea formula.
+"""Exact derivatives of the thresholded reductions, by the coarea formula.
 
 The two reductions are discontinuous in the image:
 

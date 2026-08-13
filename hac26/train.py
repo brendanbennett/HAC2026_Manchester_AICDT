@@ -20,16 +20,16 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader, IterableDataset, get_worker_info
 
-from .forward import ConvexPhotometricOperator, stack_A
+from forward_models.convex_egi import ConvexPhotometricOperator, stack_A
 from .geometry import build_cameras, make_grid
-from .lpd import LPDNet
+from solvers.lpd_convex import LPDNet
 from .radial import (fibonacci_sphere, mesh_radial, support_ray_matrix,
                      torch_dice_loss)
 from .shapes import (canonicalize_r, hull_mesh, mesh_support, mesh_to_egi,
                      sample_damit_shape, sample_training_shape)
 
 
-from .noise import NOISE_PROFILE, apply_noise  # see hac26/noise.py and docs/NOISE_MODEL.md
+from .noise import NOISE_PROFILE, apply_noise
 
 
 @dataclass
@@ -49,7 +49,7 @@ class Preset:
     sigma: float = -1.0     # FITTED on public models 1-3 (see data/conventions.json)
     delta: float = 1.0      # FITTED on public models 1-3 (see data/conventions.json)
     eps_norm: float = 1e-3
-    # None = the measured heteroscedastic profile (docs/NOISE_MODEL.md);
+    # None = the per-camera heteroscedastic profile from hac26.noise;
     # "flat" = homoscedastic, i.e. what a noiseless-generation pipeline effectively assumes.
     noise_profile_mode: str = "measured"
     noise_lo: float = 0.005
@@ -259,7 +259,7 @@ def train(pr: Preset, out_dir: str = "checkpoints", device: str | None = None,
         # A non-finite loss must never reach the weights. clip_grad_norm_ cannot help --
         # it rescales by a norm that is itself NaN -- and once the weights are NaN every
         # later step and every later checkpoint is poisoned. So check, drop the step, and
-        # abort if it is not a one-off: a run that quietly skips thousands of steps is
+        # abort if it is not a one-off: a run that skips thousands of steps is
         # not training, it is pretending to.
         if not torch.isfinite(loss):
             # A non-finite FORWARD is a genuine fault -- the model produced a number that
@@ -379,7 +379,7 @@ def load_net(ckpt_path: str, device: str | None = None) -> tuple:
     pr = Preset(**{k: v for k, v in ck["preset"].items() if k in known})
     net, grid, A, cameras, types = build_model(pr, device)
     missing, unexpected = net.load_state_dict(ck["model"], strict=False)
-    # strict=False is only safe because we check exactly what went missing: anything
+    # strict=False is only safe because the missing keys are checked: anything
     # other than a regenerable buffer means the checkpoint really is incomplete.
     bad = [k for k in missing if k not in REGENERABLE_BUFFERS]
     if bad or unexpected:

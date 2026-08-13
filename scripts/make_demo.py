@@ -14,7 +14,7 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from hac26.forward import stack_A  # noqa: E402
+from forward_models.convex_egi import stack_A  # noqa: E402
 from hac26.geometry import build_cameras  # noqa: E402
 from hac26.recon import (dice, reconstruct_from_curves, save_submission_stl,  # noqa: E402
                          voxel_grid, voxelize_convex)

@@ -1,4 +1,4 @@
-"""Exact convex forward model of HAC 2026: T = N o A (see docs/HAC2026_LPD_forward_model.md).
+"""Exact convex forward model of HAC 2026: T = N o A.
 
 A is the photometric matrix on the EGI:
     A[(c,k), i] = s_c( <R3(psi_k) u_i, omega_c>, <R3(psi_k) u_i, OMEGA0> )
@@ -10,7 +10,7 @@ with kernels
 N is per-curve mean-normalization N(y) = y / mean(y) (challenge page), implemented with
 an epsilon guard N_eps(y) = y / max(mean(y), eps); exact whenever mean(y) >= eps.
 
-Closed forms used by the LPD (verified in tests/test_core.py):
+Closed forms used by the LPD:
     DN(y)v      = v/mbar - y*mbar(v)/mbar^2
     DN(y)^T w   = w/mbar - (<y,w>/(m*mbar^2)) * ones
     [d(N o A)(g)]^T = A^T o DN(Ag)^T
@@ -19,14 +19,14 @@ from __future__ import annotations
 
 import numpy as np
 
-from .geometry import OMEGA0, NormalGrid, body_frame_dirs, psi_grid
+from hac26.geometry import OMEGA0, NormalGrid, body_frame_dirs, psi_grid
 
 
 def kernel(mu: np.ndarray, mu0: np.ndarray, curve_type: str, c_lambert: float,
            ls_weight: float = 1.0, tau: float = 0.0) -> np.ndarray:
     """Per-normal weight for one curve type.
 
-    THE TWO CURVE TYPES ARE DIFFERENT FUNCTIONALS OF THE AREA MEASURE:
+    The two curve types are different functionals of the area measure:
 
         intensity   mu+ mu0+ . 1[mu+ mu0+ > tau_I]      summed pixel VALUE
         binary      mu+      . 1[mu+ mu0+ > tau_B]      pixel COUNT, i.e. lit area

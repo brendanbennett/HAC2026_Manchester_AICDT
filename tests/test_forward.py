@@ -1,4 +1,4 @@
-"""M2 completion test -- the shadow deficit.
+"""Shadow-deficit test.
 
     D = (radiosity prediction with all visibility set to 1) - (raycast prediction)
 
@@ -26,7 +26,7 @@ import pytest
 import torch
 
 from hac26.conventions import S_LAB, cameras, source_directions
-from hac26.radiosity import RadiositySolver, emission, facet_geometry, form_factors
+from forward_models.mesh_radiosity import RadiositySolver, emission, facet_geometry, form_factors
 
 cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
 H, W, SS = 128, 128, 2          # small on purpose; the gate is about signs, not resolution
@@ -58,7 +58,7 @@ def flat_shade(verts, faces, facet_value):
 
 def _curves(rho, occlude_light, cam, dev="cuda"):
     """Reduced (I, N) for one camera, with light visibility on or off."""
-    from hac26.render import Rasteriser, reduce_curves
+    from forward_models.mesh_raster import Rasteriser, reduce_curves
     verts, faces = contact_binary()
     F, area, nrm, cen = form_factors(verts, faces, occlusion=(rho > 0))
     solver = RadiositySolver(F, rho=max(rho, 1e-12))

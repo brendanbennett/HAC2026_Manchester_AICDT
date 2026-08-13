@@ -114,7 +114,7 @@ def main() -> None:
     dataset = None
     if args.data:
         from hac26.adapter import FigurineCurves, load_pairs
-        from hac26.forward import stack_A
+        from forward_models.convex_egi import stack_A
         from hac26.geometry import build_cameras, make_grid
         grid = make_grid(pr.n_theta, pr.n_phi)
         A, _ = stack_A(grid, build_cameras(), pr.m, c_lambert=pr.c_lambert,

@@ -1,19 +1,19 @@
-"""M6 -- the LPD, as six Euler steps of a conditional flow.
+"""The LPD, as six Euler steps of a conditional flow.
 
-PRIMAL: the 32 tokens, 32 x (p in R^3 + z in R^16) = 608 dimensions. h is NOT in the flow.
+PRIMAL: the 32 tokens, 32 x (p in R^3 + z in R^16) = 608 dimensions. h is not in the flow.
 The convex core is what a cheap linear operator already recovers well; putting it in the
-sampled variable would make the network re-derive something we can solve for, and would let
+sampled variable would make the network re-derive something already solvable, and would let
 sampling noise move the overall size of the body.
 
 DUAL: the psi-Fourier coefficients of the mean-normalised curves, m = 1..40, whitened by
 s_{c,m}.
 
-WHY THE DUAL NETWORK IS SHARED ACROSS m AND NEVER MIXES m. Expanding a curve as
+The dual network is shared across m and never mixes m. Expanding a curve as
 L_g(psi) = int k_g(R_psi^-1 n) dS(n) and using Y_lm(R_psi^-1 n) = e^{-i m psi} Y_lm(n),
 
     L-hat_g(m) = sum_l k^g_{lm} S_lm
 
-so the operator is EXACTLY block-diagonal in m. There is no cross-m coupling to learn, and
+so the operator is exactly block-diagonal in m. There is no cross-m coupling to learn, and
 an architecture able to mix m would be free to model one -- fitting noise with it. So the
 set transformer runs independently at each m with weights shared across m, and m enters
 only through a Fourier embedding. Attention runs across GEOMETRIES at fixed m, which is
@@ -24,9 +24,9 @@ geometries for free.
 PROFILING. The cheap convex operator A_conv is kept alongside. At each iteration the
 residual is split by the projector Pi onto its range, and BOTH r and (I - Pi) r are fed to
 the primal network. The second is the part of the data no convex body can explain, so the
-convex block cannot quietly absorb the concavity signal before the network sees it.
+convex block cannot absorb the concavity signal before the network sees it.
 
-WHY FLOW MATCHING AND NOT L2 OR EXPECTED-DICE. Either of those computes E[x | g], and the
+Flow matching rather than L2 or expected-DICE. Either of those computes E[x | g], and the
 posterior here provably contains indistinguishable pairs: the spindle r(z) = R(1 - |z|/2)
 and the hourglass r(z) = R(1/2 + |z|/2) have equal volume, equal silhouette area from every
 equatorial direction, equal R and equal z-extent, and being axisymmetric they give constant
@@ -51,7 +51,7 @@ N_STEPS = 6
 
 
 def fourier_embed(m: torch.Tensor, dim: int = 16) -> torch.Tensor:
-    """Embedding of the rotation order m. The ONLY way m enters the dual network."""
+    """Embedding of the rotation order m. The only way m enters the dual network."""
     k = torch.arange(dim // 2, device=m.device, dtype=torch.float32)
     a = m[..., None].float() / (10.0 ** (2 * k / dim))
     return torch.cat([torch.sin(a), torch.cos(a)], -1)
@@ -94,53 +94,21 @@ class PrimalNet(nn.Module):
     """Maps the dual summary plus the current code to a flow velocity in code space."""
 
     def __init__(self, width: int = 96, hidden: int = 1024):
-        # HIDDEN MUST EXCEED CODE_DIM, and at the specified 512 it did not: the code is 608
-        # numbers, so x_t was being squeezed through a 512-wide layer and could not reach the
-        # output even as an identity. That matters because the velocity target is
-        # u = (x1 - x_t)/(1 - t) EXACTLY -- most of what the network must emit is its own
-        # input, rescaled. A rank-512 view of a 608-vector loses 96/608 = 16% of it.
-        #
-        # Measured with the residual channels zeroed, so the network needs no data at all,
-        # only that identity (lower is better, same seed, same steps):
-        #
-        #     step 2000    hidden 512: 0.638     hidden 1024: 0.533
-        #     step 4000    hidden 512: 0.548     hidden 1024: 0.394
-        #
-        # The gap widens with training rather than closing, which is what a capacity limit
-        # looks like as opposed to a slow start. This is the one place I have changed a
-        # specified number, and only because 512 < 608 is an internal inconsistency in the
-        # specification rather than a design choice it defends anywhere.
+        # hidden must exceed CODE_DIM: the velocity is mostly x_t rescaled, so a layer
+        # narrower than the code cannot pass it through even as an identity.
         super().__init__()
         self.net = nn.Sequential(
             nn.Linear(CODE_DIM + 2 * width + 16, hidden), nn.SiLU(),
             nn.Linear(hidden, hidden), nn.SiLU(),
             nn.Linear(hidden, CODE_DIM))
-        # A SKIP PATH WITH A LEARNED, TIME-DEPENDENT GAIN. The velocity target is
+        # Skip path with a learned, time-dependent gain. The velocity target is
         #
         #     u = x1 - x0 = (x1 - x_t) / (1 - t)
         #
-        # identically, so the dominant term is the network's own input times a scalar that
-        # depends only on t. Concatenating t with x_t and passing both through an MLP asks it
-        # to synthesise a MULTIPLICATIVE interaction out of additive layers, across all 608
-        # channels at once, and it does so badly.
-        #
-        # How badly: a model with one scale and one offset per step time -- twelve parameters
-        # -- reaches 0.033 and recovers the analytic scales to three figures,
-        #
-        #     learned  -1.001 -1.202 -1.497 -1.983 -2.918 -5.235
-        #     -1/(1-t) -1.000 -1.200 -1.500 -2.000 -3.000 -6.000
-        #
-        # while this MLP, with roughly a million parameters, plateaus at 0.39-0.52. With the
-        # skip added (same seed, residual channels zeroed, so no data is involved):
-        #
-        #     specified MLP   step 2000: 0.522
-        #     with skip       step  400: 0.048
-        #
-        # an order of magnitude better, five times sooner. The gain is zero-initialised, so
-        # training STARTS from exactly the specified network and departs from it only as the
-        # data warrants. The MLP is then free to model what it is actually for -- the
-        # correction the 28 lightcurves imply -- instead of spending its capacity
-        # reconstructing its own input.
+        # identically, so the dominant term is the network's own input scaled by a function
+        # of t alone. An MLP fed the concatenation of t and x_t must synthesise that
+        # multiplicative interaction from additive layers across all CODE_DIM channels.
+        # The gain is zero-initialised, so training starts from the plain MLP.
         self.gain = nn.Sequential(nn.Linear(16, 64), nn.SiLU(), nn.Linear(64, 1))
         nn.init.zeros_(self.gain[-1].weight)
         nn.init.zeros_(self.gain[-1].bias)
@@ -191,7 +159,7 @@ class LPDFlow(nn.Module):
 def flow_targets(x1: torch.Tensor, generator=None):
     """One training draw: x0 ~ N(0, I), the six interpolation times, and the target velocity.
 
-    The target is x1 - x0 at EVERY t, which is what makes this conditional flow matching
+    The target is x1 - x0 at every t, which is what makes this conditional flow matching
     rather than a denoiser: the velocity field is constant along each straight path, so the
     network is never asked to predict a posterior mean.
     """

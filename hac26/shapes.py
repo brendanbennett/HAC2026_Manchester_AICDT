@@ -1,7 +1,7 @@
 """Synthetic shape generation, EGI extraction, and a brute-force convex curve renderer.
 
 The brute-force renderer evaluates the facet-sum model directly on a mesh (valid for
-convex bodies, where visible-and-lit <=> mu>0 and mu0>0; Lemma 5.2 of the math doc)
+convex bodies, where visible-and-lit <=> mu>0 and mu0>0)
 and is used to cross-validate the matrix route A @ g in tests.
 """
 from __future__ import annotations
@@ -11,7 +11,7 @@ from scipy.spatial import ConvexHull
 from scipy.special import gammaln, lpmv
 
 from .geometry import OMEGA0, NormalGrid, body_frame_dirs, cell_index, project_closure, psi_grid
-from .forward import kernel
+from forward_models.convex_egi import kernel
 
 
 # ---------- icosphere ---------------------------------------------------------------
@@ -257,10 +257,8 @@ def _random_rotation(rng: np.random.Generator) -> np.ndarray:
 # ---------- flat-faced and few-face bodies -------------------------------------------
 # The original training family (sh / random-hull / ellipsoid) contains essentially no
 # bodies with large flat facets: a hull of 12-60 Gaussian points is round, and the SH and
-# ellipsoid families are smooth by construction. Challenge model 2 is a cube. Measured on
-# the trained support head, the cube's EGI mass sits in 6 cells (89.5%) while the network
-# predicts 24.2% spread over ~48 effective faces -- it has never seen such a body. These
-# generators close that gap.
+# ellipsoid families are smooth by construction, while challenge model 2 is a cube, whose
+# EGI mass concentrates in 6 cells. These generators add flat-faced and few-faced bodies.
 
 _PLATONIC = {}
 

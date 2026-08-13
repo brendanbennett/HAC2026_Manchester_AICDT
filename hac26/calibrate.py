@@ -1,4 +1,4 @@
-"""M4 -- calibration against the real curves of models 1, 2 and 3, using their true STLs.
+"""Calibration against the real curves of models 1, 2 and 3, using their true STLs.
 
 WHAT IS FITTED, AND AT WHAT SCOPE
 
@@ -41,8 +41,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from .conventions import S_LAB, cameras, psi_grid, source_directions, to_body
-from .radiosity import RadiositySolver, emission, facet_geometry, form_factors
-from .sensor import SensorModel
+from forward_models.mesh_radiosity import RadiositySolver, emission, facet_geometry, form_factors
+from forward_models.mesh_sensor import SensorModel
 
 __all__ = ["CalibrationParams", "decimate", "light_visibility", "body_radiance",
            "residual_to_noise"]
@@ -54,12 +54,10 @@ def decimate(verts: np.ndarray, faces: np.ndarray, target: int = 1200,
              subdivide_up: bool = True):
     """Bring a mesh TO a facet budget -- decimating when above it, subdividing when below.
 
-    Subdividing up matters and was missing. A box decimates to 12 facets and stayed there,
-    so its tokens were enormous relative to the image, and a token carries one constant
-    value across whatever pixels it covers. Measured on the held-out set: the five worst
-    shapes had 96, 320, 96, 320 and 96 tokens while all five best had 320, and the error
-    distribution was heavy-tailed around a median of 0.040 rather than uniformly poor.
-    Subdivision is exact -- it adds vertices on existing faces and changes no geometry.
+    Subdivision matters as well as decimation: a box has 12 facets, and a token carries one
+    constant value across whatever pixels it covers, so a coarse mesh gives tokens that are
+    large relative to the image. Subdivision is exact, adding vertices on existing faces
+    without changing the geometry.
     """
     import trimesh
     m = trimesh.Trimesh(verts, faces, process=False)
@@ -125,7 +123,7 @@ def body_radiance(verts, faces, rho: float, delta_rad: float, psi: np.ndarray,
     """Per-facet radiance at every phase, on the decimated radiosity mesh.
 
     The form-factor matrix and its factorisation are built ONCE; each phase costs one
-    back-substitution, which is the whole point of working in the body frame.
+    back-substitution, which is why the solve is done in the body frame.
     """
     dv, df = decimate(verts, faces, target_faces)
     F_, area, nrm, cen = form_factors(dv, df, occlusion=True)
@@ -144,7 +142,7 @@ def residual_to_noise(pred: np.ndarray, real: np.ndarray, sigma: np.ndarray,
                       eta: np.ndarray | None = None) -> np.ndarray:
     """Per-geometry residual-to-noise. NEVER aggregated across geometries.
 
-    Aggregating hides the thing worth knowing: which geometries the model cannot reproduce.
+    Aggregating hides which geometries the model cannot reproduce.
     A single number is dominated by whichever geometries are brightest.
     """
     s = sigma if eta is None else np.sqrt(sigma ** 2 + eta ** 2)

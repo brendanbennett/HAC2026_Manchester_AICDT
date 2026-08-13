@@ -1,14 +1,14 @@
 """Sanity tests tying the code to the exact mathematical statements of
-docs/HAC2026_LPD_forward_model.md. Torch-dependent tests are skipped if torch
+the convex forward model. Torch-dependent tests are skipped if torch
 is not installed; everything else is numpy/scipy only."""
 import numpy as np
 import pytest
 
 from hac26.data_io import read_curves29, write_curves29
-from hac26.forward import (build_A, deriv_adjoint_np, dn_adjoint_np, dn_np,
+from forward_models.convex_egi import (build_A, deriv_adjoint_np, dn_adjoint_np, dn_np,
                            forward_np, normalize_np, stack_A)
 from hac26.geometry import (build_cameras, make_grid, project_closure, psi_grid)
-from hac26.minkowski import solve_minkowski
+from solvers.minkowski import solve_minkowski
 from hac26.shapes import (hull_mesh, mesh_curves_convex, mesh_to_egi,
                           sample_training_shape)
 
@@ -159,7 +159,7 @@ def test_parser_roundtrip(tmp_path):
 # ---------------- torch-dependent tests ----------------------------------------------
 def test_torch_operator_matches_numpy():
     torch = pytest.importorskip("torch")
-    from hac26.forward import ConvexPhotometricOperator
+    from forward_models.convex_egi import ConvexPhotometricOperator
     grid, cams, A, types = small_setup()
     op = ConvexPhotometricOperator(A)
     g = RNG.uniform(0.1, 1.0, grid.n)
@@ -170,7 +170,7 @@ def test_torch_operator_matches_numpy():
 
 def test_torch_deriv_adjoint_matches_autograd():
     torch = pytest.importorskip("torch")
-    from hac26.forward import ConvexPhotometricOperator
+    from forward_models.convex_egi import ConvexPhotometricOperator
     grid, cams, A, types = small_setup()
     op = ConvexPhotometricOperator(A)
     op.double()
@@ -183,8 +183,8 @@ def test_torch_deriv_adjoint_matches_autograd():
 
 def test_lpd_forward_backward():
     torch = pytest.importorskip("torch")
-    from hac26.forward import ConvexPhotometricOperator
-    from hac26.lpd import LPDNet
+    from forward_models.convex_egi import ConvexPhotometricOperator
+    from solvers.lpd_convex import LPDNet
     nt, nphi, m = 6, 12, 24
     grid, cams, A, types = small_setup(nt, nphi, m)
     op = ConvexPhotometricOperator(A)

@@ -20,7 +20,7 @@ import torch
 from torch.utils.data import IterableDataset, get_worker_info
 
 from hac26.data_io import _resample
-from hac26.forward import normalize_np
+from forward_models.convex_egi import normalize_np
 from hac26.geometry import make_grid
 from hac26.radial import fibonacci_sphere, mesh_radial
 from hac26.shapes import (canonicalize_r, hull_mesh, mesh_support, mesh_to_egi,
@@ -151,7 +151,7 @@ class FigurineCurves(IterableDataset):
                 d0, mask, p, h, r_true, rho = self.pairs[rng.integers(len(self.pairs))]
                 d0, mask = d0.copy(), mask.copy()
             C, m = d0.shape
-            # heteroscedastic, from the replicate measurement -- see docs/NOISE_MODEL.md.
+            # heteroscedastic, from the co-located replicate pairs (hac26.noise).
             # Curves here are already mean-normalised, hence relative=False.
             d0 = apply_noise(d0, rng, self.pr.noise_lo, self.pr.noise_hi,
                              profile=getattr(self.pr, "noise_profile", None),

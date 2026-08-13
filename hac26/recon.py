@@ -15,7 +15,7 @@ from __future__ import annotations
 import numpy as np
 
 from .geometry import project_closure
-from .minkowski import solve_minkowski
+from solvers.minkowski import solve_minkowski
 from .shapes import face_normals_areas, rescale_touch_z
 from .stl_io import save_stl
 

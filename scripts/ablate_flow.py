@@ -23,8 +23,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from hac26.conventions import cameras, psi_grid          # noqa: E402
-from hac26.lpd_flow import N_MODES, N_STEPS, LPDFlow     # noqa: E402
-from hac26.surrogate import Surrogate                    # noqa: E402
+from solvers.lpd_flow import N_MODES, N_STEPS, LPDFlow     # noqa: E402
+from forward_models.learned_surrogate import Surrogate                    # noqa: E402
 from train_lpd import curves_from_code                   # noqa: E402
 
 

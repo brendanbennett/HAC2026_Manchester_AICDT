@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""M5 gate -- train the surrogate on M2 output and measure agreement on held-out shapes.
+"""Train the surrogate against the physical forward model and measure held-out agreement.
 
 The gate is agreement well below sigma. sigma here is the measured per-curve replicate
 noise of the real instrument, 0.005-0.03 in mean-normalised units, so "well below" means
-the surrogate must reproduce M2 to a few times 1e-3 or better -- otherwise the LPD would be
+the surrogate must reproduce the physical model to a few times 1e-3 or better, otherwise the LPD would be
 inverting an operator whose own error exceeds the noise it is trying to fit.
 
 A CUBE IS IN THE HELD-OUT SET DELIBERATELY. It is the shape whose curves are most unlike
@@ -22,10 +22,10 @@ import torch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from hac26.conventions import S_LAB, cameras, psi_grid, source_directions, to_body  # noqa
-from hac26.radiosity import RadiositySolver, emission, facet_geometry, form_factors  # noqa
+from forward_models.mesh_radiosity import RadiositySolver, emission, facet_geometry, form_factors  # noqa
 from hac26.calibrate import decimate                                         # noqa
-from hac26.render import Rasteriser                                          # noqa
-from hac26.surrogate import Surrogate, trace_features                        # noqa
+from forward_models.mesh_raster import Rasteriser                                          # noqa
+from forward_models.learned_surrogate import Surrogate, trace_features                        # noqa
 
 
 def shapes(n: int, seed: int = 0):
@@ -35,7 +35,7 @@ def shapes(n: int, seed: int = 0):
     and the cylinder from fixed constants, so 40% of any corpus was two identical meshes
     under random rotation -- diversity the overfitting gap could not use. Neck depth, crater
     count and depth, prism section count and overhang overlap all vary now, and the
-    specification's overhang class was missing entirely.
+    the overhang class was missing entirely.
     """
     import trimesh
     rng = np.random.default_rng(seed)
@@ -80,7 +80,7 @@ def shapes(n: int, seed: int = 0):
 
 
 def m2_curves(v, f, ras, psi, rho=0.85, delta=np.radians(1.0), target=600):
-    """Reference curves from the M2 pipeline."""
+    """Reference curves from the physical pipeline."""
     from hac26.calibrate import decimate
     dv, df = decimate(v, f, target)
     F_, area, nrm, cen = form_factors(dv, df, occlusion=True)
@@ -126,7 +126,7 @@ def features_for(v, f, psi, n_tokens=600, seed=0):
     1/sqrt(128) = 0.088 no matter how well the network fitted.
     """
     from hac26.calibrate import decimate
-    from hac26.radiosity import facet_geometry
+    from forward_models.mesh_radiosity import facet_geometry
     dv, df = decimate(v, f, n_tokens)
     pts, nrm, area = facet_geometry(dv, df)
     # Features for EVERY geometry, not just camera 0. The surrogate is camera-agnostic by
@@ -168,8 +168,8 @@ def main():
     ap.add_argument("--blocks", type=int, default=2)
     ap.add_argument("--modes", type=int, default=8)
     ap.add_argument("--rho", type=float, default=0.85,
-                    help="albedo of the M2 REFERENCE. The surrogate sees one\n"
-                         "gathered bounce; M2 solves the full series, so rho\n"
+                    help="albedo of the reference. The surrogate sees one\n"
+                         "gathered bounce; the reference solves the full series, so rho\n"
                          "controls how large that mismatch is.")
     a = ap.parse_args()
     dev = "cuda" if torch.cuda.is_available() else "cpu"
@@ -313,7 +313,7 @@ def main():
            "model 2 intensity": 0.0195, "model 2 binary": 0.0240,
            "model 3 intensity": 0.0173, "model 3 binary": 0.0075}
     sig_med = float(np.median(list(SIG.values())))
-    print(f"\n[M5 gate] held-out shapes: {Xte.shape[0]} (index {n_tr} is the CUBE)")
+    print(f"\nheld-out shapes: {Xte.shape[0]} (index {n_tr} is the CUBE)")
     for i in range(Xte.shape[0]):
         tag = " <- cube" if i == 0 else ""
         print(f"  shape {n_tr+i}: RMS {float(err[i].pow(2).mean().sqrt()):.5f}  "
@@ -332,7 +332,7 @@ def main():
     print(f"  below sigma for {n_below} of {len(SIG)} model/channel pairs")
     print("  GATE " + ("PASS" if rms < 0.3 * sig_med else
                        "FAIL (not WELL below sigma; below it, but not by the "
-                       "margin the specification asks for)"))
+                       "required margin)"))
 
 
 if __name__ == "__main__":

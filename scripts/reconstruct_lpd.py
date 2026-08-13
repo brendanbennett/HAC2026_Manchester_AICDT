@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""M6 + M7 -- reconstruct a competition model with the trained flow, then finish it.
+"""Reconstruct a competition model with the trained flow, then finish it.
 
 Six Euler steps, the operator re-applied at every one, S independent draws from x0, and the
 METRIC MEDOID of those draws as the answer. The medoid rather than the mean because the mean
 of several occupancy grids, thresholded, systematically erases concavity: a crater present in
 most samples but at slightly different positions averages to below the threshold everywhere.
-M7 demonstrates this on a sphere with a crater, where mean-then-threshold reproduces the
+On a sphere with a crater, mean-then-threshold reproduces the
 crater-FREE sphere exactly.
 
 Scoring is Dice on a voxel grid after posing BOTH meshes with rescale_touch_z, so the two are
@@ -28,12 +28,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from hac26.conventions import cameras, psi_grid                        # noqa: E402
 from hac26.data_io import load_model_curves                            # noqa: E402
 from hac26.field import ImplicitBody, apply_constraints, extract_mesh  # noqa: E402
-from hac26.lpd_flow import CODE_DIM, N_MODES, N_STEPS, LPDFlow         # noqa: E402
-from hac26.output import (export_stl, metric_medoid, planar_snap,      # noqa: E402
+from solvers.lpd_flow import CODE_DIM, N_MODES, N_STEPS, LPDFlow         # noqa: E402
+from solvers.output import (export_stl, metric_medoid, planar_snap,      # noqa: E402
                           ransac_planes, restore_constraints)
 from hac26.recon import dice, mesh_to_sdf                              # noqa: E402
 from hac26.shapes import mesh_support, rescale_touch_z                 # noqa: E402
-from hac26.surrogate import Surrogate                                  # noqa: E402
+from forward_models.learned_surrogate import Surrogate                                  # noqa: E402
 from train_lpd import (curves_from_code, curves_from_mesh,             # noqa: E402
                        load_decoder, set_code)                        # noqa: E402
 
@@ -65,7 +65,7 @@ def geom_tag_and_mask(mask56: np.ndarray):
 def support_from_convex(stl: str) -> torch.Tensor:
     """h for a competition body, taken from the convex stage's own reconstruction.
 
-    The flow generates the token correction and NOT h -- that is the specification's split.
+    The flow generates the token correction, not h.
     It does not follow that h is a sphere: it has to come from somewhere, and the convex
     pipeline already predicts it from these same 56 curves. Evaluated on the 64 design
     normals, which is the basis ConvexCore stores its support in.
@@ -103,14 +103,14 @@ def make_resid_fn(g_dat, surro, psi, M, radius, support=None):
 
 
 def decode(code, radius, res=64, misfit_fn=None, eta=None, support=None):
-    """Token code -> constrained mesh. M1 extraction, M1 constraints, then M7's planar snap.
+    """Token code -> constrained mesh: field extraction, constraints, then the planar snap.
 
     The snap is GATED ON THE DATA, not applied because a plane was found. planar_snap with
     misfit_fn=None accepts every candidate plane unconditionally, which its own docstring
     restricts to tests: RANSAC will always return something on a noisy mesh, and snapping to
     it flattens real curvature into a facet that was never in the data. With the misfit wired
     in, a plane survives only if flattening to it does not raise the residual past the model
-    error eta that M4 fitted -- so a genuinely faceted body keeps its facets and a smooth one
+    model error eta from the calibration, so a faceted body keeps its facets and a smooth one
     is left alone.
     """
     body = ImplicitBody(radius=radius)
@@ -183,12 +183,12 @@ def main():
                        batch=a.samples)
     print(f"  {a.samples} draws x {N_STEPS} steps in {time.time()-t0:.0f}s", flush=True)
 
-    # M7's snap is gated on the data: the misfit of a candidate mesh against the REAL curves,
-    # with the per-curve model error M4 fitted as the tolerance it may not exceed.
+    # The snap is gated on the data: the misfit of a candidate mesh against the real curves,
+    # with the per-curve model error from the calibration as the tolerance it may not exceed.
     real = torch.tensor(d["curves"], dtype=torch.float32)
     real_g = torch.stack([real[:28], real[28:]], dim=1)              # (28, 2, P)
     eta = float(torch.nn.functional.softplus(
-        torch.load("model/calibration.pt", map_location="cpu",
+        torch.load("pretrained/instrument_calibration.pt", map_location="cpu",
                    weights_only=False)["raw_eta"]).mean())
 
     def misfit(w, faces):

@@ -1,6 +1,6 @@
-"""M7 -- from 64 posterior samples to one submitted body.
+"""From posterior samples to one submitted body.
 
-WHY THE MEDOID AND NOT THE MEAN. The samples are draws from a posterior that provably
+The medoid rather than the mean. The samples are draws from a posterior that provably
 contains indistinguishable pairs, so averaging them is not a summary but a new body that
 none of them is. Concretely: a crater whose longitude is uncertain appears at a different
 place in each sample, and the mean smears it into a shallow depression everywhere, which is
@@ -12,13 +12,13 @@ thing by a different route. The metric medoid
 is instead an actual sample -- the one most typical under the very metric being scored --
 so it keeps a crater somewhere rather than nowhere.
 
-THE PLANAR SNAP IS EVIDENCE-GATED. Every ground truth is a printed polytope, so snapping
+The planar snap is evidence-gated. Every ground truth is a printed polytope, so snapping
 near-planar patches flat is usually right, and on the cube it is worth a great deal. But it
 is wrong on a genuinely smooth body, so each candidate plane is accepted only if the data
 misfit does not rise beyond the calibrated model-error floor eta. That makes the step
-self-rejecting: on a smooth body no plane clears the gate and nothing happens.
+self-rejecting: on a smooth body no plane is accepted and nothing happens.
 
-CONSTRAINTS COME LAST. The z-extent equality and the radius bound are restored as the final
+Constraints come last. The z-extent equality and the radius bound are restored as the final
 operation, after the snap, because the snap moves vertices and would otherwise break them.
 """
 from __future__ import annotations
@@ -37,8 +37,7 @@ def dice_volumes(occ_a: np.ndarray, occ_b: np.ndarray) -> float:
 def metric_medoid(occupancies) -> int:
     """Index of the sample with the highest mean Dice to all the others.
 
-    Note this is the medoid under the SCORED metric, not under any convenient surrogate --
-    the point of the estimator is that it optimises the thing being measured.
+    The medoid is taken under the scored metric itself, not under a proxy.
     """
     s = len(occupancies)
     if s == 1:
@@ -130,9 +129,8 @@ def planar_snap(verts, faces, planes, misfit_fn=None, eta: float = None, tol: fl
 def restore_constraints(verts: np.ndarray, radius: float, tol: float = 0.03) -> np.ndarray:
     """The LAST operation: z-extent equality, then the radius bound with its tolerance.
 
-    tol is not slack: posed this way the three public bodies measure r/R = 1.0079, 1.0271
-    and 0.9940, so two of the three genuinely exceed their published R and a hard clamp
-    would shrink true geometry.
+    The three public bodies measure r/R = 1.0079, 1.0271 and 0.9940, so two exceed their
+    published R. The radius is treated as an approximation with tolerance `tol`.
     """
     v = np.asarray(verts, dtype=np.float64).copy()
     zmin, zmax = v[:, 2].min(), v[:, 2].max()

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""M6 -- train the LPD as a conditional flow, then reconstruct.
+"""Train the LPD as a conditional flow.
 
-STAGE 1 builds the corpus. Each training body is fitted by the M1 field -- h plus the 32
+Stage 1 builds the corpus. Each training body is fitted by the implicit field -- h plus the 32
 tokens -- by regressing the field onto the body's signed distance. That fit is what supplies
 x1, the target token code; without it there is nothing for the flow to flow TOWARDS. Fitting
 needs no mesh extraction, only field evaluations at sampled points, so it is cheap.
@@ -11,7 +11,7 @@ x_t = (1-t) x0 + t x1, the operator is applied to x_t, the dual network reduces 
 against the data, and the primal network predicts the velocity, whose target is x1 - x0 at
 every t.
 
-ONE ECONOMY, and it is unbiased. The specification writes the loss as a sum over all six
+One economy, and it is unbiased. The loss is a sum over all six
 step times. Sampling ONE k per draw estimates the same sum without bias, and costs a sixth
 as much -- which matters because the operator needs a mesh, and FlexiCubes extraction is
 0.33 s at 32^3 against 0.01 s for everything else in an evaluation. Nothing else about the
@@ -34,9 +34,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from hac26.conventions import S_LAB, cameras, psi_grid, to_body          # noqa: E402
 from hac26.field import ImplicitBody, apply_constraints, extract_mesh    # noqa: E402
-from hac26.lpd_flow import CODE_DIM, N_MODES, N_STEPS, LPDFlow           # noqa: E402
-from hac26.radiosity import facet_geometry                               # noqa: E402
-from hac26.surrogate import (Surrogate, camera_features,                 # noqa: E402
+from solvers.lpd_flow import CODE_DIM, N_MODES, N_STEPS, LPDFlow           # noqa: E402
+from forward_models.mesh_radiosity import facet_geometry                               # noqa: E402
+from forward_models.learned_surrogate import (Surrogate, camera_features,                 # noqa: E402
                              sun_features)                               # noqa: E402
 
 
@@ -67,7 +67,7 @@ def set_code(body: ImplicitBody, code: torch.Tensor) -> None:
 
 
 def fit_body(verts, faces, radius=1.0, steps=250, n_pts=6000, device="cpu", seed=0):
-    """Fit the M1 field to a mesh by SDF regression. Returns (body, code, final loss)."""
+    """Fit the implicit field to a mesh by SDF regression. Returns (body, code, loss)."""
     import trimesh
     m = trimesh.Trimesh(verts, faces, process=False)
     rng = np.random.default_rng(seed)
@@ -93,17 +93,14 @@ def curves_from_code(code, radius, surro, psi, res=32, device=None, geoms=None,
                      chunk=4, support=None):
     """A(x): decode a token code to a body, extract, tokenise, and run the surrogate.
 
-    ALL 28 GEOMETRIES, not one. An earlier version evaluated only cameras()[0] and wrote the
-    residual into geometry slot 0, leaving the other 27 slots identically zero. The dual then
-    attended across a set whose every other member was a constant, which removes precisely the
-    cross-geometry coupling the specification identifies as the mechanism that recovers the
-    m = 0 content -- the part of the shape that a single lightcurve cannot see at all.
+    Covers all 28 geometries. The dual attends across them, which is what recovers the m = 0
+    content that a single lightcurve cannot constrain.
 
-    Two economies make the full set affordable, and neither changes the arithmetic:
-    the mesh is extracted ONCE per code rather than per camera, and the source is fixed in the
-    lab frame, so light visibility and the gathered bounce are traced once and shared across
-    all 28. What remains per camera is one batched ray cast. Chunking the surrogate over
-    geometries keeps the (G, T, P, W) activations inside 8 GB.
+    Two economies, neither changing the arithmetic: the mesh is extracted once per code rather
+    than per camera, and the source is fixed in the lab frame, so light visibility and the
+    gathered bounce are traced once and shared across all 28. What remains per camera is one
+    batched ray cast. Chunking the surrogate over geometries bounds the (G, T, P, W)
+    activations.
     """
     # The FIELD, not the marching, is the cost: 32 cross-attention tokens evaluated over
     # 33^3 = 36k grid points. On CPU that measured 15-19 s per call, which made one
@@ -111,19 +108,10 @@ def curves_from_code(code, radius, surro, psi, res=32, device=None, geoms=None,
     # quoted earlier was for a bare convex core with no token field attached.
     device = device or ("cuda" if torch.cuda.is_available() else "cpu")
     body = ImplicitBody(radius=radius).to(device)
-    # THE SUPPORT FUNCTION IS SUPPLIED, NOT ASSUMED. This line used to read
-    # set_support(full((64,), 0.8 * radius)) -- a fixed sphere -- so every operator
-    # evaluation threw away h and kept only the token correction. Measured on three corpus
-    # bodies, the M1 field reproduces them at Dice 0.869 / 0.922 / 0.761 when decoded with
-    # the h it was fitted alongside, and 0.583 / 0.390 / 0.513 when decoded against that
-    # sphere. h carries most of the shape; the tokens carry the concavity that h cannot.
-    #
-    # That single line explains three symptoms at once: the fitted codes had per-component
-    # variance 0.0018 (the tokens only ever held the small residual left after h), the corpus
-    # curves described sphere-plus-bumps bodies rather than the bodies they were labelled
-    # with, and any reconstruction was capped at a sphere with bumps -- below the convex
-    # baseline by construction. "h is not in the flow" means h comes from the convex stage,
-    # not that it is a constant.
+    # The support function is supplied by the caller, not assumed. h carries the convex part
+    # of the shape and the tokens carry the concavity h cannot express, so decoding a code
+    # against a default sphere would discard most of the geometry. h is not generated by the
+    # flow; it comes from the convex stage.
     body.core.set_support(torch.full((64,), 0.8 * radius) if support is None
                           else torch.as_tensor(support, dtype=torch.float32).to(device))
     load_decoder(body)
@@ -142,7 +130,7 @@ def curves_from_code(code, radius, surro, psi, res=32, device=None, geoms=None,
 def curves_from_mesh(v, f, surro, psi, geoms=None, chunk=4):
     """The second half of A(x): a mesh in, the 28 reduced curve pairs out.
 
-    Split out from curves_from_code so that M7's planar snap can be gated on the data misfit
+    Separate from the code path so the planar snap can be gated on the data misfit
     of a CANDIDATE mesh -- the snap is only allowed to move vertices if doing so does not
     push the misfit past the calibrated floor, and that test needs the operator applied to a
     mesh that never came from a code.
@@ -261,7 +249,7 @@ def main():
     M = min(N_MODES, a.phases // 2)
     if M < N_MODES:
         print(f'  WARNING: only {M} modes available at {a.phases} phases; '
-              f'the specification asks for {N_MODES}', flush=True)
+              f'{N_MODES} are required', flush=True)
     tag = torch.zeros(1, C, 4)
     for i, cam in enumerate(cameras()):
         tag[0, i] = torch.tensor([np.cos(np.radians(cam.azimuth_deg)),
@@ -276,11 +264,8 @@ def main():
         t = k.float() / N_STEPS
         xt = (1 - t[:, None]) * x0 + t[:, None] * x1
         # THE RESIDUAL, which means actually applying the operator to the current state.
-        # An earlier version fed only the data's Fourier content and never evaluated
-        # A(x_t). The network then had no signal about where it currently was, predicted
-        # zero, and the loss sat at 1.0 -- which is exactly E||x1 - x0||^2 for x0 ~ N(0, I),
-        # i.e. the variance of the target and nothing learned. Applying the operator costs
-        # one mesh extraction per sample and is the algorithm.
+        # The operator is applied to the current state x_t. Feeding only the data's Fourier
+        # content would leave the network without any signal about where it currently is.
         g_dat = torch.fft.rfft(curves[idx], dim=-1)[..., 1:M + 1]      # (B, G, 2, M)
         preds = []
         for b in range(a.batch):

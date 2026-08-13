@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""M4 -- fit the calibration against the real curves of models 1, 2 and 3.
+"""-- fit the calibration against the real curves of models 1, 2 and 3.
 
 STRUCTURE OF THE FIT, and why it is affordable at all. rho and the source radius enter
 through the radiosity solve, so changing them means re-rendering. Everything else -- the
@@ -31,9 +31,9 @@ from hac26.calibrate import body_radiance, decimate           # noqa: E402
 from hac26.conventions import cameras, psi_grid               # noqa: E402
 from hac26.data_io import load_model_curves                   # noqa: E402
 from hac26.noise import sigma_from_replicates                 # noqa: E402
-from hac26.radiosity import facet_geometry                    # noqa: E402
-from hac26.render import Rasteriser, otsu_threshold           # noqa: E402
-from hac26.sensor import SensorModel                          # noqa: E402
+from forward_models.mesh_radiosity import facet_geometry                    # noqa: E402
+from forward_models.mesh_raster import Rasteriser, otsu_threshold           # noqa: E402
+from forward_models.mesh_sensor import SensorModel                          # noqa: E402
 from hac26.shapes import rescale_touch_z                      # noqa: E402
 from hac26.stl_io import load_stl                             # noqa: E402
 
@@ -209,9 +209,9 @@ def main():
     torch.save({"sensor": sensor.state_dict(), "raw_tau_i": raw_tau_i.detach(),
                 "raw_tau_b": raw_tau_b.detach(), "pedestal": pedestal.detach(),
                 "raw_eta": raw_eta.detach(), "rho": a.rho, "delta_deg": a.delta_deg},
-               "model/calibration.pt")
+               "pretrained/instrument_calibration.pt")
     Path(a.out).write_text(json.dumps(report, indent=1))
-    print(f"\nwrote {a.out} and model/calibration.pt")
+    print(f"\nwrote {a.out} and pretrained/instrument_calibration.pt")
 
 
 if __name__ == "__main__":

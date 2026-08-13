@@ -1,9 +1,9 @@
-"""M2.1 -- radiosity, solved once per shape rather than once per phase.
+"""Radiosity, solved once per shape rather than once per phase.
 
-The body, mount and turntable are mutually rigid, and we work in the body frame, so the
+The body, mount and turntable are mutually rigid, and the solve is done in the body frame, so the
 geometry between facets never changes as the turntable turns. Everything that depends only
 on that geometry -- the form-factor matrix F, and therefore the factorisation of
-(I - rho F) -- is computed ONCE per candidate shape. Each phase is then a back-substitution,
+(I - rho F) -- is computed once per candidate shape. Each phase is then a back-substitution,
 and the adjoint solve (I - rho F)^T lambda = dJ/dB reuses the same factors.
 
     F_ij = (1/A_i) int int V(x,y) cos(theta_x) cos(theta_y) / (pi r^2) dA_i dA_j
@@ -16,7 +16,7 @@ Only the emission e depends on the phase, and only through which source samples 
 can see. That is the whole reason this decomposition is worth the trouble: the expensive
 object is phase-independent and the phase-dependent object is a matrix-vector product.
 
-TWO CHECKS THE SPECIFICATION REQUIRES, both asserted rather than repaired:
+Two checks, both asserted rather than repaired:
   * F is symmetrised through reciprocity before use, since the centroid quadrature below
     does not produce a reciprocal matrix by itself;
   * sum_j F_ij <= 1 for every i, because a facet cannot see more than the whole hemisphere.
@@ -168,7 +168,7 @@ def emission(normals: np.ndarray, source_dirs: np.ndarray, vis: np.ndarray | Non
     """e_i = (E0/K) sum_k (n_i . omega_k)+ V_i(omega_k).
 
     vis is (n_facets, K) in {0,1}; None means unoccluded, which is the "all visibility set
-    to 1" branch the M2 shadow-deficit test needs.
+    to 1" branch.
     """
     mu = np.clip(np.asarray(normals) @ np.asarray(source_dirs).T, 0.0, None)
     if vis is not None:

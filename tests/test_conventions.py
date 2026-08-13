@@ -1,9 +1,9 @@
-"""M0 completion test.
+"""Conventions test.
 
 The three phase angles are the gate: if they do not come out, the convention is wrong and
 nothing built on it can be trusted. The remaining tests pin the pieces those three numbers
 do not touch (rotation sense, source disc, column order), and two of them consult the real
-data, because a convention is a claim about the instrument, not about our algebra.
+data, because a convention is a claim about the instrument, not about the algebra.
 """
 import numpy as np
 import pytest
@@ -18,9 +18,9 @@ DATA = "data/raw"
 # ---------------------------------------------------------------- the gate
 
 def test_three_phase_angles():
-    """The check the specification says to stop on if it fails."""
+    """Phase angle of the published geometry."""
     assert phase_angle_deg(0.0, 0.0) == pytest.approx(0.0, abs=1e-9)
-    # cos(26) cos(135) = -0.635450 -> 129.4603 deg. The specification quotes "129.4",
+    # cos(26) cos(135) = -0.635450 -> 129.4603 deg. The challenge quotes "129.4",
     # i.e. the exact value truncated to one decimal, so the tolerance must admit that.
     assert phase_angle_deg(135.0, 26.0) == pytest.approx(129.46, abs=0.01)
     assert phase_angle_deg(180.0, 0.0) == pytest.approx(180.0, abs=1e-9)
@@ -86,7 +86,7 @@ def test_rotation_preserves_z_and_norm():
 
 
 def test_turntable_sense_is_the_measured_one():
-    """Fixed by measurement, not by the specification -- see the conventions docstring.
+    """Fixed by measurement against the real curves.
 
     Kept synthetic and instant: the comparison against the real curves was run once to
     settle the sign and is recorded there; this only guards against the constant being
@@ -127,7 +127,7 @@ def test_source_disc():
 
 @pytest.mark.parametrize("model", [1, 2, 3])
 def test_published_radius_is_approximate_not_a_bound(model):
-    """MEASURED, per the specification's instruction to check before assuming R is tight.
+    """Measured, rather than assuming the published R is a tight bound.
 
     It is neither tight nor an upper bound. Posed so that z spans exactly [-1, 1]:
 

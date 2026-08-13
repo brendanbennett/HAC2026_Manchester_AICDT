@@ -1,4 +1,4 @@
-"""M2.3 -- the sensor chain, applied in the order the hardware applies it.
+"""The sensor chain, applied in the order the hardware applies it.
 
     radiance L
       -> natural off-axis falloff cos^4(theta_off) x fitted radial vignetting
@@ -8,7 +8,7 @@
       -> quantise to 8 bits, straight-through in the backward pass
       -> box-downsample from 4x supersampling
 
-WHAT IS DELIBERATELY ABSENT: any 1/d^2 factor. Radiance is conserved along a ray, so the
+What is absent: any 1/d^2 factor. Radiance is conserved along a ray, so the
 image irradiance produced by an extended surface does not depend on how far away it is. The
 perspective effect is entirely in how many PIXELS a surface element covers, which the
 rasteriser already handles. Putting a 1/d^2 on pixel VALUES would double-count it; the
@@ -19,7 +19,7 @@ WHY THE OETF IS A SPLINE. A power law has one parameter and forces the same curv
 everywhere. Real camera transfer curves have a toe and a shoulder, and it is the shoulder
 that decides which pixels survive the Otsu threshold -- exactly the pixels that carry the
 grazing-incidence geometry. Monotonicity is enforced by construction (softplus increments)
-rather than hoped for, because a non-monotone OETF would make the value threshold of M3
+rather than hoped for, because a non-monotone OETF would make the value threshold
 multi-valued and the coarea derivative meaningless.
 """
 from __future__ import annotations
@@ -34,7 +34,7 @@ __all__ = ["SensorModel", "gaussian_psf", "box_downsample", "quantise_ste"]
 
 def gaussian_psf(sigma_px: float, radius: int | None = None,
                  device=None, dtype=torch.float32) -> torch.Tensor:
-    """Separable Gaussian PSF kernel. Stands in for the measured PSF until M4 fits it."""
+    """Separable Gaussian PSF kernel. Stands in for the measured PSF until it is fitted."""
     if radius is None:
         radius = max(1, int(np.ceil(3.0 * sigma_px)))
     x = torch.arange(-radius, radius + 1, device=device, dtype=dtype)
@@ -81,7 +81,7 @@ def quantise_ste(x: torch.Tensor, levels: int = 256) -> torch.Tensor:
 
 
 class SensorModel(nn.Module):
-    """The chain of M2.3. Every fitted quantity is a parameter here and is pinned in M4.
+    """The sensor chain. Every fitted quantity is a parameter here, pinned by the calibration.
 
     `vignette` is the radial polynomial in normalised image radius r in [0, 1]:
         V(r) = 1 + a1 r^2 + a2 r^4 + a3 r^6

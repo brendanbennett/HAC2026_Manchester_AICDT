@@ -22,7 +22,7 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from hac26.data_io import load_model_curves  # noqa: E402
-from hac26.forward import normalize_np  # noqa: E402
+from forward_models.convex_egi import normalize_np  # noqa: E402
 
 
 def load_gen_curves(path: str) -> np.ndarray:

@@ -1,4 +1,4 @@
-"""M2.2 and M2.4 -- perspective rasterisation and the reduction to the two curves.
+"""Perspective rasterisation and the reduction to the two curves.
 
     I_c(psi) = sum_p val_p * 1[val_p > tau_I]          summed pixel value
     N_c(psi) = sum_p       1[val_p > tau_B,c]          pixel count

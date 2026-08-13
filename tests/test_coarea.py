@@ -1,6 +1,6 @@
-"""M3 completion test -- analytic coarea derivative against finite differences.
+"""Analytic coarea derivative against finite differences.
 
-The specification's gate: 100 randomly chosen parameters, analytic versus FD within 1%.
+100 randomly chosen parameters, analytic versus FD within 1%.
 
 The subtlety in testing this at all is that N(tau) is an integer, so a finite difference of
 it is quantised. The derivative being checked is that of the CONTINUUM area whose pixel

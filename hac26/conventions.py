@@ -1,11 +1,11 @@
-"""M0 -- conventions. Frames, light, cameras, rotation, geometric constraints.
+"""Conventions: frames, light, cameras, rotation, geometric constraints.
 
 Everything downstream depends on these being right, so each one is stated with the check
-that pins it, and `tests/test_conventions.py` asserts the checks.
+that pins it.
 
-FRAME. z is the rotation axis. We work in the BODY frame: the mesh never moves, and the
+FRAME. z is the rotation axis. Everything is computed in the body frame: the mesh never moves, and the
 light and cameras rotate around it. That is what makes the radiosity form-factor matrix of
-M2 phase-independent -- body, mount and turntable are mutually rigid in this frame.
+phase-independent: body, mount and turntable are mutually rigid in this frame.
 
 LIGHT. The source is at (-inf, 0, 0), so the direction from the body toward it is
 
@@ -34,7 +34,7 @@ ROTATION. Directions are carried into the body frame by
 
 psi0 is one fitted scalar per body (measured near -2 deg).
 
-SENSE -- CORRECTED AGAINST THE DATA. The specification gives psi_k = +2 pi k / FRAMES. The
+SENSE is fixed against the data. The published convention gives psi_k = +2 pi k / FRAMES. The
 turntable runs the other way. Forward-modelling the three public STLs through this exact
 convention and correlating against the real curves, each allowed its own best phase origin
 so that only the SENSE is being compared:

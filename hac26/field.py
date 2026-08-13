@@ -1,4 +1,4 @@
-"""M1 -- geometry representation.
+"""-- geometry representation.
 
     f(y) = max_j (n_j . y - h_j)  +  s * Delta(y),        s = 0.15 R  (fixed)
 
@@ -12,7 +12,7 @@ beta = 50/R is log(64)/(50/R) = 0.083 R -- a systematic 8% shrink of every body,
 silently.
 
 WHY Delta must stay signed. A one-sided activation would make the correction able only to
-carve or only to grow. The concavity we are after is a deficit, but the same field has to
+carve or only to grow. The concavity sought is a deficit, but the same field has to
 be able to push out a lobe; forcing the sign turns the representation into a bias.
 """
 from __future__ import annotations
@@ -57,7 +57,7 @@ def design_energy(x, t: int = DESIGN_T):
     which IS the t-design condition -- and it needs only Legendre polynomials of the Gram
     matrix, so it differentiates trivially, unlike evaluating Y_lm directly.
 
-    An earlier version minimised raw MONOMIAL means instead. That is simply wrong: for even
+    Minimising raw monomial means instead is wrong: for even
     l the points being unit vectors forces sum_i x_i^2 = n/3, so the target is unreachable.
     It did not converge, and left the residual WORSE than the Fibonacci spiral it started
     from (1.043 against 0.062).
@@ -82,7 +82,7 @@ def spherical_design(n: int = DESIGN_N, t: int = DESIGN_T, seed: int = 0,
                      iters: int = 4000) -> np.ndarray:
     """n unit normals forming a spherical t-design, with the six axis directions included.
 
-    The axis directions are pinned deliberately. The completion test for this module is a
+    The axis directions are pinned. The reference case is a
     cube, and the core is an intersection of halfspaces tangent to the target: it reproduces
     a cube EXACTLY only if the cube's own face normals are available. A design free to drift
     off the axes leaves the nearest normal some degrees away, and the intersection then
@@ -220,10 +220,10 @@ def apply_constraints(verts: np.ndarray, radius: float, tol: float = 0.03) -> np
     z is rescaled affinely so the body touches -1 and +1 exactly, which the challenge states
     as equalities. The radius is then brought inside R only if it exceeds it.
 
-    `tol` is not slack invented for convenience. Posed this way, the three public bodies
-    measure r/R = 1.0079, 1.0271 and 0.9940, so two of the three genuinely EXCEED their
-    published R and a hard clamp would shrink the true geometry. See
-    tests/test_conventions.py::test_published_radius_is_approximate_not_a_bound.
+    Posed this way the three public bodies measure r/R = 1.0079, 1.0271 and 0.9940, so two
+    of the three exceed their published R. The published radius is therefore treated as an
+    approximation with tolerance `tol` rather than as a hard bound, which would shrink the
+    true geometry.
     """
     v = np.asarray(verts, dtype=np.float64).copy()
     zmin, zmax = v[:, 2].min(), v[:, 2].max()

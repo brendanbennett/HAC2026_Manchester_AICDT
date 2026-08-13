@@ -1,4 +1,4 @@
-"""M5 -- the fast operator the LPD needs, at thousands of evaluations.
+"""The fast operator the LPD needs, at thousands of evaluations.
 
 The split that makes this work: the GEOMETRY is ray-traced exactly and never learned, and
 only the tone-mapped response is. Per surface token and per phase, four exact features:
@@ -11,11 +11,11 @@ only the tone-mapped response is. Per surface token and per phase, four exact fe
 
 Those four carry all the non-convexity there is -- occlusion, cast shadow and
 interreflection are exactly the phenomena a convex model cannot express -- so learning them
-would be learning something we can compute. What is learned is only the map from those
+would be learning something computable directly. What is learned is only the map from those
 features to the reduced curve value, which is where the sensor chain, the thresholds and
 the pedestal live.
 
-EQUIVARIANCE, EXACTLY AND NOT APPROXIMATELY. Rotating the body by one frame permutes the
+EQUIVARIANCE, exactly AND NOT APPROXIMATELY. Rotating the body by one frame permutes the
 phase axis cyclically. The operator must commute with that, so the network is built only
 from operations that do:
 
@@ -38,12 +38,10 @@ import torch.nn as nn
 __all__ = ["TokenFeatures", "trace_features", "sun_features", "camera_features",
            "PhaseEquivariantNet", "Surrogate"]
 
-N_FEAT = 5          # camera visibility, light visibility, solid angle, gathered
-                    # bounce, and the token's own area. Area is the sum WEIGHT, but
-                    # without it as an INPUT the network cannot modulate its response
-                    # by facet size -- and a facet's contribution to the binary curve
-                    # IS its projected area, so the channel that needs it most was
-                    # the one performing worst (0.120 against 0.039 for intensity).
+N_FEAT = 5          # camera visibility, light visibility, solid angle, gathered bounce,
+                    # and the token's own area. Area is the quadrature weight and also an
+                    # input, since a facet's contribution to the binary curve is its
+                    # projected area.
 
 
 def trace_features(verts, faces, token_pts, token_nrm, cam_dirs, sun_dirs,
@@ -63,12 +61,9 @@ def trace_features(verts, faces, token_pts, token_nrm, cam_dirs, sun_dirs,
     face_norm = mesh.face_normals
     for j in range(n_p):
         v, s = cam_dirs[j], sun_dirs[j]
-        # PER-TOKEN direction to the eye. The rasteriser is perspective, so at distance 8
-        # with a unit body the view direction swings about 7 degrees across the surface;
-        # applying one global camera axis to every token is an orthographic approximation
-        # against a perspective reference. Measured on an oracle token-sum that uses the
-        # TRUE radiance and so bounds any per-token model: intensity error 0.0732 -> 0.0328
-        # and binary 0.0397 -> 0.0266, i.e. 5.9 -> 2.6 sigma and 3.2 -> 2.1 sigma.
+        # Per-token direction to the eye. The rasteriser is perspective: at distance 8 with
+        # a unit body the view direction varies by about 7 degrees across the surface, so a
+        # single global camera axis would be an orthographic approximation.
         eye = v * eye_distance
         d_eye = eye[None, :] - token_pts
         d_eye = d_eye / np.linalg.norm(d_eye, axis=1, keepdims=True)
@@ -95,7 +90,7 @@ def trace_features(verts, faces, token_pts, token_nrm, cam_dirs, sun_dirs,
 
 
 def sun_features(mesh, token_pts, token_nrm, sun_dirs, eps: float = 1e-4):
-    """Light visibility and the gathered bounce -- the two features that do NOT depend on
+    """Light visibility and the gathered bounce -- the two features that do not depend on
     the camera, so they are computed once and shared by all 28 geometries.
 
     The source is fixed in the lab frame, so at a given phase every camera sees the same
@@ -168,9 +163,8 @@ class CircularSpectralConv(nn.Module):
         f = torch.fft.rfft(x, dim=-2)
         m = min(self.modes, f.shape[-2])
         wt = torch.view_as_complex(self.w[:, :m].contiguous())
-        # Built out of place. Writing the low and high bands into a cloned tensor is two
-        # in-place ops on a leaf of the graph and autograd rejects it ("modified by an
-        # inplace operation ... expected version 0").
+        # Built out of place: writing the bands into a cloned tensor would be two in-place
+        # operations on a graph leaf, which autograd rejects.
         low = f[..., :m, :] * wt.T.unsqueeze(0).unsqueeze(0)
         high = torch.zeros_like(f[..., m:, :])
         return torch.fft.irfft(torch.cat([low, high], dim=-2), n=p, dim=-2)
@@ -207,27 +201,21 @@ class PhaseEquivariantNet(nn.Module):
         self.head = nn.Linear(width, 2)          # intensity and binary contribution
 
     def forward(self, feats, areas=None):       # (B, T, P, F), (B, T) -> (B, 2, P)
-        """Tokens are summed WEIGHTED BY AREA, which makes this a quadrature.
+        """Tokens are summed weighted by area, which makes this a quadrature.
 
-        An unweighted sum over randomly sampled tokens is a Monte-Carlo estimate of the
-        surface integral, with error 1/sqrt(T) regardless of how well the network fits:
-        at 128 tokens that is 0.088, and the measured held-out RMS was 0.084 -- the failure
-        was the discretisation, not the model. Weighting by facet area turns the same sum
-        into the same quadrature the radiosity solve already uses, so the error is set by
-        the mesh rather than by sampling luck.
+An unweighted sum over sampled tokens is a Monte-Carlo estimate of the surface
+        integral, with error 1/sqrt(T) independent of the fit. Weighting by facet area makes
+        it the same quadrature the radiosity solve uses, so the error is set by the mesh.
         """
         x = self.lift(feats)
         for s, a, m in zip(self.spec, self.attn, self.mix):
             x = x + m(s(x))
             if self.use_attention:
                 x = a(x)
-        # Softplus because BOTH reductions are sums of NON-NEGATIVE contributions: a token
-        # cannot remove intensity from the frame, nor un-count a pixel. Leaving the head
-        # linear lets contributions cancel, and the curve is then divided by its own mean,
-        # which is unstable wherever that mean approaches zero. With the head unconstrained
-        # the fit stalled at train RMS 0.064 and did not improve when capacity was raised
-        # sixfold -- it could not overfit twelve shapes, which is the signature of a map the
-        # architecture cannot represent rather than one it has not yet learned.
+        # Softplus because both reductions are sums of non-negative contributions: a token
+        # cannot remove intensity from the frame, nor un-count a pixel. A linear head lets
+        # contributions cancel, and the curve is then divided by its own mean, which is
+        # unstable where that mean approaches zero.
         h = torch.nn.functional.softplus(self.head(x))       # (B, T, P, 2)
         if areas is not None:
             h = h * areas[:, :, None, None]
@@ -235,7 +223,7 @@ class PhaseEquivariantNet(nn.Module):
 
 
 class Surrogate(nn.Module):
-    """Exact geometry in, curves out; trained against M2."""
+    """Exact geometry in, curves out; trained against the physical forward model."""
 
     def __init__(self, **kw):
         super().__init__()

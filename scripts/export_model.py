@@ -7,7 +7,7 @@ camera list, frame count, c_lambert, sigma, delta), so `build_model` regenerates
 for bit on load and there is no reason to carry it. Dropping it and the other two
 derived buffers leaves the 608,371 learned parameters, about 2.4 MB.
 
-    python export_model.py --ckpt checkpoints_dice2/lpd_gpu_final.pt --out model/lpd_final.pt
+    python export_model.py --ckpt <training-ckpt> --out pretrained/lpd_convex.pt
 """
 import argparse
 import sys
@@ -22,7 +22,7 @@ from hac26.train import REGENERABLE_BUFFERS, load_net  # noqa: E402
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--ckpt", default="checkpoints_dice2/lpd_gpu_final.pt")
-    ap.add_argument("--out", default="model/lpd_final.pt")
+    ap.add_argument("--out", default="pretrained/lpd_convex.pt")
     args = ap.parse_args()
 
     ck = torch.load(args.ckpt, map_location="cpu")

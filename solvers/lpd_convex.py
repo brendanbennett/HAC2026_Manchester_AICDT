@@ -28,7 +28,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .forward import ConvexPhotometricOperator
+from forward_models.convex_egi import ConvexPhotometricOperator
 
 
 def make_tags(cameras: list, curve_types: list) -> torch.Tensor:
@@ -129,7 +129,7 @@ class LPDNet(nn.Module):
         # gate on the operator, L = sum_k A g_k v_k. Writing v as a rank-R sum
         # v = sum_r d1^(r) (x) d2^(r) lets the shape-space factor be absorbed into R
         # primal channels (w_r = d2^(r) * g) and the data-space factor into the dual, so
-        # the operator stays EXACTLY the fixed A with its exact closed-form adjoint:
+        # the operator stays exactly the fixed A with its exact closed-form adjoint:
         #
         #     y = N( sum_r d1^(r) * (A w_r) )
         #
@@ -151,36 +151,11 @@ class LPDNet(nn.Module):
         # y >= 0, so the clamp floor is never crossed from below and the adjoint's
         # discontinuous branch is unreachable.
         #
-        # WHERE THE GATE STARTS. The first version multiplied the sigmoid by a ReZero-style
-        # scalar a = sigmoid(gate_logit) initialised at 1.2e-4, so the warm start was
-        # preserved to ~1e-4. Measured after 800 steps at 100x learning rate, the gate had
-        # not opened: logits moved from -9.00 to between -8.06 and -10.55, a still ~1e-4.
-        # It cannot open, by construction. The gate CNN's gradient carries the factor a,
-        # so at a ~ 1e-4 the CNN is frozen; raw_g is therefore its random initialisation,
-        # which is meaningless; opening the gate towards meaningless values raises the
-        # loss; so a is pushed back down. Neither can move until the other has.
-        #
-        # There is no parameterisation that escapes this. Exact warm-start fidelity
-        # requires the new pathway to contribute ~0, and every smooth map that sends
-        # something to ~0 has ~0 derivative there -- sigmoid saturates, softplus
-        # saturates, clamp is flat. A gate that cannot learn is worth nothing, so the
-        # trade goes the other way: accept a modest perturbation, keep the gradient.
-        #
-        # d1 is now just the sigmoid, with the gate CNN's output bias initialised to
-        # +gate_bias at rank 0 and to a small positive value above it, where the sigmoid
-        # derivative is O(1e-2) rather than 1e-4.
-        #
-        # Rank 0 costs nothing at all: sigmoid(+3) = 0.953 is uniform across the curve and
-        # normalize() divides by the curve mean, so it cancels exactly. The whole
-        # perturbation to the warm start is the correction ranks' contribution,
-        # d1_init * sum_{r>=1} A w_r.
-        #
-        # That budget is split ACROSS the ranks rather than given to each. A flat bias
-        # would make the perturbation grow with R -- 4.9% of the base signal at R=2 but
-        # ~25% at R=6 -- so a high rank would start further from the warm start than a low
-        # one, and "R=6 scored worse" would confound rank against how far back it began.
-        # Same class of mistake as scoring the gate against the shipped model instead of
-        # against the ungated fine-tune. Every rank now starts the same distance out.
+        # d1 is the sigmoid alone, with the gate CNN's output bias initialised to
+        # +gate_bias at rank 0 and to a small positive value above it, so every rank starts
+        # the same distance from open. A multiplicative ReZero-style scalar in front of the
+        # sigmoid is not used: its gradient carries its own value as a factor, so a scalar
+        # initialised near zero cannot open.
         self.gate_rank = gate_rank
         self.gate_bias = gate_bias
         if gate_rank:

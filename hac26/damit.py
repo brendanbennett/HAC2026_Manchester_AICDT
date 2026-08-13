@@ -1,7 +1,7 @@
 """Load DAMIT (Database of Asteroid Models from Inversion Techniques) shape models.
 
 DAMIT models are triangulated shapes derived from lightcurve inversion (mostly convex-
-inversion outputs, so their convex hull ~= the model). We parse the standard `shape.txt`
+inversion outputs, so their convex hull ~= the model). Parses the standard `shape.txt`
 files and expose them as a pool of (verts, faces) meshes for use as a training prior in
 place of the synthetic bodies in shapes.sample_training_shape.
 

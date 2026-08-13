@@ -31,7 +31,7 @@ from hac26.data_io import load_model_curves  # noqa: E402
 from hac26.radial import (dice_from_radial, fibonacci_sphere, mesh_radial)  # noqa: E402
 from hac26.recon import (body_from_support, fit_to_cylinder, smooth_support)  # noqa: E402
 from hac26.geometry import project_closure  # noqa: E402
-from hac26.minkowski import solve_minkowski  # noqa: E402
+from solvers.minkowski import solve_minkowski  # noqa: E402
 from hac26.shapes import hull_mesh, mesh_support, rescale_touch_z  # noqa: E402
 from hac26.stl_io import load_stl  # noqa: E402
 from hac26.train import load_net  # noqa: E402
@@ -44,7 +44,7 @@ def predict_h(net, grid, d, mask, radius):
     """Support function of the body this checkpoint predicts, whichever head it has.
 
     A checkpoint without a support head still defines a convex body -- via the EGI and
-    the Minkowski solve -- so we take the support function of THAT body. Every
+    the Minkowski solve, so the support function is taken from that body. Every
     checkpoint therefore lands in the same representation, which is what lets the
     EGI-only baseline take part in the Minkowski-average ensemble alongside the
     support-head models. Their failure modes differ sharply (the cube's EGI ceiling is

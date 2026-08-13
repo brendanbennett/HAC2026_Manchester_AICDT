@@ -124,7 +124,7 @@ def main():
         hv, hf = hull_mesh(tv)
         rows["hull_vs_truth"] = side_view_measure(
             surface_points(hv, hf), tp, args.n_dirs, args.res)
-        # our shipped reconstruction
+        # the reconstruction
         rf = Path(args.recon_dir) / f"Asteroid{M:02d}.stl"
         if rf.exists():
             rv, rfc = load_stl(str(rf))

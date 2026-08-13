@@ -1,8 +1,8 @@
-"""B2/B3. Bodies as unions of convex polytopes, rendered by exact ray casting.
+"""Bodies as unions of convex polytopes, rendered by exact ray casting.
 
-WHY THIS REPRESENTATION. A7 measured 527 usable dimensions in the data against 262,144
+Representation. The data carry roughly 527 usable dimensions against 262,144
 unknowns in a 64^3 SDF -- a 497:1 over-parameterisation, which is why an unregularised
-volumetric fit carves wherever the model error happens to point (A5). T7 says every ground
+volumetric fit carves wherever the model error happens to point. Every ground
 truth is a POLYTOPE, so the natural unknown is not a level set but a finite set of face
 distances. A union of K convex polytopes on N normals has K(N+3) parameters: 207 at K=3,
 N=66. That is the same order as the information the data actually carries, so the fit is
@@ -14,7 +14,7 @@ Each part is convex by construction, so it needs no convexity penalty and no eik
 and the union is non-convex exactly where parts meet -- which is the contact-binary
 geometry of model 3.
 
-WHY RAY CASTING. For a ray x = o + t d against one polytope, each halfspace gives a scalar
+Ray casting. For a ray x = o + t d against one polytope, each halfspace gives a scalar
 bound on t: <d,n_i> > 0 caps t above, < 0 caps it below. So
 
     t_enter = max_i lower_i,   t_exit = min_i upper_i,   hit iff t_enter <= t_exit
@@ -88,7 +88,7 @@ def render(H, C, N, view, sun, res=64, extent=None, tau_i=0.0, tau_b=0.02):
     """One frame: (intensity, lit area) for a parallel beam and an orthographic camera.
 
     Mirrors the imaging chain rather than an analytic functional: shade the visible
-    surface, then threshold, then SUM pixel values for intensity and COUNT them for
+    surface, then threshold, then sum pixel values for intensity and count them for
     binary. That is what the organisers' pipeline does, and it is the only way the two
     curve types differ by more than a constant.
     """
@@ -102,7 +102,7 @@ def render(H, C, N, view, sun, res=64, extent=None, tau_i=0.0, tau_b=0.02):
     ey = torch.cross(view, ex, dim=0); ey = ey / ey.norm()
     a = torch.linspace(-extent, extent, res, device=dev)
     gx, gy = torch.meshgrid(a, a, indexing="ij")
-    # `view` is omega_c, the direction from the BODY TO THE CAMERA -- the same convention
+    # `view` is omega_c, the direction from the body to the camera -- the same convention
     # the analytic operator uses when it writes mu = n . omega_c. Rays therefore start on
     # the camera side and travel along -view. Starting at -extent*view and marching along
     # +view instead renders the far surface, which shows up as the near and far cameras
@@ -117,13 +117,13 @@ def render(H, C, N, view, sun, res=64, extent=None, tau_i=0.0, tau_b=0.02):
         sh = occluded(p, sun, H, C, N)
         val = torch.zeros_like(mu)
         # RADIANCE, not radiance x mu. A Lambertian facet's radiance is rho/pi * mu0 and
-        # carries no mu: the viewing obliquity enters through the PROJECTED AREA of the
+        # carries no mu: the viewing obliquity enters through the projected area of the
         # pixel, mu dA, which the image-plane sum already supplies. Writing mu0*mu here
         # double-counts it. With val = mu0 the two sums come out as
         #     intensity = sum val * px = INT mu0 mu dA   -- the Lambert kernel mu+ mu0+
         #     binary    = count   * px = INT_lit  mu dA  -- the binary kernel mu+
-        # which is exactly the pair the analytic operator uses, and independently confirms
-        # why the binary rows carry mu+ alone (A3).
+        # which is the pair the analytic operator uses, and confirms
+        # why the binary rows carry mu+ alone.
         val[lit] = torch.where(sh, torch.zeros_like(mu0[lit]), mu0[lit])
     else:
         val = torch.zeros_like(mu)

@@ -9,7 +9,16 @@ demo_laptop/
 compare_out/
 real_compare/
 submissions/
-data/
+# Challenge inputs are the organisers' published dataset (5 GB): never redistributed.
+# Reconstruction outputs are small and ARE tracked -- they are the deliverable.
+data/*
+!data/eval_convex/
+!data/eval_lpd/
+!data/MANIFEST.sha256
+
+# Retrained on every experiment, so kept out of history. Publish a validated one as a
+# release asset instead. The two stable artefacts live in pretrained/ and ARE tracked.
+model/
 *.log
 .venv/
 .DS_Store

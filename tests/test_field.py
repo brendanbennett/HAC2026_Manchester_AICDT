@@ -1,6 +1,6 @@
-"""M1 completion test.
+"""Geometry test.
 
-The gate the specification names: encode a cube with h alone, tokens zero, extract, and
+Encode a cube with h alone, tokens zero, extract, and
 require the faces planar to within one grid cell and Dice above 0.99 against the analytic
 cube. The rest pin the properties the cube test does not touch -- that the core is a plain
 max rather than log-sum-exp, that the token field is signed and zero-mean, and that the
@@ -35,7 +35,7 @@ def test_design_is_a_ten_design():
 
 
 def test_design_contains_the_axis_directions():
-    """Required for a cube to be exactly representable by the core -- see M1 docstring."""
+    """Required for a cube to be exactly representable by the convex core."""
     x = spherical_design()
     for k in range(3):
         e = np.zeros(3); e[k] = 1.0
