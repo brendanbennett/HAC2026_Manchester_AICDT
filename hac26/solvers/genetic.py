@@ -16,6 +16,9 @@ class GeneticResult:
     best_params: np.ndarray
     best_fitness: float
     history: list[float]
+    best_params_history: list
+    best_fitness_history: list
+
 
 
 class GeneticSolver:
@@ -78,6 +81,9 @@ class GeneticSolver:
         self.n_parents = int(n_parents)
         self.n_generations = int(n_generations)
         self.mutation_decay = float(mutation_decay)
+
+        self.best_params_history = []
+        self.best_fitness_history = []
 
         self.rng = np.random.default_rng(seed)
 
@@ -187,6 +193,15 @@ class GeneticSolver:
 
             history.append(best_fitness)
 
+            # update history
+            self.best_params_history.append(
+                best_params.copy()
+            )
+
+            self.best_fitness_history.append(
+                best_fitness
+            )
+
             print(
                 f"Generation {generation + 1:3d}/{self.n_generations} "
                 f"| fitness = {best_fitness:.6g} "
@@ -200,8 +215,13 @@ class GeneticSolver:
 
             mutation_scale *= self.mutation_decay
 
+
+
         return GeneticResult(
             best_params=best_params,
             best_fitness=best_fitness,
             history=history,
+            best_params_history = self.best_params_history,
+            best_fitness_history = self.best_fitness_history
+
         )

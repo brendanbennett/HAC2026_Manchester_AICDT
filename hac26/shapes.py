@@ -79,6 +79,90 @@ def sh_lognormal_mesh(rng: np.random.Generator, L: int = 6, amp: float = 0.35,
     return u * r[:, None], faces, (a, L)
 
 
+# NOTE: added for genetic algo test #####################################################################
+
+def sh_mesh_from_coefficients(
+    coefficients: np.ndarray,
+    L: int = 6,
+    subdiv: int = 3,
+) -> tuple:
+    """Construct a star-shaped mesh from fixed spherical-harmonic coefficients.
+
+    The surface is parameterised as
+
+        r(u) = exp(sum_lm a_lm Y_lm(u))
+
+    where ``coefficients`` contains the real spherical-harmonic coefficients
+    for l=1,...,L in the same ordering used by ``real_sh_basis``.
+
+    Parameters
+    ----------
+    coefficients
+        Array of SH coefficients with length ``L * (L + 2)``.
+
+    L
+        Maximum spherical-harmonic degree.
+
+    subdiv
+        Number of icosphere subdivisions.
+
+    Returns
+    -------
+    verts
+        Array of vertex positions with shape ``(N, 3)``.
+
+    faces
+        Triangle indices with shape ``(M, 3)``.
+    """
+    coefficients = np.asarray(coefficients, dtype=float)
+
+    n_coefficients = L * (L + 2)
+
+    if coefficients.shape != (n_coefficients,):
+        raise ValueError(
+            f"Expected {n_coefficients} coefficients for L={L}, "
+            f"got shape {coefficients.shape}"
+        )
+
+    # Unit directions defining the surface.
+    u, faces = icosphere(subdiv)
+
+    # Convert directions to spherical coordinates.
+    theta = np.arccos(
+        np.clip(u[:, 2], -1.0, 1.0)
+    )
+
+    phi = np.mod(
+        np.arctan2(u[:, 1], u[:, 0]),
+        2.0 * np.pi,
+    )
+
+    # Evaluate all SH basis functions on the sphere.
+    B = real_sh_basis(
+        L,
+        theta,
+        phi,
+    )
+
+    # Log-radius parameterisation:
+    #
+    # log(r) = sum_i a_i Y_i
+    #
+    # so
+    #
+    # r = exp(B.T @ a)
+    #
+    log_r = coefficients @ B
+
+    r = np.exp(log_r)
+
+    # Convert radial function into Cartesian vertices.
+    verts = u * r[:, None]
+
+    return verts, faces
+
+##################################################################
+
 def random_convex_polytope(rng: np.random.Generator, n_pts: int = 40) -> tuple:
     pts = rng.normal(size=(n_pts, 3)) * rng.uniform(0.5, 1.5, size=3)
     hull = ConvexHull(pts)
