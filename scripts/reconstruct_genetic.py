@@ -6,6 +6,7 @@ import json
 import matplotlib.pyplot as plt
 import numpy as np
 import trimesh
+import time
 
 from hac26.shapes import (
     icosphere,
@@ -226,7 +227,8 @@ def save_results_json(
     output_dir,
     args,
     result,
-    dice_scores
+    dice_scores,
+    comp_t
 ):
     """Save run configuration and optimisation results to JSON."""
 
@@ -244,8 +246,9 @@ def save_results_json(
                 float(x)
                 for x in result.best_fitness_history
             ],
-
-        
+        },
+        "timing": {
+            "total_seconds": comp_t,
         },
     }
 
@@ -313,13 +316,16 @@ def main():
     parser.add_argument(
     "--dice-resolution",
     type=int,
-    default=64,
+    default=16,
     help="Voxel resolution used for Dice evaluation.",
     )
 
     args = parser.parse_args()
 
     rng = np.random.default_rng(args.seed)
+
+    # time computation
+    start_time = time.perf_counter()
 
     output_dir = Path("results/genetic"
             ) / (
@@ -595,7 +601,7 @@ def main():
 
 
     # ------------------------------------------------------------
-    # Convergence
+    # Convergence Plot
     # ------------------------------------------------------------
 
     plt.figure()
@@ -621,12 +627,15 @@ def main():
     # Save final results
     # ------------------------------------------------------------
 
+    total_time = time.perf_counter() - start_time
+
     save_results_json(
-    output_dir=output_dir,
-    args=args,
-    result=result,
-    dice_scores=dice_scores
-    )
+        output_dir=output_dir,
+        args=args,
+        result=result,
+        dice_scores=dice_scores,
+        comp_t = total_time
+        )
 
 
 if __name__ == "__main__":
