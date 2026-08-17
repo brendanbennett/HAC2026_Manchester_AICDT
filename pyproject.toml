@@ -10,6 +10,7 @@ requires-python = ">=3.10"
 dependencies = [
     "matplotlib>=3.10.9",
     "numpy>=1.24",
+    "rtree>=1.4.1",
     "scipy>=1.10",
     "trimesh>=5.0.0",
 ]

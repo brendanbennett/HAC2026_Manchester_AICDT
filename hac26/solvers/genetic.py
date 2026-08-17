@@ -15,7 +15,6 @@ class GeneticResult:
 
     best_params: np.ndarray
     best_fitness: float
-    history: list[float]
     best_params_history: list
     best_fitness_history: list
 
@@ -161,6 +160,8 @@ class GeneticSolver:
 
         return self._apply_bounds(population)
 
+
+
     def run(self):
         """Run the genetic optimisation.
 
@@ -173,41 +174,42 @@ class GeneticSolver:
 
         best_params = None
         best_fitness = -np.inf
-        history = []
 
         mutation_scale = self.mutation_scale
 
-        for generation in range(self.n_generations):
-            fitness = self._evaluate(population)
+        # ------------------------------------------------------------
+        # Generation 0: evaluate the initial population
+        # ------------------------------------------------------------
 
+        fitness = self._evaluate(population)
+
+        best_idx = np.argmax(fitness)
+
+        best_fitness = fitness[best_idx]
+        best_params = population[best_idx].copy()
+
+        self.best_params_history.append(best_params.copy())
+        self.best_fitness_history.append(best_fitness)
+
+        print(
+            f"Generation {0:3d}/{self.n_generations} "
+            f"| fitness = {best_fitness:.6g} "
+            f"| mutation = {mutation_scale:.4g}"
+        )
+
+        # ------------------------------------------------------------
+        # Evolution
+        # ------------------------------------------------------------
+
+        for generation in range(1, self.n_generations + 1):
+
+            # Select parents from the current population.
             parents, parent_fitness = self._select(
                 population,
                 fitness,
             )
 
-            generation_best = parent_fitness[0]
-
-            if generation_best > best_fitness:
-                best_fitness = generation_best
-                best_params = parents[0].copy()
-
-            history.append(best_fitness)
-
-            # update history
-            self.best_params_history.append(
-                best_params.copy()
-            )
-
-            self.best_fitness_history.append(
-                best_fitness
-            )
-
-            print(
-                f"Generation {generation + 1:3d}/{self.n_generations} "
-                f"| fitness = {best_fitness:.6g} "
-                f"| mutation = {mutation_scale:.4g}"
-            )
-
+            # Mutate parents to create the next population.
             population = self._mutate(
                 parents,
                 mutation_scale,
@@ -215,12 +217,30 @@ class GeneticSolver:
 
             mutation_scale *= self.mutation_decay
 
+            # Evaluate the new population.
+            fitness = self._evaluate(population)
+
+            generation_best_idx = np.argmax(fitness)
+            generation_best_fitness = fitness[generation_best_idx]
+
+            # Update global best.
+            if generation_best_fitness > best_fitness:
+                best_fitness = generation_best_fitness
+                best_params = population[generation_best_idx].copy()
+
+            self.best_params_history.append(best_params.copy())
+            self.best_fitness_history.append(best_fitness)
+
+            print(
+                f"Generation {generation:3d}/{self.n_generations} "
+                f"| fitness = {best_fitness:.6g} "
+                f"| mutation = {mutation_scale:.4g}"
+            )
 
 
         return GeneticResult(
             best_params=best_params,
             best_fitness=best_fitness,
-            history=history,
             best_params_history = self.best_params_history,
             best_fitness_history = self.best_fitness_history
 

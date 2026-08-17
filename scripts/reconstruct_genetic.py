@@ -2,7 +2,7 @@
 
 import argparse
 from pathlib import Path
-
+import json
 import matplotlib.pyplot as plt
 import numpy as np
 import trimesh
@@ -10,8 +10,12 @@ import trimesh
 from hac26.shapes import (
     icosphere,
     sh_mesh_from_coefficients,
+    mesh_curves_convex,
 )
 from hac26.solvers.genetic import GeneticSolver
+from hac26.geometry import build_cameras
+from hac26.recon import dice
+from hac26.scoring.voxel import score_mesh, prepare_truth
 
 
 def make_target_coefficients(
@@ -53,6 +57,65 @@ def shape_fitness(
     )
 
     return -error
+
+
+def lightcurve_fitness(
+    coefficients,
+    target_curves,
+    L,
+    subdiv,
+    cameras,
+    m,
+    curve_types,
+    c_lambert=0.1,
+    sigma=1.0,
+    delta=1.0,
+    psi0=0.0,
+    ls_weight=1.0,
+):
+    """Calculate fitness by comparing model and target lightcurves.
+
+    Higher fitness is better, so this returns the negative mean squared
+    lightcurve residual.
+    """
+
+    # ------------------------------------------------------------
+    # Candidate shape
+    # ------------------------------------------------------------
+
+    vertices, faces = sh_mesh_from_coefficients(
+        coefficients,
+        L=L,
+        subdiv=subdiv,
+    )
+
+    # ------------------------------------------------------------
+    # Candidate lightcurves
+    # ------------------------------------------------------------
+
+    curves = mesh_curves_convex(
+        vertices,
+        faces,
+        cameras=cameras,
+        m=m,
+        curve_types=curve_types,
+        c_lambert=c_lambert,
+        sigma=sigma,
+        delta=delta,
+        psi0=psi0,
+        ls_weight=ls_weight,
+    )
+
+    # ------------------------------------------------------------
+    # Residual
+    # ------------------------------------------------------------
+
+    residual = curves - target_curves
+
+    # Mean squared error over all cameras and phases.
+    mse = np.mean(residual**2)
+
+    return -mse
 
 
 def plot_mesh(
@@ -156,7 +219,46 @@ def save_shape_stl(
 
     print(f"Saved {path}")
 
+    return mesh
 
+
+def save_results_json(
+    output_dir,
+    args,
+    result,
+    dice_scores
+):
+    """Save run configuration and optimisation results to JSON."""
+
+
+    config = vars(args).copy()
+    config["n_coefficients"] = args.L * (args.L + 2)
+
+    results = {
+        "config": config,
+        "result": {
+            "dice_scores": dice_scores,
+            "best_fitness": float(result.best_fitness),
+            "best_params": result.best_params.tolist(),
+            "fitness_history": [
+                float(x)
+                for x in result.best_fitness_history
+            ],
+
+        
+        },
+    }
+
+    with open(output_dir / "results.json", "w") as f:
+        json.dump(
+            results,
+            f,
+            indent=2,
+        )
+
+###############################################################
+# MAIN #
+###############################################################
 
 def main():
 
@@ -197,14 +299,51 @@ def main():
     )
 
     parser.add_argument(
+        "--m",
+        type=int,
+        default=50,
+    )
+
+    parser.add_argument(
         "--seed",
         type=int,
         default=42,
     )
 
+    parser.add_argument(
+    "--dice-resolution",
+    type=int,
+    default=64,
+    help="Voxel resolution used for Dice evaluation.",
+    )
+
     args = parser.parse_args()
 
     rng = np.random.default_rng(args.seed)
+
+    output_dir = Path("results/genetic"
+            ) / (
+            f"L{args.L}"
+            f"_subdiv{args.subdiv}"
+            f"_m{args.m}"
+            f"_gen{args.generations}"
+            f"_pop{args.population_size}"
+            f"_parents{args.parents}"
+            f"_seed{args.seed}"
+            f"_diceres{args.dice_resolution}"
+        )
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    # ------------------------------------------------------------
+    # Camera and lightcurve configuration
+    # ------------------------------------------------------------
+
+    # camera angles 
+    cameras = build_cameras()
+
+    # lightcurve types
+    curve_types = ["intensity"] * len(cameras) #+ ["binary"] * N_CAMS
+
 
     # ------------------------------------------------------------
     # SH dimensionality
@@ -218,7 +357,7 @@ def main():
     )
 
     # ------------------------------------------------------------
-    # Hidden target shape
+    # Hidden target shape and lightcurves
     # ------------------------------------------------------------
 
     target_coefficients = make_target_coefficients(
@@ -226,12 +365,24 @@ def main():
         L=args.L,
     )
 
-    target_vertices, target_faces = (
-        sh_mesh_from_coefficients(
-            target_coefficients,
-            L=args.L,
-            subdiv=args.subdiv,
-        )
+    target_vertices, target_faces = sh_mesh_from_coefficients(
+        target_coefficients,
+        L=args.L,
+        subdiv=args.subdiv,
+    )
+
+    
+    target_curves = mesh_curves_convex(
+        target_vertices,
+        target_faces,
+        cameras=cameras,
+        m=args.m,
+        curve_types=curve_types,
+    )
+
+    np.save(
+    output_dir / "truth_curves.npy",
+    target_curves,
     )
 
     # ------------------------------------------------------------
@@ -269,41 +420,20 @@ def main():
         ]
     )
 
-    # ------------------------------------------------------------
-    # Checkpoints
-    # ------------------------------------------------------------
-
-    checkpoints = sorted(
-        set(
-            [
-                1,
-                10,
-                25,
-                args.generations,
-            ]
-        )
-    )
-
-    checkpoint_shapes = {}
-
-    def save_checkpoint(
-        generation,
-        coefficients,
-        fitness,
-    ):
-        checkpoint_shapes[generation] = (
-            coefficients.copy(),
-            fitness,
-        )
 
     # ------------------------------------------------------------
     # Fitness function
     # ------------------------------------------------------------
 
     def fitness(coefficients):
-        return shape_fitness(
-            coefficients,
-            target_coefficients,
+        return lightcurve_fitness(
+            coefficients=coefficients,
+            target_curves=target_curves,
+            L=args.L,
+            subdiv=args.subdiv,
+            cameras=cameras,
+            m=args.m,
+            curve_types=curve_types,
         )
 
     # ------------------------------------------------------------
@@ -320,62 +450,69 @@ def main():
         mutation_decay=0.98,
         bounds=bounds,
         seed=args.seed,
-        # checkpoint_fn=save_checkpoint,
-        # checkpoints=checkpoints,
     )
 
     result = solver.run()
+
 
     # ------------------------------------------------------------
     # Save shape checkpoints
     # ------------------------------------------------------------
 
-    output_dir = Path("results/genetic")
+    # use this in case it stops early
+    # [0] = initial pop, [n] = nth evolution
+    n_generations = len(result.best_fitness_history) - 1
 
-    n_generations = len(result.history)
-
-    checkpoint_generations = {
-        "start": 0,
-        "generation_25": max(1, n_generations // 4),
-        "generation_50": max(1, n_generations // 2),
-        "generation_75": max(1, 3 * n_generations // 4),
-        "final": n_generations,
-    }
+    checkpoint_generations = [
+        0,
+        n_generations // 4,
+        n_generations // 2,
+        3 * n_generations // 4,
+        n_generations,
+    ]
 
     # Truth
-    save_shape_stl(
+    truth_mesh = save_shape_stl(
         target_coefficients,
         L=args.L,
         subdiv=args.subdiv,
         path=output_dir / "truth.stl",
+    ) 
+
+    truth_mesh_voxelised = prepare_truth(
+        truth_mesh.vertices,
+        truth_mesh.faces,
+        n=args.dice_resolution,
     )
 
-    # Start
-    save_shape_stl(
-        initial_coefficients,
-        L=args.L,
-        subdiv=args.subdiv,
-        path=output_dir / "start.stl",
-    )
 
-    # Checkpoint / final shapes
-    for name, generation in checkpoint_generations.items():
+    dice_scores = {}
 
-        if name == "start":
-            continue
+    for generation in checkpoint_generations:
 
-        # History is zero-indexed.
-        index = generation - 1
+        coefficients = result.best_params_history[generation]
 
-        coefficients = result.best_params_history[index]
-
-        save_shape_stl(
+        vertices, faces = sh_mesh_from_coefficients(
             coefficients,
             L=args.L,
             subdiv=args.subdiv,
-            path=output_dir / f"{name}.stl",
         )
 
+        # track updates
+        mesh = save_shape_stl(
+            coefficients,
+            L=args.L,
+            subdiv=args.subdiv,
+            path=output_dir / f"generation_{generation:04d}.stl",
+        )
+
+
+        # Dice
+        dice_scores[f"generation_{generation:04d}"] = score_mesh(
+            mesh.vertices,
+            mesh.faces,
+            truth_mesh_voxelised,
+        )
 
     # ------------------------------------------------------------
     # Print recovered coefficients
@@ -396,45 +533,64 @@ def main():
     )
 
 
+
     # ------------------------------------------------------------
-    # Save checkpoint visualisations
+    # Lightcurve visualisations
     # ------------------------------------------------------------
 
-    n_generations = len(
-        result.history
+
+    final_vertices, final_faces = sh_mesh_from_coefficients(
+        result.best_params,
+        L=args.L,
+        subdiv=args.subdiv,
     )
 
-    checkpoint_generations = sorted(
-        set(
-            [
-                1,
-                max(1, n_generations // 4),
-                max(1, n_generations // 2),
-                max(1, 3 * n_generations // 4),
-                n_generations,
-            ]
-        )
+    final_curves = mesh_curves_convex(
+        final_vertices,
+        final_faces,
+        cameras=cameras,
+        m=args.m,
+        curve_types=curve_types,
     )
 
-    for generation in checkpoint_generations:
 
-        # history is zero-indexed
-        index = generation - 1
+    fig, axes = plt.subplots(
+        len(cameras),
+        1,
+        figsize=(8, 2 * len(cameras)),
+        sharex=True,
+    )
 
-        coefficients = (
-            result.best_params_history[index]
+    if len(cameras) == 1:
+        axes = [axes]
+
+    for i, ax in enumerate(axes):
+
+        ax.plot(
+            target_curves[i],
+            label="truth",
         )
 
-        fitness = (
-            result.best_fitness_history[index]
+        ax.plot(
+            final_curves[i],
+            "--",
+            label="GA",
         )
 
+        ax.set_ylabel(f"Camera {i}")
 
+        ax.legend()
 
+    axes[-1].set_xlabel("Phase")
 
-    # ------------------------------------------------------------
-    # Visualise checkpoint shapes
-    # ------------------------------------------------------------
+    fig.tight_layout()
+
+    fig.savefig(
+        output_dir / "lightcurve_comparison.png",
+        dpi=200,
+    )
+
+    plt.close(fig)
 
 
 
@@ -446,10 +602,10 @@ def main():
 
     plt.plot(
         np.arange(
-            1,
-            args.generations + 1,
+            0,
+            len(result.best_fitness_history)
         ),
-        result.history,
+        result.best_fitness_history
     )
 
     plt.xlabel("Generation")
@@ -459,6 +615,18 @@ def main():
     plt.tight_layout()
 
     plt.savefig(output_dir / "genetic_convergence.png")
+
+
+    # ------------------------------------------------------------
+    # Save final results
+    # ------------------------------------------------------------
+
+    save_results_json(
+    output_dir=output_dir,
+    args=args,
+    result=result,
+    dice_scores=dice_scores
+    )
 
 
 if __name__ == "__main__":

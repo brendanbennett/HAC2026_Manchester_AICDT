@@ -34,14 +34,159 @@ def occupancy(v, f, n, extent):
     return mesh_to_sdf(np.ascontiguousarray(v), np.ascontiguousarray(f), n, extent) < 0
 
 
-def score(stl: str, model: int, data_dir: str = "dataset/raw", n: int = 128) -> float:
+def prepare_truth(
+    truth_vertices,
+    truth_faces,
+    n=128,
+):
+    """Prepare a truth mesh for repeated Dice evaluation.
+
+    The returned object contains the voxelised truth and the voxel grid
+    extent to use for all subsequent reconstructions.
+    """
+
+    truth_vertices = rescale_touch_z(
+        np.asarray(truth_vertices)
+    )
+    truth_faces = np.asarray(truth_faces)
+
+    extent = (
+        float(np.abs(truth_vertices).max())
+        * 1.05
+    )
+
+    truth_occupancy = occupancy(
+        truth_vertices,
+        truth_faces,
+        n,
+        extent,
+    )
+
+    return {
+        "occupancy": truth_occupancy,
+        "extent": extent,
+        "n": n,
+    }
+
+def score_mesh(
+    recon_vertices,
+    recon_faces,
+    truth,
+):
+    """Calculate voxel Dice against a prepared truth.
+
+    Parameters
+    ----------
+    recon_vertices, recon_faces
+        Vertices and triangular faces of the reconstruction.
+
+    truth
+        Prepared truth returned by ``prepare_truth``.
+
+    Returns
+    -------
+    float
+        Voxel Dice score.
+    """
+
+    recon_vertices = rescale_touch_z(
+        np.asarray(recon_vertices)
+    )
+    recon_faces = np.asarray(recon_faces)
+
+    recon_occupancy = occupancy(
+        recon_vertices,
+        recon_faces,
+        truth["n"],
+        truth["extent"],
+    )
+
+    return float(
+        dice(
+            recon_occupancy,
+            truth["occupancy"],
+        )
+    )
+
+
+def score_meshes(
+    recon_vertices,
+    recon_faces,
+    truth_vertices,
+    truth_faces,
+    n=128,
+):
+    """Calculate voxel Dice between two meshes.
+
+    This is the backwards-compatible interface. For repeated scoring
+    against the same truth, use ``prepare_truth`` and ``score_mesh``.
+    """
+
+    truth = prepare_truth(
+        truth_vertices,
+        truth_faces,
+        n=n,
+    )
+
+    return score_mesh(
+        recon_vertices,
+        recon_faces,
+        truth,
+    )
+
+
+
+def score_stls(
+    recon_stl,
+    truth_stl,
+    n=128,
+):
+    """Calculate voxel Dice between two STL files."""
+
     import trimesh
-    r = trimesh.load(stl, process=False)
-    t = trimesh.load(Path(data_dir) / TRUTH[model], process=False)
-    rv, tv = rescale_touch_z(np.asarray(r.vertices)), rescale_touch_z(np.asarray(t.vertices))
-    e = max(float(np.abs(rv).max()), float(np.abs(tv).max())) * 1.05
-    return float(dice(occupancy(rv, np.asarray(r.faces), n, e),
-                      occupancy(tv, np.asarray(t.faces), n, e)))
+
+    recon = trimesh.load(
+        recon_stl,
+        process=False,
+    )
+
+    truth = trimesh.load(
+        truth_stl,
+        process=False,
+    )
+
+    return score_meshes(
+        recon.vertices,
+        recon.faces,
+        truth.vertices,
+        truth.faces,
+        n=n,
+    )
+
+
+def score(
+    stl: str,
+    model: int,
+    data_dir: str = "dataset/raw",
+    n: int = 128,
+    ) -> float:
+
+    truth_stl = Path(data_dir) / TRUTH[model]
+
+    return score_stls(
+        stl,
+        truth_stl,
+        n=n,
+    )
+
+# def score(stl: str, model: int, data_dir: str = "dataset/raw", n: int = 128) -> float:
+#     import trimesh
+#     r = trimesh.load(stl, process=False)
+#     t = trimesh.load(Path(data_dir) / TRUTH[model], process=False)
+#     rv, tv = rescale_touch_z(np.asarray(r.vertices)), rescale_touch_z(np.asarray(t.vertices))
+#     e = max(float(np.abs(rv).max()), float(np.abs(tv).max())) * 1.05
+#     return float(dice(occupancy(rv, np.asarray(r.faces), n, e),
+#                       occupancy(tv, np.asarray(t.faces), n, e)))
 
 
 def main():
