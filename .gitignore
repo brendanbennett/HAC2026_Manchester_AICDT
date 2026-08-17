@@ -15,3 +15,5 @@ dataset/*
 # asset instead; the stable ones live in models/.
 runs/
 
+# practice results
+results/genetic/toy_spherical_harmonics/*

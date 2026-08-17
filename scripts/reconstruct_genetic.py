@@ -17,8 +17,10 @@ from hac26.solvers.genetic import GeneticSolver
 from hac26.geometry import build_cameras
 from hac26.recon import dice
 from hac26.scoring.voxel import score_mesh, prepare_truth
+from hac26.data_io import load_model_curves
 from hac26.genetic_utils import make_target_coefficients, lightcurve_fitness, \
-                                save_shape_stl, save_results_json
+                                save_shape_stl, save_results_json, load_truth_mesh, \
+                                plot_lightcurve_comparison, plot_genetic_convergence
 
 
 
@@ -93,13 +95,33 @@ def main():
         default='results/genetic',
     )
 
+    parser.add_argument(
+        "--model",
+        type=int,
+        default=None,
+        help=(
+            "Challenge asteroid model number. If omitted, use a synthetic SH target."
+        ),
+    )
+
+    parser.add_argument(
+        "--data-dir",
+        type=str,
+        default="dataset/raw",
+        help="Challenge dataset directory.",
+    )
+
+    # load args
     args = parser.parse_args()
 
+    # generate seed
     rng = np.random.default_rng(args.seed)
 
     # time computation
     start_time = time.perf_counter()
 
+    # configure directory
+    data_dir = Path(args.data_dir)
     output_dir = Path(args.output_dir) / (
             f"L{args.L}"
             f"_subdiv{args.subdiv}"
@@ -114,15 +136,99 @@ def main():
     
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # ------------------------------------------------------------
-    # Camera and lightcurve configuration
-    # ------------------------------------------------------------
 
+    # --------------------------------------------------------
+    # Load source of truth (if exists)
+    # --------------------------------------------------------
+    
     # camera angles 
     cameras = build_cameras()
 
     # lightcurve types
-    curve_types = ["intensity"] * len(cameras) #+ ["binary"] * N_CAMS
+    curve_types = ["intensity"] * len(cameras) #+ ["binary"] * len(cameras) 
+
+
+    if args.model is None:
+        
+        # Synthetic problem
+        print("Running synthetic SH reconstruction")
+
+        target_coefficients = make_target_coefficients(
+            rng,
+            L=args.L,
+        )
+
+        target_vertices, target_faces = sh_mesh_from_coefficients(
+            target_coefficients,
+            L=args.L,
+            subdiv=args.subdiv,
+        )
+
+        target_curves = mesh_curves_convex(
+            target_vertices,
+            target_faces,
+            cameras=cameras,
+            m=args.m,
+            curve_types=curve_types,
+        )
+
+        # TODO: use this ?
+        target_mask = np.ones(
+            target_curves.shape[0],
+            dtype=np.float32,
+            )
+
+        np.save(
+        output_dir / "truth_curves.npy",
+        target_curves,
+        )
+
+        # TODO: looks like some overlap of functionality here
+        truth_mesh = save_shape_stl(
+            target_coefficients,
+            L=args.L,
+            subdiv=args.subdiv,
+            path=output_dir / "truth.stl",
+        ) 
+
+        truth_mesh_voxelised = prepare_truth(
+            truth_mesh.vertices,
+            truth_mesh.faces,
+            n=args.dice_resolution,
+        )
+
+    else:
+
+        # Real asteroid
+        print(f"Running real asteroid model {args.model}")
+
+        lc_dict = load_model_curves(data_dir=data_dir,
+                                          model_idx=args.model,
+                                          m=args.m,
+                                          renormalize=True)
+        
+        # TODO: When using the binary, use all 56 curves here
+        target_curves = lc_dict['curves'][:28]
+
+        np.save(
+        output_dir / "truth_curves.npy",
+        target_curves,
+        )
+
+        # TODO: use the mask?
+        target_mask = lc_dict['mask']
+
+        truth_mesh = load_truth_mesh(
+            args.model,
+            data_dir,
+        )
+
+        truth_mesh_voxelised = prepare_truth(
+            truth_mesh.vertices,
+            truth_mesh.faces,
+            n=args.dice_resolution,
+        )
+
 
 
     # ------------------------------------------------------------
@@ -136,34 +242,6 @@ def main():
         f"({n_coefficients} SH coefficients)"
     )
 
-    # ------------------------------------------------------------
-    # Hidden target shape and lightcurves
-    # ------------------------------------------------------------
-
-    target_coefficients = make_target_coefficients(
-        rng,
-        L=args.L,
-    )
-
-    target_vertices, target_faces = sh_mesh_from_coefficients(
-        target_coefficients,
-        L=args.L,
-        subdiv=args.subdiv,
-    )
-
-    
-    target_curves = mesh_curves_convex(
-        target_vertices,
-        target_faces,
-        cameras=cameras,
-        m=args.m,
-        curve_types=curve_types,
-    )
-
-    np.save(
-    output_dir / "truth_curves.npy",
-    target_curves,
-    )
 
     # ------------------------------------------------------------
     # Initial genome
@@ -244,20 +322,6 @@ def main():
         n_generations,
     ]
 
-    # Truth
-    truth_mesh = save_shape_stl(
-        target_coefficients,
-        L=args.L,
-        subdiv=args.subdiv,
-        path=output_dir / "truth.stl",
-    ) 
-
-    truth_mesh_voxelised = prepare_truth(
-        truth_mesh.vertices,
-        truth_mesh.faces,
-        n=args.dice_resolution,
-    )
-
 
     dice_scores = {}
 
@@ -294,8 +358,9 @@ def main():
     print("\nOptimisation complete")
     print("---------------------")
 
-    print("\nTarget coefficients:")
-    print(target_coefficients)
+    if args.model is None:
+        print("\nTarget coefficients:")
+        print(target_coefficients)
 
     print("\nRecovered coefficients:")
     print(result.best_params)
@@ -318,52 +383,15 @@ def main():
         subdiv=args.subdiv,
     )
 
-    final_curves = mesh_curves_convex(
-        final_vertices,
-        final_faces,
+    plot_lightcurve_comparison(
+        vertices=final_vertices,
+        faces=final_faces,
+        target_curves=target_curves,
         cameras=cameras,
-        m=args.m,
         curve_types=curve_types,
+        m=args.m,
+        output_path=output_dir / "lightcurve_comparison.png",
     )
-
-
-    fig, axes = plt.subplots(
-        len(cameras),
-        1,
-        figsize=(8, 2 * len(cameras)),
-        sharex=True,
-    )
-
-    if len(cameras) == 1:
-        axes = [axes]
-
-    for i, ax in enumerate(axes):
-
-        ax.plot(
-            target_curves[i],
-            label="truth",
-        )
-
-        ax.plot(
-            final_curves[i],
-            "--",
-            label="GA",
-        )
-
-        ax.set_ylabel(f"Camera {i}")
-
-        ax.legend()
-
-    axes[-1].set_xlabel("Phase")
-
-    fig.tight_layout()
-
-    fig.savefig(
-        output_dir / "lightcurve_comparison.png",
-        dpi=200,
-    )
-
-    plt.close(fig)
 
 
 
@@ -371,23 +399,10 @@ def main():
     # Convergence Plot
     # ------------------------------------------------------------
 
-    plt.figure()
-
-    plt.plot(
-        np.arange(
-            0,
-            len(result.best_fitness_history)
-        ),
-        result.best_fitness_history
+    plot_genetic_convergence(
+        result.best_fitness_history,
+        output_dir / "genetic_convergence.png",
     )
-
-    plt.xlabel("Generation")
-    plt.ylabel("Best fitness")
-    plt.title("Genetic algorithm convergence")
-
-    plt.tight_layout()
-
-    plt.savefig(output_dir / "genetic_convergence.png")
 
 
     # ------------------------------------------------------------

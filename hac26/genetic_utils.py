@@ -2,23 +2,49 @@
 
 # Helper functions for reconstruct_genetic.py
 
-import argparse
+
 from pathlib import Path
 import json
 import matplotlib.pyplot as plt
 import numpy as np
 import trimesh
-import time
+
 
 from hac26.shapes import (
     icosphere,
     sh_mesh_from_coefficients,
     mesh_curves_convex,
 )
-from hac26.solvers.genetic import GeneticSolver
-from hac26.geometry import build_cameras
-from hac26.recon import dice
-from hac26.scoring.voxel import score_mesh, prepare_truth
+
+
+import trimesh
+
+
+def load_truth_mesh(model, data_dir):
+    """Load a public challenge asteroid mesh."""
+
+    truth_files = {
+        1: "AsteroidModel01_shape_public/asteroid1.stl",
+        2: "AsteroidModel02_shape_public/asteroid2.stl",
+        3: "AsteroidModel03_shape_public/asteroid3.stl",
+    }
+
+    if model not in truth_files:
+        raise ValueError(
+            f"No public truth shape available for model {model}."
+        )
+
+    path = data_dir / truth_files[model]
+
+    if not path.exists():
+        raise FileNotFoundError(
+            f"Truth STL not found: {path}"
+        )
+
+    return trimesh.load(
+        path,
+        process=False,
+    )
 
 
 def make_target_coefficients(
@@ -235,8 +261,38 @@ def save_results_json(
     """Save run configuration and optimisation results to JSON."""
 
 
+    def _json_serializable(obj):
+        """Convert common NumPy types to JSON-serializable Python types."""
+
+        if isinstance(obj, np.ndarray):
+            return obj.tolist()
+
+        if isinstance(obj, np.integer):
+            return int(obj)
+
+        if isinstance(obj, np.floating):
+            return float(obj)
+
+        if isinstance(obj, np.bool_):
+            return bool(obj)
+
+        if isinstance(obj, dict):
+            return {
+                key: _json_serializable(value)
+                for key, value in obj.items()
+            }
+
+        if isinstance(obj, (list, tuple)):
+            return [
+                _json_serializable(value)
+                for value in obj
+            ]
+
+        return obj
+
     config = vars(args).copy()
     config["n_coefficients"] = args.L * (args.L + 2)
+    config["output_dir"] = str(output_dir)
 
     results = {
         "config": config,
@@ -254,9 +310,134 @@ def save_results_json(
         },
     }
 
+
     with open(output_dir / "results.json", "w") as f:
         json.dump(
-            results,
+            _json_serializable(results),
             f,
             indent=2,
         )
+
+
+
+## PLOTTING ## 
+
+def plot_lightcurve_comparison(
+    vertices,
+    faces,
+    target_curves,
+    cameras,
+    curve_types,
+    m,
+    output_path,
+):
+    """Plot target and reconstructed lightcurves for each camera.
+
+    Parameters
+    ----------
+    vertices, faces
+        Mesh of the reconstructed shape.
+
+    target_curves : np.ndarray
+        Target lightcurves, shape (n_cameras, m).
+
+    cameras : list
+        Camera definitions used by the forward model.
+
+    curve_types : list
+        Curve type for each camera.
+
+    m : int
+        Number of phase samples.
+
+    output_path : str or Path
+        Path at which to save the figure.
+    """
+
+    final_curves = mesh_curves_convex(
+        vertices,
+        faces,
+        cameras=cameras,
+        m=m,
+        curve_types=curve_types,
+    )
+
+    fig, axes = plt.subplots(
+        len(cameras),
+        1,
+        figsize=(8, 2 * len(cameras)),
+        sharex=True,
+    )
+
+    if len(cameras) == 1:
+        axes = [axes]
+
+    phase = np.arange(m) / m
+
+    for i, ax in enumerate(axes):
+
+        ax.plot(
+            phase,
+            target_curves[i],
+            label="truth",
+        )
+
+        ax.plot(
+            phase,
+            final_curves[i],
+            "--",
+            label="GA",
+        )
+
+        ax.set_ylabel(f"Camera {i}")
+
+        ax.legend()
+
+    axes[-1].set_xlabel("Phase")
+
+    fig.tight_layout()
+
+    fig.savefig(
+        output_path,
+        dpi=200,
+    )
+
+    plt.close(fig)
+
+
+def plot_genetic_convergence(
+    best_fitness_history,
+    output_path,
+):
+    """Plot genetic algorithm convergence.
+
+    Parameters
+    ----------
+    best_fitness_history : array-like
+        Best fitness recorded at each generation.
+
+    output_path : str or Path
+        Path at which to save the figure.
+    """
+
+    generations = np.arange(len(best_fitness_history))
+
+    fig, ax = plt.subplots(figsize=(8, 5))
+
+    ax.plot(
+        generations,
+        best_fitness_history,
+    )
+
+    ax.set_xlabel("Generation")
+    ax.set_ylabel("Best fitness")
+    ax.set_title("Genetic algorithm convergence")
+
+    fig.tight_layout()
+
+    fig.savefig(
+        output_path,
+        dpi=200,
+    )
+
+    plt.close(fig)   
