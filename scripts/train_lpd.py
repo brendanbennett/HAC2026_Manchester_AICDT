@@ -87,7 +87,7 @@ def fit_body(verts, faces, radius=1.0, steps=250, n_pts=6000, device="cpu", seed
 
 
 def curves_from_code(code, radius, surro, psi, res=32, device=None, geoms=None,
-                     chunk=4, support=None):
+                     chunk=4, support=None, decoder_path="runs/token_decoder.pt"):
     """A(x): decode a token code to a body, extract, tokenise, and run the surrogate.
 
     Covers all 28 geometries. The dual attends across them, which is what recovers the m = 0
@@ -107,7 +107,7 @@ def curves_from_code(code, radius, surro, psi, res=32, device=None, geoms=None,
     n_norm = body.core.n.shape[0]
     body.core.set_support(torch.full((n_norm,), 0.8 * radius) if support is None
                           else torch.as_tensor(support, dtype=torch.float32).to(device))
-    load_decoder(body)
+    load_decoder(body, path=decoder_path)
     set_code(body, code.to(device))
     ext = radius * 1.6
     v, f = extract_mesh(lambda y: body(y), ext, res=res, device=device)
@@ -168,7 +168,7 @@ def _run_chunked(surro, fe, ar, dv, chunk):
 
 
 def corpus(n, psi, surro, device, seed=0, cache=None,
-           codes_file="runs/corpus_codes.npz"):
+           codes_file="runs/corpus_codes.npz", decoder_path="runs/token_decoder.pt"):
     """Curves for the corpus, from codes fitted by scripts/fit_shapes.py.
 
     The codes and the shared decoder come from the AUTODECODER fit, not from per-body fits.
@@ -189,7 +189,7 @@ def corpus(n, psi, surro, device, seed=0, cache=None,
     for i in range(len(all_codes)):
         t0 = time.time()
         code = torch.tensor(all_codes[i]); h = torch.tensor(all_sup[i])
-        cur = curves_from_code(code, 1.0, surro, psi, support=h)
+        cur = curves_from_code(code, 1.0, surro, psi, support=h, decoder_path=decoder_path)
         if cur is None:
             print(f"  body {i}: degenerate, skipped", flush=True); continue
         codes.append(all_codes[i]); curves.append(cur.numpy()); sup.append(all_sup[i])
@@ -211,6 +211,15 @@ def main():
     ap.add_argument("--phases", type=int, default=96)
     ap.add_argument("--batch", type=int, default=2)
     ap.add_argument("--out", default="runs/lpd_flow.pt")
+    ap.add_argument("--codes-file", default="runs/corpus_codes.npz",
+                    help="output of scripts/fit_shapes.py --out")
+    ap.add_argument("--decoder-file", default="runs/token_decoder.pt",
+                    help="output of scripts/fit_shapes.py --decoder")
+    ap.add_argument("--cache-tag", default="shared",
+                    help="distinguishes the /tmp curve cache between runs that use the "
+                         "same --phases but different --codes-file/--bodies; the cache key "
+                         "otherwise ignores both, so a small test run and a production run "
+                         "at the same --phases would silently read each other's curves")
     a = ap.parse_args()
     dev = "cpu"                     # extraction runs on CPU; the nets are small
     psi = psi_grid(a.phases)
@@ -227,8 +236,8 @@ def main():
 
     print("[stage 1] corpus", flush=True)
     codes, curves, sup = corpus(
-        a.bodies, psi, surro, dev,
-        cache=f"/tmp/lpd_corpus_{a.phases}_g{len(cameras())}_shared.npz")
+        a.bodies, psi, surro, dev, codes_file=a.codes_file, decoder_path=a.decoder_file,
+        cache=f"/tmp/lpd_corpus_{a.phases}_g{len(cameras())}_{a.cache_tag}.npz")
     print(f"  corpus: codes {tuple(codes.shape)}, curves {tuple(curves.shape)}", flush=True)
 
     print("[stage 2] flow", flush=True)
@@ -259,7 +268,7 @@ def main():
         preds = []
         for b in range(a.batch):
             cur = curves_from_code(xt[b].detach(), 1.0, surro, psi,
-                                   support=sup[idx[b]])
+                                   support=sup[idx[b]], decoder_path=a.decoder_file)
             preds.append(torch.zeros_like(curves[0]) if cur is None else cur)
         g_cur = torch.fft.rfft(torch.stack(preds), dim=-1)[..., 1:M + 1]
         r = g_dat - g_cur                                   # (B, G, 2, M) complex

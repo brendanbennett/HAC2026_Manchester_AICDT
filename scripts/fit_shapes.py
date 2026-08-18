@@ -49,14 +49,30 @@ def main():
     ap.add_argument("--batch", type=int, default=4, help="bodies per step")
     ap.add_argument("--out", default="runs/corpus_codes.npz")
     ap.add_argument("--decoder", default="runs/token_decoder.pt")
+    ap.add_argument("--shapes-dir", default=None,
+                    help="directory written by scripts/build_shape_library.py; if given, "
+                         "the corpus is drawn from it instead of train_surrogate.shapes()")
+    ap.add_argument("--seed", type=int, default=0,
+                    help="shuffle seed when reading --shapes-dir (ignored otherwise: "
+                         "train_surrogate.shapes() is deterministic in draw order already)")
     a = ap.parse_args()
 
-    from train_surrogate import shapes
-    print(f"[1] sampling SDF for {a.bodies} bodies", flush=True)
+    if a.shapes_dir:
+        from hac26.library_io import load_library_dir
+        print(f"[1] loading {a.bodies} bodies from {a.shapes_dir}", flush=True)
+        shape_list = load_library_dir(a.shapes_dir, n=a.bodies, seed=a.seed)
+        if len(shape_list) < a.bodies:
+            print(f"  WARNING: only {len(shape_list)} bodies available in {a.shapes_dir}, "
+                  f"requested {a.bodies}", flush=True)
+    else:
+        from train_surrogate import shapes
+        print(f"[1] sampling SDF for {a.bodies} bodies", flush=True)
+        shape_list = shapes(a.bodies, seed=0)
+
     data, h0s = [], []
     ref = ImplicitBody(radius=1.0)
     nrm = ref.core.n.detach().cpu().numpy()
-    for i, (v, f) in enumerate(shapes(a.bodies, seed=0)):
+    for i, (v, f) in enumerate(shape_list):
         P, S = samples(v, f, seed=i)
         data.append((P, S))
         h0s.append(np.array([max(1e-3, float((v @ n).max())) for n in nrm], dtype=np.float32))

@@ -77,12 +77,14 @@ def support_from_convex(stl: str) -> torch.Tensor:
     return torch.tensor(np.maximum(h, 1e-3), dtype=torch.float32)
 
 
-def make_resid_fn(g_dat, surro, psi, M, radius, support=None):
+def make_resid_fn(g_dat, surro, psi, M, radius, support=None,
+                  decoder_path="runs/token_decoder.pt"):
     """resid_fn(code) -> (residual, convex complement), with the operator actually applied."""
     def fn(x):
         preds = []
         for b in range(len(x)):
-            cur = curves_from_code(x[b].detach(), radius, surro, psi, support=support)
+            cur = curves_from_code(x[b].detach(), radius, surro, psi, support=support,
+                                   decoder_path=decoder_path)
             preds.append(torch.zeros(28, 2, len(psi)) if cur is None else cur)
         g_cur = torch.fft.rfft(torch.stack(preds), dim=-1)[..., 1:M + 1]
         r = g_dat.expand_as(g_cur) - g_cur
@@ -102,7 +104,8 @@ def make_resid_fn(g_dat, surro, psi, M, radius, support=None):
     return fn
 
 
-def decode(code, radius, res=64, misfit_fn=None, eta=None, support=None):
+def decode(code, radius, res=64, misfit_fn=None, eta=None, support=None,
+          decoder_path="runs/token_decoder.pt"):
     """Token code -> constrained mesh: field extraction, constraints, then the planar snap.
 
     The snap is gated on the data rather than applied because a plane was found: RANSAC will
@@ -113,7 +116,7 @@ def decode(code, radius, res=64, misfit_fn=None, eta=None, support=None):
     body = ImplicitBody(radius=radius)
     body.core.set_support(torch.full((body.core.n.shape[0],), 0.8 * radius)
                           if support is None else support)
-    load_decoder(body)
+    load_decoder(body, path=decoder_path)
     set_code(body, code)
     v, f = extract_mesh(lambda y: body(y), radius * 1.6, res=res, device="cpu")
     if len(f) < 8:
@@ -139,6 +142,8 @@ def main():
     ap.add_argument("--model", type=int, required=True)
     ap.add_argument("--ckpt", default="runs/lpd_flow.pt")
     ap.add_argument("--surrogate", default="runs/surrogate.pt")
+    ap.add_argument("--decoder-file", default="runs/token_decoder.pt",
+                    help="output of scripts/fit_shapes.py --decoder")
     ap.add_argument("--data-dir", default="dataset/raw")
     ap.add_argument("--samples", type=int, default=8)
     ap.add_argument("--phases", type=int, default=96)
@@ -175,7 +180,8 @@ def main():
     print(f"model {a.model}: R = {R}, {int(mask.sum())}/28 geometries present", flush=True)
 
     t0 = time.time()
-    codes = net.sample(make_resid_fn(g_dat, surro, psi, M, R, support=support),
+    codes = net.sample(make_resid_fn(g_dat, surro, psi, M, R, support=support,
+                                     decoder_path=a.decoder_file),
                        tag.expand(a.samples, -1, -1), mask.expand(a.samples, -1),
                        batch=a.samples)
     print(f"  {a.samples} draws x {N_STEPS} steps in {time.time()-t0:.0f}s", flush=True)
@@ -208,7 +214,7 @@ def main():
     meshes, occs, snaps = [], [], []
     for i in range(a.samples):
         v, f, kept = decode(codes[i], R, res=a.res, misfit_fn=misfit, eta=eta,
-                            support=support)
+                            support=support, decoder_path=a.decoder_file)
         if v is None:
             print(f"  draw {i}: degenerate, dropped", flush=True); continue
         meshes.append((v, f)); occs.append(occupancy(v, f)); snaps.append(kept)

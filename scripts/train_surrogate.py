@@ -164,8 +164,8 @@ def main():
                          "loss swung 0.067-0.195 between logged steps purely\n"
                          "from that. Accumulation buys a larger EFFECTIVE batch\n"
                          "without the attention memory a larger real one needs.")
-    ap.add_argument("--width", type=int, default=64)
-    ap.add_argument("--blocks", type=int, default=2)
+    ap.add_argument("--width", type=int, default=96)
+    ap.add_argument("--blocks", type=int, default=3)
     ap.add_argument("--modes", type=int, default=8)
     ap.add_argument("--rho", type=float, default=0.85,
                     help="albedo of the reference. The surrogate sees one\n"

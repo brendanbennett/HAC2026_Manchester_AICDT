@@ -34,6 +34,8 @@ def main():
     ap.add_argument("--corpus", default="/tmp/lpd_corpus_96_g28_h.npz")
     ap.add_argument("--draws", type=int, default=24)
     ap.add_argument("--phases", type=int, default=96)
+    ap.add_argument("--decoder-file", default="runs/token_decoder.pt",
+                    help="output of scripts/fit_shapes.py --decoder")
     a = ap.parse_args()
 
     z = np.load(a.corpus)
@@ -68,7 +70,8 @@ def main():
         y = x1[i]; x0 = torch.randn_like(y)
         k = torch.tensor([d % N_STEPS]); t = k.float() / N_STEPS
         xt = (1 - t[:, None]) * x0 + t[:, None] * y
-        cur = curves_from_code(xt[0], 1.0, surro, psi, support=sup[i[0]])
+        cur = curves_from_code(xt[0], 1.0, surro, psi, support=sup[i[0]],
+                               decoder_path=a.decoder_file)
         if cur is None:
             continue
         g_dat = torch.fft.rfft(curves[i], dim=-1)[..., 1:M + 1]
