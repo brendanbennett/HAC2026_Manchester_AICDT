@@ -95,6 +95,8 @@ rm -f "/tmp/lpd_corpus_${FLOW_PHASES}_g28_smoke.npz"     # start clean every tim
 run "train_lpd" logs/smoke_flow.log \
   "$PY" scripts/train_lpd.py \
     --bodies "$N_BODIES" --steps "$FLOW_STEPS" --phases "$FLOW_PHASES" --batch 1 \
+    --val-bodies 2 --val-every 10 --patience 2 \
+    --ckpt-every 10 --log-every 5 --no-resume \
     --codes-file "$OUT/corpus_codes.npz" --decoder-file "$OUT/token_decoder.pt" \
     --cache-tag smoke \
     --out "$OUT/lpd_flow.pt"

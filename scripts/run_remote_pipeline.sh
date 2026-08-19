@@ -49,7 +49,7 @@ set -uo pipefail
 cd "$(dirname "$0")/.."
 
 # ---------------------------------------------------------------- configuration
-N_BODIES=${N_BODIES:-5000}
+N_BODIES=${N_BODIES:-1000}
 LIB_SEED=${LIB_SEED:-0}
 LIB_WORKERS=${LIB_WORKERS:-$(nproc)}
 LIB_RES=${LIB_RES:-64}
@@ -63,12 +63,19 @@ DESIGN_N=${DESIGN_N:-64}   # hac26.field.ImplicitBody hardcodes n_normals=DESIGN
 FIT_STEPS=${FIT_STEPS:-4000}
 FIT_BATCH=${FIT_BATCH:-4}
 
-FLOW_STEPS=${FLOW_STEPS:-4000}
+FLOW_STEPS=${FLOW_STEPS:-1000}   # a cap: the flow stops early once the held-out loss plateaus
 FLOW_PHASES=${FLOW_PHASES:-96}
 FLOW_BATCH=${FLOW_BATCH:-2}
+FLOW_VAL_BODIES=${FLOW_VAL_BODIES:-8}   # held out of training to score early stopping; 0 off
+FLOW_VAL_EVERY=${FLOW_VAL_EVERY:-200}
+FLOW_PATIENCE=${FLOW_PATIENCE:-5}
+FLOW_CKPT_EVERY=${FLOW_CKPT_EVERY:-100}   # steps between resumable checkpoints; 0 disables
+FLOW_CKPT=${FLOW_CKPT:-runs/lpd_flow.pt.ckpt}   # in runs/ (EOS), not /tmp: it has to
+                                                # outlive the job that wrote it
+FLOW_LOG_EVERY=${FLOW_LOG_EVERY:-10}
 
 RECON_SAMPLES=${RECON_SAMPLES:-6}
-RECON_RES=${RECON_RES:-64}
+RECON_RES=${RECON_RES:-96}
 
 # shellcheck disable=SC1091
 source scripts/_venv_setup.sh   # creates+activates .venv, installs deps if missing, sets PY
@@ -114,7 +121,10 @@ run_stage() {
     return 0
   fi
   log "=== $name: starting"
-  if "$@" 2>&1 | tee "logs/$name.log"; then
+  # -a, not a truncating tee: a stage that gets re-launched after a pre-emption is a
+  # continuation, and the earlier attempt's log is how you tell what it already did.
+  echo "=== $name: starting $(date -u +%FT%TZ) ===" >> "logs/$name.log"
+  if "$@" 2>&1 | tee -a "logs/$name.log"; then
     mark_done "$name"
     log "=== $name: done"
   else
@@ -176,11 +186,66 @@ run_stage fit "$CODES_FILE" \
     --steps "$FIT_STEPS" --batch "$FIT_BATCH" \
     --out "$CODES_FILE" --decoder "$DECODER_FILE"
 
+# ------------------------------------------------- 7a. carry the flow corpus across jobs
+# train_lpd.py's stage 1 applies the operator once per body -- a serial loop that is the
+# expensive half of the flow stage at N_BODIES=1000 -- and caches the result under /tmp,
+# keyed by phases, geometry count and --cache-tag. A batch worker gets a fresh /tmp per job,
+# so a pre-empted or retried run would rebuild the whole corpus before training a single
+# step. The master copy therefore lives in runs/ (EOS, persistent) and is copied -- never
+# moved -- into /tmp here, so the persistent one still stands if this job dies mid-run.
+N_GEOM=$($PY -c 'from hac26.conventions import cameras; print(len(cameras()))' 2>/dev/null \
+         || echo 28)
+CACHE_NAME=lpd_corpus_${FLOW_PHASES}_g${N_GEOM}_shared.npz
+TMP_CACHE=/tmp/$CACHE_NAME
+KEEP_CACHE=${FLOW_CACHE_KEEP:-runs/$CACHE_NAME}
+
+save_corpus_cache() {
+  # Runs on any exit, including a failed flow stage or a pre-emption signal: the corpus is
+  # built before the first training step, so it is worth keeping even when training dies.
+  # Written beside the target and renamed, so a job killed mid-copy cannot leave a truncated
+  # cache for the next one to load.
+  [ -f "$TMP_CACHE" ] || return 0
+  if [ ! -f "$KEEP_CACHE" ] || [ "$TMP_CACHE" -nt "$KEEP_CACHE" ]; then
+    # A job killed while numpy was writing the cache leaves a truncated .npz. Copying that
+    # over a good persistent copy would cost the next job the whole corpus, so check the
+    # archive's CRCs first -- an .npz is a zip, and this reads it once, in about a second.
+    if ! $PY -c 'import sys, zipfile; sys.exit(zipfile.ZipFile(sys.argv[1]).testzip() is not None)' \
+         "$TMP_CACHE" 2>/dev/null; then
+      log "WARNING: $TMP_CACHE is incomplete (interrupted write?) -- not saving it"
+      return 0
+    fi
+    if cp -f "$TMP_CACHE" "$KEEP_CACHE.part" && mv -f "$KEEP_CACHE.part" "$KEEP_CACHE"; then
+      log "corpus cache saved to $KEEP_CACHE"
+    else
+      log "WARNING: could not save the corpus cache to $KEEP_CACHE"
+      rm -f "$KEEP_CACHE.part"
+    fi
+  fi
+}
+trap save_corpus_cache EXIT INT TERM
+
+if [ ! -f "$TMP_CACHE" ] && [ -f "$KEEP_CACHE" ]; then
+  # A cache built against different codes is worse than no cache: the key ignores
+  # --codes-file and --bodies, so a refitted corpus would be trained against silently stale
+  # curves. Mtimes settle it -- the cache has to be newer than the codes it was built from.
+  if [ "$CODES_FILE" -nt "$KEEP_CACHE" ] || [ "$DECODER_FILE" -nt "$KEEP_CACHE" ]; then
+    log "=== corpus cache: $KEEP_CACHE predates $CODES_FILE -- ignoring it, stage 1 rebuilds"
+  elif cp -p "$KEEP_CACHE" "$TMP_CACHE"; then   # -p: same mtime, so the exit copy is a no-op
+    log "=== corpus cache: seeded $TMP_CACHE from $KEEP_CACHE (stage 1 will be skipped)"
+  else
+    log "WARNING: could not copy $KEEP_CACHE to $TMP_CACHE -- stage 1 rebuilds the corpus"
+  fi
+fi
+
 # ---------------------------------------------------------------- 7. flow
 run_stage flow runs/lpd_flow.pt \
   $PY scripts/train_lpd.py \
     --bodies "$N_BODIES" --steps "$FLOW_STEPS" --phases "$FLOW_PHASES" \
     --batch "$FLOW_BATCH" --out runs/lpd_flow.pt \
+    --val-bodies "$FLOW_VAL_BODIES" --val-every "$FLOW_VAL_EVERY" \
+    --patience "$FLOW_PATIENCE" \
+    --ckpt-every "$FLOW_CKPT_EVERY" --ckpt-file "$FLOW_CKPT" \
+    --log-every "$FLOW_LOG_EVERY" \
     --codes-file "$CODES_FILE" --decoder-file "$DECODER_FILE"
 
 # ---------------------------------------------------------------- 8. reconstruct all 10
@@ -190,7 +255,15 @@ if should_run reconstruct; then
   for M in 1 2 3 4 5 6 7 8 9 10; do
     P=$(printf "%02d" "$M")
     OUT="results/lpd/Asteroid$P.stl"
-    log "  --- model $M -> $OUT"
+    # Each model is its own unit of work: a job that dies on model 7 should cost model 7,
+    # not the six that already finished. The .json is written last, so a model counts as
+    # done only when both files are there.
+    if [ -s "$OUT" ] && [ -s "results/lpd/Asteroid$P.json" ] \
+       && [ "$STAGES_AFTER_FORCE" != "1" ]; then
+      log "  --- model $M: skipped ($OUT already written -- rm it to redo just this one)"
+      continue
+    fi
+    log "  --- model $M -> $OUT (started $(date -u +%H:%M:%S))"
     if ! $PY scripts/reconstruct_lpd.py --model "$M" --samples "$RECON_SAMPLES" \
         --res "$RECON_RES" --ckpt runs/lpd_flow.pt --decoder-file "$DECODER_FILE" \
         --out "$OUT" \

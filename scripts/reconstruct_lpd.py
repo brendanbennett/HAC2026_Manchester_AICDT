@@ -166,7 +166,17 @@ def main():
     surro = surro.to(gdev).eval()
 
     net = LPDFlow()
-    net.load_state_dict(torch.load(a.ckpt, map_location="cpu"))
+    sd = torch.load(a.ckpt, map_location="cpu", weights_only=False)
+    if "net" in sd and isinstance(sd.get("step"), int):
+        # A train_lpd.py resume checkpoint rather than a finished run's weights: a job that
+        # died mid-training still left one behind, and its best held-out state is a better
+        # answer than not reconstructing at all. Prefer that state over the last step's.
+        print(f"  {a.ckpt} is a training checkpoint at step {sd['step']}"
+              + (f", using its best weights from step {sd['best_step']} "
+                 f"(val {sd['best']:.5f})" if sd.get("best_state") else ", using its "
+                 "current weights (no held-out evaluation in it yet)"), flush=True)
+        sd = sd["best_state"] or sd["net"]
+    net.load_state_dict(sd)
     net.eval()
 
     sup_stl = a.support_from or f"results/convex/Asteroid{a.model:02d}.stl"
