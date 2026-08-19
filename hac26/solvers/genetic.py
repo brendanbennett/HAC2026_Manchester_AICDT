@@ -125,6 +125,9 @@ class GeneticSolver:
             )
         )
 
+        # Always include the unmodified initial shape.
+        population[0] = self.initial_params
+
         return self._apply_bounds(population)
 
     def _evaluate(self, population):
@@ -140,25 +143,55 @@ class GeneticSolver:
 
         return population[indices], fitness[indices]
 
+
     def _mutate(self, parents, mutation_scale):
-        """Generate a new population by mutating selected parents."""
+        """Generate a new population by mutating selected parents.
+
+        The best parent is carried over unchanged as population[0].
+        The remaining population consists of mutated children drawn
+        from the selected parents.
+        """
+
+        # ------------------------------------------------------------
+        # Keep the best parent unchanged
+        # ------------------------------------------------------------
+
+        population = np.empty(
+            (
+                self.population_size,
+                len(parents[0]),
+            )
+        )
+
+        population[0] = parents[0]
+
+        # ------------------------------------------------------------
+        # Generate mutated children
+        # ------------------------------------------------------------
+
+        n_children = self.population_size - 1
+
         parent_indices = self.rng.integers(
             0,
             len(parents),
-            size=self.population_size,
+            size=n_children,
         )
 
-        population = parents[parent_indices].copy()
+        children = parents[parent_indices].copy()
 
         mutations = self.rng.normal(
             loc=0.0,
             scale=mutation_scale,
-            size=population.shape,
+            size=children.shape,
         )
 
-        population += mutations
+        children += mutations
 
-        return self._apply_bounds(population)
+        children = self._apply_bounds(children)
+
+        population[1:] = children
+
+        return population
 
 
 

@@ -77,6 +77,13 @@ def main():
     )
 
     parser.add_argument(
+    "--simplify-faces",
+    type=int,
+    default=None,
+    help="Reduces size of input model for cheaper dice evaluation",
+    )
+
+    parser.add_argument(
     "--mutation-scale",
     type=float,
     default=0.05,
@@ -132,6 +139,7 @@ def main():
             f"_mutscale{args.mutation_scale}"
             f"_seed{args.seed}"
             f"_diceres{args.dice_resolution}"
+            f"_simpface{args.simplify_faces}"
         )
     
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -227,6 +235,7 @@ def main():
             truth_mesh.vertices,
             truth_mesh.faces,
             n=args.dice_resolution,
+            simplify_faces=args.simplify_faces
         )
 
 

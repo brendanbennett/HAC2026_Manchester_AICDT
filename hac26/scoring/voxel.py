@@ -25,6 +25,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from hac26.recon import dice, mesh_to_sdf          # noqa: E402
 from hac26.shapes import rescale_touch_z           # noqa: E402
 
+import trimesh
+
 TRUTH = {1: "AsteroidModel01_shape_public/asteroid1.stl",
          2: "AsteroidModel02_shape_public/asteroid2.stl",
          3: "AsteroidModel03_shape_public/asteroid3.stl"}
@@ -38,22 +40,40 @@ def prepare_truth(
     truth_vertices,
     truth_faces,
     n=128,
+    simplify_faces=None,
 ):
-    """Prepare a truth mesh for repeated Dice evaluation.
+    """Prepare a truth mesh for repeated Dice evaluation."""
 
-    The returned object contains the voxelised truth and the voxel grid
-    extent to use for all subsequent reconstructions.
-    """
+    truth_mesh = trimesh.Trimesh(
+        vertices=np.asarray(truth_vertices),
+        faces=np.asarray(truth_faces),
+        process=False,
+    )
+
+    print(
+        f"Truth mesh: "
+        f"{len(truth_mesh.vertices):,} vertices, "
+        f"{len(truth_mesh.faces):,} faces"
+    )
+
+    if simplify_faces is not None:
+        truth_mesh = truth_mesh.simplify_quadric_decimation(
+            face_count=simplify_faces
+        )
+
+        print(
+            f"Simplified truth mesh: "
+            f"{len(truth_mesh.vertices):,} vertices, "
+            f"{len(truth_mesh.faces):,} faces"
+        )
 
     truth_vertices = rescale_touch_z(
-        np.asarray(truth_vertices)
+        np.asarray(truth_mesh.vertices)
     )
-    truth_faces = np.asarray(truth_faces)
 
-    extent = (
-        float(np.abs(truth_vertices).max())
-        * 1.05
-    )
+    truth_faces = np.asarray(truth_mesh.faces)
+
+    extent = float(np.abs(truth_vertices).max()) * 1.05
 
     truth_occupancy = occupancy(
         truth_vertices,
@@ -67,6 +87,7 @@ def prepare_truth(
         "extent": extent,
         "n": n,
     }
+
 
 def score_mesh(
     recon_vertices,
