@@ -30,11 +30,10 @@ __all__ = ["spherical_design", "DESIGN_N", "DESIGN_T", "ConvexCore", "TokenField
            "ImplicitBody", "extract_mesh", "apply_constraints", "CORE_SCALE",
            "TOKEN_SIGMA_FRAC"]
 
-DESIGN_N = 64          # a design of N normals gives facets ~4/sqrt(N) across and leaves a
-                       # bulge ~2/N of the support distance at each face centre, so the
-                       # count has to be large before the faceting drops below the
-                       # resolution of either scoring measure. scripts/make_design.py
-                       # builds larger ones.
+DESIGN_N = 4096        # a design of N normals gives facets ~4/sqrt(N) across and leaves a
+                       # bulge ~2/N of the support distance at each face centre. This must
+                       # have a matching hac26/design4096.npy cache; runtime generation at
+                       # this size is deliberately rejected by spherical_design().
 DESIGN_T = 10          # spherical design strength
 CORE_SCALE = 0.15      # s = CORE_SCALE * R
 CORE_CHUNK_ELEMS = 6e7 # cap on the (points x normals) intermediate, ~240 MB in float32
@@ -93,7 +92,7 @@ def spherical_design(n: int = DESIGN_N, t: int = DESIGN_T, seed: int = 0,
     cube, and the core is an intersection of halfspaces tangent to the target: it reproduces
     a cube EXACTLY only if the cube's own face normals are available. A design free to drift
     off the axes leaves the nearest normal some degrees away, and the intersection then
-    bulges at every face centre. Pinning six of the sixty-four costs the design property
+    bulges at every face centre. Pinning the six coordinate axes costs the design property
     almost nothing (the residual is reported by `_design_residual` and asserted in the tests)
     and makes flat-faced bodies -- which every ground truth is -- exactly representable.
 
@@ -105,6 +104,10 @@ def spherical_design(n: int = DESIGN_N, t: int = DESIGN_T, seed: int = 0,
         x = np.load(cache)
         if len(x) == n:
             return x
+    if n > 512:
+        raise FileNotFoundError(
+            f"{cache} is missing. Generate it once with "
+            f"`python scripts/make_design.py --n {n}` before constructing ImplicitBody().")
     axes = np.array([[1., 0, 0], [-1., 0, 0], [0, 1., 0], [0, -1., 0], [0, 0, 1.], [0, 0, -1.]])
     m = n - len(axes)
     i = np.arange(m) + 0.5

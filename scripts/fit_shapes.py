@@ -16,9 +16,11 @@ Public bodies are never in the library.
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 import time
 from pathlib import Path
+from multiprocessing import Pool
 
 import numpy as np
 import torch
@@ -26,10 +28,10 @@ import torch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from hac26.field import ImplicitBody          # noqa: E402
+from hac26.field import DESIGN_N, ImplicitBody          # noqa: E402
 
 
-def samples(verts, faces, n_pts=6000, seed=0):
+def sample_arrays(verts, faces, n_pts=6000, seed=0):
     import trimesh
     m = trimesh.Trimesh(verts, faces, process=False)
     rng = np.random.default_rng(seed)
@@ -38,8 +40,19 @@ def samples(verts, faces, n_pts=6000, seed=0):
     surf, _ = trimesh.sample.sample_surface(m, n_pts // 2)
     pts = np.vstack([pts, surf + rng.normal(0, 0.03, surf.shape)])
     sd = -m.nearest.signed_distance(pts)       # trimesh: positive inside
-    return (torch.tensor(pts, dtype=torch.float32),
-            torch.tensor(sd, dtype=torch.float32))
+    return pts.astype(np.float32), sd.astype(np.float32)
+
+
+def samples(verts, faces, n_pts=6000, seed=0):
+    pts, sd = sample_arrays(verts, faces, n_pts=n_pts, seed=seed)
+    return torch.tensor(pts), torch.tensor(sd)
+
+
+def _prepare_shape(args):
+    i, verts, faces, normals, n_pts = args
+    pts, sd = sample_arrays(verts, faces, n_pts=n_pts, seed=i)
+    h0 = np.maximum((verts @ normals.T).max(axis=0), 1e-3).astype(np.float32)
+    return i, pts, sd, h0
 
 
 def main():
@@ -47,6 +60,10 @@ def main():
     ap.add_argument("--bodies", type=int, default=40)
     ap.add_argument("--steps", type=int, default=3000)
     ap.add_argument("--batch", type=int, default=4, help="bodies per step")
+    ap.add_argument("--workers", type=int, default=1,
+                    help="parallel workers for independent SDF/support preprocessing")
+    ap.add_argument("--points", type=int, default=6000,
+                    help="SDF sample points per body")
     ap.add_argument("--out", default="runs/corpus_codes.npz")
     ap.add_argument("--decoder", default="runs/token_decoder.pt")
     ap.add_argument("--shapes-dir", default=None,
@@ -69,15 +86,36 @@ def main():
         print(f"[1] sampling SDF for {a.bodies} bodies", flush=True)
         shape_list = shapes(a.bodies, seed=0)
 
-    data, h0s = [], []
+    data, h0s = [None] * len(shape_list), [None] * len(shape_list)
     ref = ImplicitBody(radius=1.0)
     nrm = ref.core.n.detach().cpu().numpy()
-    for i, (v, f) in enumerate(shape_list):
-        P, S = samples(v, f, seed=i)
-        data.append((P, S))
-        h0s.append(np.array([max(1e-3, float((v @ n).max())) for n in nrm], dtype=np.float32))
-        if i % 10 == 0:
-            print(f"    body {i}", flush=True)
+    jobs = [(i, np.asarray(v, dtype=np.float64), np.asarray(f, dtype=np.int64), nrm,
+             a.points)
+            for i, (v, f) in enumerate(shape_list)]
+    workers = max(1, int(a.workers))
+    pool = None
+    if workers == 1:
+        iterator = map(_prepare_shape, jobs)
+    else:
+        pool = Pool(workers)
+        iterator = pool.imap_unordered(_prepare_shape, jobs, chunksize=2)
+    failed = False
+    try:
+        for n_done, (i, pts, sd, h0) in enumerate(iterator, start=1):
+            data[i] = (torch.tensor(pts), torch.tensor(sd))
+            h0s[i] = h0
+            if n_done % 10 == 0 or n_done == len(jobs):
+                print(f"    preprocessed {n_done}/{len(jobs)} bodies", flush=True)
+    except Exception:
+        failed = True
+        if pool is not None:
+            pool.terminate()
+        raise
+    finally:
+        if pool is not None:
+            if not failed:
+                pool.close()
+            pool.join()
 
     # ONE decoder, shared by every body: the modules are assigned, not copied, so the
     # parameters are literally the same tensors.
@@ -109,14 +147,25 @@ def main():
         loss = loss / len(idx)
         opt.zero_grad(); loss.backward(); opt.step()
         if s % 250 == 0 or s == a.steps - 1:
-            print(f"    step {s:>5}  sdf loss {float(loss):.5f}  "
+            print(f"    step {s:>5}  sdf loss {float(loss.detach()):.5f}  "
                   f"{time.time()-t0:.0f}s", flush=True)
 
     codes = np.stack([torch.cat([b.tokens.p.reshape(-1), b.tokens.z.reshape(-1)])
                       .detach().numpy() for b in bodies])
     sup = np.stack([b.core.h.detach().numpy() for b in bodies])   # the property
     Path("model").mkdir(exist_ok=True)
-    np.savez(a.out, codes=codes, support=sup)
+    meta = {
+        "schema": 1,
+        "bodies": int(len(bodies)),
+        "design_n": int(DESIGN_N),
+        "points": int(a.points),
+        "steps": int(a.steps),
+        "batch": int(a.batch),
+        "seed": int(a.seed),
+        "shapes_dir": None if a.shapes_dir is None else str(Path(a.shapes_dir)),
+        "decoder_file": str(Path(a.decoder)),
+    }
+    np.savez(a.out, codes=codes, support=sup, meta=json.dumps(meta, sort_keys=True))
     torch.save({k: v for k, v in shared.state_dict().items()
                 if not k.startswith(("p", "z"))}, a.decoder)
     print(f"  codes {codes.shape}, per-component variance {codes.var(0).mean():.5f}")

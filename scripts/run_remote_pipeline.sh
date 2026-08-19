@@ -51,17 +51,17 @@ cd "$(dirname "$0")/.."
 # ---------------------------------------------------------------- configuration
 N_BODIES=${N_BODIES:-1000}
 LIB_SEED=${LIB_SEED:-0}
-LIB_WORKERS=${LIB_WORKERS:-$(nproc)}
+LIB_WORKERS=${LIB_WORKERS:-$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 2)}
 LIB_RES=${LIB_RES:-64}
 LIB_DIR=${LIB_DIR:-dataset/generated/shapes}
 
-DESIGN_N=${DESIGN_N:-64}   # hac26.field.ImplicitBody hardcodes n_normals=DESIGN_N=64; this
-                           # is NOT the 4096 in make_design.py's docstring example, which is
-                           # a larger design nothing in this pipeline reads. design64.npy is
-                           # already checked in, so with the default this stage is a no-op.
+DESIGN_N=${DESIGN_N:-4096}
+DESIGN_DEVICE=${DESIGN_DEVICE:-}
 
 FIT_STEPS=${FIT_STEPS:-4000}
 FIT_BATCH=${FIT_BATCH:-4}
+FIT_WORKERS=${FIT_WORKERS:-$LIB_WORKERS}
+FIT_POINTS=${FIT_POINTS:-6000}
 
 FLOW_STEPS=${FLOW_STEPS:-1000}   # a cap: the flow stops early once the held-out loss plateaus
 FLOW_PHASES=${FLOW_PHASES:-96}
@@ -73,9 +73,17 @@ FLOW_CKPT_EVERY=${FLOW_CKPT_EVERY:-100}   # steps between resumable checkpoints;
 FLOW_CKPT=${FLOW_CKPT:-runs/lpd_flow.pt.ckpt}   # in runs/ (EOS), not /tmp: it has to
                                                 # outlive the job that wrote it
 FLOW_LOG_EVERY=${FLOW_LOG_EVERY:-10}
+FLOW_OPERATOR_RES=${FLOW_OPERATOR_RES:-32}
+FLOW_TRAIN_GEOMS=${FLOW_TRAIN_GEOMS:-8}
 
 RECON_SAMPLES=${RECON_SAMPLES:-6}
 RECON_RES=${RECON_RES:-96}
+RECON_SNAP=${RECON_SNAP:-0}
+MEDOID_VOLUME_ONLY=${MEDOID_VOLUME_ONLY:-0}
+MEDOID_SIDE_POINTS=${MEDOID_SIDE_POINTS:-200000}
+MEDOID_SIDE_DIRS=${MEDOID_SIDE_DIRS:-36}
+MEDOID_SIDE_RES=${MEDOID_SIDE_RES:-512}
+MEDOID_SIDE_MODE=${MEDOID_SIDE_MODE:-side}
 
 # shellcheck disable=SC1091
 source scripts/_venv_setup.sh   # creates+activates .venv, installs deps if missing, sets PY
@@ -94,30 +102,83 @@ mkdir -p runs runs/.done logs results/lpd
 
 # ---------------------------------------------------------------- helpers
 STAGES_AFTER_FORCE=0
+
+log() { echo "[$(date -u +%H:%M:%S)] $*"; }
+
+stage_signature() {
+  case "$1" in
+    library)
+      printf 'stage=library\nN_BODIES=%s\nLIB_SEED=%s\nLIB_RES=%s\nLIB_DIR=%s\n' \
+        "$N_BODIES" "$LIB_SEED" "$LIB_RES" "$LIB_DIR"
+      ;;
+    design)
+      printf 'stage=design\nDESIGN_N=%s\nDESIGN_DEVICE=%s\n' \
+        "$DESIGN_N" "$DESIGN_DEVICE"
+      ;;
+    calibrate)
+      printf 'stage=calibrate\nDATA_DIR=%s\n' "$DATA_DIR"
+      ;;
+    surrogate)
+      printf 'stage=surrogate\nDATA_DIR=%s\nSURROGATE=default\n' "$DATA_DIR"
+      ;;
+    fit)
+      printf 'stage=fit\nN_BODIES=%s\nLIB_DIR=%s\nLIB_SEED=%s\nLIB_RES=%s\nDESIGN_N=%s\nFIT_STEPS=%s\nFIT_BATCH=%s\nFIT_POINTS=%s\nCODES_FILE=%s\nDECODER_FILE=%s\n' \
+        "$N_BODIES" "$LIB_DIR" "$LIB_SEED" "$LIB_RES" "$DESIGN_N" "$FIT_STEPS" \
+        "$FIT_BATCH" "$FIT_POINTS" "$CODES_FILE" "$DECODER_FILE"
+      ;;
+    flow)
+      printf 'stage=flow\nN_BODIES=%s\nLIB_DIR=%s\nLIB_SEED=%s\nLIB_RES=%s\nDESIGN_N=%s\nFIT_STEPS=%s\nFIT_BATCH=%s\nFIT_POINTS=%s\nFLOW_STEPS=%s\nFLOW_PHASES=%s\nFLOW_BATCH=%s\nFLOW_VAL_BODIES=%s\nFLOW_VAL_EVERY=%s\nFLOW_PATIENCE=%s\nFLOW_CKPT_EVERY=%s\nFLOW_CKPT=%s\nFLOW_LOG_EVERY=%s\nFLOW_OPERATOR_RES=%s\nFLOW_TRAIN_GEOMS=%s\nCODES_FILE=%s\nDECODER_FILE=%s\n' \
+        "$N_BODIES" "$LIB_DIR" "$LIB_SEED" "$LIB_RES" "$DESIGN_N" "$FIT_STEPS" \
+        "$FIT_BATCH" "$FIT_POINTS" "$FLOW_STEPS" "$FLOW_PHASES" "$FLOW_BATCH" \
+        "$FLOW_VAL_BODIES" "$FLOW_VAL_EVERY" "$FLOW_PATIENCE" "$FLOW_CKPT_EVERY" \
+        "$FLOW_CKPT" "$FLOW_LOG_EVERY" \
+        "$FLOW_OPERATOR_RES" "$FLOW_TRAIN_GEOMS" "$CODES_FILE" "$DECODER_FILE"
+      ;;
+    reconstruct)
+      printf 'stage=reconstruct\nDESIGN_N=%s\nFLOW_STEPS=%s\nFLOW_PHASES=%s\nFLOW_BATCH=%s\nFLOW_OPERATOR_RES=%s\nFLOW_TRAIN_GEOMS=%s\nRECON_SAMPLES=%s\nRECON_RES=%s\nRECON_SNAP=%s\nMEDOID_VOLUME_ONLY=%s\nMEDOID_SIDE_POINTS=%s\nMEDOID_SIDE_DIRS=%s\nMEDOID_SIDE_RES=%s\nMEDOID_SIDE_MODE=%s\nDECODER_FILE=%s\n' \
+        "$DESIGN_N" "$FLOW_STEPS" "$FLOW_PHASES" "$FLOW_BATCH" "$FLOW_OPERATOR_RES" \
+        "$FLOW_TRAIN_GEOMS" "$RECON_SAMPLES" "$RECON_RES" "$RECON_SNAP" \
+        "$MEDOID_VOLUME_ONLY" "$MEDOID_SIDE_POINTS" "$MEDOID_SIDE_DIRS" \
+        "$MEDOID_SIDE_RES" "$MEDOID_SIDE_MODE" "$DECODER_FILE"
+      ;;
+    score)
+      printf 'stage=score\nDATA_DIR=%s\nRECON_DIR=results/lpd\nRECON_SAMPLES=%s\nRECON_RES=%s\nRECON_SNAP=%s\nMEDOID_VOLUME_ONLY=%s\nMEDOID_SIDE_POINTS=%s\nMEDOID_SIDE_DIRS=%s\nMEDOID_SIDE_RES=%s\nMEDOID_SIDE_MODE=%s\n' \
+        "$DATA_DIR" "$RECON_SAMPLES" "$RECON_RES" "$RECON_SNAP" \
+        "$MEDOID_VOLUME_ONLY" "$MEDOID_SIDE_POINTS" "$MEDOID_SIDE_DIRS" \
+        "$MEDOID_SIDE_RES" "$MEDOID_SIDE_MODE"
+      ;;
+    *)
+      printf 'stage=%s\n' "$1"
+      ;;
+  esac
+}
+
 should_run() {
   # A stage runs if: it was named by --force-stage, a stage before it was, or it has no
-  # marker yet. Once one stage is forced, everything downstream reruns too, since each
-  # stage's output feeds the next.
+  # marker with the exact configuration for this run. --force-stage intentionally reruns the
+  # named stage and everything downstream.
   local stage="$1"
   if [ "$stage" = "$FORCE_STAGE" ]; then STAGES_AFTER_FORCE=1; fi
   if [ "$STAGES_AFTER_FORCE" = "1" ]; then return 0; fi
-  [ ! -f "runs/.done/$stage" ]
+  local marker="runs/.done/$stage"
+  if [ ! -f "$marker" ]; then return 0; fi
+  local want have
+  want="$(stage_signature "$stage")"
+  have="$(cat "$marker")"
+  if [ "$want" != "$have" ]; then
+    log "=== $stage: config changed since marker was written; rerunning"
+    return 0
+  fi
+  return 1
 }
 
-mark_done() { date -u +%FT%TZ > "runs/.done/$1"; }
-
-log() { echo "[$(date -u +%H:%M:%S)] $*"; }
+mark_done() { stage_signature "$1" > "runs/.done/$1"; }
 
 run_stage() {
   # run_stage NAME OUTPUT_FILE -- CMD...
   local name="$1" out="$2"; shift 2
   if ! should_run "$name"; then
     log "=== $name: skipped (already done -- rm runs/.done/$name or use --force-stage to redo)"
-    return 0
-  fi
-  if [ -n "$out" ] && [ -e "$out" ] && [ "$STAGES_AFTER_FORCE" != "1" ]; then
-    log "=== $name: output $out already exists, marking done without rerunning"
-    mark_done "$name"
     return 0
   fi
   log "=== $name: starting"
@@ -133,6 +194,10 @@ run_stage() {
   fi
 }
 
+valid_design() {
+  $PY -c "import sys, numpy as np; n = int(sys.argv[1]); x = np.load(f'hac26/design{n}.npy'); assert x.shape == (n, 3); assert np.isfinite(x).all(); assert np.allclose(np.linalg.norm(x, axis=1), 1.0, atol=1e-6)" "$1"
+}
+
 # ---------------------------------------------------------------- 2. shape library
 run_stage library "$LIB_DIR/manifest.json" \
   $PY scripts/build_shape_library.py \
@@ -140,8 +205,22 @@ run_stage library "$LIB_DIR/manifest.json" \
     --workers "$LIB_WORKERS" --res "$LIB_RES"
 
 # ---------------------------------------------------------------- 3. spherical design
-run_stage design "hac26/design${DESIGN_N}.npy" \
-  $PY scripts/make_design.py --n "$DESIGN_N"
+DESIGN_ARGS=(--n "$DESIGN_N")
+if [ -n "$DESIGN_DEVICE" ]; then
+  DESIGN_ARGS+=(--device "$DESIGN_DEVICE")
+fi
+if should_run design; then
+  if [ "$FORCE_STAGE" != "design" ] && [ -f "hac26/design${DESIGN_N}.npy" ] \
+      && valid_design "$DESIGN_N"; then
+    log "=== design: existing hac26/design${DESIGN_N}.npy is valid"
+    mark_done design
+  else
+    run_stage design "hac26/design${DESIGN_N}.npy" \
+      $PY scripts/make_design.py "${DESIGN_ARGS[@]}"
+  fi
+else
+  log "=== design: skipped (already done -- rm runs/.done/design or use --force-stage to redo)"
+fi
 
 # ---------------------------------------------------------------- 4. instrument calibration
 if [ -f models/instrument_calibration.pt ] && [ "$FORCE_STAGE" != "calibrate" ]; then
@@ -183,19 +262,21 @@ DECODER_FILE=runs/token_decoder.pt
 run_stage fit "$CODES_FILE" \
   $PY scripts/fit_shapes.py \
     --bodies "$N_BODIES" --shapes-dir "$LIB_DIR" --seed "$LIB_SEED" \
-    --steps "$FIT_STEPS" --batch "$FIT_BATCH" \
+    --steps "$FIT_STEPS" --batch "$FIT_BATCH" --workers "$FIT_WORKERS" \
+    --points "$FIT_POINTS" \
     --out "$CODES_FILE" --decoder "$DECODER_FILE"
 
 # ------------------------------------------------- 7a. carry the flow corpus across jobs
 # train_lpd.py's stage 1 applies the operator once per body -- a serial loop that is the
 # expensive half of the flow stage at N_BODIES=1000 -- and caches the result under /tmp,
-# keyed by phases, geometry count and --cache-tag. A batch worker gets a fresh /tmp per job,
-# so a pre-empted or retried run would rebuild the whole corpus before training a single
-# step. The master copy therefore lives in runs/ (EOS, persistent) and is copied -- never
-# moved -- into /tmp here, so the persistent one still stands if this job dies mid-run.
+# keyed by phases, geometry count, operator resolution, design size and --cache-tag. A batch
+# worker gets a fresh /tmp per job, so a pre-empted or retried run would rebuild the whole
+# corpus before training a single step. The master copy therefore lives in runs/ (EOS,
+# persistent) and is copied -- never moved -- into /tmp here, so the persistent one still
+# stands if this job dies mid-run.
 N_GEOM=$($PY -c 'from hac26.conventions import cameras; print(len(cameras()))' 2>/dev/null \
          || echo 28)
-CACHE_NAME=lpd_corpus_${FLOW_PHASES}_g${N_GEOM}_shared.npz
+CACHE_NAME=lpd_corpus_${FLOW_PHASES}_g${N_GEOM}_res${FLOW_OPERATOR_RES}_n${DESIGN_N}_shared.npz
 TMP_CACHE=/tmp/$CACHE_NAME
 KEEP_CACHE=${FLOW_CACHE_KEEP:-runs/$CACHE_NAME}
 
@@ -241,7 +322,8 @@ fi
 run_stage flow runs/lpd_flow.pt \
   $PY scripts/train_lpd.py \
     --bodies "$N_BODIES" --steps "$FLOW_STEPS" --phases "$FLOW_PHASES" \
-    --batch "$FLOW_BATCH" --out runs/lpd_flow.pt \
+    --batch "$FLOW_BATCH" --operator-res "$FLOW_OPERATOR_RES" \
+    --train-geoms "$FLOW_TRAIN_GEOMS" --out runs/lpd_flow.pt \
     --val-bodies "$FLOW_VAL_BODIES" --val-every "$FLOW_VAL_EVERY" \
     --patience "$FLOW_PATIENCE" \
     --ckpt-every "$FLOW_CKPT_EVERY" --ckpt-file "$FLOW_CKPT" \
@@ -264,9 +346,19 @@ if should_run reconstruct; then
       continue
     fi
     log "  --- model $M -> $OUT (started $(date -u +%H:%M:%S))"
-    if ! $PY scripts/reconstruct_lpd.py --model "$M" --samples "$RECON_SAMPLES" \
-        --res "$RECON_RES" --ckpt runs/lpd_flow.pt --decoder-file "$DECODER_FILE" \
-        --out "$OUT" \
+    RECON_ARGS=(--model "$M" --samples "$RECON_SAMPLES" --res "$RECON_RES"
+      --ckpt runs/lpd_flow.pt --decoder-file "$DECODER_FILE" --out "$OUT"
+      --medoid-side-points "$MEDOID_SIDE_POINTS"
+      --medoid-side-dirs "$MEDOID_SIDE_DIRS"
+      --medoid-side-res "$MEDOID_SIDE_RES"
+      --medoid-side-mode "$MEDOID_SIDE_MODE")
+    if [ "$RECON_SNAP" = "1" ]; then
+      RECON_ARGS+=(--snap)
+    fi
+    if [ "$MEDOID_VOLUME_ONLY" = "1" ]; then
+      RECON_ARGS+=(--medoid-volume-only)
+    fi
+    if ! $PY scripts/reconstruct_lpd.py "${RECON_ARGS[@]}" \
         2>&1 | tee -a logs/reconstruct.log; then
       log "  --- model $M FAILED"
       ok=0
@@ -290,5 +382,6 @@ fi
 
 log "=== pipeline complete"
 log "    library:  $LIB_DIR ($N_BODIES bodies; see $LIB_DIR/report.md)"
+log "    normals:  $DESIGN_N"
 log "    flow ckpt: runs/lpd_flow.pt"
 log "    reconstructions: results/lpd/Asteroid*.stl"

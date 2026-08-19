@@ -34,9 +34,13 @@ N_BODIES=${N_BODIES:-16}
 LIB_RES=${LIB_RES:-32}
 LIB_WORKERS=${LIB_WORKERS:-$(nproc 2>/dev/null || echo 2)}
 FIT_STEPS=${FIT_STEPS:-25}
+FIT_WORKERS=${FIT_WORKERS:-$LIB_WORKERS}
+FIT_POINTS=${FIT_POINTS:-1500}
 FLOW_STEPS=${FLOW_STEPS:-25}
 FLOW_PHASES=${FLOW_PHASES:-16}     # != the real run's 96, so the /tmp curve cache can't
                                     # collide with a production run at the same phase count
+FLOW_OPERATOR_RES=${FLOW_OPERATOR_RES:-16}
+DESIGN_N=${DESIGN_N:-4096}
 
 # shellcheck disable=SC1091
 source scripts/_venv_setup.sh   # creates+activates .venv, installs deps if missing, sets PY
@@ -72,15 +76,19 @@ run "shape library" logs/smoke_library.log \
     --report-sample "$N_BODIES"
 tail -20 logs/smoke_library.log
 
-log "=== 2/5 spherical design (no-op if hac26/design64.npy is already checked in)"
-run "spherical design" logs/smoke_design.log "$PY" scripts/make_design.py --n 64
+log "=== 2/5 spherical design (no-op if hac26/design${DESIGN_N}.npy is already checked in)"
+if [ -f "hac26/design${DESIGN_N}.npy" ]; then
+  log "    hac26/design${DESIGN_N}.npy already exists" | tee logs/smoke_design.log
+else
+  run "spherical design" logs/smoke_design.log "$PY" scripts/make_design.py --n "$DESIGN_N"
+fi
 tail -5 logs/smoke_design.log
 
 log "=== 3/5 fit_shapes: autodecoder over the smoke library"
 run "fit_shapes" logs/smoke_fit.log \
   "$PY" scripts/fit_shapes.py \
     --bodies "$N_BODIES" --shapes-dir "$LIB_DIR" \
-    --steps "$FIT_STEPS" --batch 2 \
+    --steps "$FIT_STEPS" --batch 2 --workers "$FIT_WORKERS" --points "$FIT_POINTS" \
     --out "$OUT/corpus_codes.npz" --decoder "$OUT/token_decoder.pt"
 tail -20 logs/smoke_fit.log
 
@@ -91,25 +99,32 @@ if [ ! -f runs/surrogate.pt ]; then
 fi
 
 log "=== 4/5 train_lpd: flow over the smoke corpus"
-rm -f "/tmp/lpd_corpus_${FLOW_PHASES}_g28_smoke.npz"     # start clean every time
+rm -f "/tmp/lpd_corpus_${FLOW_PHASES}_g28_res${FLOW_OPERATOR_RES}_n${DESIGN_N}_smoke.npz"
 run "train_lpd" logs/smoke_flow.log \
   "$PY" scripts/train_lpd.py \
     --bodies "$N_BODIES" --steps "$FLOW_STEPS" --phases "$FLOW_PHASES" --batch 1 \
     --val-bodies 2 --val-every 10 --patience 2 \
     --ckpt-every 10 --log-every 5 --no-resume \
+    --operator-res "$FLOW_OPERATOR_RES" \
     --codes-file "$OUT/corpus_codes.npz" --decoder-file "$OUT/token_decoder.pt" \
     --cache-tag smoke \
     --out "$OUT/lpd_flow.pt"
 tail -20 logs/smoke_flow.log
 
-if [ -d dataset/raw ]; then
+if [ -d dataset/raw ] && [ -f runs/surrogate.pt ]; then
   log "=== 5/5 reconstruct: dataset/raw is present, reconstructing model 1 for real"
   mkdir -p results/smoke
   run "reconstruct_lpd" logs/smoke_reconstruct.log \
     "$PY" scripts/reconstruct_lpd.py --model 1 --samples 1 --res 24 \
-      --ckpt "$OUT/lpd_flow.pt" --out results/smoke/Asteroid01.stl
+      --ckpt "$OUT/lpd_flow.pt" --decoder-file "$OUT/token_decoder.pt" \
+      --medoid-volume-only --out results/smoke/Asteroid01.stl
   tail -20 logs/smoke_reconstruct.log
   log "    wrote results/smoke/Asteroid01.stl"
+elif [ -d dataset/raw ]; then
+  log "=== 5/5 reconstruct: skipped (runs/surrogate.pt not present)"
+  log "    train_lpd.py can use an untrained surrogate for wiring, but reconstruct_lpd.py"
+  log "    intentionally loads a checkpoint. Copy or train runs/surrogate.pt to exercise"
+  log "    this last stage."
 else
   log "=== 5/5 reconstruct: skipped (dataset/raw not present)"
   log "    reconstruct_lpd.py needs the real measured curves to reconstruct against, so it"

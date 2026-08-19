@@ -13,6 +13,7 @@ same draws, once with the real residual and once with the residual channels zero
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 from pathlib import Path
 
@@ -23,6 +24,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from hac26.conventions import cameras, psi_grid          # noqa: E402
+from hac26.field import DESIGN_N                         # noqa: E402
 from hac26.solvers.lpd_flow import N_MODES, N_STEPS, LPDFlow     # noqa: E402
 from hac26.forward.learned_surrogate import Surrogate                    # noqa: E402
 from train_lpd import curves_from_code                   # noqa: E402
@@ -31,16 +33,40 @@ from train_lpd import curves_from_code                   # noqa: E402
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--ckpt", default="runs/lpd_flow.pt")
-    ap.add_argument("--corpus", default="/tmp/lpd_corpus_96_g28_h.npz")
+    ap.add_argument("--corpus", default=None)
     ap.add_argument("--draws", type=int, default=24)
     ap.add_argument("--phases", type=int, default=96)
+    ap.add_argument("--operator-res", type=int, default=32)
+    ap.add_argument("--cache-tag", default="shared")
     ap.add_argument("--decoder-file", default="runs/token_decoder.pt",
                     help="output of scripts/fit_shapes.py --decoder")
     a = ap.parse_args()
 
-    z = np.load(a.corpus)
+    corpus = a.corpus or (f"/tmp/lpd_corpus_{a.phases}_g{len(cameras())}_"
+                          f"res{a.operator_res}_n{DESIGN_N}_{a.cache_tag}.npz")
+    z = np.load(corpus)
+    meta = json.loads(str(z["meta"])) if "meta" in z.files else None
+    if meta is None:
+        print(f"  WARNING: {corpus} has no metadata; make sure it is not a stale cache",
+              flush=True)
+    else:
+        expected = {
+            "phases": int(a.phases),
+            "n_geoms": int(len(cameras())),
+            "operator_res": int(a.operator_res),
+            "design_n": int(DESIGN_N),
+        }
+        bad = {k: (meta.get(k), v) for k, v in expected.items() if meta.get(k) != v}
+        if bad:
+            raise SystemExit(f"{corpus} metadata does not match this ablation: {bad}")
     x1 = torch.tensor(z["codes"]); curves = torch.tensor(z["curves"])
     sup = torch.tensor(z["support"])
+    if sup.ndim != 2 or sup.shape[1] != DESIGN_N:
+        raise SystemExit(f"{corpus} support has shape {tuple(sup.shape)}, "
+                         f"but DESIGN_N={DESIGN_N}")
+    if curves.ndim != 4 or curves.shape[1:] != (len(cameras()), 2, a.phases):
+        raise SystemExit(f"{corpus} curves have shape {tuple(curves.shape)}, "
+                         "which does not match the requested phase/operator grid")
     psi = psi_grid(a.phases); M = min(N_MODES, a.phases // 2)
 
     gdev = "cuda" if torch.cuda.is_available() else "cpu"
@@ -71,7 +97,7 @@ def main():
         k = torch.tensor([d % N_STEPS]); t = k.float() / N_STEPS
         xt = (1 - t[:, None]) * x0 + t[:, None] * y
         cur = curves_from_code(xt[0], 1.0, surro, psi, support=sup[i[0]],
-                               decoder_path=a.decoder_file)
+                               res=a.operator_res, decoder_path=a.decoder_file)
         if cur is None:
             continue
         g_dat = torch.fft.rfft(curves[i], dim=-1)[..., 1:M + 1]

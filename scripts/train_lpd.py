@@ -32,6 +32,7 @@ to reconstruct from an unfinished run, point reconstruct_lpd.py --ckpt at the .c
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 import time
 from pathlib import Path
@@ -42,7 +43,7 @@ import torch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from hac26.conventions import S_LAB, cameras, psi_grid, to_body          # noqa: E402
-from hac26.field import ImplicitBody, extract_mesh    # noqa: E402
+from hac26.field import DESIGN_N, ImplicitBody, extract_mesh    # noqa: E402
 from hac26.solvers.lpd_flow import N_MODES, N_STEPS, LPDFlow           # noqa: E402
 from hac26.forward.mesh.radiosity import facet_geometry                               # noqa: E402
 from hac26.forward.learned_surrogate import (Surrogate, camera_features,                 # noqa: E402
@@ -50,6 +51,81 @@ from hac26.forward.learned_surrogate import (Surrogate, camera_features,        
 
 
 _DECODER = {}
+
+
+def _corpus_meta(n, psi, op_res) -> dict:
+    return {
+        "schema": 3,
+        "bodies": int(n),
+        "phases": int(len(psi)),
+        "n_geoms": int(len(cameras())),
+        "operator_res": int(op_res),
+        "design_n": int(DESIGN_N),
+    }
+
+
+def _decode_meta(z) -> dict | None:
+    if "meta" not in z.files:
+        return None
+    try:
+        return json.loads(str(z["meta"]))
+    except Exception:                                  # noqa: BLE001  corrupt metadata
+        return None
+
+
+def _load_valid_corpus_cache(cache: str, expected: dict):
+    try:
+        z = np.load(cache, allow_pickle=False)
+    except Exception as exc:                           # noqa: BLE001  corrupt: rebuild
+        print(f"  ignoring unreadable corpus cache {cache}: {exc}", flush=True)
+        return None
+    meta = _decode_meta(z)
+    if meta is None:
+        print(f"  ignoring legacy corpus cache {cache}: no metadata", flush=True)
+        return None
+    bad = [k for k, v in expected.items() if meta.get(k) != v]
+    if bad:
+        print(f"  ignoring stale corpus cache {cache}: metadata mismatch {bad}",
+              flush=True)
+        return None
+    if not {"codes", "curves", "support"}.issubset(z.files):
+        print(f"  ignoring stale corpus cache {cache}: missing arrays", flush=True)
+        return None
+    codes, curves, support = z["codes"], z["curves"], z["support"]
+    if (len(codes) == 0 or support.shape != (len(codes), DESIGN_N)
+            or curves.shape != (len(codes), len(cameras()), 2, expected["phases"])):
+        print(f"  ignoring stale corpus cache {cache}: bad array shapes", flush=True)
+        return None
+    print(f"  loaded corpus of {len(codes)} bodies from {cache}", flush=True)
+    return torch.tensor(codes), torch.tensor(curves), torch.tensor(support)
+
+
+def _load_valid_corpus_part(path: Path, expected: dict, body_index: int):
+    if not path.exists():
+        return None
+    try:
+        z = np.load(path, allow_pickle=False)
+    except Exception as exc:                           # noqa: BLE001  corrupt: redo
+        print(f"  ignoring unreadable corpus part {path}: {exc}", flush=True)
+        return None
+    meta = _decode_meta(z)
+    if meta is None or any(meta.get(k) != v for k, v in expected.items()):
+        print(f"  ignoring stale corpus part {path}", flush=True)
+        return None
+    if int(z["body_index"]) != int(body_index):
+        print(f"  ignoring corpus part {path}: body index mismatch", flush=True)
+        return None
+    code, curve, support = z["code"], z["curve"], z["support"]
+    if support.shape != (DESIGN_N,) or curve.shape != (len(cameras()), 2, expected["phases"]):
+        print(f"  ignoring corpus part {path}: bad array shapes", flush=True)
+        return None
+    return code, curve, support
+
+
+def _save_corpus_part(path: Path, body_index: int, code, curve, support, expected: dict):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    np.savez(path, body_index=int(body_index), code=code, curve=curve, support=support,
+             meta=json.dumps(expected, sort_keys=True))
 
 
 def load_decoder(body, path="runs/token_decoder.pt"):
@@ -88,8 +164,7 @@ def fit_body(verts, faces, radius=1.0, steps=250, n_pts=6000, device="cpu", seed
     P = torch.tensor(pts, dtype=torch.float32, device=device)
     S = torch.tensor(sd, dtype=torch.float32, device=device)
     body = ImplicitBody(radius=radius).to(device)
-    h0 = np.array([max(1e-3, float((verts @ n).max()))
-                   for n in body.core.n.cpu().numpy()], dtype=np.float32)
+    h0 = np.maximum(verts @ body.core.n.cpu().numpy().T, 1e-3).max(axis=0).astype(np.float32)
     body.core.set_support(torch.tensor(h0))
     opt = torch.optim.Adam(body.parameters(), lr=0.02)
     for _ in range(steps):
@@ -117,8 +192,15 @@ def curves_from_code(code, radius, surro, psi, res=32, device=None, geoms=None,
     # h is supplied by the caller and comes from the convex stage; the flow generates only
     # the token correction.
     n_norm = body.core.n.shape[0]
-    body.core.set_support(torch.full((n_norm,), 0.8 * radius) if support is None
-                          else torch.as_tensor(support, dtype=torch.float32).to(device))
+    if support is None:
+        h = torch.full((n_norm,), 0.8 * radius, dtype=torch.float32, device=device)
+    else:
+        h = torch.as_tensor(support, dtype=torch.float32, device=device)
+        if h.numel() != n_norm:
+            raise ValueError(f"support has {h.numel()} entries, but this field uses "
+                             f"{n_norm} normals; rerun fit_shapes.py after changing "
+                             "DESIGN_N")
+    body.core.set_support(h)
     load_decoder(body, path=decoder_path)
     set_code(body, code.to(device))
     ext = radius * 1.6
@@ -179,7 +261,7 @@ def _run_chunked(surro, fe, ar, dv, chunk):
         return surro_cpu(torch.tensor(fe, dtype=torch.float32), ar.cpu())
 
 
-def corpus(n, psi, surro, device, seed=0, cache=None,
+def corpus(n, psi, surro, device, seed=0, cache=None, op_res: int = 32,
            codes_file="runs/corpus_codes.npz", decoder_path="runs/token_decoder.pt"):
     """Curves for the corpus, from codes fitted by scripts/fit_shapes.py.
 
@@ -188,32 +270,61 @@ def corpus(n, psi, surro, device, seed=0, cache=None,
     to any other decoder -- which is what made the token channel inert. Run fit_shapes.py
     first; this only applies the operator.
     """
-    if cache and Path(cache).exists():
-        z = np.load(cache)
-        print(f"  loaded corpus of {len(z['codes'])} bodies", flush=True)
-        return (torch.tensor(z["codes"]), torch.tensor(z["curves"]),
-                torch.tensor(z["support"]))
     if not Path(codes_file).exists():
         raise SystemExit(f"{codes_file} missing -- run scripts/fit_shapes.py first")
+    if not Path(decoder_path).exists():
+        raise SystemExit(f"{decoder_path} missing -- run scripts/fit_shapes.py first")
     zz = np.load(codes_file)
+    if "codes" not in zz.files or "support" not in zz.files:
+        raise SystemExit(f"{codes_file} must contain 'codes' and 'support' arrays")
+    if len(zz["codes"]) < n:
+        raise SystemExit(f"{codes_file} contains {len(zz['codes'])} bodies, "
+                         f"but --bodies requested {n}")
+    if zz["support"].ndim != 2 or zz["support"].shape[1] != DESIGN_N:
+        raise SystemExit(f"{codes_file} support has shape {zz['support'].shape}, "
+                         f"but DESIGN_N={DESIGN_N}; rerun fit_shapes.py")
     all_codes, all_sup = zz["codes"][:n], zz["support"][:n]
+    expected_meta = _corpus_meta(n, psi, op_res)
+    if cache and Path(cache).exists():
+        cached = _load_valid_corpus_cache(cache, expected_meta)
+        if cached is not None:
+            return cached
+
+    part_dir = Path(f"{cache}.parts") if cache else None
     codes, curves, sup = [], [], []
     for i in range(len(all_codes)):
         t0 = time.time()
+        if part_dir is not None:
+            part = part_dir / f"body_{i:05d}.npz"
+            cached_part = _load_valid_corpus_part(part, expected_meta, i)
+            if cached_part is not None:
+                code_i, cur_i, sup_i = cached_part
+                codes.append(code_i); curves.append(cur_i); sup.append(sup_i)
+                print(f"  body {i}: resumed from {part}", flush=True)
+                continue
         code = torch.tensor(all_codes[i]); h = torch.tensor(all_sup[i])
-        cur = curves_from_code(code, 1.0, surro, psi, support=h, decoder_path=decoder_path)
+        cur = curves_from_code(code, 1.0, surro, psi, res=op_res, support=h,
+                               decoder_path=decoder_path)
         if cur is None:
             print(f"  body {i}: degenerate, skipped", flush=True); continue
-        codes.append(all_codes[i]); curves.append(cur.numpy()); sup.append(all_sup[i])
+        cur_np = cur.numpy()
+        codes.append(all_codes[i]); curves.append(cur_np); sup.append(all_sup[i])
+        if part_dir is not None:
+            _save_corpus_part(part_dir / f"body_{i:05d}.npz", i, all_codes[i], cur_np,
+                              all_sup[i], expected_meta)
         print(f"  body {i}: h {float(h.min()):.3f}-{float(h.max()):.3f}, "
               f"{time.time()-t0:.1f}s", flush=True)
+    if not codes:
+        raise SystemExit("every corpus body decoded to a degenerate mesh")
     codes = np.stack(codes); curves = np.stack(curves); sup = np.stack(sup)
     if cache:
-        np.savez(cache, codes=codes, curves=curves, support=sup)
+        np.savez(cache, codes=codes, curves=curves, support=sup,
+                 meta=json.dumps(expected_meta, sort_keys=True))
     return torch.tensor(codes), torch.tensor(curves), torch.tensor(sup)
 
 
-def flow_loss(net, surro, psi, codes, curves, sup, idx, x0, k, M, tag, mask, decoder_path):
+def flow_loss(net, surro, psi, codes, curves, sup, idx, x0, k, M, tag, mask,
+              decoder_path, op_res=32, train_geoms=None):
     """The flow-matching loss for one batch, given the draws (idx, x0, k).
 
     Split out of the training loop so validation scores the same objective through the same
@@ -229,11 +340,29 @@ def flow_loss(net, surro, psi, codes, curves, sup, idx, x0, k, M, tag, mask, dec
     # The operator is applied to the current state x_t. Feeding only the data's Fourier
     # content would leave the network without any signal about where it currently is.
     g_dat = torch.fft.rfft(curves[idx], dim=-1)[..., 1:M + 1]      # (B, G, 2, M)
+    geoms_t = None
+    geoms = None
+    step_mask = mask.expand(B, C)
+    if train_geoms is not None:
+        n_geoms = max(1, min(C, int(train_geoms)))
+        if n_geoms < C:
+            geoms_t = torch.randperm(C)[:n_geoms].sort().values
+            geoms = geoms_t.tolist()
+            step_mask = torch.zeros(B, C)
+            step_mask[:, geoms_t] = 1.0
+
     preds = []
     for b in range(B):
         cur = curves_from_code(xt[b].detach(), 1.0, surro, psi,
-                               support=sup[idx[b]], decoder_path=decoder_path)
-        preds.append(torch.zeros_like(curves[0]) if cur is None else cur)
+                               res=op_res, geoms=geoms, support=sup[idx[b]],
+                               decoder_path=decoder_path)
+        pred = torch.zeros_like(curves[0])
+        if cur is not None:
+            if geoms_t is None:
+                pred = cur
+            else:
+                pred[geoms_t] = cur
+        preds.append(pred)
     g_cur = torch.fft.rfft(torch.stack(preds), dim=-1)[..., 1:M + 1]
     r = g_dat - g_cur                                   # (B, G, 2, M) complex
     # the convex operator explains the low orders best, so its complement is what the
@@ -249,12 +378,12 @@ def flow_loss(net, surro, psi, codes, curves, sup, idx, x0, k, M, tag, mask, dec
         perp[:, :, :M, 2 * ch + 1] = r_perp[:, :, ch].imag
     feats[:, :, :M, 4] = g_dat[:, :, 0].real
     feats[:, :, :M, 5] = g_dat[:, :, 1].real
-    u = net.velocity(xt, feats, perp, tag.expand(B, C, 4), mask.expand(B, C), t)
+    u = net.velocity(xt, feats, perp, tag.expand(B, C, 4), step_mask, t)
     return ((u - (x1 - x0)) ** 2).mean()
 
 
 def validate(net, surro, psi, codes, curves, sup, val_idx, val_x0, val_k, M, tag, mask,
-             decoder_path, chunk):
+             decoder_path, chunk, op_res=32):
     """Mean flow loss over the held-out bodies, at fixed draws. Chunked to bound memory."""
     was_training = net.training
     net.eval()
@@ -264,7 +393,8 @@ def validate(net, surro, psi, codes, curves, sup, val_idx, val_x0, val_k, M, tag
             sl = slice(i, i + chunk)
             b = len(val_idx[sl])
             tot += b * float(flow_loss(net, surro, psi, codes, curves, sup, val_idx[sl],
-                                       val_x0[sl], val_k[sl], M, tag, mask, decoder_path))
+                                       val_x0[sl], val_k[sl], M, tag, mask, decoder_path,
+                                       op_res=op_res))
             n += b
     net.train(was_training)
     return tot / max(n, 1)
@@ -312,6 +442,10 @@ def main():
     # only 8 exist and the dual silently ran at a fifth of its specified width.
     ap.add_argument("--phases", type=int, default=96)
     ap.add_argument("--batch", type=int, default=2)
+    ap.add_argument("--operator-res", type=int, default=32,
+                    help="FlexiCubes resolution used inside curves_from_code")
+    ap.add_argument("--train-geoms", type=int, default=28,
+                    help="number of camera geometries sampled per flow step")
     ap.add_argument("--out", default="runs/lpd_flow.pt")
     ap.add_argument("--codes-file", default="runs/corpus_codes.npz",
                     help="output of scripts/fit_shapes.py --out")
@@ -365,7 +499,9 @@ def main():
     print(f"[{_now()}] [stage 1] corpus", flush=True)
     codes, curves, sup = corpus(
         a.bodies, psi, surro, dev, codes_file=a.codes_file, decoder_path=a.decoder_file,
-        cache=f"/tmp/lpd_corpus_{a.phases}_g{len(cameras())}_{a.cache_tag}.npz")
+        cache=f"/tmp/lpd_corpus_{a.phases}_g{len(cameras())}_"
+              f"res{a.operator_res}_n{DESIGN_N}_{a.cache_tag}.npz",
+        op_res=a.operator_res)
     print(f"  corpus: codes {tuple(codes.shape)}, curves {tuple(curves.shape)}", flush=True)
 
     print(f"[{_now()}] [stage 2] flow", flush=True)
@@ -382,6 +518,9 @@ def main():
                                   np.sin(np.radians(cam.azimuth_deg)),
                                   np.sin(np.radians(cam.elevation_deg)), 1.0])
     mask = torch.ones(1, C)
+    train_geoms = max(1, min(C, int(a.train_geoms)))
+    print(f"  operator extraction res {a.operator_res}; training samples "
+          f"{train_geoms}/{C} geometries per step", flush=True)
 
     # The held-out bodies are drawn from a fixed permutation, so the split is the same on a
     # resumed or repeated run over the same corpus, and a body never scores the network that
@@ -409,7 +548,13 @@ def main():
     stopped_at = a.steps
     start_step, elapsed_before = 0, 0.0
     ckpt_path = a.ckpt_file or f"{a.out}.ckpt"
-    meta = {"dim": int(codes.shape[1]), "n_val": n_val}
+    meta = {
+        "dim": int(codes.shape[1]),
+        "n_val": n_val,
+        "phases": int(a.phases),
+        "operator_res": int(a.operator_res),
+        "train_geoms": train_geoms,
+    }
 
     # A job that dies at step 250 of 300 should not cost the 250 steps it already paid for.
     if a.resume and Path(ckpt_path).exists():
@@ -423,12 +568,13 @@ def main():
             # weights: they would be reported as progress towards a corpus they never saw.
             print(f"  WARNING: {ckpt_path} predates {a.codes_file} -- ignoring it and "
                   f"training from step 0", flush=True)
-        elif st.get("dim") != meta["dim"] or st.get("n_val") != n_val:
-            raise SystemExit(
-                f"{ckpt_path} was written for code dim {st.get('dim')} and "
-                f"{st.get('n_val')} held-out bodies; this run has {meta['dim']} and "
-                f"{n_val}. Delete it or pass --no-resume.")
         else:
+            bad = [f"{k}: checkpoint={st.get(k)!r}, current={v!r}"
+                   for k, v in meta.items() if st.get(k) != v]
+            if bad:
+                raise SystemExit(
+                    f"{ckpt_path} was written for different flow settings "
+                    f"({'; '.join(bad)}). Delete it or pass --no-resume.")
             net.load_state_dict(st["net"])
             opt.load_state_dict(st["opt"])
             torch.set_rng_state(st["rng"])
@@ -450,12 +596,13 @@ def main():
         x0 = torch.randn(a.batch, codes.shape[1], dtype=codes.dtype)
         k = torch.randint(0, N_STEPS, (a.batch,))          # unbiased single-k estimator
         loss = flow_loss(net, surro, psi, codes, curves, sup, idx, x0, k, M, tag, mask,
-                         a.decoder_file)
+                         a.decoder_file, op_res=a.operator_res,
+                         train_geoms=train_geoms)
         opt.zero_grad(); loss.backward(); opt.step()
         now = time.time()
         step_s = now - t_step
         elapsed = elapsed_before + (now - t_run)
-        if s % a.log_every == 0 or s == a.steps - 1:
+        if (a.log_every and s % a.log_every == 0) or s == a.steps - 1:
             # Wall clock, seconds per step and a projection to the cap: on a batch worker
             # with a wall-clock limit, what matters is whether the remaining steps fit in
             # the slot, and that is not something a bare loss line can answer.
@@ -468,7 +615,7 @@ def main():
         if n_val and ((s + 1) % a.val_every == 0 or s == a.steps - 1):
             t_val = time.time()
             vl = validate(net, surro, psi, codes, curves, sup, val_idx, val_x0, val_k, M,
-                          tag, mask, a.decoder_file, a.batch)
+                          tag, mask, a.decoder_file, a.batch, op_res=a.operator_res)
             if vl < best - a.min_delta:
                 best, best_step, stale = vl, s, 0
                 best_state = {k_: v.detach().clone() for k_, v in net.state_dict().items()}

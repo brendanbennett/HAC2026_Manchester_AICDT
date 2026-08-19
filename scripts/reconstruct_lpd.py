@@ -1,10 +1,14 @@
 #!/usr/bin/env python3
-"""Reconstruct a competition model with the trained flow, then finish it.
+"""Reconstruct a competition model with the trained flow.
 
 Six Euler steps with the operator re-applied at each, several independent draws from x0, and
-the metric medoid of those draws as the answer. The medoid rather than the mean because
-thresholding a mean of occupancy grids erases concavity: a feature present in most samples but
-at slightly different places averages to below the threshold everywhere.
+the metric medoid of those draws as the answer. The medoid combines volume overlap with the
+side-view boundary distance used by the challenge, rather than only picking the voxel-Dice
+central sample. That matters for non-convexity because silhouettes see necks and waists that
+volume overlap can blur.
+
+Planar snapping is opt-in. It can help faceted/polyhedral targets, but it also projects
+near-coplanar vertices onto fitted planes and can turn smooth decoded surfaces into terraces.
 
 Dice is measured on a voxel grid after posing both meshes with rescale_touch_z, so they are
 compared in the frame the challenge defines.
@@ -105,17 +109,21 @@ def make_resid_fn(g_dat, surro, psi, M, radius, support=None,
 
 
 def decode(code, radius, res=64, misfit_fn=None, eta=None, support=None,
-          decoder_path="runs/token_decoder.pt"):
-    """Token code -> constrained mesh: field extraction, constraints, then the planar snap.
-
-    The snap is gated on the data rather than applied because a plane was found: RANSAC will
-    always return something on a noisy mesh, and snapping to it flattens curvature that was
-    never measured. A plane survives only if flattening to it does not raise the residual past
-    the model error from the calibration.
-    """
+           decoder_path="runs/token_decoder.pt", snap: bool = False,
+           snap_planes: int = 12, snap_tol: float = 0.02,
+           snap_min_frac: float = 0.02):
+    """Token code -> constrained mesh, with optional planar snapping."""
     body = ImplicitBody(radius=radius)
-    body.core.set_support(torch.full((body.core.n.shape[0],), 0.8 * radius)
-                          if support is None else support)
+    n_norm = body.core.n.shape[0]
+    if support is None:
+        h = torch.full((n_norm,), 0.8 * radius)
+    else:
+        h = torch.as_tensor(support, dtype=torch.float32)
+        if h.numel() != n_norm:
+            raise ValueError(f"support has {h.numel()} entries, but this field uses "
+                             f"{n_norm} normals; rerun the convex/support stage after "
+                             "changing DESIGN_N")
+    body.core.set_support(h)
     load_decoder(body, path=decoder_path)
     set_code(body, code)
     v, f = extract_mesh(lambda y: body(y), radius * 1.6, res=res, device="cpu")
@@ -123,12 +131,13 @@ def decode(code, radius, res=64, misfit_fn=None, eta=None, support=None,
         return None, None, 0
     v = apply_constraints(v, radius)
     kept = 0
-    planes = ransac_planes(v, f)
+    planes = ransac_planes(v, f, n_planes=snap_planes, tol=snap_tol,
+                           min_frac=snap_min_frac) if snap else []
     if len(planes):
         v, kept = planar_snap(v, f, planes,
                               misfit_fn=(None if misfit_fn is None
                                          else lambda w: misfit_fn(w, f)),
-                              eta=eta)
+                              eta=eta, tol=snap_tol)
         v = restore_constraints(v, radius)
     return v, f, kept
 
@@ -150,10 +159,26 @@ def main():
     ap.add_argument("--res", type=int, default=64)
     ap.add_argument("--out", required=True)
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--snap", action="store_true",
+                    help="enable RANSAC planar snapping postprocess")
+    ap.add_argument("--snap-planes", type=int, default=12)
+    ap.add_argument("--snap-tol", type=float, default=0.02)
+    ap.add_argument("--snap-min-frac", type=float, default=0.02)
+    ap.add_argument("--medoid-volume-only", action="store_true",
+                    help="select the medoid by voxel Dice only, matching the old behaviour")
+    ap.add_argument("--medoid-side-points", type=int, default=200000,
+                    help="surface samples per draw for side-view medoid selection; use "
+                         "1000000 to match hac26/scoring/side_view.py exactly")
+    ap.add_argument("--medoid-side-dirs", type=int, default=36)
+    ap.add_argument("--medoid-side-res", type=int, default=512)
+    ap.add_argument("--medoid-side-mode", choices=["side", "sphere"], default="side")
     ap.add_argument("--support-from", default=None,
                     help="STL whose support function supplies h; defaults to the convex "
                          "stage's reconstruction of this model")
     a = ap.parse_args()
+    if not a.medoid_volume_only and a.medoid_side_points <= 0:
+        raise SystemExit("--medoid-side-points must be positive unless --medoid-volume-only "
+                         "is set")
     torch.manual_seed(a.seed)
 
     R = CYLINDER_R[a.model]
@@ -224,23 +249,54 @@ def main():
     meshes, occs, snaps = [], [], []
     for i in range(a.samples):
         v, f, kept = decode(codes[i], R, res=a.res, misfit_fn=misfit, eta=eta,
-                            support=support, decoder_path=a.decoder_file)
+                            support=support, decoder_path=a.decoder_file,
+                            snap=a.snap, snap_planes=a.snap_planes,
+                            snap_tol=a.snap_tol, snap_min_frac=a.snap_min_frac)
         if v is None:
             print(f"  draw {i}: degenerate, dropped", flush=True); continue
         meshes.append((v, f)); occs.append(occupancy(v, f)); snaps.append(kept)
     if not meshes:
         raise SystemExit("every draw was degenerate")
-    k = metric_medoid(occs)
+
+    medoid_metric = "volume"
+    if a.medoid_volume_only:
+        k = metric_medoid(occs)
+    else:
+        try:
+            from hac26.scoring.side_view import surface_points
+        except ImportError as exc:
+            raise SystemExit("side-view medoid needs scipy, scikit-image, and trimesh; "
+                             "install the project dependencies or pass "
+                             "--medoid-volume-only") from exc
+        print(f"  side-view medoid: {a.medoid_side_points} surface points/draw, "
+              f"{a.medoid_side_dirs} dirs, res {a.medoid_side_res}", flush=True)
+        outlines = [surface_points(v, f, n=a.medoid_side_points, seed=a.seed + i)
+                    for i, (v, f) in enumerate(meshes)]
+        k = metric_medoid(occs, outlines, side_n_dirs=a.medoid_side_dirs,
+                          side_res=a.medoid_side_res, side_mode=a.medoid_side_mode)
+        medoid_metric = "volume+side_view"
+
     v, f = meshes[k]
-    print(f"  planes accepted per draw (eta = {eta:.4f}): {snaps}", flush=True)
-    print(f"  medoid = draw {k} of {len(meshes)}; "
+    if a.snap:
+        print(f"  planes accepted per draw (eta = {eta:.4f}): {snaps}", flush=True)
+    else:
+        print("  planar snap disabled", flush=True)
+    print(f"  medoid = draw {k} of {len(meshes)} by {medoid_metric}; "
           f"mean pairwise Dice {np.mean([dice(occs[k], o) for o in occs]):.4f}", flush=True)
 
     Path(a.out).parent.mkdir(parents=True, exist_ok=True)
     info = export_stl(a.out, v, f)
     res = {"model": a.model, "radius": R, "draws": len(meshes), "medoid": int(k),
            "spread": float(np.mean([dice(occs[k], o) for o in occs])),
-           "eta": eta, "planes_accepted": snaps, **info}
+           "medoid_metric": medoid_metric,
+           "medoid_volume_only": bool(a.medoid_volume_only),
+           "medoid_side_points": 0 if a.medoid_volume_only else int(a.medoid_side_points),
+           "medoid_side_dirs": int(a.medoid_side_dirs),
+           "medoid_side_res": int(a.medoid_side_res),
+           "medoid_side_mode": a.medoid_side_mode,
+           "eta": eta, "snap_enabled": bool(a.snap),
+           "snap_planes": int(a.snap_planes), "snap_tol": float(a.snap_tol),
+           "snap_min_frac": float(a.snap_min_frac), "planes_accepted": snaps, **info}
 
     if a.model in PUBLIC:
         import trimesh

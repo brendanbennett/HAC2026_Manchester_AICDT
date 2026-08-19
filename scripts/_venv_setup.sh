@@ -110,6 +110,19 @@ fi
 echo "[venv] active: $(command -v python) ($(python --version 2>&1))"
 PY=python
 
+_ensure_pip() {
+  if python -m pip --version >/dev/null 2>&1; then
+    return 0
+  fi
+  echo "[venv] pip is missing; bootstrapping it with ensurepip"
+  if python -m ensurepip --upgrade >/dev/null 2>&1; then
+    return 0
+  fi
+  echo "ERROR: this Python venv has no pip and ensurepip could not install it." >&2
+  echo "Try recreating the venv, or install pip for this Python distribution." >&2
+  exit 1
+}
+
 # Dependency check. Deliberately NOT `pip install -e ".[torch]"`: an editable install writes
 # hac26.egg-info/ INSIDE the repo to build its metadata, which fails with the exact same
 # "Operation not permitted" as venv creation if the repo itself is on a Windows-mounted WSL
@@ -121,10 +134,8 @@ PY=python
 # do. Installing named packages (not `.` or `-e .`) never touches the current directory:
 # pip builds them in its own temp/cache dirs regardless of where REPO_ROOT lives.
 #
-# Versions match pyproject.toml's [project.dependencies] and the "torch" extra; trimesh,
-# scikit-image, rtree, and fast_simplification are used by fit_shapes.py, train_lpd.py, and
-# the shape library's marching-cubes step but aren't listed there. rtree backs trimesh's
-# spatial index (nearest.signed_distance, used to build SDF training samples) and
+# Versions match pyproject.toml's runtime dependencies and the "torch" extra. rtree backs
+# trimesh's spatial index (nearest.signed_distance, used to build SDF training samples) and
 # fast_simplification backs simplify_quadric_decimation (used by hac26/calibrate.py's mesh
 # decimation, called from train_lpd.py's curve rendering) -- trimesh imports both lazily and
 # neither falls back gracefully, so their absence only surfaces once that specific code path
@@ -135,8 +146,9 @@ python -c "import numpy, scipy, torch, trimesh, skimage, rtree, fast_simplificat
   >/dev/null 2>&1 || NEED_INSTALL=1
 if [ "$NEED_INSTALL" = "1" ] || [ "${FORCE_DEPS:-0}" = "1" ]; then
   echo "[venv] installing dependencies (this can take a while, especially torch)"
-  pip install --upgrade pip -q
-  pip install "numpy>=1.24" "scipy>=1.10" "torch>=2.1" \
+  _ensure_pip
+  python -m pip install --upgrade pip -q
+  python -m pip install "numpy>=1.24" "scipy>=1.10" "torch>=2.1" \
     trimesh scikit-image rtree fast_simplification -q
   python -c "import numpy, scipy, torch, trimesh, skimage, rtree, fast_simplification" || {
     echo "ERROR: dependency install ran but imports still fail; see the pip output above." >&2
