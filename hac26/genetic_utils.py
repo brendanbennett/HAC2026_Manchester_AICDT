@@ -9,7 +9,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import trimesh
 
-
+from hac26.scoring.voxel import score_mesh
 from hac26.shapes import (
     icosphere,
     sh_mesh_from_coefficients,
@@ -251,44 +251,15 @@ def save_shape_stl(
     return mesh
 
 
-def save_results_json(
+def save_checkpoint_results(
     output_dir,
     args,
-    result,
+    best_params,
+    best_fitness,
     dice_scores,
     comp_t
-):
-    """Save run configuration and optimisation results to JSON."""
-
-
-    def _json_serializable(obj):
-        """Convert common NumPy types to JSON-serializable Python types."""
-
-        if isinstance(obj, np.ndarray):
-            return obj.tolist()
-
-        if isinstance(obj, np.integer):
-            return int(obj)
-
-        if isinstance(obj, np.floating):
-            return float(obj)
-
-        if isinstance(obj, np.bool_):
-            return bool(obj)
-
-        if isinstance(obj, dict):
-            return {
-                key: _json_serializable(value)
-                for key, value in obj.items()
-            }
-
-        if isinstance(obj, (list, tuple)):
-            return [
-                _json_serializable(value)
-                for value in obj
-            ]
-
-        return obj
+    ):
+    """Update results.json with the current optimisation state."""
 
     config = vars(args).copy()
     config["n_coefficients"] = args.L * (args.L + 2)
@@ -297,23 +268,16 @@ def save_results_json(
     results = {
         "config": config,
         "result": {
+            "best_fitness": float(best_fitness),
+            "best_params": best_params.tolist(),
             "dice_scores": dice_scores,
-            "best_fitness": float(result.best_fitness),
-            "best_params": result.best_params.tolist(),
-            "fitness_history": [
-                float(x)
-                for x in result.best_fitness_history
-            ],
-        },
-        "timing": {
-            "total_seconds": comp_t,
+            "time_taken": float(comp_t),
         },
     }
 
-
     with open(output_dir / "results.json", "w") as f:
         json.dump(
-            _json_serializable(results),
+            results,
             f,
             indent=2,
         )
@@ -322,78 +286,106 @@ def save_results_json(
 
 ## PLOTTING ## 
 
+
 def plot_lightcurve_comparison(
-    vertices,
-    faces,
     target_curves,
-    cameras,
-    curve_types,
-    m,
+    curves_dir,
     output_path,
+    m,
+    plot_all=True,
 ):
-    """Plot target and reconstructed lightcurves for each camera.
+    """Plot saved GA lightcurves against the target lightcurves.
 
     Parameters
     ----------
-    vertices, faces
-        Mesh of the reconstructed shape.
-
     target_curves : np.ndarray
-        Target lightcurves, shape (n_cameras, m).
+        Truth lightcurves.
 
-    cameras : list
-        Camera definitions used by the forward model.
+    curves_dir : Path
+        Directory containing checkpoint lightcurve .npy files.
 
-    curve_types : list
-        Curve type for each camera.
+    output_path : Path
+        Path for the output figure.
 
     m : int
         Number of phase samples.
 
-    output_path : str or Path
-        Path at which to save the figure.
+    plot_all : bool, default=True
+        If True, plot lightcurves from all saved generations.
+        If False, plot only the final saved generation.
     """
 
-    final_curves = mesh_curves_convex(
-        vertices,
-        faces,
-        cameras=cameras,
-        m=m,
-        curve_types=curve_types,
+    curves_dir = Path(curves_dir)
+
+    curve_files = sorted(
+        curves_dir.glob("generation_*.npy")
     )
 
-    fig, axes = plt.subplots(
-        len(cameras),
-        1,
-        figsize=(8, 2 * len(cameras)),
-        sharex=True,
-    )
+    if not curve_files:
+        raise FileNotFoundError(
+            f"No lightcurve files found in {curves_dir}"
+        )
 
-    if len(cameras) == 1:
-        axes = [axes]
+    # ------------------------------------------------------------
+    # Select which generations to plot
+    # ------------------------------------------------------------
+
+    if not plot_all:
+        curve_files = [curve_files[-1]]
 
     phase = np.arange(m) / m
 
-    for i, ax in enumerate(axes):
+    # ------------------------------------------------------------
+    # Create figure
+    # ------------------------------------------------------------
 
+    fig, axes = plt.subplots(
+        len(target_curves),
+        1,
+        figsize=(8, 2 * len(target_curves)),
+        sharex=True,
+    )
+
+    if len(target_curves) == 1:
+        axes = [axes]
+
+    # ------------------------------------------------------------
+    # Plot truth
+    # ------------------------------------------------------------
+
+    for i, ax in enumerate(axes):
         ax.plot(
             phase,
             target_curves[i],
             label="truth",
         )
 
-        ax.plot(
-            phase,
-            final_curves[i],
-            "--",
-            label="GA",
+    # ------------------------------------------------------------
+    # Plot GA curves
+    # ------------------------------------------------------------
+
+    for curve_file in curve_files:
+
+        curves = np.load(curve_file)
+
+        generation = curve_file.stem.replace(
+            "generation_",
+            "",
         )
 
-        ax.set_ylabel(f"Camera {i}")
+        for i, ax in enumerate(axes):
+            ax.plot(
+                phase,
+                curves[i],
+                "--",
+                label=f"GA {generation}",
+            )
 
-        ax.legend()
+            ax.set_ylabel(f"Camera {i}")
 
     axes[-1].set_xlabel("Phase")
+
+    axes[0].legend()
 
     fig.tight_layout()
 
@@ -403,7 +395,6 @@ def plot_lightcurve_comparison(
     )
 
     plt.close(fig)
-
 
 def plot_genetic_convergence(
     best_fitness_history,

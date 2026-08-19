@@ -7,6 +7,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import trimesh
 import time
+import cloudpickle
 
 from hac26.shapes import (
     icosphere,
@@ -19,8 +20,9 @@ from hac26.recon import dice
 from hac26.scoring.voxel import score_mesh, prepare_truth
 from hac26.data_io import load_model_curves
 from hac26.genetic_utils import make_target_coefficients, lightcurve_fitness, \
-                                save_shape_stl, save_results_json, load_truth_mesh, \
-                                plot_lightcurve_comparison, plot_genetic_convergence
+                                save_shape_stl,  load_truth_mesh, \
+                                plot_lightcurve_comparison, plot_genetic_convergence, \
+                                save_checkpoint_results
 
 
 
@@ -144,6 +146,13 @@ def main():
     
     output_dir.mkdir(parents=True, exist_ok=True)
 
+    # make a output path for lightcurve files
+    lc_dir = output_dir / Path('curves')
+    lc_dir.mkdir(parents=True, exist_ok=True)
+
+    # make an output path for the stl files
+    stl_dir = output_dir / Path('stl')
+    stl_dir.mkdir(parents=True, exist_ok=True)
 
     # --------------------------------------------------------
     # Load source of truth (if exists)
@@ -187,7 +196,7 @@ def main():
             )
 
         np.save(
-        output_dir / "truth_curves.npy",
+        lc_dir / "truth_curves.npy",
         target_curves,
         )
 
@@ -196,7 +205,7 @@ def main():
             target_coefficients,
             L=args.L,
             subdiv=args.subdiv,
-            path=output_dir / "truth.stl",
+            path=stl_dir / "truth.stl",
         ) 
 
         truth_mesh_voxelised = prepare_truth(
@@ -297,6 +306,105 @@ def main():
         )
 
     # ------------------------------------------------------------
+    # Define how to save checkpoints in solver
+    # ------------------------------------------------------------
+
+    # [0] = initial pop, [n] = nth evolution    
+    checkpoint_generations = [
+        0,
+        args.generations // 4,
+        args.generations // 2,
+        3 * args.generations // 4,
+        args.generations,
+    ]
+
+    dice_scores = {}
+
+    def checkpoint(
+        generation,
+        best_params,
+        best_fitness,
+    ):
+        # Only save at requested checkpoints
+        if generation not in checkpoint_generations:
+            return
+
+        checkpoint_name = f"generation_{generation:04d}"
+
+        # --------------------------------------------------------
+        # Save current best parameters
+        # --------------------------------------------------------
+
+        # np.save(
+        #     output_dir / f"{checkpoint_name}_params.npy",
+        #     best_params,
+        # )
+
+        # --------------------------------------------------------
+        # Save current best STL
+        # --------------------------------------------------------
+
+        mesh = save_shape_stl(
+            best_params,
+            L=args.L,
+            subdiv=args.subdiv,
+            path=stl_dir / f"{checkpoint_name}.stl",
+        )
+
+        # --------------------------------------------------------
+        # Generate and save current best lightcurves
+        # --------------------------------------------------------
+
+        curves = mesh_curves_convex(
+            mesh.vertices,
+            mesh.faces,
+            cameras=cameras,
+            m=args.m,
+            curve_types=curve_types,
+        )
+
+        np.save(
+            lc_dir / f"{checkpoint_name}_curves.npy",
+            curves,
+        )
+
+        # --------------------------------------------------------
+        # Dice score
+        # --------------------------------------------------------
+
+        dice_score = score_mesh(
+            mesh.vertices,
+            mesh.faces,
+            truth_mesh_voxelised,
+        )
+
+        dice_scores[checkpoint_name] = float(dice_score)
+
+        print(
+            f"Checkpoint generation {generation}: "
+            f"fitness={best_fitness:.6g}, "
+            f"dice={dice_score:.4f}"
+        )
+
+        # --------------------------------------------------------
+        # Update results.json
+        # --------------------------------------------------------
+
+        elapsed_time = time.perf_counter() - start_time
+
+        save_checkpoint_results(
+            output_dir=output_dir,
+            args=args,
+            best_params=best_params,
+            best_fitness=best_fitness,
+            dice_scores=dice_scores,
+            comp_t = elapsed_time
+        )
+
+        with open(output_dir / "solver.pkl", "wb") as f:
+            cloudpickle.dump(solver, f)
+
+    # ------------------------------------------------------------
     # Genetic optimiser
     # ------------------------------------------------------------
 
@@ -312,53 +420,8 @@ def main():
         seed=args.seed,
     )
 
-    result = solver.run()
+    result = solver.run(checkpoint_fn=checkpoint)
 
-
-    # ------------------------------------------------------------
-    # Save shape checkpoints
-    # ------------------------------------------------------------
-
-    # use this in case it stops early
-    # [0] = initial pop, [n] = nth evolution
-    n_generations = len(result.best_fitness_history) - 1
-
-    checkpoint_generations = [
-        0,
-        n_generations // 4,
-        n_generations // 2,
-        3 * n_generations // 4,
-        n_generations,
-    ]
-
-
-    dice_scores = {}
-
-    for generation in checkpoint_generations:
-
-        coefficients = result.best_params_history[generation]
-
-        vertices, faces = sh_mesh_from_coefficients(
-            coefficients,
-            L=args.L,
-            subdiv=args.subdiv,
-        )
-
-        # track updates
-        mesh = save_shape_stl(
-            coefficients,
-            L=args.L,
-            subdiv=args.subdiv,
-            path=output_dir / f"generation_{generation:04d}.stl",
-        )
-
-
-        # Dice
-        dice_scores[f"generation_{generation:04d}"] = score_mesh(
-            mesh.vertices,
-            mesh.faces,
-            truth_mesh_voxelised,
-        )
 
     # ------------------------------------------------------------
     # Print recovered coefficients
@@ -393,13 +456,11 @@ def main():
     )
 
     plot_lightcurve_comparison(
-        vertices=final_vertices,
-        faces=final_faces,
         target_curves=target_curves,
-        cameras=cameras,
-        curve_types=curve_types,
+        curves_dir=lc_dir,
         m=args.m,
         output_path=output_dir / "lightcurve_comparison.png",
+        plot_all=False
     )
 
 
@@ -420,13 +481,8 @@ def main():
 
     total_time = time.perf_counter() - start_time
 
-    save_results_json(
-        output_dir=output_dir,
-        args=args,
-        result=result,
-        dice_scores=dice_scores,
-        comp_t = total_time
-        )
+    with open(output_dir / "solver.pkl", "rb") as f:
+        solver = cloudpickle.load(f)
 
 
 if __name__ == "__main__":

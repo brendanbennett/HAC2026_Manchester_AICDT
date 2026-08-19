@@ -84,6 +84,7 @@ class GeneticSolver:
         self.best_params_history = []
         self.best_fitness_history = []
 
+
         self.rng = np.random.default_rng(seed)
 
         if bounds is not None:
@@ -195,8 +196,15 @@ class GeneticSolver:
 
 
 
-    def run(self):
+    def run(self, checkpoint_fn):
         """Run the genetic optimisation.
+
+        Parameters
+        ----------
+        checkpoint_fn : callable, optional
+            Called after each generation with:
+                checkpoint_fn(generation, best_params, best_fitness)
+        
 
         Returns
         -------
@@ -229,6 +237,14 @@ class GeneticSolver:
             f"| fitness = {best_fitness:.6g} "
             f"| mutation = {mutation_scale:.4g}"
         )
+
+        # Checkpoint generation 0
+        if checkpoint_fn is not None:
+            checkpoint_fn(
+                0,
+                best_params.copy(),
+                best_fitness,
+            )
 
         # ------------------------------------------------------------
         # Evolution
@@ -270,6 +286,14 @@ class GeneticSolver:
                 f"| mutation = {mutation_scale:.4g}"
             )
 
+
+            # Checkpoint
+            if checkpoint_fn is not None:
+                checkpoint_fn(
+                    generation,
+                    best_params.copy(),
+                    best_fitness,
+                )
 
         return GeneticResult(
             best_params=best_params,
