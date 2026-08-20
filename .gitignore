@@ -16,5 +16,5 @@ dataset/*
 runs/
 
 # practice results
-results/genetic/toy_spherical_harmonics/*
 results/genetic/simpfaces/*
+results/genetic/testing/*
