@@ -1,0 +1,66 @@
+{
+  "label": "convex",
+  "assd_ref": 0.2,
+  "results": {
+    "1": {
+      "model": 1,
+      "stl": "results/convex/Asteroid01.stl",
+      "voxel": 0.9792234403433374,
+      "assd_mean": 0.012336782734128542,
+      "assd_worst": 0.01636425360192336,
+      "hausdorff_mean": 0.040432362492476455,
+      "side_score_UNOFFICIAL": 0.9383160863293573,
+      "composite_UNOFFICIAL": 0.9587697633363473,
+      "pose": {
+        "z_min": -1.0,
+        "z_max": 1.0,
+        "touches_planes": true,
+        "max_axis_dist": 1.1198824283928985,
+        "min_enclosing_R": 1.1088203956434528,
+        "cylinder_R": 1.12,
+        "fits_cylinder": true,
+        "on_axis": true
+      }
+    },
+    "2": {
+      "model": 2,
+      "stl": "results/convex/Asteroid02.stl",
+      "voxel": 0.9128254383568071,
+      "assd_mean": 0.03513061386128942,
+      "assd_worst": 0.06756107500327865,
+      "hausdorff_mean": 0.21868124151117038,
+      "side_score_UNOFFICIAL": 0.8243469306935529,
+      "composite_UNOFFICIAL": 0.86858618452518,
+      "pose": {
+        "z_min": -1.0,
+        "z_max": 1.0,
+        "touches_planes": true,
+        "max_axis_dist": 1.4224110016358795,
+        "min_enclosing_R": 1.4119993489298612,
+        "cylinder_R": 1.42,
+        "fits_cylinder": true,
+        "on_axis": true
+      }
+    },
+    "3": {
+      "model": 3,
+      "stl": "results/convex/Asteroid03.stl",
+      "voxel": 0.6922043532618403,
+      "assd_mean": 0.1134952619313153,
+      "assd_worst": 0.12465642050274275,
+      "hausdorff_mean": 0.4581408897697224,
+      "side_score_UNOFFICIAL": 0.43252369034342353,
+      "composite_UNOFFICIAL": 0.5623640218026319,
+      "pose": {
+        "z_min": -1.0,
+        "z_max": 1.0,
+        "touches_planes": true,
+        "max_axis_dist": 0.8801045538408512,
+        "min_enclosing_R": 0.86407430026444,
+        "cylinder_R": 0.88,
+        "fits_cylinder": true,
+        "on_axis": true
+      }
+    }
+  }
+}

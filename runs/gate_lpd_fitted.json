@@ -1,0 +1,66 @@
+{
+  "label": "lpd_fitted",
+  "assd_ref": 0.2,
+  "results": {
+    "1": {
+      "model": 1,
+      "stl": "results/lpd_fitted/Asteroid01.stl",
+      "voxel": 0.9727071862163797,
+      "assd_mean": 0.014271964699633313,
+      "assd_worst": 0.017274747680846313,
+      "hausdorff_mean": 0.052119753655215977,
+      "side_score_UNOFFICIAL": 0.9286401765018334,
+      "composite_UNOFFICIAL": 0.9506736813591066,
+      "pose": {
+        "z_min": -1.0,
+        "z_max": 1.0,
+        "touches_planes": true,
+        "max_axis_dist": 1.1145060752057108,
+        "min_enclosing_R": 1.1087999979995418,
+        "cylinder_R": 1.12,
+        "fits_cylinder": true,
+        "on_axis": true
+      }
+    },
+    "2": {
+      "model": 2,
+      "stl": "results/lpd_fitted/Asteroid02.stl",
+      "voxel": 0.9345596232007664,
+      "assd_mean": 0.028958420097654047,
+      "assd_worst": 0.04268730005737051,
+      "hausdorff_mean": 0.21537957594727997,
+      "side_score_UNOFFICIAL": 0.8552078995117298,
+      "composite_UNOFFICIAL": 0.8948837613562481,
+      "pose": {
+        "z_min": -1.0,
+        "z_max": 1.0,
+        "touches_planes": true,
+        "max_axis_dist": 1.4182042157430113,
+        "min_enclosing_R": 1.4058000060915536,
+        "cylinder_R": 1.42,
+        "fits_cylinder": true,
+        "on_axis": true
+      }
+    },
+    "3": {
+      "model": 3,
+      "stl": "results/lpd_fitted/Asteroid03.stl",
+      "voxel": 0.6835921674544226,
+      "assd_mean": 0.12037581107798014,
+      "assd_worst": 0.1304996681419799,
+      "hausdorff_mean": 0.4708755984197662,
+      "side_score_UNOFFICIAL": 0.3981209446100994,
+      "composite_UNOFFICIAL": 0.540856556032261,
+      "pose": {
+        "z_min": -1.0,
+        "z_max": 1.0,
+        "touches_planes": true,
+        "max_axis_dist": 0.8849293404507714,
+        "min_enclosing_R": 0.871200006788074,
+        "cylinder_R": 0.88,
+        "fits_cylinder": true,
+        "on_axis": true
+      }
+    }
+  }
+}

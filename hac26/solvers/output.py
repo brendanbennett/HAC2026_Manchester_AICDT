@@ -7,16 +7,16 @@ place in each sample, and the mean smears it into a shallow depression everywher
 to say back into a filled convex body. Thresholding a marginal occupancy field does the same
 thing by a different route. The metric medoid
 
-    x* = argmin_s rank(-mean Dice_s) + rank(mean side-view ASSD_s)
+    x* = argmax_s (1/S) sum_s' Dice(B_s, B_s')
 
-is instead an actual sample -- the one most typical under the metrics being scored -- so it
-keeps a crater somewhere rather than nowhere. If no side-view outlines are supplied, the same
-function falls back to the old Dice-only medoid.
+is instead an actual sample -- the one most typical under the very metric being scored --
+so it keeps a crater somewhere rather than nowhere.
 
-The planar snap helper is optional. It can help faceted/polyhedral targets, but it is wrong on
-a genuinely smooth body, so the reconstruction script leaves it off unless requested. When it
-is used, each candidate plane is accepted only if the data misfit does not rise beyond the
-calibrated model-error floor eta.
+The planar snap is evidence-gated. Every ground truth is a printed polytope, so snapping
+near-planar patches flat is usually right, and on the cube it is worth a great deal. But it
+is wrong on a genuinely smooth body, so each candidate plane is accepted only if the data
+misfit does not rise beyond the calibrated model-error floor eta. That makes the step
+self-rejecting: on a smooth body no plane is accepted and nothing happens.
 
 Constraints come last. The z-extent equality and the radius bound are restored as the final
 operation, after the snap, because the snap moves vertices and would otherwise break them.
@@ -34,8 +34,7 @@ def dice_volumes(occ_a: np.ndarray, occ_b: np.ndarray) -> float:
     return float(2.0 * inter / max(occ_a.sum() + occ_b.sum(), 1))
 
 
-def metric_medoid(occupancies, outlines=None, side_n_dirs: int = 36,
-                  side_res: int = 512, side_mode: str = "side") -> int:
+def metric_medoid(occupancies, outlines=None) -> int:
     """Index of the sample most central under the scored metrics, over the samples.
 
     The medoid is taken under the scored metrics themselves, not under a proxy, and it is
@@ -55,34 +54,29 @@ def metric_medoid(occupancies, outlines=None, side_n_dirs: int = 36,
     what the challenge does, and introduces no free parameter.
 
     `outlines` is an optional list of surface-point arrays, one per sample, in the same order
-    as `occupancies`. Without it this reduces to the volume-only medoid. The side-view
-    settings are passed through to hac26.scoring.side_view.side_view_measure.
+    as `occupancies`. Without it this reduces to the volume-only medoid.
     """
     s = len(occupancies)
     if s == 1:
         return 0
-    if outlines is not None and len(outlines) != s:
-        raise ValueError(f"got {len(outlines)} outlines for {s} occupancy grids")
-
     mean_dice = np.zeros(s)
     for i in range(s):
-        for j in range(i + 1, s):
-            d = dice_volumes(occupancies[i], occupancies[j])
-            mean_dice[i] += d
-            mean_dice[j] += d
-    mean_dice /= (s - 1)
+        acc = 0.0
+        for j in range(s):
+            if i != j:
+                acc += dice_volumes(occupancies[i], occupancies[j])
+        mean_dice[i] = acc / (s - 1)
     if outlines is None:
         return int(np.argmax(mean_dice))
 
     from hac26.scoring.side_view import side_view_measure
     mean_bd = np.zeros(s)
     for i in range(s):
-        for j in range(i + 1, s):
-            bd = side_view_measure(outlines[i], outlines[j], n_dirs=side_n_dirs,
-                                   res=side_res, mode=side_mode)["assd_mean"]
-            mean_bd[i] += bd
-            mean_bd[j] += bd
-    mean_bd /= (s - 1)
+        acc = 0.0
+        for j in range(s):
+            if i != j:
+                acc += side_view_measure(outlines[i], outlines[j])["assd_mean"]
+        mean_bd[i] = acc / (s - 1)
 
     # rank 0 = best under each measure; Dice high is good, boundary distance low is good
     r_dice = np.argsort(np.argsort(-mean_dice))
