@@ -420,8 +420,9 @@ class LibrarySpec:
     radius: float = 1.0
     convexity_max: float = 0.98          # volume / hull volume must fall below this
     base_weights: dict = _dcfield(default_factory=lambda: {
-        "star_sh": 0.20, "ellipsoid": 0.10, "polytope": 0.12, "lobes": 0.18,
-        "prism": 0.12, "rubble": 0.14, "arch": 0.06, "slab": 0.08})
+        "star_sh": 0.17, "ellipsoid": 0.08, "polytope": 0.10, "lobes": 0.15,
+        "prism": 0.10, "rubble": 0.12, "arch": 0.05, "slab": 0.07,
+        "contact_binary": 0.16})
     n_modifiers: tuple = (2, 6)          # inclusive range, drawn per body
     mod_weights: dict = _dcfield(default_factory=lambda: {
         "craters": 0.18, "pitted": 0.10, "basin": 0.12, "cuts": 0.14, "groove": 0.10,
@@ -464,6 +465,24 @@ def _base(rng: np.random.Generator, kind: str, s: float) -> tuple:
         u /= np.linalg.norm(u, axis=1, keepdims=True)
         d = s * rng.uniform(0.55, 1.15, n)
         return sd_convex(u, d), {"n_planes": n}
+    if kind == "contact_binary":
+        # Two ellipsoids forced APART, with the fillet capped low. `lobes` cannot produce this
+        # shape: its centres are drawn N(0,I) * U(0.25,0.55) against semi-axes U(0.35,0.75),
+        # so the components fuse, and op_smooth_union with a fillet up to 0.18 fills whatever
+        # crease survives. Measured over the library as shipped, the MEDIAN body has a neck
+        # ratio of about 1.0 -- deep necks exist only in the tail -- while a deep central cut
+        # is exactly what the hard public body needs. Separation >= 0.9 (a1x + a2x) puts the
+        # components at or past tangency, so the waist is a real pinch rather than a dimple.
+        a1 = s * rng.uniform(0.42, 0.62, 3)
+        a2 = s * rng.uniform(0.34, 0.55, 3)
+        sep = rng.uniform(0.90, 1.02) * (a1[0] + a2[0])
+        k_fill = float(rng.uniform(0.01, 0.05))
+        u = rng.normal(size=3); u /= np.linalg.norm(u)
+        c = 0.5 * sep * u
+        f = op_smooth_union(sd_ellipsoid(centre=-c, axes=a1, rot=R),
+                            sd_ellipsoid(centre=c, axes=a2, rot=R), k=k_fill)
+        return f, {"axes1": a1.tolist(), "axes2": a2.tolist(),
+                   "separation": float(sep), "fillet": k_fill}
     if kind == "lobes":
         k = int(rng.integers(2, 5))
         fs, cs = [], []
@@ -643,10 +662,14 @@ def sample_body(rng: np.random.Generator, spec: LibrarySpec | None = None) -> Bo
     """
     spec = spec or LibrarySpec()
     last = None
+    # Drawn ONCE, outside the retry loop. Redrawing it per attempt biases the realised base
+    # distribution towards whatever survives the non-convexity gate first: measured, prism
+    # fell from its nominal 0.12 to 0.037 and polytope rose from 0.12 to 0.225, while
+    # write_report printed base_weights as though it had been honoured.
+    base_kind = _draw(spec.base_weights, rng)
     for attempt in range(spec.max_attempts):
         strength = 1.0 + 0.25 * attempt
         s = 1.0
-        base_kind = _draw(spec.base_weights, rng)
         f, rec = _base(rng, base_kind, s)
         recipe = {"base": base_kind, **rec, "mods": []}
         n_mod = int(rng.integers(spec.n_modifiers[0], spec.n_modifiers[1] + 1))

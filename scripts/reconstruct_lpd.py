@@ -34,18 +34,26 @@ from hac26.solvers.lpd_flow import N_MODES, N_STEPS, LPDFlow         # noqa: E40
 from hac26.solvers.output import (export_stl, metric_medoid, planar_snap,      # noqa: E402
                           ransac_planes, restore_constraints)
 from hac26.covariance import load_covariance, whitened_misfit          # noqa: E402
-from hac26.recon import dice                                           # noqa: E402
+from hac26.recon import dice, fit_to_cylinder                          # noqa: E402
 from hac26.scoring.voxel import occupancy as _occupancy           # noqa: E402
-from hac26.shapes import mesh_support, rescale_touch_z                 # noqa: E402
+from hac26.shapes import canonicalize_r, mesh_support, rescale_touch_z   # noqa: E402
 from hac26.forward.learned_surrogate import Surrogate                                  # noqa: E402
-from train_lpd import (curves_from_code, curves_from_mesh,             # noqa: E402
-                       load_decoder, set_code)                        # noqa: E402
+from train_lpd import (cond_channels, curves_from_code, curves_from_mesh,   # noqa: E402
+                       set_code)                                      # noqa: E402
 
 CYLINDER_R = {1: 1.12, 2: 1.42, 3: 0.88, 4: 1.475, 5: 1.22,
               6: 0.925, 7: 1.205, 8: 1.24, 9: 0.67, 10: 3.95}
 PUBLIC = {1: "AsteroidModel01_shape_public/asteroid1.stl",
           2: "AsteroidModel02_shape_public/asteroid2.stl",
           3: "AsteroidModel03_shape_public/asteroid3.stl"}
+
+SPREAD_MAX = 0.95   # mean Dice of the OFF-MEDOID draws against the medoid, above which the
+                    # draws are one body rather than a posterior. Gated on the off-medoid mean
+                    # and not on `spread`, which includes the medoid's Dice against itself and
+                    # is therefore sample-count dependent (at 2 draws `spread > 0.95` needs
+                    # 0.900, at 16 it needs 0.947). The committed runs sat at 0.991-0.994 with
+                    # a token correction that was identically zero; a live channel has to
+                    # disagree with itself somewhere.
 
 
 def data_modes(curves56: np.ndarray, n_modes: int):
@@ -73,43 +81,52 @@ def support_from_convex(stl: str) -> torch.Tensor:
     It does not follow that h is a sphere: it has to come from somewhere, and the convex
     stage already predicts it from these same 56 curves. Evaluated on the design normals,
     which is the basis ConvexCore stores its support in.
+
+    CANONICALISED first. The convex stage writes its STL in the physical frame -- z in [-1,1]
+    but xy already scaled to the published R by `fit_to_cylinder` (scripts/eval_exact.py) --
+    while the corpus the code was fitted against is posed at xy r_max = 1. Support is a
+    max over vertices, so it does not transform under an anisotropic scale by any scalar; the
+    vertices have to be canonicalised and h recomputed. See hac26/shapes.py::canonicalize_r,
+    which states the convention this restores:
+        train target : canonicalize_r(hull)              r_max = 1
+        test  output : fit_to_cylinder(prediction, R)    r_max = R
     """
     import trimesh
     m = trimesh.load(stl, process=False)
+    v = canonicalize_r(rescale_touch_z(np.asarray(m.vertices)))
     n = ImplicitBody(radius=1.0).core.n.detach().cpu().numpy()
-    h = mesh_support(np.asarray(m.vertices), n)
+    h = mesh_support(v, n)
     return torch.tensor(np.maximum(h, 1e-3), dtype=torch.float32)
 
 
-def make_resid_fn(g_dat, surro, psi, M, radius, support=None,
-                  decoder_path="runs/token_decoder.pt"):
-    """resid_fn(code) -> (residual, convex complement), with the operator actually applied."""
-    def fn(x):
+def make_resid_fn(net, g_dat, surro, psi, M, radius, support=None):
+    """resid_fn(z, t) -> (residual features, sphere channels, volume channels).
+
+    `z` is the flow's WHITENED code; it is decoded here, so nothing in the sampling loop has
+    to know which space it is holding. `support` is the BASE h from the convex stage; the
+    code's dh block corrects it, exactly as the perturbation did during training.
+    """
+    sph0, vol0 = cond_channels(support)
+    def fn(z, t):
+        raw = net.codec.decode(z.detach())
         preds = []
-        for b in range(len(x)):
-            cur = curves_from_code(x[b].detach(), radius, surro, psi, support=support,
-                                   decoder_path=decoder_path)
+        for b in range(len(z)):
+            cur = curves_from_code(raw[b], radius, surro, psi, support=support)
             preds.append(torch.zeros(28, 2, len(psi)) if cur is None else cur)
         g_cur = torch.fft.rfft(torch.stack(preds), dim=-1)[..., 1:M + 1]
         r = g_dat.expand_as(g_cur) - g_cur
-        r_perp = r.clone()
-        r_perp[..., :4] = 0            # the convex operator explains the low orders best
-        B = len(x)
+        B = len(z)
         feats = torch.zeros(B, 28, N_MODES, 6)
-        perp = torch.zeros(B, 28, N_MODES, 6)
         for ch in range(2):
             feats[:, :, :M, 2 * ch] = r[:, :, ch].real
             feats[:, :, :M, 2 * ch + 1] = r[:, :, ch].imag
-            perp[:, :, :M, 2 * ch] = r_perp[:, :, ch].real
-            perp[:, :, :M, 2 * ch + 1] = r_perp[:, :, ch].imag
         feats[:, :, :M, 4] = g_dat[:, :, 0].real.expand(B, -1, -1)
         feats[:, :, :M, 5] = g_dat[:, :, 1].real.expand(B, -1, -1)
-        return feats, perp
+        return feats, sph0.expand(B, -1, -1), vol0.expand(B, -1, -1, -1, -1)
     return fn
 
 
-def decode(code, radius, res=64, misfit_fn=None, eta=None, support=None,
-           decoder_path="runs/token_decoder.pt", snap: bool = False,
+def decode(code, radius, res=64, misfit_fn=None, eta=None, support=None, snap: bool = False,
            snap_planes: int = 12, snap_tol: float = 0.02,
            snap_min_frac: float = 0.02):
     """Token code -> constrained mesh, with optional planar snapping."""
@@ -123,8 +140,7 @@ def decode(code, radius, res=64, misfit_fn=None, eta=None, support=None,
             raise ValueError(f"support has {h.numel()} entries, but this field uses "
                              f"{n_norm} normals; rerun the convex/support stage after "
                              "changing DESIGN_N")
-    body.core.set_support(h)
-    load_decoder(body, path=decoder_path)
+    body.set_support(h)
     set_code(body, code)
     v, f = extract_mesh(lambda y: body(y), radius * 1.6, res=res, device="cpu")
     if len(f) < 8:
@@ -146,13 +162,21 @@ def occupancy(v, f, n=64, extent=None):
     return _occupancy(v, f, n, extent or float(np.abs(v).max()) * 1.05)
 
 
+def _enable_tf32():
+    """TF32 on the matmul path. The operator's field evaluation is (points x normals) and
+    (points x sites) matmuls at about three decimal places of useful precision; TF32 keeps ten
+    bits of mantissa, which is more than the surrogate's own accuracy, and is several times
+    faster on any Ampere-or-later GPU. No effect on CPU or on older cards."""
+    if torch.cuda.is_available():
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", type=int, required=True)
     ap.add_argument("--ckpt", default="runs/lpd_flow.pt")
     ap.add_argument("--surrogate", default="runs/surrogate.pt")
-    ap.add_argument("--decoder-file", default="runs/token_decoder.pt",
-                    help="output of scripts/fit_shapes.py --decoder")
     ap.add_argument("--data-dir", default="dataset/raw")
     ap.add_argument("--samples", type=int, default=8)
     ap.add_argument("--phases", type=int, default=96)
@@ -176,6 +200,7 @@ def main():
                     help="STL whose support function supplies h; defaults to the convex "
                          "stage's reconstruction of this model")
     a = ap.parse_args()
+    _enable_tf32()
     if not a.medoid_volume_only and a.medoid_side_points <= 0:
         raise SystemExit("--medoid-side-points must be positive unless --medoid-volume-only "
                          "is set")
@@ -214,9 +239,16 @@ def main():
     tag, mask = geom_tag_and_mask(d["mask"])
     print(f"model {a.model}: R = {R}, {int(mask.sum())}/28 geometries present", flush=True)
 
+    # The whole inversion runs in the CANONICAL frame (xy r_max = 1), which is the frame the
+    # corpus was fitted in (fit_shapes.py builds every body at radius=1.0) and the frame the
+    # operator was trained in (train_lpd.py calls curves_from_code(code, 1.0, ...)). The width
+    # is restored from the published R afterwards, by fit_to_cylinder -- exactly the split
+    # hac26/shapes.py::canonicalize_r describes and scripts/eval_exact.py already uses for the
+    # convex path. Decoding at radius=R instead left the token positions in canonical units
+    # inside a body R times wider while sigma and s were scaled by R, so at R=3.95 all 32
+    # tokens sat in the inner 18% of the width with sigma ~ the entire z half-height.
     t0 = time.time()
-    codes = net.sample(make_resid_fn(g_dat, surro, psi, M, R, support=support,
-                                     decoder_path=a.decoder_file),
+    codes = net.sample(make_resid_fn(net, g_dat, surro, psi, M, 1.0, support=support),
                        tag.expand(a.samples, -1, -1), mask.expand(a.samples, -1),
                        batch=a.samples)
     print(f"  {a.samples} draws x {N_STEPS} steps in {time.time()-t0:.0f}s", flush=True)
@@ -246,14 +278,16 @@ def main():
             return float(((c - real_g) ** 2).mean().sqrt())
         return float(whitened_misfit(pred56, real, COV["s2"]))
 
+    raw_codes = net.codec.decode(codes)     # out of the flow's whitened space, once
     meshes, occs, snaps = [], [], []
     for i in range(a.samples):
-        v, f, kept = decode(codes[i], R, res=a.res, misfit_fn=misfit, eta=eta,
-                            support=support, decoder_path=a.decoder_file,
+        v, f, kept = decode(raw_codes[i], 1.0, res=a.res, misfit_fn=misfit, eta=eta,
+                            support=support,
                             snap=a.snap, snap_planes=a.snap_planes,
                             snap_tol=a.snap_tol, snap_min_frac=a.snap_min_frac)
         if v is None:
             print(f"  draw {i}: degenerate, dropped", flush=True); continue
+        v = fit_to_cylinder(v, R)            # canonical -> physical, xy only, z untouched
         meshes.append((v, f)); occs.append(occupancy(v, f)); snaps.append(kept)
     if not meshes:
         raise SystemExit("every draw was degenerate")
@@ -281,13 +315,29 @@ def main():
         print(f"  planes accepted per draw (eta = {eta:.4f}): {snaps}", flush=True)
     else:
         print("  planar snap disabled", flush=True)
+    spread = float(np.mean([dice(occs[k], o) for o in occs]))   # includes the self-term, 1.0
+    off = ([dice(occs[k], o) for j, o in enumerate(occs) if j != k] or [0.0])
+    spread_off = float(np.mean(off))
     print(f"  medoid = draw {k} of {len(meshes)} by {medoid_metric}; "
-          f"mean pairwise Dice {np.mean([dice(occs[k], o) for o in occs]):.4f}", flush=True)
+          f"mean Dice to medoid {spread_off:.4f}", flush=True)
+
+    collapsed = len(meshes) > 1 and spread_off > SPREAD_MAX
+    if collapsed:
+        print(f"\n  *** WARNING: mean Dice to the medoid {spread_off:.4f} > {SPREAD_MAX}: "
+              f"the draws "
+              f"are the same body.\n"
+              f"      A posterior this tight is not confidence, it is a dead channel. The "
+              f"usual cause is a\n"
+              f"      correction that is identically zero, which makes every draw "
+              f"exactly the convex core;\n"
+              f"      rerun scripts/fit_shapes.py and check its [check] line. The STL below "
+              f"is still written.\n", flush=True)
 
     Path(a.out).parent.mkdir(parents=True, exist_ok=True)
     info = export_stl(a.out, v, f)
     res = {"model": a.model, "radius": R, "draws": len(meshes), "medoid": int(k),
-           "spread": float(np.mean([dice(occs[k], o) for o in occs])),
+           "spread": spread, "spread_off_medoid": spread_off,
+           "collapsed": bool(collapsed),
            "medoid_metric": medoid_metric,
            "medoid_volume_only": bool(a.medoid_volume_only),
            "medoid_side_points": 0 if a.medoid_volume_only else int(a.medoid_side_points),

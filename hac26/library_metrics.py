@@ -37,8 +37,16 @@ __all__ = ["participation_ratio", "spectrum", "descriptor_support", "descriptor_
            "check_body", "check_library", "design_normals"]
 
 
-def design_normals(n: int = 64) -> np.ndarray:
-    """The spherical design the solver's convex core is defined on."""
+def design_normals(n: int = 256) -> np.ndarray:
+    """A spherical design for the descriptors below.
+
+    NOT DESIGN_N. These are library statistics, not the solver's core: the participation
+    ratio of the support descriptor is capped by this count, so it has to be large enough to
+    resolve the structure being measured, but generating DESIGN_N = 4096 here would cost a
+    15-hour build for a diagnostic. The default was 64, which capped PR(support) at 64 while
+    the docstring claimed it was "the design the solver's convex core is defined on" -- it
+    was not, and the cap was reached in practice.
+    """
     p = Path(__file__).with_name(f"design{n}.npy")
     if p.exists():
         return np.load(p)
@@ -77,12 +85,14 @@ def descriptor_support(verts: np.ndarray, normals: np.ndarray | None = None) -> 
 def descriptor_concavity(verts: np.ndarray, faces: np.ndarray,
                          probes: np.ndarray, normals: np.ndarray | None = None,
                          res: int = 64, extent: float = 1.35) -> np.ndarray:
-    """f_body(y) - f_core(y) at fixed probe points: what the token field has to carry.
+    """f_body(y) - f_core(y) at fixed probe points: what the correction has to carry.
 
-    `TokenField` is fitted to exactly this difference -- the convex core explains f_core and
-    Delta makes up the rest -- so the spread of this vector across a library bounds how many
-    dimensions the token code can possibly need. Computed from the body's own occupancy by a
-    distance transform, so it needs neither torch nor trimesh.
+    `GaussianLattice` is fitted to exactly this difference -- the convex core explains f_core
+    and Delta makes up the rest. The lattice has a FIXED N_SITES amplitudes regardless of what
+    any body needs, so this no longer bounds a code dimension; what it bounds is whether that
+    many amplitudes, at the lattice spacing, can express the concavity a library actually
+    contains. Computed from the body's own occupancy by a distance transform, so it needs
+    neither torch nor trimesh.
     """
     n = design_normals() if normals is None else np.asarray(normals, float)
     h = descriptor_support(verts, n)

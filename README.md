@@ -11,7 +11,6 @@ Previous corpus came from mesh booleans, which produced bodies that are two inte
 - hac26/shape_library.py, curves_mesh.py, library_io.py, library_metrics.py: generation, mesh extraction, on-disk format and the acceptance metrics.
 - scripts/build_shape_library.py: parallel, resumable generation to disk.
 - scripts/fit_shapes.py: --shapes-dir to draw the corpus from a built library instead of train_surrogate.shapes().
-- Thread --decoder-file through train_lpd, reconstruct_lpd and ablate_flow so a run is not pinned to runs/token_decoder.pt.
 - scripts/_venv_setup.sh, run_remote_pipeline.sh, run_smoke_test.sh, validate_generation.py: remote run plumbing and generation checks.
 
 Surrogate trained on: 

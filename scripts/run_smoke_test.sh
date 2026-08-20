@@ -19,7 +19,7 @@
 # clobbering it.
 #
 # What this DOES prove: the shape library builds valid, non-convex, single-component bodies;
-# fit_shapes.py can fit an autodecoder against them; train_lpd.py can train against that
+# fit_shapes.py can fit codes against them; train_lpd.py can train against that
 # corpus; the flow checkpoint that comes out loads and runs in reconstruct_lpd.py.
 #
 # What this does NOT prove: that the results are any good. 16 bodies, 20 steps, and (unless
@@ -84,12 +84,12 @@ else
 fi
 tail -5 logs/smoke_design.log
 
-log "=== 3/5 fit_shapes: autodecoder over the smoke library"
+log "=== 3/5 fit_shapes: per-body fit over the smoke library"
 run "fit_shapes" logs/smoke_fit.log \
   "$PY" scripts/fit_shapes.py \
     --bodies "$N_BODIES" --shapes-dir "$LIB_DIR" \
     --steps "$FIT_STEPS" --batch 2 --workers "$FIT_WORKERS" --points "$FIT_POINTS" \
-    --out "$OUT/corpus_codes.npz" --decoder "$OUT/token_decoder.pt"
+    --out "$OUT/corpus_codes.npz"
 tail -20 logs/smoke_fit.log
 
 if [ ! -f runs/surrogate.pt ]; then
@@ -106,7 +106,7 @@ run "train_lpd" logs/smoke_flow.log \
     --val-bodies 2 --val-every 10 --patience 2 \
     --ckpt-every 10 --log-every 5 --no-resume \
     --operator-res "$FLOW_OPERATOR_RES" \
-    --codes-file "$OUT/corpus_codes.npz" --decoder-file "$OUT/token_decoder.pt" \
+    --codes-file "$OUT/corpus_codes.npz" \
     --cache-tag smoke \
     --out "$OUT/lpd_flow.pt"
 tail -20 logs/smoke_flow.log
@@ -116,7 +116,7 @@ if [ -d dataset/raw ] && [ -f runs/surrogate.pt ]; then
   mkdir -p results/smoke
   run "reconstruct_lpd" logs/smoke_reconstruct.log \
     "$PY" scripts/reconstruct_lpd.py --model 1 --samples 1 --res 24 \
-      --ckpt "$OUT/lpd_flow.pt" --decoder-file "$OUT/token_decoder.pt" \
+      --ckpt "$OUT/lpd_flow.pt" \
       --medoid-volume-only --out results/smoke/Asteroid01.stl
   tail -20 logs/smoke_reconstruct.log
   log "    wrote results/smoke/Asteroid01.stl"

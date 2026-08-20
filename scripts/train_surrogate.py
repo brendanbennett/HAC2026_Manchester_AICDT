@@ -133,7 +133,7 @@ def features_for(v, f, psi, n_tokens=600, seed=0):
     # construction -- its inputs are mu, mu0 and visibility, which already encode where the
     # camera is -- so one network serves all 28, and training it on all of them is what
     # makes it valid off azimuth 0. Conditioning the LPD on a single geometry gives the dual
-    # 160 numbers to determine 608 code dimensions, and the flow correspondingly learned
+    # 160 numbers to determine 1856 code dimensions, and the flow correspondingly learned
     # 5.4% of the target variance.
     sun_d = np.stack([to_body(S_LAB, np.array([p]))[0] for p in psi])
     out = []
@@ -164,8 +164,8 @@ def main():
                          "loss swung 0.067-0.195 between logged steps purely\n"
                          "from that. Accumulation buys a larger EFFECTIVE batch\n"
                          "without the attention memory a larger real one needs.")
-    ap.add_argument("--width", type=int, default=96)
-    ap.add_argument("--blocks", type=int, default=3)
+    ap.add_argument("--width", type=int, default=64)
+    ap.add_argument("--blocks", type=int, default=2)
     ap.add_argument("--modes", type=int, default=8)
     ap.add_argument("--rho", type=float, default=0.85,
                     help="albedo of the reference. The surrogate sees one\n"

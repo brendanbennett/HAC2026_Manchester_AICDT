@@ -10,9 +10,9 @@ import numpy as np
 import pytest
 import torch
 
-from hac26.field import (CORE_SCALE, DESIGN_N, DESIGN_T, TOKEN_SIGMA_FRAC, ConvexCore,
-                         ImplicitBody, TokenField, _design_residual, apply_constraints,
-                         extract_mesh, spherical_design)
+from hac26.field import (DESIGN_ITERS, DESIGN_N, DESIGN_T, LATTICE_EXTENT, N_SITES,
+                         ConvexCore, GaussianLattice, ImplicitBody, _design_residual,
+                         apply_constraints, design_sha, extract_mesh, spherical_design)
 
 A = 1.0            # cube half-side
 RES = 128
@@ -72,29 +72,86 @@ def test_core_h_is_non_negative():
     assert (core.h >= 0).all()
 
 
-# ------------------------------------------------------------------ the token field
+# ------------------------------------------------------------------ the correction
 
-def test_token_field_is_signed_and_zero_mean():
+def test_correction_is_signed_and_adds_where_kernels_overlap():
+    """The predecessor's softmax weights summed to one, so co-located tokens AVERAGED: you
+    could not carve deeper by clustering. Amplitudes on a fixed lattice add."""
+    gl = GaussianLattice()
+    with torch.no_grad():
+        gl.g.zero_()
+        near = torch.cdist(gl.p, torch.zeros(1, 3))[:, 0].argsort()[:8]
+        gl.g[near] = 0.1
+    d_one = float(gl(torch.zeros(1, 3)))
+    with torch.no_grad():
+        gl.g[near] = 0.2
+    assert float(gl(torch.zeros(1, 3))) == pytest.approx(2 * d_one, rel=1e-5)
+    with torch.no_grad():
+        gl.g[near[:4]] = -0.2
+    d = gl(torch.randn(256, 3) * 0.5)
+    assert float(d.min()) < 0 < float(d.max())          # signed: it grows as well as carves
+
+
+def test_correction_does_not_depend_on_the_query_batch():
+    """Delta must be a function of y alone. The predecessor ended `out - out.mean()`, the mean
+    over the call's own points, so extract_mesh -- which evaluates the grid in chunks of
+    262144 -- subtracted a different constant from each chunk and the extracted surface
+    stepped at the boundaries by 0.84 of a grid cell at res=128."""
     torch.manual_seed(0)
-    tf = TokenField(radius=1.0)
-    for p in tf.parameters():
-        with torch.no_grad():
-            p.copy_(torch.randn_like(p) * 0.5)
-    y = torch.randn(512, 3) * 0.6
-    d = tf(y)
-    assert abs(float(d.mean())) < 1e-5          # zero-mean by construction
-    assert float(d.min()) < 0 < float(d.max())  # signed: it grows as well as carves
+    gl = GaussianLattice()
+    with torch.no_grad():
+        gl.g.normal_(0, 0.1)
+    y = torch.randn(3000, 3) * 0.5
+    parts = torch.cat([gl(y[:2000]), gl(y[2000:])])
+    assert float((gl(y) - parts).abs().max()) < 1e-6
 
 
-def test_token_sigma_is_fixed_not_learned():
-    tf = TokenField(radius=2.0)
-    assert tf.sigma == pytest.approx(TOKEN_SIGMA_FRAC * 2.0)
-    assert not any(n.endswith("sigma") for n, _ in tf.named_parameters())
+def test_the_lattice_is_fixed_and_never_travels_with_a_checkpoint():
+    """`g` is the code; the sites and widths are constants of the representation. If they were
+    persistent, a saved state would silently redefine another body's lattice."""
+    gl = GaussianLattice()
+    assert [n for n, _ in gl.named_parameters()] == ["g"]
+    assert list(gl.state_dict().keys()) == ["g"]
+    assert gl.g.numel() == N_SITES
+    assert float(gl.p.abs().max()) < LATTICE_EXTENT          # cell centres, not corners
 
 
-def test_core_scale_is_fixed():
-    b = ImplicitBody(radius=2.0)
-    assert b.s == pytest.approx(CORE_SCALE * 2.0)
+def test_dh_is_band_limited_whatever_the_flow_emits():
+    """An out-of-band dh kills facets, and a dead facet has an exactly zero row in the area
+    Jacobian -- no gradient at all, not merely a bad one. The limit is structural.
+
+    Exactly band-limited in the ARGUMENT of the softplus; approximately so in h itself,
+    because d/dx softplus = sigmoid is not constant and h varies across normals. Measured, the
+    induced change in h carries about 5% out-of-band content at any realistic dh scale, which
+    is first-order and does not shrink with the perturbation -- far below the fully-white dh
+    that kills 7% of facets at N=128, but not zero, and worth knowing it is not zero.
+    """
+    n = spherical_design(64)
+    body = ImplicitBody(radius=1.0, normals=n)
+    body.set_support(torch.tensor(cube_support(n), dtype=torch.float32))
+    from hac26.field import _real_sh
+    y5 = torch.tensor(_real_sh(n, 5), dtype=torch.float32)
+    torch.manual_seed(0)
+    with torch.no_grad():
+        body.dh.normal_(0, 0.02)
+        arg = body.dh_expand @ body.dh                       # the argument: exactly band-limited
+        moved = body.support() - body.core.h                 # h itself: approximately so
+    r_arg = arg - y5 @ torch.linalg.lstsq(y5, arg).solution
+    assert float(r_arg.norm() / arg.norm()) < 1e-4
+    r_h = moved - y5 @ torch.linalg.lstsq(y5, moved).solution
+    assert float(r_h.norm() / moved.norm()) < 0.10
+    assert bool((body.support() > 0).all())                  # positivity is automatic
+
+
+def test_every_parameter_block_receives_gradient():
+    """The bug this replaces: h became unreachable from the loss while the fit still reported
+    a falling number. Assert the loss can move all three blocks."""
+    n = spherical_design(64)
+    body = ImplicitBody(radius=1.0, normals=n)
+    body.set_support(torch.tensor(cube_support(n), dtype=torch.float32))
+    (body(torch.randn(512, 3) * 0.5) ** 2).mean().backward()
+    for name, prm in body.named_parameters():
+        assert prm.grad is not None and float(prm.grad.abs().max()) > 0, f"{name} is dead"
 
 
 # ------------------------------------------------------------------ constraints
@@ -122,10 +179,11 @@ def test_cube_extraction_is_planar_and_matches():
     """Encode a cube with h alone, tokens zero, extract at 128^3."""
     n = spherical_design()
     body = ImplicitBody(radius=A * np.sqrt(2.0), normals=n)
-    body.core.set_support(torch.tensor(cube_support(n), dtype=torch.float32))
-
-    extent = A * 1.6
-    verts, faces = extract_mesh(lambda y: body(y, use_tokens=False), extent, res=RES)
+    body.set_support(torch.tensor(cube_support(n), dtype=torch.float32))
+    # g and dh at zero, so this is the core alone -- the correction is switched off by being
+    # zero rather than by a flag, because a flag nothing else passes is dead API surface.
+    extent = LATTICE_EXTENT + 0.5
+    verts, faces = extract_mesh(lambda y: body(y), extent, res=RES)
     assert len(verts) > 0 and len(faces) > 0
 
     cell = 2.0 * extent / RES

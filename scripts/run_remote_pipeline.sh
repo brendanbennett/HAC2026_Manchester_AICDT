@@ -49,7 +49,7 @@ set -uo pipefail
 cd "$(dirname "$0")/.."
 
 # ---------------------------------------------------------------- configuration
-N_BODIES=${N_BODIES:-1000}
+N_BODIES=${N_BODIES:-600}
 LIB_SEED=${LIB_SEED:-0}
 LIB_WORKERS=${LIB_WORKERS:-$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 2)}
 LIB_RES=${LIB_RES:-64}
@@ -122,24 +122,24 @@ stage_signature() {
       printf 'stage=surrogate\nDATA_DIR=%s\nSURROGATE=default\n' "$DATA_DIR"
       ;;
     fit)
-      printf 'stage=fit\nN_BODIES=%s\nLIB_DIR=%s\nLIB_SEED=%s\nLIB_RES=%s\nDESIGN_N=%s\nFIT_STEPS=%s\nFIT_BATCH=%s\nFIT_POINTS=%s\nCODES_FILE=%s\nDECODER_FILE=%s\n' \
+      printf 'stage=fit\nN_BODIES=%s\nLIB_DIR=%s\nLIB_SEED=%s\nLIB_RES=%s\nDESIGN_N=%s\nFIT_STEPS=%s\nFIT_BATCH=%s\nFIT_POINTS=%s\nCODES_FILE=%s\n' \
         "$N_BODIES" "$LIB_DIR" "$LIB_SEED" "$LIB_RES" "$DESIGN_N" "$FIT_STEPS" \
-        "$FIT_BATCH" "$FIT_POINTS" "$CODES_FILE" "$DECODER_FILE"
+        "$FIT_BATCH" "$FIT_POINTS" "$CODES_FILE"
       ;;
     flow)
-      printf 'stage=flow\nN_BODIES=%s\nLIB_DIR=%s\nLIB_SEED=%s\nLIB_RES=%s\nDESIGN_N=%s\nFIT_STEPS=%s\nFIT_BATCH=%s\nFIT_POINTS=%s\nFLOW_STEPS=%s\nFLOW_PHASES=%s\nFLOW_BATCH=%s\nFLOW_VAL_BODIES=%s\nFLOW_VAL_EVERY=%s\nFLOW_PATIENCE=%s\nFLOW_CKPT_EVERY=%s\nFLOW_CKPT=%s\nFLOW_LOG_EVERY=%s\nFLOW_OPERATOR_RES=%s\nFLOW_TRAIN_GEOMS=%s\nCODES_FILE=%s\nDECODER_FILE=%s\n' \
+      printf 'stage=flow\nN_BODIES=%s\nLIB_DIR=%s\nLIB_SEED=%s\nLIB_RES=%s\nDESIGN_N=%s\nFIT_STEPS=%s\nFIT_BATCH=%s\nFIT_POINTS=%s\nFLOW_STEPS=%s\nFLOW_PHASES=%s\nFLOW_BATCH=%s\nFLOW_VAL_BODIES=%s\nFLOW_VAL_EVERY=%s\nFLOW_PATIENCE=%s\nFLOW_CKPT_EVERY=%s\nFLOW_CKPT=%s\nFLOW_LOG_EVERY=%s\nFLOW_OPERATOR_RES=%s\nFLOW_TRAIN_GEOMS=%s\nCODES_FILE=%s\n' \
         "$N_BODIES" "$LIB_DIR" "$LIB_SEED" "$LIB_RES" "$DESIGN_N" "$FIT_STEPS" \
         "$FIT_BATCH" "$FIT_POINTS" "$FLOW_STEPS" "$FLOW_PHASES" "$FLOW_BATCH" \
         "$FLOW_VAL_BODIES" "$FLOW_VAL_EVERY" "$FLOW_PATIENCE" "$FLOW_CKPT_EVERY" \
         "$FLOW_CKPT" "$FLOW_LOG_EVERY" \
-        "$FLOW_OPERATOR_RES" "$FLOW_TRAIN_GEOMS" "$CODES_FILE" "$DECODER_FILE"
+        "$FLOW_OPERATOR_RES" "$FLOW_TRAIN_GEOMS" "$CODES_FILE"
       ;;
     reconstruct)
-      printf 'stage=reconstruct\nDESIGN_N=%s\nFLOW_STEPS=%s\nFLOW_PHASES=%s\nFLOW_BATCH=%s\nFLOW_OPERATOR_RES=%s\nFLOW_TRAIN_GEOMS=%s\nRECON_SAMPLES=%s\nRECON_RES=%s\nRECON_SNAP=%s\nMEDOID_VOLUME_ONLY=%s\nMEDOID_SIDE_POINTS=%s\nMEDOID_SIDE_DIRS=%s\nMEDOID_SIDE_RES=%s\nMEDOID_SIDE_MODE=%s\nDECODER_FILE=%s\n' \
+      printf 'stage=reconstruct\nDESIGN_N=%s\nFLOW_STEPS=%s\nFLOW_PHASES=%s\nFLOW_BATCH=%s\nFLOW_OPERATOR_RES=%s\nFLOW_TRAIN_GEOMS=%s\nRECON_SAMPLES=%s\nRECON_RES=%s\nRECON_SNAP=%s\nMEDOID_VOLUME_ONLY=%s\nMEDOID_SIDE_POINTS=%s\nMEDOID_SIDE_DIRS=%s\nMEDOID_SIDE_RES=%s\nMEDOID_SIDE_MODE=%s\n' \
         "$DESIGN_N" "$FLOW_STEPS" "$FLOW_PHASES" "$FLOW_BATCH" "$FLOW_OPERATOR_RES" \
         "$FLOW_TRAIN_GEOMS" "$RECON_SAMPLES" "$RECON_RES" "$RECON_SNAP" \
         "$MEDOID_VOLUME_ONLY" "$MEDOID_SIDE_POINTS" "$MEDOID_SIDE_DIRS" \
-        "$MEDOID_SIDE_RES" "$MEDOID_SIDE_MODE" "$DECODER_FILE"
+        "$MEDOID_SIDE_RES" "$MEDOID_SIDE_MODE"
       ;;
     score)
       printf 'stage=score\nDATA_DIR=%s\nRECON_DIR=results/lpd\nRECON_SAMPLES=%s\nRECON_RES=%s\nRECON_SNAP=%s\nMEDOID_VOLUME_ONLY=%s\nMEDOID_SIDE_POINTS=%s\nMEDOID_SIDE_DIRS=%s\nMEDOID_SIDE_RES=%s\nMEDOID_SIDE_MODE=%s\n' \
@@ -258,13 +258,12 @@ fi
 
 # ---------------------------------------------------------------- 6. per-body codes
 CODES_FILE=runs/corpus_codes.npz
-DECODER_FILE=runs/token_decoder.pt
 run_stage fit "$CODES_FILE" \
   $PY scripts/fit_shapes.py \
     --bodies "$N_BODIES" --shapes-dir "$LIB_DIR" --seed "$LIB_SEED" \
     --steps "$FIT_STEPS" --batch "$FIT_BATCH" --workers "$FIT_WORKERS" \
     --points "$FIT_POINTS" \
-    --out "$CODES_FILE" --decoder "$DECODER_FILE"
+    --out "$CODES_FILE"
 
 # ------------------------------------------------- 7a. carry the flow corpus across jobs
 # train_lpd.py's stage 1 applies the operator once per body -- a serial loop that is the
@@ -309,7 +308,7 @@ if [ ! -f "$TMP_CACHE" ] && [ -f "$KEEP_CACHE" ]; then
   # A cache built against different codes is worse than no cache: the key ignores
   # --codes-file and --bodies, so a refitted corpus would be trained against silently stale
   # curves. Mtimes settle it -- the cache has to be newer than the codes it was built from.
-  if [ "$CODES_FILE" -nt "$KEEP_CACHE" ] || [ "$DECODER_FILE" -nt "$KEEP_CACHE" ]; then
+  if [ "$CODES_FILE" -nt "$KEEP_CACHE" ] || [ -nt "$KEEP_CACHE" ]; then
     log "=== corpus cache: $KEEP_CACHE predates $CODES_FILE -- ignoring it, stage 1 rebuilds"
   elif cp -p "$KEEP_CACHE" "$TMP_CACHE"; then   # -p: same mtime, so the exit copy is a no-op
     log "=== corpus cache: seeded $TMP_CACHE from $KEEP_CACHE (stage 1 will be skipped)"
@@ -328,7 +327,7 @@ run_stage flow runs/lpd_flow.pt \
     --patience "$FLOW_PATIENCE" \
     --ckpt-every "$FLOW_CKPT_EVERY" --ckpt-file "$FLOW_CKPT" \
     --log-every "$FLOW_LOG_EVERY" \
-    --codes-file "$CODES_FILE" --decoder-file "$DECODER_FILE"
+    --codes-file "$CODES_FILE"
 
 # ---------------------------------------------------------------- 8. reconstruct all 10
 if should_run reconstruct; then
@@ -347,7 +346,7 @@ if should_run reconstruct; then
     fi
     log "  --- model $M -> $OUT (started $(date -u +%H:%M:%S))"
     RECON_ARGS=(--model "$M" --samples "$RECON_SAMPLES" --res "$RECON_RES"
-      --ckpt runs/lpd_flow.pt --decoder-file "$DECODER_FILE" --out "$OUT"
+      --ckpt runs/lpd_flow.pt --out "$OUT"
       --medoid-side-points "$MEDOID_SIDE_POINTS"
       --medoid-side-dirs "$MEDOID_SIDE_DIRS"
       --medoid-side-res "$MEDOID_SIDE_RES"
