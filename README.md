@@ -1,18 +1,3 @@
-# hac26
-KNOWN ISSUES ORDER OF URGENCY:
-- Flow Checkpoints: Currently corpus building (at current configuration takes 50s / body at 1000 bodies. This is not saved between corpus build and flow training or checkpointed throughout like surrogate building/training and is only saved when .stls are created . A failed flow training will not only lose the training but also the 14 hour corpus build.
-- No early stopping: 4000 (configurable) steps in flow training will run irregardless of convergence. This is is computationally costly as each step draws from two bodies (from the 1000 created in the corpus). This can take on the order of days even with no loss improvement.
-- Parallelisation: The remote pipeline has to run Curves_from_code which is called in a for loop = 50s (*1000 bodies in corpus building) + (2*50*4000 iterations in flow training). For Corpus building should be easily parallelisable as each body should be created independently, and some parallelisation is definitely possible in flow training as well.
-- Data download checksum fails
-
-UPDATE:
-Previous corpus came from mesh booleans, which produced bodies that are two interpenetrating closed surfaces; a signed distance sampled against such a mesh is not a signed distance, so the codes fitted to it were fitted to noise. Build the bodies as level sets on an occupancy grid instead, where connectedness, void freeness and closure are all decidable and repairable before any triangle exists, and marching cubes returns a closed oriented manifold by construction.
-
-- hac26/shape_library.py, curves_mesh.py, library_io.py, library_metrics.py: generation, mesh extraction, on-disk format and the acceptance metrics.
-- scripts/build_shape_library.py: parallel, resumable generation to disk.
-- scripts/fit_shapes.py: --shapes-dir to draw the corpus from a built library instead of train_surrogate.shapes().
-- scripts/_venv_setup.sh, run_remote_pipeline.sh, run_smoke_test.sh, validate_generation.py: remote run plumbing and generation checks.
-
 Surrogate trained on: 
 python scripts/train_surrogate.py --width 96 --blocks 3 --modes 8 --train 256 --held 16 --phases 32 --steps 6000
 
