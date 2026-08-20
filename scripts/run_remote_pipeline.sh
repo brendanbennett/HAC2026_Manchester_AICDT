@@ -49,7 +49,7 @@ set -uo pipefail
 cd "$(dirname "$0")/.."
 
 # ---------------------------------------------------------------- configuration
-N_BODIES=${N_BODIES:-600}
+N_BODIES=${N_BODIES:-1000}
 LIB_SEED=${LIB_SEED:-0}
 LIB_WORKERS=${LIB_WORKERS:-$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 2)}
 LIB_RES=${LIB_RES:-64}
@@ -308,7 +308,7 @@ if [ ! -f "$TMP_CACHE" ] && [ -f "$KEEP_CACHE" ]; then
   # A cache built against different codes is worse than no cache: the key ignores
   # --codes-file and --bodies, so a refitted corpus would be trained against silently stale
   # curves. Mtimes settle it -- the cache has to be newer than the codes it was built from.
-  if [ "$CODES_FILE" -nt "$KEEP_CACHE" ] || [ -nt "$KEEP_CACHE" ]; then
+  if [ "$CODES_FILE" -nt "$KEEP_CACHE" ]; then
     log "=== corpus cache: $KEEP_CACHE predates $CODES_FILE -- ignoring it, stage 1 rebuilds"
   elif cp -p "$KEEP_CACHE" "$TMP_CACHE"; then   # -p: same mtime, so the exit copy is a no-op
     log "=== corpus cache: seeded $TMP_CACHE from $KEEP_CACHE (stage 1 will be skipped)"

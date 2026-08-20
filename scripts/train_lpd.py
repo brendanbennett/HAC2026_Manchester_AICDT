@@ -716,10 +716,10 @@ def main():
                          "and the saved checkpoint is those weights, so the model that is "
                          "selected is the model that was measured. 0 disables it.")
     ap.add_argument("--time-budget", type=float, default=20.0,
-                    help="hours. The projected finish time is checked against this after the "
-                         "first few steps and the run refuses to start if it will overrun. "
-                         "An ephemeral machine that is wiped on a deadline turns an overrun "
-                         "into a total loss, and --ckpt resume cannot help with that.")
+                    help="hours. After the first few steps the finish time is projected and "
+                         "compared against this, and the largest --steps that would fit is "
+                         "printed. It warns rather than exits: the run checkpoints and "
+                         "resumes, so an overrun costs a restart, not the work.")
     ap.add_argument("--cache-tag", default="shared",
                     help="distinguishes the /tmp curve cache between runs that use the "
                          "same --phases but different --codes-file/--bodies; the cache key "
@@ -893,11 +893,17 @@ def main():
                   f"{_hms(a.time_budget * 3600)} allowed. Largest --steps that fits: {n_fit}",
                   flush=True)
             if proj > a.time_budget * 3600.0:
-                raise SystemExit(
-                    f"train_lpd: projected {_hms(proj)} exceeds the --time-budget of "
-                    f"{_hms(a.time_budget * 3600)}. Lower --steps to about {n_fit}, or lower "
-                    f"--operator-res / --train-geoms, which is where the time goes. Refusing "
-                    f"to start a run that cannot finish.")
+                # A WARNING, not an exit. An earlier version refused to start, on the premise
+                # that being killed on a deadline loses everything. It does not: this script
+                # checkpoints every --ckpt-every steps and resumes from the optimiser state,
+                # the RNG state and the early-stopping counters, and the corpus cache is
+                # preserved to runs/ by a trap on EXIT/INT/TERM. A run that overruns is
+                # therefore resumed, not lost -- and refusing to start it would have thrown
+                # away the progress it would have made.
+                print(f"  [budget] WARNING: {_hms(proj)} exceeds the budget by "
+                      f"{_hms(proj - a.time_budget * 3600)}. This run will be cut short and "
+                      f"resumed from {ckpt_path}; pass --steps {n_fit} if you would rather it "
+                      f"finish inside one window.", flush=True)
         if (a.log_every and s % a.log_every == 0) or s == a.steps - 1:
             # Wall clock, seconds per step and a projection to the cap: on a batch worker
             # with a wall-clock limit, what matters is whether the remaining steps fit in

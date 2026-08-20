@@ -186,8 +186,10 @@ gave the body **7.6 cells across its z extent**; canonical gives 40 at the same 
 - EMA with **zero-init and bias correction** (the two conventions are mutually exclusive; mixing
   them divides by 0.002 at n=2 and produces NaN — this happened and was caught). Window tied to
   the run: `decay = min(--ema, 1 - 10/steps)`.
-- `--time-budget` (default 20 h): times three steps, projects, and **refuses to start a run that
-  cannot finish**, printing the largest `--steps` that fits.
+- `--time-budget` (default 20 h): times three steps, projects the finish, and prints the largest
+  `--steps` that would fit. It **warns rather than exits** -- the run checkpoints every
+  `--ckpt-every` steps and resumes from the optimiser state, the RNG state and the
+  early-stopping counters, so an overrun costs a restart, not the work.
 - `support_residual_channel` — `A^T r` on the dh directions. See §8 for what it is not.
 - Digest gates on both designs; `code_dim` in every cache key and meta.
 - `fit_body` and `flow_targets` deleted (zero callers each).
@@ -305,9 +307,16 @@ a spread comparable to the magnitude — that is what "no collapse" looks like.
    Inherent to the scoring strategy, not a bug, but it is a convexity-ward selection.
 7. **`lpd_flow.py` has no committed tests.** By deliberate instruction — only single-use checks
    were run. The verifications in §9 exist only in this document.
-8. **`--time-budget` is a projection, not a scheduler.** It refuses to start a run that cannot
-   finish; it will not stop one that slows down later.
-9. **All flow-training numbers in this session are meaningless as accuracy.** They were produced
+8. **`--time-budget` is a projection, not a scheduler.** It warns once, from three measured
+   steps; it will not notice a run that slows down later.
+9. **The reconstruction codes are persisted** to `<out>.codes.npz` (raw codes, the support they
+   were decoded against, the radius) *before* any draw is decoded, so a degenerate-draw exit or a
+   crash in the medoid still leaves them. They are also the only record of the posterior -- the
+   STL keeps the medoid alone, so without them a convex result cannot be told apart from a medoid
+   that picked badly. Re-extracting at a different `--res` or medoid rule from a saved file costs
+   minutes against the ~24% of the operator budget a fresh reconstruction costs.
+
+10. **All flow-training numbers in this session are meaningless as accuracy.** They were produced
    with an untrained surrogate over 4-6 bodies and 4 steps. Only the *shapes*, the plumbing and
    the diagnostics were being tested.
 
@@ -345,9 +354,13 @@ Then `train_lpd`, watching two lines: the `[budget]` projection in the first min
 - `ablate_flow.py` used to claim the target is `(x1 - x_t)/(1 - t)` so late draws "carry a gain of
   6". In this parameterisation that expression is **identically `x1 - x0`** — the target does not
   depend on t. Do not build a per-t weighting on that.
-- `N_BODIES` was lowered 1000 -> 600. Justification: weighted by camera work the corpus build is
-  **63%** of the operator budget (1000 bodies x 28 geometries vs 2000 training calls x 8), and the
-  machine is wiped at 24 h so no cache survives to amortise it.
+- `N_BODIES` stays at **1000**. It was briefly lowered to 600 on the premise that nothing
+  survives the 24 h deadline, so the corpus build -- 39% of the operator budget by camera-passes
+  -- would be repaid every run. That premise is false: only the GPU processes are killed, the
+  filesystem persists, `save_corpus_cache` copies the corpus to `runs/` from a trap on
+  EXIT/INT/TERM (CRC-checking the archive first), and the next run seeds `/tmp` from it. The
+  corpus is built once. `train_lpd` likewise checkpoints and resumes, and the corpus build itself
+  resumes per body through `{cache}.parts/`.
 
 ---
 

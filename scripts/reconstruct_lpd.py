@@ -29,7 +29,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from hac26.conventions import cameras, psi_grid                        # noqa: E402
 from hac26.data_io import load_model_curves                            # noqa: E402
-from hac26.field import ImplicitBody, apply_constraints, extract_mesh  # noqa: E402
+from hac26.field import (CODE_DIM, DESIGN_N, N_DIR, N_SITES, ImplicitBody,   # noqa: E402
+                         apply_constraints, extract_mesh)
 from hac26.solvers.lpd_flow import N_MODES, N_STEPS, LPDFlow         # noqa: E402
 from hac26.solvers.output import (export_stl, metric_medoid, planar_snap,      # noqa: E402
                           ransac_planes, restore_constraints)
@@ -279,6 +280,40 @@ def main():
         return float(whitened_misfit(pred56, real, COV["s2"]))
 
     raw_codes = net.codec.decode(codes)     # out of the flow's whitened space, once
+
+    # PERSIST THE CODES, here -- before anything is decoded.
+    #
+    # Every operator call is already spent at this line: --samples draws x N_STEPS Euler
+    # steps, all at 28 geometries, which is about a quarter of the whole pipeline's operator
+    # budget. Everything after this point is mesh extraction and scoring, which is cheap.
+    # Writing them here rather than beside the STL means they survive a degenerate-draw exit,
+    # a crash in the medoid, or an out-of-memory at a high --res -- all of which currently
+    # discard the sampling with nothing left to inspect.
+    #
+    # It is also the only record of the posterior. The STL keeps the medoid alone, so the
+    # other draws are gone: if a reconstruction comes out convex, the STL cannot distinguish
+    # a collapsed posterior from a medoid that picked badly, and these can.
+    #
+    # `codes` are RAW, so decode(codes[i], 1.0, support=support) reproduces draw i exactly and
+    # fit_to_cylinder(v, radius) returns it to the physical frame. The whitened codes are not
+    # stored: codec.encode() recovers them, and they would double the file.
+    codes_path = Path(a.out).with_suffix(".codes.npz")
+    try:
+        Path(a.out).parent.mkdir(parents=True, exist_ok=True)
+        np.savez(codes_path,
+                 codes=raw_codes.detach().cpu().numpy(),
+                 support=np.asarray(support, dtype=np.float32),
+                 radius=np.float32(R),
+                 meta=json.dumps({"model": int(a.model), "code_dim": int(CODE_DIM),
+                                  "n_dir": int(N_DIR), "n_sites": int(N_SITES),
+                                  "design_n": int(DESIGN_N), "samples": int(a.samples),
+                                  "frame": "canonical; apply fit_to_cylinder(v, radius)"},
+                                 sort_keys=True))
+        print(f"  codes saved to {codes_path}", flush=True)
+    except OSError as exc:                  # never let a diagnostic cost the reconstruction
+        codes_path = None
+        print(f"  WARNING: could not save the codes to {codes_path}: {exc}", flush=True)
+
     meshes, occs, snaps = [], [], []
     for i in range(a.samples):
         v, f, kept = decode(raw_codes[i], 1.0, res=a.res, misfit_fn=misfit, eta=eta,
@@ -346,7 +381,8 @@ def main():
            "medoid_side_mode": a.medoid_side_mode,
            "eta": eta, "snap_enabled": bool(a.snap),
            "snap_planes": int(a.snap_planes), "snap_tol": float(a.snap_tol),
-           "snap_min_frac": float(a.snap_min_frac), "planes_accepted": snaps, **info}
+           "snap_min_frac": float(a.snap_min_frac), "planes_accepted": snaps,
+           "codes_file": None if codes_path is None else str(codes_path), **info}
 
     if a.model in PUBLIC:
         import trimesh
