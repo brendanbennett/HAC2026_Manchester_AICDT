@@ -133,7 +133,7 @@ def features_for(v, f, psi, n_tokens=600, seed=0):
     # construction -- its inputs are mu, mu0 and visibility, which already encode where the
     # camera is -- so one network serves all 28, and training it on all of them is what
     # makes it valid off azimuth 0. Conditioning the LPD on a single geometry gives the dual
-    # 160 numbers to determine 608 code dimensions, and the flow correspondingly learned
+    # 160 numbers to determine 1856 code dimensions, and the flow correspondingly learned
     # 5.4% of the target variance.
     sun_d = np.stack([to_body(S_LAB, np.array([p]))[0] for p in psi])
     out = []

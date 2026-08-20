@@ -7,11 +7,19 @@ name = "hac26"
 version = "0.1.0"
 description = "Learned Primal-Dual lightcurve inversion for the Helsinki Asteroid Challenge 2026"
 requires-python = ">=3.10"
-dependencies = ["numpy>=1.24", "scipy>=1.10"]
+dependencies = [
+    "numpy>=1.24",
+    "scipy>=1.10",
+    "trimesh",
+    "scikit-image",
+    "rtree",
+    "fast_simplification",
+]
 
 [project.optional-dependencies]
 torch = ["torch>=2.1"]
 test = ["pytest>=7.0"]
+pipeline = ["torch>=2.1"]
 
 [tool.setuptools]
 packages = ["hac26"]

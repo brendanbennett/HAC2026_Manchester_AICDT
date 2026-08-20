@@ -28,10 +28,10 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from hac26.field import DESIGN_T, design_energy      # noqa: E402
+from hac26.field import DESIGN_ITERS, DESIGN_T, design_energy      # noqa: E402
 
 
-def build(n: int, t: int = DESIGN_T, iters: int = 4000, lr: float = 1e-2,
+def build(n: int, t: int = DESIGN_T, iters: int = DESIGN_ITERS, lr: float = 1e-2,
           device: str = "cpu", seed: int = 0, report: int = 250) -> np.ndarray:
     axes = np.array([[1., 0, 0], [-1., 0, 0], [0, 1., 0],
                      [0, -1., 0], [0, 0, 1.], [0, 0, -1.]])
@@ -51,8 +51,9 @@ def build(n: int, t: int = DESIGN_T, iters: int = 4000, lr: float = 1e-2,
         x = torch.cat([fixed, p / p.norm(dim=1, keepdim=True)], 0)
         loss = design_energy(x, t)
         opt.zero_grad(); loss.backward(); opt.step()
-        v = float(loss.detach())
-        if v < best:
+        v = abs(float(loss.detach()))   # the sum cancels to ~1e-15 and can go slightly
+        if v < best:                    # negative; selecting on the signed value latches
+                                        # onto numerical noise rather than the minimum
             best, best_x = v, x.detach().clone()
         if report and (k % report == 0 or k == iters - 1):
             print(f"  iter {k:>5}  energy {v:.6e}  best {best:.6e}  "
@@ -64,7 +65,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--n", type=int, required=True, help="number of normals")
     ap.add_argument("--t", type=int, default=DESIGN_T, help="design strength")
-    ap.add_argument("--iters", type=int, default=4000)
+    ap.add_argument("--iters", type=int, default=DESIGN_ITERS)
     ap.add_argument("--lr", type=float, default=1e-2)
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     ap.add_argument("--out", default=None)
