@@ -47,6 +47,35 @@ def load_truth_mesh(model, data_dir):
     )
 
 
+def load_initialisation_mesh(args):
+
+    """
+    Loads a mesh for starting point of genetic algorithm
+
+    Raises:
+        FileNotFoundError: _description_
+    """
+
+    if args.initial_stl is not None:
+        initial_stl = Path(args.initial_stl)
+
+        if not initial_stl.exists():
+            raise FileNotFoundError(
+                f"Initial STL not found: {initial_stl}"
+            )
+
+        initial_mesh = trimesh.load(initial_stl, process=False)
+
+        print(f"Loaded initial shape from {initial_stl}")
+        print(f"  vertices: {len(initial_mesh.vertices)}")
+        print(f"  faces: {len(initial_mesh.faces)}")
+
+    else:
+        initial_mesh = None
+
+    return(initial_mesh)
+
+
 def make_target_coefficients(
     rng: np.random.Generator,
     L: int,
@@ -281,6 +310,10 @@ def save_checkpoint_results(
             f,
             indent=2,
         )
+
+
+
+
 
 
 

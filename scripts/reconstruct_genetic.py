@@ -22,7 +22,7 @@ from hac26.data_io import load_model_curves
 from hac26.genetic_utils import make_target_coefficients, lightcurve_fitness, \
                                 save_shape_stl,  load_truth_mesh, \
                                 plot_lightcurve_comparison, plot_genetic_convergence, \
-                                save_checkpoint_results
+                                save_checkpoint_results, load_initialisation_mesh
 
 
 
@@ -118,6 +118,13 @@ def main():
         type=str,
         default="dataset/raw",
         help="Challenge dataset directory.",
+    )
+
+    parser.add_argument(
+    "--initial-stl",
+    type=str,
+    default=None,
+    help="STL file to use as the initial shape.",
     )
 
     # load args
@@ -247,6 +254,11 @@ def main():
             simplify_faces=args.simplify_faces
         )
 
+    # ------------------------------------------------------------
+    # Load initialisation
+    # ------------------------------------------------------------
+
+    initial_mesh = load_initialisation_mesh(args)
 
 
     # ------------------------------------------------------------
