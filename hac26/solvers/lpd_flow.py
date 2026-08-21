@@ -70,6 +70,10 @@ __all__ = ["CODE_DIM", "N_DIR", "N_SITES", "N_MODES", "N_STEPS", "T_DIM",
 N_MODES = 40
 N_STEPS = 6
 T_DIM = 32          # width of the TIME embedding, which is not the mode embedding
+G_LIMIT = 4.0       # the decode saturates at this multiple of the corpus's largest fitted
+                    # amplitude. Measured: a body at 2.7x the corpus maximum still extracts
+                    # and decimates normally, so 4x is comfortably outside anything the flow
+                    # should ever emit and far inside where the arithmetic breaks.
 
 
 def fourier_embed(m: torch.Tensor, dim: int = 16) -> torch.Tensor:
@@ -287,6 +291,7 @@ class CodeCodec(nn.Module):
         self.register_buffer("g_s", torch.ones(1))
         self.register_buffer("mu", torch.zeros(2))     # [dh, g], one scalar each
         self.register_buffer("sd", torch.ones(2))
+        self.register_buffer("u_lim", torch.full((1,), 80.0))
 
     @torch.no_grad()
     def fit(self, codes: torch.Tensor, eps_std: float) -> None:
@@ -302,6 +307,10 @@ class CodeCodec(nn.Module):
         self.sd[0] = max(float(eps_std), 1e-12)
         self.mu[1] = float(med)
         self.sd[1] = float(mad)
+        # The saturation point of the decode, expressed as a bound on the AMPLITUDE and
+        # converted back through asinh. See decode() for why this exists.
+        g_lim = float(g.abs().max()) * G_LIMIT
+        self.u_lim.fill_(float(np.arcsinh(g_lim / float(self.g_s))))
 
     def _split(self, x):
         return x[..., :N_DIR], x[..., N_DIR:]
@@ -313,8 +322,28 @@ class CodeCodec(nn.Module):
                           (u - self.mu[1]) / self.sd[1]], -1)
 
     def decode(self, z: torch.Tensor) -> torch.Tensor:
+        """z -> raw code. SATURATING, and that is not optional.
+
+        sinh is unbounded and its relative error grows with its argument, so an ordinary
+        regression error in z becomes an astronomical error in the field: measured, doubling
+        z takes |g| from 2.7x the corpus maximum to 545x, and tripling it to 1e5x. That alone
+        is survivable -- the level set is nonsense but a mesh still comes out. What is not
+        survivable is that float32 sinh OVERFLOWS at |u| ~ 89, i.e. |z| ~ 69: g becomes
+        +-inf, the field is non-finite, and the extracted mesh is garbage that fails inside
+        facet indexing several call frames later, long after the cause.
+
+        A single gradient spike is enough to get there, and because the training checkpoint
+        restores weights, optimiser moments and RNG together, a resume replays it exactly.
+
+        Clamping `u` fixes the whole chain at its one source: no non-finite amplitude can be
+        produced by any caller -- training probe, sampler or ablation. The limit is set from
+        the corpus's own maximum amplitude times G_LIMIT, so it cannot bind on anything the
+        flow has been taught to produce; it only saturates excursions that were already
+        meaningless. Per coordinate rather than a vector rescale, so an in-range site is
+        never touched by an out-of-range neighbour.
+        """
         zd, zg = self._split(z)
-        u = zg * self.sd[1] + self.mu[1]
+        u = (zg * self.sd[1] + self.mu[1]).clamp(-self.u_lim, self.u_lim)
         return torch.cat([zd * self.sd[0] + self.mu[0], self.g_s * torch.sinh(u)], -1)
 
 
