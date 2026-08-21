@@ -443,7 +443,8 @@ def corpus(n, psi, surro, device, seed=0, cache=None, op_res: int = 32,
 
 
 def flow_loss(net, surro, psi, codes, curves, sup, idx, x0, t, M, tag, mask,
-              op_res=32, train_geoms=None, eps=None, return_diag=False):
+              op_res=32, train_geoms=None, eps=None, return_diag=False,
+              ablate=False):
     """The flow-matching loss for one batch, given the draws (idx, x0, t, eps).
 
     Split out of the training loop so validation scores the same objective through the same
@@ -461,7 +462,15 @@ def flow_loss(net, surro, psi, codes, curves, sup, idx, x0, t, M, tag, mask,
     Everything here is in the CODEC's whitened space. x0 ~ N(0, I) only means something once
     the code has been transformed to match it: raw dh has std 0.0199 and raw g has std 0.0483,
     about fifty times narrower, and g has kurtosis 14.5 whose tail IS the deep carves.
+
+    `ablate` additionally scores the same draws with every curve channel switched off, and
+    returns (loss, ablated_loss, n_degenerate). One operator call serves both, so the two
+    arms differ by the switch and by nothing else. Off by default; the training path does
+    not enter the branch.
     """
+    if ablate and return_diag:
+        raise ValueError("flow_loss: ablate and return_diag return different tuples; "
+                         "ask for one or the other")
     B, C = len(idx), tag.shape[1]
     dev = codes.device
     if eps is None:
@@ -500,12 +509,14 @@ def flow_loss(net, surro, psi, codes, curves, sup, idx, x0, t, M, tag, mask,
                           tag.expand(B, C, 4), step_mask, t, sph, vol)
         x1_hat = xt + (1 - t[:, None]) * v0
     xt_raw = net.codec.decode(x1_hat)
-    preds = []
+    preds, n_bad = [], 0
     for b in range(B):
         cur = curves_from_code(xt_raw[b], 1.0, surro, psi,
                                res=op_res, geoms=geoms, support=h_pert[b])
         pred = torch.zeros_like(curves[0])
-        if cur is not None:
+        if cur is None:
+            n_bad += 1                  # decoded to under 8 faces; A(x) is unavailable
+        else:
             if geoms_t is None:
                 pred = cur
             else:
@@ -523,12 +534,26 @@ def flow_loss(net, surro, psi, codes, curves, sup, idx, x0, t, M, tag, mask,
         feats[:, :, :M, 2 * ch + 1] = r[:, :, ch].imag
     feats[:, :, :M, 4] = g_dat[:, :, 0].real
     feats[:, :, :M, 5] = g_dat[:, :, 1].real
+
+    def _score(v):
+        # Per-block weights. Unweighted, g's 1728 dimensions take about 89% of the
+        # gradient and the 128-dimensional support block -- the one the operator can
+        # actually see -- gets the rest. Weighting by 1/N_block makes the two blocks
+        # contribute equally per block.
+        err = (v - (x1 - x0)) ** 2
+        return 0.5 * (err[:, :N_DIR].mean() + err[:, N_DIR:].mean())
+
     u = net.velocity(xt, feats, tag.expand(B, C, 4), step_mask, t, sph, vol)
-    # Per-block weights. Unweighted, g's 1728 dimensions take about 89% of the gradient and
-    # the 128-dimensional support block -- the one the operator can actually see -- gets the
-    # rest. Weighting by 1/N_block makes the two blocks contribute equally per block.
-    err = (u - (x1 - x0)) ** 2
-    loss = 0.5 * (err[:, :N_DIR].mean() + err[:, N_DIR:].mean())
+    loss = _score(u)
+    if ablate:
+        # THE ABLATION ARM (scripts/ablate_flow.py), scored off the SAME operator call so
+        # the two arms cannot differ by anything except the switch. Both paths the curves
+        # take, not just the dual's: sph[..., 4] is the adjoint channel, and it feeds the
+        # sphere branch, which is the branch that emits the dh block.
+        sph0 = sph.clone(); sph0[..., 4] = 0.0
+        u0 = net.velocity(xt, torch.zeros_like(feats), tag.expand(B, C, 4), step_mask,
+                          t, sph0, vol)
+        return loss, _score(u0), n_bad
     if not return_diag:
         return loss
     with torch.no_grad():

@@ -5,10 +5,25 @@ Beating the data-free bar is necessary evidence that the data contributes, and n
 sufficient. The flow sees x_t = (1-t) x0 + t x1, which leaks x1 directly as t grows, and with
 a corpus of only 40 bodies a network can identify WHICH body it is near without ever
 consulting a curve. This ablation separates the two: evaluate the trained flow twice on the
-same draws, once with the real residual and once with the residual channels zeroed.
+same draws, once with the curves and once without them.
 
     if the two are close      the curves are decoration and the flow is memorising
     if zeroing hurts          the operator is contributing, by that margin
+
+WHAT "WITHOUT" MEANS. Every channel that carries curve information: the Fourier residual, the
+raw data coefficients that share the same tensor (feats channels 4 and 5 are g_dat, not r),
+and the adjoint channel on the sphere branch. Not just the residual, despite the name this
+test has always had -- an arm that keeps the raw coefficients is not data-free.
+
+BOTH ARMS COME FROM ONE flow_loss CALL, off one operator call, so they differ by the switch
+and by nothing else.
+This file used to re-implement the objective, and every part it duplicated has since moved:
+the operator is applied at x1_hat rather than x_t, the dh block is supervised against a
+perturbation instead of against zero, and the residual reaches the network through a second
+path (the adjoint channel on the sphere branch) that a copy did not know about. All three
+drifts pushed the same way -- they made the operator look worthless -- so the copy could
+report a MEMORISING verdict on a flow that was using the curves correctly. There is now one
+implementation, in train_lpd.flow_loss, and this file only supplies the draws.
 """
 from __future__ import annotations
 
@@ -25,10 +40,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from hac26.conventions import cameras, psi_grid          # noqa: E402
 from hac26.field import DESIGN_N                         # noqa: E402
-from hac26.solvers.lpd_flow import CODE_DIM, N_DIR, N_MODES, LPDFlow   # noqa: E402
-from hac26.forward.learned_surrogate import Surrogate                    # noqa: E402
-from train_lpd import (cond_channels, corpus_cache_path,   # noqa: E402
-                       curves_from_code)                   # noqa: E402
+from hac26.solvers.lpd_flow import CODE_DIM, N_MODES, LPDFlow   # noqa: E402
+from hac26.forward.learned_surrogate import Surrogate            # noqa: E402
+from train_lpd import (_dh_perturbation, corpus_cache_path,      # noqa: E402
+                       flow_loss)                                # noqa: E402
 
 
 def main():
@@ -39,6 +54,9 @@ def main():
     ap.add_argument("--phases", type=int, default=96)
     ap.add_argument("--operator-res", type=int, default=32)
     ap.add_argument("--cache-tag", default="shared")
+    ap.add_argument("--val-bodies", type=int, default=8,
+                    help="must match the training run: the held-out split is reproduced here "
+                         "so the ablation scores the bodies the flow could have memorised")
     a = ap.parse_args()
 
     corpus = a.corpus or corpus_cache_path(a.phases, len(cameras()), a.operator_res,
@@ -59,10 +77,10 @@ def main():
         bad = {k: (meta.get(k), v) for k, v in expected.items() if meta.get(k) != v}
         if bad:
             raise SystemExit(f"{corpus} metadata does not match this ablation: {bad}")
-    x1 = torch.tensor(z["codes"]); curves = torch.tensor(z["curves"])
+    codes = torch.tensor(z["codes"]); curves = torch.tensor(z["curves"])
     sup = torch.tensor(z["support"])
-    if x1.ndim != 2 or x1.shape[1] != CODE_DIM:
-        raise SystemExit(f"{corpus} codes have shape {tuple(x1.shape)}, but "
+    if codes.ndim != 2 or codes.shape[1] != CODE_DIM:
+        raise SystemExit(f"{corpus} codes have shape {tuple(codes.shape)}, but "
                          f"CODE_DIM={CODE_DIM}; rebuild the corpus")
     if sup.ndim != 2 or sup.shape[1] != DESIGN_N:
         raise SystemExit(f"{corpus} support has shape {tuple(sup.shape)}, "
@@ -78,59 +96,45 @@ def main():
     surro = surro.to(gdev).eval()
     net = LPDFlow(); net.load_state_dict(torch.load(a.ckpt, map_location="cpu")); net.eval()
 
-    tag = torch.zeros(1, 28, 4)
+    C = len(cameras())
+    tag = torch.zeros(1, C, 4)
     for i, cam in enumerate(cameras()):
         tag[0, i] = torch.tensor([np.cos(np.radians(cam.azimuth_deg)),
                                   np.sin(np.radians(cam.azimuth_deg)),
                                   np.sin(np.radians(cam.elevation_deg)), 1.0])
-    mask = torch.ones(1, 28)
+    mask = torch.ones(1, C)
 
-    # STRATIFIED OVER t, not sampled, and t is now CONTINUOUS -- the flow is trained that
-    # way, so scoring it on six discrete times would score a different objective.
-    #
-    # A previous version of this comment claimed the target is u = (x1 - x_t)/(1 - t) so that
-    # a draw near t = 1 "carries a gain of 6 and contributes 36x the squared error". In this
-    # parameterisation that expression is IDENTICALLY x1 - x0: the target does not depend on
-    # t at all, and the printed gain was not a property of it. What does vary with t is how
-    # informative the operator call is, which is why the bins are still reported separately.
-    torch.manual_seed(0)
-    real_loss, zero_loss = [], []
+    # SCORE THE TRAINING BODIES, taken from the same fixed permutation train_lpd.py splits on.
+    # A held-out body cannot be memorised, so a margin there proves nothing about the failure
+    # this test exists to catch; the training bodies are the population where "identify the
+    # body from x_t alone" is actually available to the network.
+    perm = torch.randperm(len(codes), generator=torch.Generator().manual_seed(0))
+    pool = perm[max(0, min(a.val_bodies, len(codes) - 1)):]
+
+    # STRATIFIED OVER t, not sampled, and t is CONTINUOUS -- the flow is trained that way, so
+    # scoring it on six discrete times would score a different objective. What varies with t
+    # is how informative the operator call is, which is why the bins are reported separately.
     n_bins = 6
+    gen = torch.Generator().manual_seed(0)
+    idx = pool[torch.randint(0, len(pool), (a.draws,), generator=gen)]
+    x0 = torch.randn(a.draws, codes.shape[1], dtype=codes.dtype, generator=gen)
+    t = ((torch.arange(a.draws) % n_bins).to(codes.dtype) + 0.5) / n_bins
+    eps = _dh_perturbation(a.draws, generator=gen)
+
+    real_loss, zero_loss, n_bad = [], [], 0
     per_t = {k: ([], []) for k in range(n_bins)}
     for d in range(a.draws):
-        i = torch.randint(0, len(x1), (1,))
-        y = net.codec.encode(x1[i]); x0 = torch.randn_like(y)
-        kb = d % n_bins
-        t = torch.tensor([(kb + 0.5) / n_bins])
-        xt = (1 - t[:, None]) * x0 + t[:, None] * y
-        raw = net.codec.decode(xt)
-        h = sup[i[0]]
-        cur = curves_from_code(raw[0], 1.0, surro, psi, support=h)
-        if cur is None:
-            continue
-        g_dat = torch.fft.rfft(curves[i], dim=-1)[..., 1:M + 1]
-        g_cur = torch.fft.rfft(cur[None], dim=-1)[..., 1:M + 1]
-        r = g_dat - g_cur
-        feats = torch.zeros(1, 28, N_MODES, 6)
-        for ch in range(2):
-            feats[:, :, :M, 2 * ch] = r[:, :, ch].real
-            feats[:, :, :M, 2 * ch + 1] = r[:, :, ch].imag
-        feats[:, :, :M, 4] = g_dat[:, :, 0].real
-        feats[:, :, :M, 5] = g_dat[:, :, 1].real
-        sph, vol = cond_channels(h[None])
-        zed = torch.zeros_like(feats)
+        sl = slice(d, d + 1)
         with torch.no_grad():
-            u_real = net.velocity(xt, feats, tag, mask, t, sph, vol)
-            u_zero = net.velocity(xt, zed, tag, mask, t, sph, vol)
-        tgt = y - x0
-        # the same per-block weighting the training loss uses, or the two are not comparable
-        def _l(u):
-            e = (u - tgt) ** 2
-            return 0.5 * float(e[:, :N_DIR].mean() + e[:, N_DIR:].mean())
-        real_loss.append(_l(u_real)); zero_loss.append(_l(u_zero))
-        per_t[kb][0].append(real_loss[-1]); per_t[kb][1].append(zero_loss[-1])
-        print(f"  draw {d:>3}  t={float(t):.3f}  real {real_loss[-1]:.5f}   "
-              f"zeroed {zero_loss[-1]:.5f}", flush=True)
+            r_, z_, bad = flow_loss(net, surro, psi, codes, curves, sup, idx[sl], x0[sl],
+                                    t[sl], M, tag, mask, op_res=a.operator_res,
+                                    eps=eps[sl], ablate=True)
+        r_, z_ = float(r_), float(z_); n_bad += int(bad)
+        real_loss.append(r_); zero_loss.append(z_)
+        kb = d % n_bins
+        per_t[kb][0].append(r_); per_t[kb][1].append(z_)
+        print(f"  draw {d:>3}  t={float(t[d]):.3f}  real {r_:.5f}   zeroed {z_:.5f}",
+              flush=True)
 
     print("\n  per t bin:")
     for k in range(n_bins):
@@ -142,6 +146,10 @@ def main():
     print(f"\n  with the real residual : {r_:.5f}")
     print(f"  residual zeroed        : {z_:.5f}")
     print(f"  the operator is worth  : {z_ - r_:+.5f}  ({100*(z_-r_)/max(z_,1e-12):+.1f}%)")
+    if n_bad:
+        print(f"\n  WARNING: {n_bad}/{a.draws} draws decoded to under 8 faces, so A(x) was "
+              f"\n  unavailable and the residual was the raw data. Both arms saw the same "
+              f"\n  thing on those draws, which pulls the margin toward zero.")
     print("\n  A margin near zero means the curves are decoration and the flow is"
           "\n  identifying corpus bodies from x_t alone.")
 
