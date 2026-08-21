@@ -177,8 +177,20 @@ class TokenField(nn.Module):
                  d_att: int = 32, hidden: int = 64):
         super().__init__()
         self.sigma = TOKEN_SIGMA_FRAC * radius
-        self.p = nn.Parameter(torch.zeros(n_tokens, 3))
-        self.z = nn.Parameter(torch.zeros(n_tokens, dim))
+        # Tokens MUST be initialised distinct. With p and z all zero every token is
+        # identical, so the softmax over them is uniform for every y, a @ v(z) does not
+        # depend on y, and the zero-mean subtraction below cancels what is left: Delta
+        # is exactly zero. Worse, it stays that way -- identical tokens receive identical
+        # gradients, so the configuration is a symmetric critical point and training can
+        # never separate them. The field then contributes nothing, ImplicitBody reduces
+        # to its convex core, and every body fits to the same code.
+        # Positions are spread through the body, not just jittered: a token reaches only
+        # sigma = 0.25 R, so tokens clustered at the centre cannot describe a waist.
+        u = torch.randn(n_tokens, 3)
+        u = u / u.norm(dim=1, keepdim=True)
+        r = 0.85 * radius * torch.rand(n_tokens, 1) ** (1.0 / 3.0)
+        self.p = nn.Parameter(u * r)
+        self.z = nn.Parameter(0.5 * torch.randn(n_tokens, dim))
         self.q = nn.Linear(3, d_att)
         self.k = nn.Linear(dim, d_att)
         self.v = nn.Linear(dim, d_att)
