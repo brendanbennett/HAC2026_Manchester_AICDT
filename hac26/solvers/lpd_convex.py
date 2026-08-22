@@ -4,7 +4,7 @@ Unrolled scheme (I iterations, per-iteration parameters):
     h_i = h_{i-1} + Gamma_i( h_{i-1}, T(softplus(f_{i-1}^{(2)})), d, tags, mask )
     f_i = f_{i-1} + Lambda_i( f_{i-1}, [dT(softplus(f_{i-1}^{(1)}))]^T h_i^{(1)}, coords )
     return p = softplus(f_I^{(1)}) / sum(...)
-where T = N_eps o A is the exact convex photometric operator (forward.py) and the
+where T = N_eps o A is the exact convex photometric operator (forward/convex_egi.py) and the
 derivative adjoint is the closed form A^T o DN^T, chained with softplus' = sigmoid.
 
 Design choices tied to exact structure of the problem:
@@ -193,6 +193,11 @@ class LPDNet(nn.Module):
             if R:
                 # d1 in (0,1) identically -- it is a sigmoid, nothing else. That is
                 # what makes the forward, and its adjoint, defined everywhere.
+                #
+                # mch appears twice on purpose. gate_d1 is declared with the same input
+                # width as duals, but it cannot take y2: y2 is computed FROM d1 two lines
+                # down. So the y2 slot gets a filler, and mask is the cheapest one to hand.
+                # Do not "tidy" this -- the shipped checkpoint was trained on this layout.
                 d1 = torch.sigmoid(
                     self.gate_d1[i](torch.cat([h, d[:, None], mch, tags, mch], dim=1)))
                 w = F.softplus(f[:, 1:1 + R].reshape(B, R, -1))

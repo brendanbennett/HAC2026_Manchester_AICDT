@@ -6,7 +6,9 @@ Minkowski 1897; Schneider, Brunn-Minkowski Theory, 2nd ed., sec. 8.2):
     minimize   sum_i g_i h_i
     subject to vol(P(h)) >= 1,      P(h) = { x : <u_i, x> <= h_i  for all i }
 
-using SLSQP with the exact gradient d vol / d h_i = area of facet i (a.e.).
+What is actually solved is the scale-free quotient just below the imports, which is
+equivalent by homogeneity and needs no constraint -- L-BFGS-B with box bounds, and the
+exact gradient d vol / d h_i = area of facet i (a.e.).
 {vol >= 1} is a convex feasible set because vol^{1/3} is concave in h
 (Brunn-Minkowski inequality). A minimizer with vol = 1 has surface area measure
 proportional to sum_i g_i delta_{u_i}; the absolute scale is irrelevant here because

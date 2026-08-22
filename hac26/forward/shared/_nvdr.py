@@ -1,6 +1,6 @@
 """Import nvdiffrast with its CUDA runtime preloaded.
 
-The extension is compiled against CUDA 12.9 (see tools/setup_toolchain.sh for why that is
+The extension is compiled against CUDA 12.9 (see scripts/setup_toolchain.sh for why that is
 the only consistent choice on this machine) while torch ships cu13, so `_nvdiffrast_c.so`
 needs libcudart.so.12 which is not on the default loader path. Preloading it RTLD_GLOBAL
 before the import satisfies that without requiring LD_LIBRARY_PATH to be set in every shell

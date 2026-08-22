@@ -5,14 +5,14 @@ directions are carried into it, which makes the transport phase-independent sinc
 and turntable are mutually rigid.
 
 Tabulated camera azimuths are measured from the light direction, so the lab azimuth is
-180 + az. psi0 is one fitted scalar per body.
+180 + az. psi0 is a per-body phase offset that every caller leaves at zero; nothing fits it.
 
 SENSE is fixed by correlating forward-modelled curves for the public bodies against the real
 ones, not by the published wording, which is ambiguous about the direction of rotation.
 
 The published bounding-cylinder radius is treated as an approximation rather than a hard
-bound: posed to z in [-1, 1], two of the three public bodies exceed their own published R, so
-clamping to it would shrink true geometry.
+bound: posed to z in [-1, 1] a public body can sit right at or slightly past its published R,
+so clamping to it would shrink true geometry.
 """
 from __future__ import annotations
 

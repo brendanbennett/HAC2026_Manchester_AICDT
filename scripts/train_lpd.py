@@ -42,13 +42,16 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from hac26.conventions import S_LAB, cameras, psi_grid, to_body          # noqa: E402
-from hac26.field import (CODE_DIM, DESIGN_N, LATTICE_EXTENT, LATTICE_SHAPE,   # noqa: E402
+from hac26.conventions import S_LAB, SENSE, cameras, psi_grid, to_body   # noqa: E402
+from hac26.field import (CODE_DIM, DESIGN_N, LATTICE_ALPHA, LATTICE_EXTENT,   # noqa: E402
+                         LATTICE_SHAPE,
                          N_DIR, N_SITES, GaussianLattice, ImplicitBody, design_sha,
-                         dir_design, extract_mesh, sh_expand, spherical_design)
+                         dir_design, extract_mesh, sh_expand, spherical_design,
+                         support_resample)
 from hac26.solvers.lpd_flow import N_MODES, N_STEPS, LPDFlow           # noqa: E402
 from hac26.forward.mesh.radiosity import facet_geometry                               # noqa: E402
-from hac26.forward.learned_surrogate import (Surrogate, camera_features,                 # noqa: E402
+from hac26.forward.learned_surrogate import (SURROGATE_DEFAULTS, Surrogate,   # noqa: E402
+                                             camera_features, load_surrogate,
                              sun_features)                               # noqa: E402
 
 
@@ -63,13 +66,23 @@ def corpus_cache_path(phases, n_geoms, op_res, tag) -> str:
 
 def _corpus_meta(n, psi, op_res) -> dict:
     return {
-        "schema": 4,
+        "schema": 5,      # 5: facet areas mean-normalised into the surrogate features, and
+                          #    the adjoint operator built at sigma = SENSE. Both change A(x),
+                          #    so every schema-4 cache and part is stale.
         "bodies": int(n),
         "phases": int(len(psi)),
         "n_geoms": int(len(cameras())),
         "operator_res": int(op_res),
         "design_n": int(DESIGN_N),
         "code_dim": int(CODE_DIM),
+        # The lattice, because `g` is amplitudes ON it. CODE_DIM pins only the site COUNT:
+        # changing LATTICE_ALPHA 0.9 -> 0.7, or the extent, leaves every other key identical
+        # while every kernel g multiplies becomes a different function, and the /tmp curve
+        # cache would be reused. fit_shapes.py already writes these into the corpus meta;
+        # nothing read them.
+        "lattice_shape": list(LATTICE_SHAPE),
+        "lattice_extent": float(LATTICE_EXTENT),
+        "lattice_alpha": float(LATTICE_ALPHA),
     }
 
 
@@ -118,7 +131,9 @@ def _load_valid_corpus_part(path: Path, expected: dict, body_index: int):
         print(f"  ignoring unreadable corpus part {path}: {exc}", flush=True)
         return None
     meta = _decode_meta(z)
-    if meta is None or any(meta.get(k) != v for k, v in expected.items()):
+    # `bodies` is excluded: body i's curves do not depend on how many bodies the run asked
+    # for, and comparing it threw away the whole .parts directory whenever --bodies changed.
+    if meta is None or any(meta.get(k) != v for k, v in expected.items() if k != "bodies"):
         print(f"  ignoring stale corpus part {path}", flush=True)
         return None
     if int(z["body_index"]) != int(body_index):
@@ -137,18 +152,18 @@ def _save_corpus_part(path: Path, body_index: int, code, curve, support, expecte
              meta=json.dumps(expected, sort_keys=True))
 
 
-DH_EPS_STD = 0.02      # std of the training-time perturbation of h, in units of R. The
-                       # measured dh a fitted body needs is 0.0199 R, so this is the scale the
-                       # flow has to learn to undo -- and because eps is redrawn every draw it
-                       # doubles as augmentation at no operator cost.
+DH_EPS_STD = 0.02      # std of the training-time perturbation of h, in units of R -- about
+                       # the correction a fitted body actually needs, so it is the scale the
+                       # flow has to learn to undo. Redrawn every draw, so it doubles as
+                       # augmentation at no operator cost.
 
 
 def _dh_perturbation(n: int, generator=None) -> torch.Tensor:
     """Band-limited dh perturbations, one row per draw, drawn on the N_DIR directions.
 
     Band-limited by construction: an out-of-band dh kills facets, and a dead facet has an
-    exactly zero row in the area Jacobian, i.e. no gradient at all rather than a bad one.
-    Measured facet death from white dh at 2% R: 3% at N=64, 7% at 128, 27% at 256, 53% at 512.
+    exactly zero row in the area Jacobian -- no gradient at all rather than a bad one. The
+    damage from a white dh gets worse the finer the design.
     """
     global _DH_SELF
     if _DH_SELF is None:
@@ -172,16 +187,20 @@ def perturb_support(h: torch.Tensor, eps: torch.Tensor) -> torch.Tensor:
     global _EXPAND_CACHE
     if _EXPAND_CACHE is None:
         _EXPAND_CACHE = torch.from_numpy(sh_expand(dir_design(N_DIR), spherical_design(DESIGN_N)))
-    e = _EXPAND_CACHE.to(h.device)
+    if h.device not in _EXPAND_DEV:
+        _EXPAND_DEV[h.device] = _EXPAND_CACHE.to(h.device)
+    e = _EXPAND_DEV[h.device]
     hh = h.clamp_min(1e-6)
     raw = hh + torch.log(-torch.expm1(-hh))            # stable inverse softplus
     return torch.nn.functional.softplus(raw + eps.to(h.device) @ e.T)
 
 
 _EXPAND_CACHE = None
+_EXPAND_DEV: dict = {}
 
 
 _A_DIR = None
+_A_DIR_DEV: dict = {}
 
 
 def support_residual_channel(r_phase: torch.Tensor, n_phases: int,
@@ -189,20 +208,21 @@ def support_residual_channel(r_phase: torch.Tensor, n_phases: int,
     """A^T r, on the dh directions: which support directions the residual implicates.
 
     `build_A` takes ARBITRARY normals, so the operator is built directly on dir_design(N_DIR)
-    rather than on the default 1152-cell lat-lon NormalGrid. That matters: a design pins the
-    six coordinate axes and has cells at neither the equator nor the poles, and on flat-faced
-    bodies -- which every ground truth is -- it is exact where the grid is 13.2% off.
+    rather than on the default lat-lon NormalGrid. That matters: a design pins the six
+    coordinate axes and has cells at neither the equator nor the poles, and on flat-faced
+    bodies -- which every ground truth is -- it is exact where the grid is well off.
 
     WHAT THIS IS AND IS NOT. It is the transpose of the convex photometric operator. It does
     NOT include the normalisation Jacobian DN, and it does NOT include J = d(areas)/dh, so it
     is not the exact gradient of the misfit with respect to h. Both would need the current
-    body's polytope and areas rebuilt per sample; J alone is a 4096x4096 object per body. The
+    body's polytope and areas rebuilt per sample; J alone is design-sized squared, per body. The
     direction information -- which is the whole job of a conditioning channel -- survives
     without them, and the branch whitens and re-scales its own input anyway.
 
     Read it as a hint, not a gradient. A_conv is provably blind to concavity: a notched cube's
-    unshadowed curves are reproduced exactly, as a fatter box, and 90% of its row-space power
-    sits at l <= 3. It can say which face is wrong; it can never say what shape the dent is.
+    unshadowed curves are reproduced exactly, as a fatter box, and nearly all of its row-space
+    power sits at low degree. It can say which face is wrong; it can never say what shape the
+    dent is.
     That is exactly why this is a conditioning input and is never added to the velocity.
     """
     global _A_DIR
@@ -213,12 +233,23 @@ def support_residual_channel(r_phase: torch.Tensor, n_phases: int,
         from hac26.geometry import build_cameras
         cams = list(build_cameras()) + list(build_cameras())
         types = ["intensity"] * len(build_cameras()) + ["binary"] * len(build_cameras())
-        A = build_A(dir_design(N_DIR), cams, n_phases, types, c_lambert=c_lambert)
+        # sigma=SENSE, NOT build_A's default of +1. build_A takes its angles from
+        # hac26.geometry.psi_grid, whose own docstring warns that "importing the wrong one
+        # silently reverses the rotation"; every curve this operator is contracted against
+        # comes from hac26.conventions.psi_grid at SENSE = -1, the value FITTED on the public
+        # models (hac26/train.py:49 passes it for exactly this reason). Left at the default
+        # the adjoint reads the residual through a mirrored turntable, which leaves it
+        # decorrelated from the true one rather than merely mis-scaled.
+        A = build_A(dir_design(N_DIR), cams, n_phases, types, c_lambert=c_lambert,
+                    sigma=SENSE)
         _A_DIR = (torch.from_numpy(np.ascontiguousarray(A, dtype=np.float32)), n_phases)
-    A = _A_DIR[0].to(r_phase.device)                       # (56, P, N_DIR)
+        _A_DIR_DEV.clear()
+    if r_phase.device not in _A_DIR_DEV:                   # was copied host-to-device per call
+        _A_DIR_DEV[r_phase.device] = _A_DIR[0].to(r_phase.device)
+    A = _A_DIR_DEV[r_phase.device]                         # (56, P, N_DIR)
     stacked = torch.cat([r_phase[:, :, 0], r_phase[:, :, 1]], 1)      # (B, 56, P)
     a = torch.einsum("cpn,bcp->bn", A, stacked)
-    # whitened per sample: the raw magnitude is order 1e2 and varies with the residual scale,
+    # whitened per sample: the raw magnitude is large and varies with the residual scale,
     # which would otherwise dominate the branch's first layer
     return a / a.std(dim=1, keepdim=True).clamp_min(1e-8)
 
@@ -227,7 +258,10 @@ def cond_channels(support: torch.Tensor, device=None):
     """The per-body conditioning the two branches see, built once per body.
 
     Sphere branch (B, N_DIR, 5): the base support resampled onto the dh directions, the three
-    components of the direction itself, and a slot for the aligned adjoint channel.
+    components of the direction itself, and a slot for the aligned adjoint channel. The
+    resample is support_resample, not sh_expand -- the latter is a degree-5 projector, which
+    is what dh needs and what h does not: on a cube it throws away a chunk of mean h, far
+    more than the correction the branch is trained to emit.
 
     Volume branch (B, 5, nx, ny, nz): the convex core's signed distance AT THE LATTICE SITES,
     the inside indicator, and normalised x, y, z. `core_sdf` is what replaces culling -- the
@@ -241,26 +275,36 @@ def cond_channels(support: torch.Tensor, device=None):
     if _DIR_CACHE is None:
         d = dir_design(N_DIR)
         nrm = spherical_design(DESIGN_N)
+        # support_resample, NOT sh_expand: h is a support function and is not band-limited
+        # on a flat-faced body. See hac26/field.py::support_resample for the measurements.
         _DIR_CACHE = (torch.from_numpy(d.astype(np.float32)),
-                      torch.from_numpy(sh_expand(nrm, d)),
+                      torch.from_numpy(support_resample(nrm, d)),
                       GaussianLattice().p)
-    dirs, to_dir, sites = (t.to(dev) for t in _DIR_CACHE)
+    if dev not in _DIR_CACHE_DEV:
+        _DIR_CACHE_DEV[dev] = tuple(t.to(dev) for t in _DIR_CACHE)
+    dirs, to_dir, sites = _DIR_CACHE_DEV[dev]
     h_dir = sup.to(dev) @ to_dir.T                                    # (B, N_DIR)
     sph = torch.cat([h_dir[..., None],
                      dirs[None].expand(B, -1, -1),
                      torch.zeros(B, N_DIR, 1, device=dev)], -1)       # (B, N_DIR, 5)
 
-    core = ImplicitBody(radius=1.0).core.to(dev)
-    sdf = []
-    for b in range(B):
-        sdf.append(core(sites, h=sup[b].to(dev)))
-    sdf = torch.stack(sdf)                                            # (B, N_SITES)
+    if dev not in _CORE_CACHE:      # was a full ImplicitBody construction per call
+        _CORE_CACHE[dev] = ImplicitBody(radius=1.0).core.to(dev)
+    core = _CORE_CACHE[dev]
+    # sites @ n.T does not depend on the body, so it is computed once instead of once per
+    # batch entry. What is left per entry is a subtract and a max.
+    if (dev, "proj") not in _CORE_CACHE:
+        _CORE_CACHE[(dev, "proj")] = sites @ core.n.T                 # (N_SITES, n_normals)
+    proj = _CORE_CACHE[(dev, "proj")]
+    sdf = torch.stack([(proj - sup[b].to(dev)).amax(-1) for b in range(B)])
     xyz = (sites / LATTICE_EXTENT).T[None].expand(B, -1, -1)          # (B, 3, N_SITES)
     vol = torch.cat([sdf[:, None], (sdf < 0).float()[:, None], xyz], 1)
     return sph, vol.reshape(B, 5, *LATTICE_SHAPE)
 
 
 _DIR_CACHE = None
+_DIR_CACHE_DEV: dict = {}
+_CORE_CACHE: dict = {}
 
 
 def code_of(body: ImplicitBody) -> torch.Tensor:
@@ -279,7 +323,7 @@ def set_code(body: ImplicitBody, code: torch.Tensor) -> None:
 
 
 def curves_from_code(code, radius, surro, psi, res=32, device=None, geoms=None,
-                     chunk=4, support=None):
+                     chunk=None, support=None):
     """A(x): decode a RAW code to a body, extract, tokenise, and run the surrogate.
 
     Covers all 28 geometries. The dual attends across them, which is what recovers the m = 0
@@ -316,7 +360,7 @@ def curves_from_code(code, radius, surro, psi, res=32, device=None, geoms=None,
     return curves_from_mesh(v, f, surro, psi, geoms=geoms, chunk=chunk)
 
 
-def curves_from_mesh(v, f, surro, psi, geoms=None, chunk=4):
+def curves_from_mesh(v, f, surro, psi, geoms=None, chunk=None):
     """The second half of A(x): a mesh in, the 28 reduced curve pairs out.
 
     Separate from the code path so the planar snap can be evaluated on a candidate mesh that
@@ -326,6 +370,12 @@ def curves_from_mesh(v, f, surro, psi, geoms=None, chunk=4):
     from hac26.calibrate import decimate
     v, f = decimate(v, f, 600)
     c, n, a = facet_geometry(v, f)
+    # AREAS ARE MEAN-NORMALISED into the features, because that is what the surrogate was
+    # fitted on: scripts/train_surrogate.py builds its training features with
+    # `areas=area / area.sum()`. Passing the raw areas here fed feature channel 4 a value
+    # larger by the body's total surface area -- body-dependent, so not a constant the
+    # network could have absorbed, and the resulting shift in A(x) is well above the
+    # measurement noise. The quadrature weight `ar` below was always normalised, which hid it.
     mesh = trimesh.Trimesh(v, f, process=False)
     cams = list(cameras()) if geoms is None else [list(cameras())[i] for i in geoms]
     sun_d = np.stack([to_body(S_LAB, np.array([p]))[0] for p in psi])
@@ -333,19 +383,40 @@ def curves_from_mesh(v, f, surro, psi, geoms=None, chunk=4):
     fe = np.stack([camera_features(
         mesh, c, n,
         np.stack([to_body(np.asarray(cm.v), np.array([p]))[0] for p in psi]),
-        sun, areas=a) for cm in cams])
+        sun, areas=a / a.sum()) for cm in cams])
     dv = next(surro.parameters()).device
     ar = torch.tensor(np.tile((a / a.sum())[None], (len(cams), 1)),
                       dtype=torch.float32, device=dv)
-    return _run_chunked(surro, fe, ar, dv, chunk)   # (G, 2, P)
+    return _run_chunked(surro, fe, ar, dv, _auto_chunk(dv, len(cams), chunk))  # (G, 2, P)
+
+
+_CHUNK_OK: dict = {}
+
+
+def _auto_chunk(dv, n_geoms: int, requested) -> int:
+    """Geometries per surrogate call.
+
+    A single constant of 4 was used for CPU and CUDA alike and is wrong on both. On CPU the
+    (G, T, P, W) activation blows the cache, so smaller is faster. On a card the opposite
+    holds: sequential small launches leave the device idle, and with need_weights=False
+    removing the attention matrix all 28 geometries fit at once. `_CHUNK_OK` remembers what
+    survived, so a card that OOMs at the first guess pays the failed allocation and the
+    empty_cache() sync once rather than on every operator call in the run.
+    """
+    if requested is not None:
+        return int(requested)
+    key = str(dv)
+    if key in _CHUNK_OK:
+        return _CHUNK_OK[key]
+    return n_geoms if key.startswith("cuda") else 1
 
 
 def _run_chunked(surro, fe, ar, dv, chunk):
     """Evaluate the surrogate over geometry chunks, halving on OOM and falling back to CPU.
 
-    The activations are (G, T, P, W) = (28, 600, 96, 96) at full width, which is 2 GB per
-    four geometries. Whether that fits depends on what else holds the card -- a training run
-    in another process, for one -- so the chunk cannot be a fixed constant chosen once. An
+    The activations are (geometries, tokens, phases, width), so they scale with the chunk.
+    Whether a chunk fits depends on what else holds the card -- a training run in another
+    process, for one -- so it cannot be a fixed constant chosen once. An
     unattended reconstruction that dies on a transient allocation failure is worse than a
     slow one, and the CPU path gives identical numbers.
     """
@@ -354,18 +425,27 @@ def _run_chunked(surro, fe, ar, dv, chunk):
             out = []
             with torch.no_grad():
                 for i in range(0, len(fe), chunk):
-                    x = torch.tensor(fe[i:i + chunk], dtype=torch.float32, device=dv)
-                    out.append(surro(x, ar[i:i + chunk]).cpu())
-            return torch.cat(out)
+                    x = torch.from_numpy(np.ascontiguousarray(
+                        fe[i:i + chunk], dtype=np.float32)).to(dv, non_blocking=True)
+                    out.append(surro(x, ar[i:i + chunk]))
+            _CHUNK_OK[str(dv)] = chunk        # remember what fit; see _auto_chunk
+            return torch.cat(out).cpu()       # one transfer back, not one per chunk
         except torch.OutOfMemoryError:
             torch.cuda.empty_cache()
             chunk //= 2
-    surro_cpu = surro.to("cpu")
-    with torch.no_grad():
-        return surro_cpu(torch.tensor(fe, dtype=torch.float32), ar.cpu())
+            _CHUNK_OK[str(dv)] = max(chunk, 1)
+    # .to() is IN PLACE on a module, so this used to be a one-way door: one transient CUDA
+    # OOM anywhere in a 15-hour run left the surrogate on the CPU for every remaining call.
+    dev_was = next(surro.parameters()).device
+    try:
+        surro.to("cpu")
+        with torch.no_grad():
+            return surro(torch.tensor(fe, dtype=torch.float32), ar.cpu())
+    finally:
+        surro.to(dev_was)
 
 
-def corpus(n, psi, surro, device, seed=0, cache=None, op_res: int = 32,
+def corpus(n, psi, surro, cache=None, op_res: int = 32,
            codes_file="runs/corpus_codes.npz"):
     """Curves for the corpus, from codes fitted by scripts/fit_shapes.py.
 
@@ -460,8 +540,8 @@ def flow_loss(net, surro, psi, codes, curves, sup, idx, x0, t, M, tag, mask,
     what makes 600 bodies enough to teach a 128-dimensional support correction.
 
     Everything here is in the CODEC's whitened space. x0 ~ N(0, I) only means something once
-    the code has been transformed to match it: raw dh has std 0.0199 and raw g has std 0.0483,
-    about fifty times narrower, and g has kurtosis 14.5 whose tail IS the deep carves.
+    the code has been transformed to match it: raw dh and g are far narrower, and g is
+    heavy-tailed, with the tail being the deep carves.
 
     `ablate` additionally scores the same draws with every curve channel switched off, and
     returns (loss, ablated_loss, n_degenerate). One operator call serves both, so the two
@@ -489,6 +569,7 @@ def flow_loss(net, surro, psi, codes, curves, sup, idx, x0, t, M, tag, mask,
         if n_geoms < C:
             geoms_t = torch.randperm(C)[:n_geoms].sort().values
             geoms = geoms_t.tolist()
+            geoms_t = geoms_t.to(dev)
             step_mask = torch.zeros(B, C, device=dev)
             step_mask[:, geoms_t] = 1.0
 
@@ -500,7 +581,7 @@ def flow_loss(net, surro, psi, codes, curves, sup, idx, x0, t, M, tag, mask,
     # The velocity is constant along a straight path, so that extrapolation is the model's own
     # estimate of the endpoint. It matters because x_t at small t is mostly x0, and x0 is a
     # standard Gaussian in the codec's space: decoded, its tail draws are amplitudes several
-    # times anything the corpus contains. A residual measured at a body like that says almost
+    # times anything the corpus contains. A residual taken at a body like that says almost
     # nothing about the body being reconstructed. v0 is a first pass with the residual
     # features ZEROED -- it costs one network forward and NO operator call, which is the
     # expensive part -- so the correction is free in the only currency that matters here.
@@ -510,24 +591,40 @@ def flow_loss(net, surro, psi, codes, curves, sup, idx, x0, t, M, tag, mask,
         x1_hat = xt + (1 - t[:, None]) * v0
     xt_raw = net.codec.decode(x1_hat)
     preds, n_bad = [], 0
+    live_b = torch.ones(B, device=dev)
     for b in range(B):
         cur = curves_from_code(xt_raw[b], 1.0, surro, psi,
                                res=op_res, geoms=geoms, support=h_pert[b])
         pred = torch.zeros_like(curves[0])
         if cur is None:
-            n_bad += 1                  # decoded to under 8 faces; A(x) is unavailable
+            n_bad += 1
+            # A(x) is UNAVAILABLE, which is not the same as a prediction of zero flux.
+            # Left alone, `pred` stays zero and the residual becomes the data itself -- a
+            # full-amplitude phantom disagreement on every geometry. Drop this body out of
+            # the operator instead, so the step sees it as carrying no operator information.
+            live_b[b] = 0.0
         else:
+            cur = cur.to(dev)          # A(x) comes back on CPU; this is the only crossing
             if geoms_t is None:
                 pred = cur
             else:
                 pred[geoms_t] = cur
         preds.append(pred)
     pred_stack = torch.stack(preds)
+    step_mask = step_mask * live_b[:, None]
     g_cur = torch.fft.rfft(pred_stack, dim=-1)[..., 1:M + 1]
     r = g_dat - g_cur                                   # (B, G, 2, M) complex
-    # the same residual in PHASE space, which is the space the convex operator lives in
+    # The same residual in PHASE space, which is the space the convex operator lives in,
+    # MASKED to the geometries the operator was actually run on. With --train-geoms < 28
+    # (the pipeline default is 8) `pred_stack` is zero on every unselected geometry, so an
+    # unmasked call hands the adjoint the full data curve on every unselected geometry,
+    # which swamps the real residual and is then normalised down to noise inside
+    # support_residual_channel. The dual path was already masked, through the pooling in
+    # LPDFlow._summary; this one was not.
     sph = sph.clone()
-    sph[..., 4] = support_residual_channel(curves[idx].to(dev) - pred_stack, curves.shape[-1])
+    sph[..., 4] = support_residual_channel(
+        (curves[idx].to(dev) - pred_stack) * step_mask[:, :, None, None],
+        curves.shape[-1])
     feats = torch.zeros(B, C, N_MODES, 6, device=dev)
     for ch in range(2):                                 # EVERY geometry, not slot 0
         feats[:, :, :M, 2 * ch] = r[:, :, ch].real
@@ -536,10 +633,10 @@ def flow_loss(net, surro, psi, codes, curves, sup, idx, x0, t, M, tag, mask,
     feats[:, :, :M, 5] = g_dat[:, :, 1].real
 
     def _score(v):
-        # Per-block weights. Unweighted, g's 1728 dimensions take about 89% of the
-        # gradient and the 128-dimensional support block -- the one the operator can
-        # actually see -- gets the rest. Weighting by 1/N_block makes the two blocks
-        # contribute equally per block.
+        # Per-block weights. The lattice block has far more dimensions than the support
+        # block, so unweighted it takes almost the whole gradient and the support block --
+        # the one the operator can actually see -- gets the scraps. Weighting by 1/N_block
+        # makes the two contribute equally per block.
         err = (v - (x1 - x0)) ** 2
         return 0.5 * (err[:, :N_DIR].mean() + err[:, N_DIR:].mean())
 
@@ -609,8 +706,8 @@ class EMA:
 
     The buffer therefore starts at ZERO, not at the init weights. The two conventions are
     mutually exclusive and mixing them is not a small error: correcting a buffer that already
-    started at w0 divides by 1 - decay^n, which is 0.002 at n = 2, and the weights blow up by
-    500x into NaN on the first validation.
+    started at w0 divides by 1 - decay^n, which is tiny for the first few steps, and the
+    weights blow up into NaN on the first validation.
     """
 
     def __init__(self, net, decay: float = 0.999):
@@ -638,7 +735,12 @@ class EMA:
         return out
 
     def load(self, d, n):
-        self.shadow = {k: v.detach().clone().float() for k, v in d.items()}
+        # Onto the device the shadow was built on. A resume reads the checkpoint with
+        # map_location="cpu" while the net may be on CUDA, and the next update() would
+        # otherwise add a CUDA parameter into a CPU buffer.
+        self.shadow = {k: v.detach().to(self.shadow[k].device if k in self.shadow
+                                        else v.device).float().clone()
+                       for k, v in d.items()}
         self.n = int(n)
 
 
@@ -698,9 +800,9 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--bodies", type=int, default=40)
     ap.add_argument("--steps", type=int, default=1500)
-    # The dual uses m = 1..40, and an rFFT of n phases yields floor(n/2)+1
-    # coefficients, so fewer than 81 phases cannot supply 40 modes. At 16 phases
-    # only 8 exist and the dual silently ran at a fifth of its specified width.
+    # The dual uses m = 1..N_MODES, and an rFFT of n phases yields floor(n/2)+1
+    # coefficients, so fewer than 2*N_MODES phases cannot supply them all. Below that the
+    # dual silently runs narrower than its specified width.
     ap.add_argument("--phases", type=int, default=96)
     ap.add_argument("--batch", type=int, default=2)
     ap.add_argument("--operator-res", type=int, default=32,
@@ -711,6 +813,11 @@ def main():
     ap.add_argument("--codes-file", default="runs/corpus_codes.npz",
                     help="output of scripts/fit_shapes.py --out")
     # --steps is the cap; training stops earlier when the held-out loss stops improving.
+    ap.add_argument("--seed", type=int, default=0,
+                    help="seeds the global RNG. main() previously seeded only the held-out "
+                         "split and the validation draws, so net init and every training "
+                         "draw came from an unseeded stream and a fresh run was not "
+                         "reproducible. A resume still restores the checkpointed RNG state.")
     ap.add_argument("--val-bodies", type=int, default=8,
                     help="bodies held out of training to score early stopping on; 0 trains "
                          "the full --steps and keeps the final weights")
@@ -752,28 +859,41 @@ def main():
                          "at the same --phases would silently read each other's curves")
     a = ap.parse_args()
     _enable_tf32()
-    dev = "cpu"                     # extraction runs on CPU; the nets are small
+    torch.manual_seed(a.seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(a.seed)
     psi = psi_grid(a.phases)
 
+    # THE FLOW RUNS ON THE ACCELERATOR. It used to sit on the CPU with the comment "the nets
+    # are small"; they are not, and the volume branch is a 3-D convolution stack, so on CPU a
+    # single step costs seconds of work a card does in milliseconds.
+    # The operator stays where it was -- it returns CPU tensors and flow_loss moves them once.
     gdev = "cuda" if torch.cuda.is_available() else "cpu"
-    surro = Surrogate(width=96, modes=8, blocks=3)
+    dev = gdev
     sd = Path("runs/surrogate.pt")
     if sd.exists():
-        surro.load_state_dict(torch.load(sd, map_location="cpu"))
-        print("  loaded the trained surrogate", flush=True)
-    surro = surro.to(gdev).eval()
+        # load_surrogate, not a hard-coded Surrogate(96, 8, 3): the checkpoint carries the
+        # architecture AND the phase grid it was fitted on, and warns if that grid is not the
+        # one this run evaluates it at.
+        surro, smeta = load_surrogate(sd, phases=a.phases, device=gdev)
+        print(f"  loaded the trained surrogate {smeta}", flush=True)
+    else:
+        print("  WARNING: runs/surrogate.pt missing; using an UNTRAINED surrogate",
+              flush=True)
+        surro = Surrogate(**SURROGATE_DEFAULTS).to(gdev).eval()
     print(f"  surrogate on {gdev}; operator covers all {len(cameras())} geometries",
           flush=True)
 
     print(f"[{_now()}] [stage 1] corpus", flush=True)
     codes, curves, sup = corpus(
-        a.bodies, psi, surro, dev, codes_file=a.codes_file,
+        a.bodies, psi, surro, codes_file=a.codes_file,
         cache=corpus_cache_path(a.phases, len(cameras()), a.operator_res, a.cache_tag),
         op_res=a.operator_res)
     print(f"  corpus: codes {tuple(codes.shape)}, curves {tuple(curves.shape)}", flush=True)
+    codes, curves, sup = codes.to(dev), curves.to(dev), sup.to(dev)
 
     print(f"[{_now()}] [stage 2] flow", flush=True)
-    net = LPDFlow()
+    net = LPDFlow().to(dev)
     # The codec is fitted from the corpus and lives IN the network, so it rides the state_dict
     # into every checkpoint and back out at reconstruction. Statistics kept anywhere else
     # would silently desync between training and inference.
@@ -789,9 +909,10 @@ def main():
     # is a worse estimate of the trained field than an average of the recent ones. Validation
     # scores the AVERAGED weights, not the raw ones: scoring one model and shipping another is
     # how early stopping ends up selecting a checkpoint nobody evaluated.
-    # The window is tied to the RUN, not fixed. decay = 0.999 averages over 1/(1-d) = 1000
-    # steps; on a 2500-step budget that is 40% of training, so the shipped weights lag deep
-    # into the regime where the velocity is still close to E[x1 - x0], which transports every
+    # The window is tied to the RUN, not fixed. A fixed decay averages over 1/(1-d) steps,
+    # which on a short budget is a large fraction of the whole run -- the shipped weights
+    # then lag deep into the regime where the velocity is still close to E[x1 - x0], which
+    # transports every
     # draw towards the corpus MEAN code -- and a mean over bodies is smoother, hence more
     # convex, than any of them. Ten percent of the run keeps the averaging useful and the lag
     # proportionate.
@@ -810,7 +931,8 @@ def main():
         tag[0, i] = torch.tensor([np.cos(np.radians(cam.azimuth_deg)),
                                   np.sin(np.radians(cam.azimuth_deg)),
                                   np.sin(np.radians(cam.elevation_deg)), 1.0])
-    mask = torch.ones(1, C)
+    tag = tag.to(dev)
+    mask = torch.ones(1, C, device=dev)
     train_geoms = max(1, min(C, int(a.train_geoms)))
     print(f"  operator extraction res {a.operator_res}; training samples "
           f"{train_geoms}/{C} geometries per step", flush=True)
@@ -824,17 +946,18 @@ def main():
     if n_val < a.val_bodies:
         print(f"  WARNING: corpus has {len(codes)} bodies; holding out {n_val} for "
               f"validation instead of {a.val_bodies}", flush=True)
-    val_idx, train_idx = perm[:n_val], perm[n_val:]
+    val_idx, train_idx = perm[:n_val].to(dev), perm[n_val:].to(dev)
     if n_val:
         # Fixed noise and fixed step times: the same draws at every evaluation, so a change
         # in the score is a change in the network. The times cycle through the schedule
         # rather than being sampled, which is the low-variance form of the training estimator.
         gen = torch.Generator().manual_seed(1234)
-        val_x0 = torch.randn(n_val, codes.shape[1], dtype=codes.dtype, generator=gen)
+        val_x0 = torch.randn(n_val, codes.shape[1], dtype=codes.dtype,
+                             generator=gen).to(dev)
         # Times stratified over [0,1), not sampled and not snapped to the six step times: the
         # flow is now trained at continuous t, and validation has to score the same objective.
-        val_t = (torch.arange(n_val, dtype=codes.dtype) + 0.5) / max(n_val, 1)
-        val_eps = _dh_perturbation(n_val, generator=gen)
+        val_t = ((torch.arange(n_val, dtype=codes.dtype) + 0.5) / max(n_val, 1)).to(dev)
+        val_eps = _dh_perturbation(n_val, generator=gen).to(dev)
         print(f"  {len(train_idx)} training bodies, {n_val} held out; validating every "
               f"{a.val_every} steps, patience {a.patience}", flush=True)
     else:
@@ -846,6 +969,10 @@ def main():
     start_step, elapsed_before = 0, 0.0
     ckpt_path = a.ckpt_file or f"{a.out}.ckpt"
     meta = {
+        # `bodies` is in here because the held-out split is drawn from a permutation of
+        # len(codes): resuming with a different --bodies quietly moves bodies across the
+        # split, so the checkpoint would be scored on data it had trained on.
+        "bodies": int(len(codes)),
         "dim": int(codes.shape[1]),
         "n_modes": int(N_MODES),        # `modes` is a buffer and IS in the state_dict, so a
         "n_steps": int(N_STEPS),        # mismatch would otherwise surface as a bare
@@ -894,14 +1021,14 @@ def main():
 
     t_run = t_step = time.time()
     for s in range(start_step, a.steps):
-        idx = train_idx[torch.randint(0, len(train_idx), (a.batch,))]
-        x0 = torch.randn(a.batch, codes.shape[1], dtype=codes.dtype)
+        idx = train_idx[torch.randint(0, len(train_idx), (a.batch,)).to(dev)]
+        x0 = torch.randn(a.batch, codes.shape[1], dtype=codes.dtype).to(dev)
         # Continuous t, STRATIFIED across the batch. Six discrete step times meant the network
         # only ever saw six points on its own trajectory. Stratifying gives an O(1/B^2)
         # estimator instead of O(1/B), which is what makes a larger batch superlinearly
         # better; the operator is called once per draw either way, so this costs nothing.
         t = ((torch.arange(a.batch, dtype=codes.dtype) + torch.rand(a.batch)) / a.batch)
-        t = t[torch.randperm(a.batch)]
+        t = t[torch.randperm(a.batch)].to(dev)
         loss = flow_loss(net, surro, psi, codes, curves, sup, idx, x0, t, M, tag, mask,
                          op_res=a.operator_res, train_geoms=train_geoms)
         opt.zero_grad(); loss.backward(); opt.step(); ema.update(net)

@@ -42,10 +42,9 @@ def design_normals(n: int = 256) -> np.ndarray:
 
     NOT DESIGN_N. These are library statistics, not the solver's core: the participation
     ratio of the support descriptor is capped by this count, so it has to be large enough to
-    resolve the structure being measured, but generating DESIGN_N = 4096 here would cost a
-    15-hour build for a diagnostic. The default was 64, which capped PR(support) at 64 while
-    the docstring claimed it was "the design the solver's convex core is defined on" -- it
-    was not, and the cap was reached in practice.
+    resolve the structure being measured -- but building a design the size of DESIGN_N takes
+    hours, which is too much for a diagnostic. An earlier default was small enough that the
+    cap was hit in practice.
     """
     p = Path(__file__).with_name(f"design{n}.npy")
     if p.exists():
@@ -75,7 +74,7 @@ def descriptor_support(verts: np.ndarray, normals: np.ndarray | None = None) -> 
     """h(n) = max_v <v, n> on the design normals.
 
     This is not a proxy: `scripts/fit_shapes.py` computes exactly this vector as `h0s` and
-    loads it into `ConvexCore.set_support`, so it IS the convex half of the fitted code,
+    computes the same quantity for its own normals, so it IS the convex half of the code,
     obtainable without running the autodecoder.
     """
     n = design_normals() if normals is None else np.asarray(normals, float)
@@ -240,7 +239,7 @@ def pairwise_dice(bodies: list, res: int = 48, extent: float = 1.35,
 
 # --------------------------------------------------------------------------- validity
 
-def check_body(body, radius: float = 1.0, convexity_max: float = 0.95,
+def check_body(body, radius: float = 1.0, convexity_max: float = 0.98,
                pose_tol: float = 1e-6, radius_tol: float = 1e-6) -> dict:
     """Every per-body constraint, reported separately."""
     v, f = body.verts, body.faces

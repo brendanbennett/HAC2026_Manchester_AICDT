@@ -92,11 +92,10 @@ def projection_directions(n: int = 36, mode: str = "side"):
     return np.stack([np.cos(th), np.sin(th), np.zeros_like(th)], 1)
 
 
-def side_view_measure(pts_a, pts_b, n_dirs=36, res=512, mode="side"):
-    """Aggregate boundary distance over well-spread viewing directions."""
-    ext = 1.05 * max(np.abs(pts_a).max(), np.abs(pts_b).max())
-    assds, hauss = [], []
+def view_frames(n_dirs=36, mode="side"):
+    """The (e1, e2) image axes for each viewing direction, in order."""
     up = np.array([0.0, 0.0, 1.0])
+    out = []
     for v in projection_directions(n_dirs, mode):
         e1 = np.cross(up, v)
         if np.linalg.norm(e1) < 1e-8:
@@ -104,23 +103,50 @@ def side_view_measure(pts_a, pts_b, n_dirs=36, res=512, mode="side"):
         e1 = e1 / np.linalg.norm(e1)
         e2 = np.cross(v, e1)
         e2 = e2 / np.linalg.norm(e2)
-        ca = silhouette_contours(pts_a, e1, e2, ext, res)
-        cb = silhouette_contours(pts_b, e1, e2, ext, res)
+        out.append((e1, e2))
+    return out
+
+
+def outline_set(pts, ext, n_dirs=36, res=512, mode="side"):
+    """One cloud's boundary curves, one per viewing direction (None where empty).
+
+    Split out of side_view_measure so a caller comparing S clouds pairwise projects each of
+    them ONCE rather than S-1 times. `ext` must be shared across the clouds being compared,
+    for the same reason the voxel grid is: the contours are returned in model units, and a
+    per-pair ext puts each pair on a different pixel pitch.
+    """
+    return [silhouette_contours(pts, e1, e2, ext, res) for e1, e2 in view_frames(n_dirs, mode)]
+
+
+def measure_outlines(oa, ob):
+    """Aggregate boundary distance between two outline sets from `outline_set`."""
+    assds, hauss = [], []
+    for ca, cb in zip(oa, ob):
         if ca is None or cb is None:
             continue
         a, h = boundary_distance(ca, cb)
         assds.append(a)
         hauss.append(h)
+    if not assds:
+        return {"assd_mean": float("inf"), "assd_worst": float("inf"),
+                "hausdorff_mean": float("inf"), "hausdorff_worst": float("inf"), "n_dirs": 0}
     return {"assd_mean": float(np.mean(assds)), "assd_worst": float(np.max(assds)),
             "hausdorff_mean": float(np.mean(hauss)),
             "hausdorff_worst": float(np.max(hauss)), "n_dirs": len(assds)}
+
+
+def side_view_measure(pts_a, pts_b, n_dirs=36, res=512, mode="side"):
+    """Aggregate boundary distance over well-spread viewing directions."""
+    ext = 1.05 * max(np.abs(pts_a).max(), np.abs(pts_b).max())
+    return measure_outlines(outline_set(pts_a, ext, n_dirs, res, mode),
+                            outline_set(pts_b, ext, n_dirs, res, mode))
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--models", type=int, nargs="+", default=[1, 2, 3])
     ap.add_argument("--recon-dir", default="results/lpd")
-    ap.add_argument("--data-dir", default="../data/raw")
+    ap.add_argument("--data-dir", default="dataset/raw")
     ap.add_argument("--n-dirs", type=int, default=36)
     ap.add_argument("--res", type=int, default=512)
     ap.add_argument("--out", default="projection_scores.json")
@@ -133,7 +159,7 @@ def main():
             print(f"model {M}: no truth STL", flush=True)
             continue
         tv, tfc = load_stl(tf[0])
-        tv = rescale_touch_z(tv)
+        tv = rescale_touch_z(tv, tfc)
         tp = surface_points(tv, tfc)
 
         rows = {}
@@ -148,6 +174,7 @@ def main():
         rf = Path(args.recon_dir) / f"Asteroid{M:02d}.stl"
         if rf.exists():
             rv, rfc = load_stl(str(rf))
+            rv = rescale_touch_z(rv, rfc)
             rows["shipped_vs_truth"] = side_view_measure(
                 surface_points(rv, rfc), tp, args.n_dirs, args.res)
 

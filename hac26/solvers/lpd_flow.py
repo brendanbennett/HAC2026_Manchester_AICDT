@@ -10,19 +10,20 @@ recovers well, so sampling the whole of h would make the network re-derive somet
 solvable and would let noise move the overall size of the body. But that operator ASSUMES
 convexity, and a non-convex body is darker than its own hull from self-shadowing -- so it
 explains darkness with shape and its h is wrong in a direction that always favours a convex
-answer. dh corrects that, band-limited to degree <= 5 because the curves constrain only about
-35-40 support directions and an out-of-band dh kills facets outright.
+answer. dh corrects that, band-limited to degree <= 5 because the curves constrain far
+fewer support directions than the design has, and an out-of-band dh kills facets outright.
 
 Each block gets its own network, because they are different objects on different domains: a
 3-D CNN over the lattice for g, a sphere-convolution over the design directions for dh. The
 predecessor flattened the whole code into an MLP, which is why it needed `hidden > CODE_DIM`
-("the velocity is mostly x_t rescaled"); at 1856 that rule would have cost 13.1 M parameters
-for 600 bodies. The structured branches cost about a tenth of that and the rule disappears
+("the velocity is mostly x_t rescaled"), which at this code dimension is far more parameters
+than the corpus can support. The structured branches cost a fraction of that and the rule
+disappears
 with the flattening, because both branches carry the identity path for free -- from S_0 = I in
 the sphere bank and from the centre tap of the 3x3x3 kernel.
 
-DUAL: the psi-Fourier coefficients of the mean-normalised curves, m = 1..40, whitened by
-s_{c,m}.
+DUAL: the psi-Fourier coefficients of the mean-normalised curves, m = 1..40. Not whitened --
+the covariance is used for the snap gate, not for the network input.
 
 The dual network is shared across m and never mixes m. Expanding a curve as
 L_g(psi) = int k_g(R_psi^-1 n) dS(n) and using Y_lm(R_psi^-1 n) = e^{-i m psi} Y_lm(n),
@@ -51,8 +52,9 @@ Flow matching rather than L2 or expected-DICE. Either of those computes E[x | g]
 posterior here provably contains indistinguishable pairs: the spindle r(z) = R(1 - |z|/2)
 and the hourglass r(z) = R(1/2 + |z|/2) have equal volume, equal silhouette area from every
 equatorial direction, equal R and equal z-extent, and being axisymmetric they give constant
-curves -- so all 28 mean-normalised curves are identically 1.0 for both, while they sit
-0.263 apart in Dice. Their conditional mean is neither of them and is smoother than both.
+curves -- so every mean-normalised curve is identically 1.0 for both, while the two bodies
+are nowhere near each other in Dice. Their conditional mean is neither of them and is
+smoother than both.
 A flow samples from the posterior instead of averaging over it.
 """
 from __future__ import annotations
@@ -71,9 +73,8 @@ N_MODES = 40
 N_STEPS = 6
 T_DIM = 32          # width of the TIME embedding, which is not the mode embedding
 G_LIMIT = 4.0       # the decode saturates at this multiple of the corpus's largest fitted
-                    # amplitude. Measured: a body at 2.7x the corpus maximum still extracts
-                    # and decimates normally, so 4x is comfortably outside anything the flow
-                    # should ever emit and far inside where the arithmetic breaks.
+                    # amplitude: outside anything the flow should emit, well inside where
+                    # float32 sinh overflows.
 
 
 def fourier_embed(m: torch.Tensor, dim: int = 16) -> torch.Tensor:
@@ -86,12 +87,10 @@ def fourier_embed(m: torch.Tensor, dim: int = 16) -> torch.Tensor:
 def time_embed(t: torch.Tensor, dim: int = T_DIM) -> torch.Tensor:
     """Embedding of t in [0, 1]. Separate from fourier_embed, which is scaled for m = 1..40.
 
-    Reusing the mode embedding for time was a real defect: its slowest band has period about
-    47 in its argument, so over t in [0,1] every one of its bands sits in the small-angle
-    regime. Measured on the six step times it produced singular values
-    [6.85, 1.03, 7.7e-2, 3.2e-3, 7.2e-5, 1.0e-6] -- condition number 6.7e6, effectively rank
-    four. The gain path, whose entire job is to learn a function of t alone, was reading that.
-    Here the frequencies span 1 to 2^(dim/2 - 1) cycles across the unit interval instead.
+Reusing the mode embedding for time does not work: its slowest band has period ~47 in its
+    argument, so over t in [0,1] every band sits in the small-angle regime and the embedding
+    is badly conditioned. The gain path, whose whole job is a function of t, reads this.
+    Frequencies here span 1 to 2^(dim/2 - 1) cycles across the unit interval.
     """
     k = torch.arange(dim // 2, device=t.device, dtype=torch.float32)
     a = t[..., None].float() * (2.0 * np.pi) * (2.0 ** k)
@@ -125,7 +124,10 @@ class DualSetTransformer(nn.Module):
             y = x.permute(0, 2, 1, 3).reshape(B * M, C, -1)  # attend over C, at fixed m
             km = kpm[:, None, :].expand(B, M, C).reshape(B * M, C)
             km = torch.where(km.all(-1, keepdim=True), torch.zeros_like(km), km)
-            y, _ = att(y, y, y, key_padding_mask=km)
+            # need_weights=False routes to scaled_dot_product_attention instead of
+            # materialising the (B*M*heads, C, C) attention matrix and its head-mean, neither
+            # of which is read. Same output, and flash attention on CUDA.
+            y, _ = att(y, y, y, key_padding_mask=km, need_weights=False)
             x = x + y.reshape(B, M, C, -1).permute(0, 2, 1, 3)
             x = x + mlp(x)
         return x
@@ -179,8 +181,12 @@ class SphereConv(nn.Module):
 
 
 class _FiLM(nn.Module):
-    """Per-channel scale and shift from the conditioning vector. Zero-init, so a fresh block
-    starts as the identity and the branch starts as its own skip path."""
+    """Per-channel scale and shift from the conditioning vector.
+
+    Zero-init, so at the start it passes its input straight through and the conditioning has
+    no effect at all until the weights move. The branch itself starts at zero because its
+    HEAD is zero-init, which is a separate thing.
+    """
 
     def __init__(self, cond_dim: int, width: int):
         super().__init__()
@@ -199,11 +205,12 @@ class _FiLM(nn.Module):
 class SphereBranch(nn.Module):
     """Velocity for the dh block: a sphere convolution over the N_DIR design directions.
 
-    Input channels: dh_t, the aligned adjoint channel J^T A^T DN^T r (whitened per sample --
-    its raw magnitude is order 1e2), h_base, and the three components of the direction itself.
-    The adjoint channel is CONDITIONING and is never added to the velocity: A_conv is blind to
-    concavity and under-signals a deep pit by 3x, so it can say which face is wrong but never
-    what shape the dent is.
+    Input channels, in order: dh_t, h_base, the three components of the direction, and the
+    aligned adjoint channel A^T r (whitened per sample). cond_channels builds the last five.
+
+    The adjoint channel is CONDITIONING and is never added to the velocity: the convex
+    operator is blind to concavity, so it can say which face is wrong but not what shape the
+    dent is.
     """
 
     def __init__(self, cond_dim: int, width: int = 128, blocks: int = 4, in_ch: int = 6):
@@ -266,13 +273,13 @@ class CodeCodec(nn.Module):
     Two jobs, both required and neither previously present anywhere in the repo.
 
     WHITENING. x0 is drawn from N(0, I) and the target is x1 - x0, so the two endpoints have
-    to live in the same space. Measured on fitted bodies, dh has std 0.0199 and g has std
-    0.0483 in units of R -- about fifty times narrower than N(0, I). Untransformed, the flow
-    spends its whole trajectory travelling from a unit Gaussian to a spike.
+    to live in the same space. Raw dh and g are one or two orders of magnitude narrower than
+    a unit Gaussian; untransformed, the flow spends its whole trajectory travelling from a
+    unit Gaussian to a spike.
 
-    ASINH on g. Measured kurtosis 14.5 and max|z| 12.98; after asinh, 3.17 and 4.53. The heavy
-    tail IS the deep carves, so the alternative -- clipping, or letting a Gaussian flow model
-    it badly -- is exactly the alternative that gives back convex answers.
+    ASINH on g. Its distribution is heavy-tailed, and the tail IS the deep carves, so the
+    alternatives -- clipping, or letting a Gaussian flow model it badly -- are exactly the
+    ones that give back convex answers.
 
     Per-BLOCK SCALARS, not per-coordinate. A per-site mean and variance is body-dependent and
     would break the weight sharing that lets a few hundred bodies teach 1728 amplitudes -- the
@@ -325,12 +332,11 @@ class CodeCodec(nn.Module):
         """z -> raw code. SATURATING, and that is not optional.
 
         sinh is unbounded and its relative error grows with its argument, so an ordinary
-        regression error in z becomes an astronomical error in the field: measured, doubling
-        z takes |g| from 2.7x the corpus maximum to 545x, and tripling it to 1e5x. That alone
-        is survivable -- the level set is nonsense but a mesh still comes out. What is not
-        survivable is that float32 sinh OVERFLOWS at |u| ~ 89, i.e. |z| ~ 69: g becomes
-        +-inf, the field is non-finite, and the extracted mesh is garbage that fails inside
-        facet indexing several call frames later, long after the cause.
+        regression error in z becomes an enormous error in the field. That alone is
+        survivable -- the level set is nonsense but a mesh still comes out. What is not is
+        that float32 sinh OVERFLOWS: g becomes +-inf, the field is non-finite, and the
+        extracted mesh fails inside facet indexing several frames later, long after the
+        cause.
 
         A single gradient spike is enough to get there, and because the training checkpoint
         restores weights, optimiser moments and RNG together, a resume replays it exactly.
@@ -386,9 +392,9 @@ class LPDFlow(nn.Module):
         # Pool over GEOMETRIES only, then project each mode to `mode_feat` with ONE shared
         # Linear. The predecessor summed over geometries AND modes while dividing by the
         # geometry count alone, so the summary was exactly N_MODES = 40 times a true mean --
-        # measured 40.000004, independent of the mask -- and which mode carried the signal was
-        # discarded. A dense Linear(n_modes*width, ...) would instead be precisely the cross-m
-        # mixing this module's docstring spends fifteen lines arguing against.
+        # so the summary was N_MODES times a true mean, and which mode carried the signal was
+        # discarded. A dense Linear(n_modes*width, ...) would instead be exactly the cross-m
+        # mixing this module argues against.
         self.mode_proj = nn.Linear(width, mode_feat)
         self.summary_dim = n_modes * mode_feat
         self.primal = PrimalNet(self.summary_dim)
@@ -401,9 +407,9 @@ class LPDFlow(nn.Module):
         w = mask[:, :, None, None]
         pooled = (d * w).sum(1) / w.sum(1).clamp_min(1e-6)       # (B, M, width) -- true mean
         # Slots beyond M = min(N_MODES, phases//2) are zero-filled by the caller and carry no
-        # data, but the dual still emits bias + mode-embedding for them. Measured at phases=16
-        # they contributed 81.7% MORE norm than the real modes. Detect them from the input
-        # rather than from a constructor argument, so a checkpoint cannot disagree with a run.
+        # data, but the dual still emits bias + mode-embedding for them, and at low phase
+        # counts that dominates. Detect them from the input rather than from a constructor
+        # argument, so a checkpoint cannot disagree with a run.
         live = (resid.abs().sum((1, 3)) > 0).float()[..., None]  # (B, M, 1)
         return (self.mode_proj(pooled) * live).reshape(resid.shape[0], -1)
 
@@ -412,17 +418,33 @@ class LPDFlow(nn.Module):
         return self.primal(code, self._summary(resid, geom_tag, mask), te, sphere_ch, vol_ch)
 
     @torch.no_grad()
-    def sample(self, resid_fn, geom_tag, mask, batch: int = 1, device="cpu"):
+    def sample(self, resid_fn, geom_tag, mask, cond, batch: int = 1, device="cpu"):
         """x0 ~ N(0, I) then n_steps Euler steps, in the codec's whitened space throughout.
 
-        `resid_fn(code)` returns (residual, sphere_channels, vol_channels) for the current
-        code and re-applies the operator at every step rather than linearising once. It is
-        given the WHITENED code and decodes internally, so nothing outside this loop has to
-        know which space it is holding.
+        `resid_fn(code, t)` returns (residual, sphere_channels, vol_channels) and re-applies
+        the operator at every step rather than linearising once. It is given a WHITENED code
+        and decodes internally, so nothing outside this loop has to know which space it holds.
+        `cond` is (sphere_channels, vol_channels) for this body with the adjoint channel still
+        zero -- constant, since h is fixed at reconstruction -- and is what the first pass
+        conditions on.
+
+        THE OPERATOR IS APPLIED AT x1_hat = x + (1 - t) v0(x), NOT AT x, because that is what
+        train_lpd.flow_loss does and a sampler that differs from the objective it was trained
+        against is scoring a different model. It matters most at k = 0, where x is still the
+        raw Gaussian draw: decoded, that is a body several times anything the corpus contains,
+        and the residual it returns says almost nothing about the body being reconstructed.
+        The first pass runs the residual features ZEROED, so it costs one network forward and
+        no operator call -- and the operator is the entire cost of this loop.
         """
+        sph0, vol0 = cond
+        sph0 = sph0.expand(batch, -1, -1)
+        vol0 = vol0.expand(batch, -1, -1, -1, -1)
+        zero = torch.zeros(batch, geom_tag.shape[1], self.n_modes, 6, device=device)
         x = torch.randn(batch, CODE_DIM, device=device)
         for k in range(self.n_steps):
             t = torch.full((batch,), k / self.n_steps, device=device)
-            r, sph, vol = resid_fn(x, t)
+            v0 = self.velocity(x, zero, geom_tag, mask, t, sph0, vol0)
+            x1_hat = x + (1 - t[:, None]) * v0
+            r, sph, vol = resid_fn(x1_hat, t)
             x = x + self.velocity(x, r, geom_tag, mask, t, sph, vol) / self.n_steps
         return x

@@ -89,18 +89,28 @@ class Rasteriser:
                vert_radiance: torch.Tensor, eye: np.ndarray,
                fov_y_rad: float, antialias: bool = True):
         """Returns (radiance image (1,H,W), coverage mask (1,H,W)) at supersampled size."""
+        return self.render_batch(verts, faces, vert_radiance, eye[None], fov_y_rad, antialias)
+
+    def render_batch(self, verts: torch.Tensor, faces: torch.Tensor,
+                     vert_radiance: torch.Tensor, eyes: np.ndarray,
+                     fov_y_rad: float, antialias: bool = True):
+        """Same, for many eyes at once. Returns (radiance (B,H,W), coverage (B,H,W)).
+
+        The radiance is shared across the batch, which is the case that matters: it depends
+        on the source direction, so every camera at one rotation phase sees the same one.
+        Rasterising them together is one kernel launch instead of 28.
+        """
         dev = self.device
-        mv = look_at(eye, device=dev)
         proj = perspective(fov_y_rad, self.w / self.h, device=dev)
-        mvp = proj @ mv
+        mvp = torch.stack([proj @ look_at(np.asarray(e), device=dev) for e in eyes])
         v_h = torch.cat([verts, torch.ones(len(verts), 1, device=dev, dtype=verts.dtype)], 1)
-        clip = (v_h @ mvp.T)[None]
+        clip = torch.einsum("vj,bij->bvi", v_h, mvp).contiguous()
         tri = faces.to(torch.int32).contiguous()
-        rast, _ = self.dr.rasterize(self.ctx, clip.contiguous(), tri, resolution=self.resolution)
+        rast, _ = self.dr.rasterize(self.ctx, clip, tri, resolution=self.resolution)
         attr = vert_radiance.reshape(1, -1, 1)
         img, _ = self.dr.interpolate(attr, rast, tri)
         if antialias:
-            img = self.dr.antialias(img, rast, clip.contiguous(), tri)
+            img = self.dr.antialias(img, rast, clip, tri)
         return img[..., 0], (rast[..., 3] > 0).to(img.dtype)
 
 

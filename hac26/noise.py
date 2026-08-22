@@ -73,8 +73,8 @@ def replicate_offset_r2(curves: np.ndarray, mask: np.ndarray | None = None) -> n
     a rigid offset. Near 0 means the pair is co-located and the difference is honest noise;
     near 1 means the cameras are not where they are documented to be and sigma is inflated.
 
-    Measured on the public models: R^2 <= 0.002 on the geometric (binary) channel, and
-    at the noisy azimuths, so the spread across curves is noise rather than geometry.
+    On the public models this comes out near zero on the geometric (binary) channel and at
+    the noisy azimuths, so the spread across curves is noise rather than geometry.
     """
     C, m = curves.shape
     mask = np.ones(C) if mask is None else np.asarray(mask)

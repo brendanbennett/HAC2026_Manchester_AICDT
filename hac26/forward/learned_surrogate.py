@@ -1,19 +1,21 @@
 """The fast operator the LPD needs, at thousands of evaluations.
 
 The split that makes this work: the GEOMETRY is ray-traced exactly and never learned, and
-only the tone-mapped response is. Per surface token and per phase, four exact features:
+only the tone-mapped response is. Per surface token and per phase:
 
     camera visibility            is the token seen from this camera
     light visibility             penumbra-weighted over the K source samples
     perspective solid angle      how much image area the token subtends
     one gathered bounce          FREE: it is the blocker hit of the shadow rays, which
                                  have already been cast for light visibility
+    the token's own area         quadrature weight, and an input too: a facet's share of
+                                 the binary curve is its projected area
 
-Those four carry all the non-convexity there is -- occlusion, cast shadow and
+The first four carry all the non-convexity there is -- occlusion, cast shadow and
 interreflection are exactly the phenomena a convex model cannot express -- so learning them
-would be learning something computable directly. What is learned is only the map from those
-features to the reduced curve value, which is where the sensor chain, the thresholds and
-the pedestal live.
+would be learning something computable directly. What is learned is only the map from these
+features to the reduced curve value, which is where the shared sensor chain lives. The
+per-curve terms of the calibration are applied nowhere; see scripts/train_surrogate.py.
 
 EQUIVARIANCE, exactly AND NOT APPROXIMATELY. Rotating the body by one frame permutes the
 phase axis cyclically. The operator must commute with that, so the network is built only
@@ -94,8 +96,8 @@ def sun_features(mesh, token_pts, token_nrm, sun_dirs, eps: float = 1e-4):
     the camera, so they are computed once and shared by all 28 geometries.
 
     The source is fixed in the lab frame, so at a given phase every camera sees the same
-    illumination. Re-tracing the shadow rays per camera repeats identical work 28 times.
-    Verified against trace_features to 3.4e-17, i.e. float summation order only.
+    illumination. Re-tracing the shadow rays per camera repeats identical work once per
+    camera. Checked against trace_features: the two agree to float summation order.
     """
     n_t, n_p = len(token_pts), len(sun_dirs)
     o = np.repeat(token_pts + token_nrm * eps, n_p, axis=0)
@@ -134,7 +136,7 @@ def camera_features(mesh, token_pts, token_nrm, cam_dirs, sun, areas=None,
 
 
 class TokenFeatures(nn.Module):
-    """Pointwise lift of the four exact features, identical at every phase."""
+    """Pointwise lift of the N_FEAT per-token features, identical at every phase."""
 
     def __init__(self, width: int = 64):
         super().__init__()
@@ -181,7 +183,14 @@ class PhaseSharedAttention(nn.Module):
     def forward(self, x):                       # (B, T, P, W)
         b, t, p, w = x.shape
         y = x.permute(0, 2, 1, 3).reshape(b * p, t, w)
-        y, _ = self.att(y, y, y)
+        # need_weights=False, and it is not cosmetic. With it True (the torch default)
+        # F.multi_head_attention_forward takes the bmm+softmax path and materialises the
+        # (bsz*heads, L, S) attention matrix PLUS a (bsz, L, S) head-mean, both of which are
+        # discarded here. That is quadratic in the token count, per layer, and it is most of
+        # what a chunked run spends. False routes to scaled_dot_product_attention, i.e.
+        # flash / memory-efficient attention with O(L) memory on CUDA. Same output either
+        # way.
+        y, _ = self.att(y, y, y, need_weights=False)
         y = y.reshape(b, p, t, w).permute(0, 2, 1, 3)
         return self.norm(x + y)
 
@@ -232,3 +241,52 @@ class Surrogate(nn.Module):
     def forward(self, feats, areas=None):
         c = self.net(feats, areas)
         return c / c.mean(dim=-1, keepdim=True).clamp_min(1e-9)
+
+
+# --------------------------------------------------------------- checkpoint with its config
+
+SURROGATE_DEFAULTS = {"width": 96, "modes": 8, "blocks": 3}
+
+
+def save_surrogate(net, path, meta: dict) -> None:
+    """Weights AND the configuration they were built and trained under.
+
+    A bare state_dict records neither the architecture nor the phase grid, so a rerun of
+    train_surrogate.py with different flags produced a file the pipeline either refused to
+    load (wrong width/blocks) or loaded and silently misused (wrong phase count). Both have
+    happened. Consumers read this through load_surrogate and check it.
+    """
+    import torch
+    torch.save({"net": net.state_dict(), "meta": dict(meta)}, path)
+
+
+def load_surrogate(path, phases: int | None = None, device="cpu"):
+    """(net, meta). Accepts the legacy bare state_dict, assuming SURROGATE_DEFAULTS for it.
+
+    `phases` is the grid the CALLER will evaluate on. A surrogate fitted on a coarser grid is
+    not the same operator: rFFT bin k is rotation order k at any P, so keeping modes 0..8 is
+    the same band either way -- but sampling at P frames ALIASES every true order above P/2
+    down into that band, so a net trained at P = 16 learned to reproduce aliased curves and
+    is then asked for unaliased ones.
+    """
+    import torch
+    blob = torch.load(path, map_location="cpu", weights_only=False)
+    if isinstance(blob, dict) and "net" in blob and "meta" in blob:
+        meta, sd = dict(blob["meta"]), blob["net"]
+    else:
+        meta, sd = dict(SURROGATE_DEFAULTS), blob
+        meta["legacy"] = True
+        print(f"  WARNING: {path} carries no metadata; assuming "
+              f"{SURROGATE_DEFAULTS} and an unknown phase grid", flush=True)
+    net = Surrogate(width=int(meta.get("width", 96)), modes=int(meta.get("modes", 8)),
+                    blocks=int(meta.get("blocks", 3)),
+                    use_attention=bool(meta.get("attention", True)))
+    net.load_state_dict(sd)
+    got = meta.get("phases")
+    if phases is not None and got is not None and int(got) != int(phases):
+        print(f"  WARNING: {path} was trained at {got} phases and is being evaluated at "
+              f"{phases}. Sampling at {got} aliases every rotation order above {int(got)//2} "
+              f"into the band the network kept, so it was fitted to a different operator. "
+              f"Retrain with --phases {phases}.", flush=True)
+    return net.to(device).eval(), meta
+

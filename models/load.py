@@ -3,15 +3,16 @@
     lpd_convex.pt                trained convex LPD; produced every reconstruction in
                                  results/convex. Carries its own `preset`, so the
                                  architecture is rebuilt from the file with no other input.
-                                 Summed Dice 1.9459 over the three public models
-                                 (0.8682 / 0.4647 / 0.6130, 128^3 voxel grid, both meshes
-                                 posed by rescale_touch_z).
 
-    instrument_calibration.pt    parameters fitted to the real lab curves of models 1-3:
-                                 albedo, source angular radius, PSF width, OETF knots,
-                                 per-curve intensity and binary thresholds, per-curve
-                                 pedestal, per-body initial phase, per-curve model error.
-                                 Independent of any reconstruction method.
+    instrument_calibration.pt    fitted to the real lab curves of models 1-3: vignetting,
+                                 PSF width, OETF knots, clip knee, per-curve pedestal and
+                                 per-curve model error. Independent of any reconstruction
+                                 method.
+
+                                 Also in the file but NOT fitted: the two per-curve
+                                 thresholds (a hard comparison passes no gradient), and rho
+                                 and delta_deg, which are whatever was passed on the command
+                                 line. There is no psi0 in the file. See scripts/calibrate.py.
 
 Both are torch pickles, so torch.load executes their contents; load only copies you trust.
 """

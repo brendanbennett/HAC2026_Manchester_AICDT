@@ -12,7 +12,7 @@ What is absent: any 1/d^2 factor. Radiance is conserved along a ray, so the
 image irradiance produced by an extended surface does not depend on how far away it is. The
 perspective effect is entirely in how many PIXELS a surface element covers, which the
 rasteriser already handles. Putting a 1/d^2 on pixel VALUES would double-count it; the
-roughly 2x difference between near and far limb is a projected-area effect, not a
+difference between near and far limb is a projected-area effect, not a
 brightness one. The only radiometric falloff here is off-axis cos^4 and fitted vignetting.
 
 The OETF is a spline. A power law has one parameter and forces the same curvature
@@ -32,13 +32,21 @@ import torch.nn.functional as F
 __all__ = ["SensorModel", "gaussian_psf", "box_downsample", "quantise_ste"]
 
 
-def gaussian_psf(sigma_px: float, radius: int | None = None,
+def gaussian_psf(sigma_px, radius: int | None = None,
                  device=None, dtype=torch.float32) -> torch.Tensor:
-    """Separable Gaussian PSF kernel. Stands in for the measured PSF until it is fitted."""
+    """Separable Gaussian PSF kernel, differentiable in sigma when a tensor is passed.
+
+    It has to be: raw_psf is in the calibration's optimiser, and passing a plain float here
+    detaches it, so it could never move.
+
+    `radius` stays an int on purpose -- it is the kernel's support, not a fitted quantity,
+    and tying it to sigma would add a discontinuity every time ceil() steps.
+    """
+    sig = torch.as_tensor(sigma_px, device=device, dtype=dtype)
     if radius is None:
-        radius = max(1, int(np.ceil(3.0 * sigma_px)))
+        radius = max(1, int(np.ceil(3.0 * float(sig.detach()))))
     x = torch.arange(-radius, radius + 1, device=device, dtype=dtype)
-    k = torch.exp(-0.5 * (x / max(sigma_px, 1e-6)) ** 2)
+    k = torch.exp(-0.5 * (x / sig.clamp_min(1e-6)) ** 2)
     return k / k.sum()
 
 
@@ -138,7 +146,7 @@ class SensorModel(nn.Module):
         normalised distance from the optical axis, in [0, 1] at the frame corner.
         """
         x = radiance * cos_off.clamp_min(0.0) ** 4 * self.vignette(radius)
-        x = _separable_conv(x, gaussian_psf(float(self.psf_sigma), device=x.device,
+        x = _separable_conv(x, gaussian_psf(self.psf_sigma, device=x.device,
                                             dtype=x.dtype))
         x = self.oetf(x / self.saturation.clamp_min(1e-6))
         x = x.clamp(0.0, 1.0)                       # saturation

@@ -3,13 +3,15 @@
 
 STRUCTURE OF THE FIT, and why it is affordable at all. rho and the source radius enter
 through the radiosity solve, so changing them means re-rendering. Everything else -- the
-sensor chain, the thresholds, the pedestals, psi0 -- acts on the VALUE IMAGE and downstream
+sensor chain, the pedestals, psi0 -- acts on the VALUE IMAGE and downstream
 of it. So the radiance images are rendered once and cached, and the remaining parameters
-are fitted on the cache. psi0 is a cyclic shift of a curve, applied by Fourier
-interpolation after reduction rather than by re-rendering at shifted phases.
+are fitted on the cache.
 
-Radiosity runs on a decimated mesh (necessarily: model 1's 800k facets would need a 5,120 GB
-form-factor matrix) and its per-facet radiance is transferred to the full mesh by nearest
+psi0, the per-body phase offset, is NOT fitted here and is not applied: every call leaves it
+at zero.
+
+Radiosity runs on a decimated mesh, necessarily -- a dense form-factor matrix on a full
+ground-truth mesh does not fit in memory. Its per-facet radiance is transferred by nearest
 centroid, so the SILHOUETTE -- which is what the binary channel measures -- still comes from
 the original geometry.
 
@@ -73,12 +75,11 @@ def render_body(model: int, n_phase: int, res, ss, rho, delta, device="cuda",
     cams = cameras()
     out = torch.zeros(28, n_phase, ras.resolution[0], ras.resolution[1],
                       dtype=torch.float32, device=device)
+    eyes = np.stack([np.asarray(c.v) for c in cams]) * 8.0
     for j in range(n_phase):
-        val = np.repeat(L[j][idx], 3).astype(np.float32)
-        vr = torch.tensor(val, device=device)
-        for c, cam in enumerate(cams):
-            img, _ = ras.render(fv_t, ff_t, vr, eye=np.asarray(cam.v) * 8.0, fov_y_rad=fov)
-            out[c, j] = img[0]
+        vr = torch.tensor(np.repeat(L[j][idx], 3).astype(np.float32), device=device)
+        img, _ = ras.render_batch(fv_t, ff_t, vr, eyes, fov_y_rad=fov)   # all 28 in one call
+        out[:, j] = img
     return out, ras, fov
 
 
@@ -97,17 +98,24 @@ def main():
     dev = "cuda" if torch.cuda.is_available() else "cpu"
 
     sensor = SensorModel(quantise=True).to(dev)
-    raw_tau_i = torch.full((56,), -2.0, device=dev, requires_grad=True)
-    raw_tau_b = torch.full((56,), -1.0, device=dev, requires_grad=True)
+    # The two thresholds are CONSTANTS, not fitted. Both enter only through a hard
+    # comparison, `val > tau`, whose derivative is zero everywhere it is defined, so no
+    # gradient reaches them and an optimiser holds them at their initial values. They were
+    # in the parameter group and had no effect there. Fitting them needs a relaxation of the
+    # comparison, which is a modelling choice and not made here.
+    raw_tau_i = torch.full((56,), -2.0, device=dev)
+    raw_tau_b = torch.full((56,), -1.0, device=dev)
+    # The pedestal IS fitted: it shifts the value image before the reduction, so the
+    # intensity channel is differentiable in it even though the mask is not.
     pedestal = torch.zeros(56, device=dev, requires_grad=True)
-    # eta is the FITTED residual model error. Fixing it silently sets the
-    # denominator of every reported ratio: with eta = 0.05 against a measured
-    # sigma of 0.002-0.05, eta dominates and the numbers stop being
-    # residual-to-NOISE at all. Fitted per curve, in log space to keep it > 0.
+    # eta is the FITTED residual model error. Fixing it by hand silently sets the
+    # denominator of every reported ratio -- pick it too large and it swamps the measured
+    # sigma and the numbers stop being residual-to-NOISE at all. Per curve, in log space so
+    # it stays positive.
     raw_eta = torch.full((56,), float(np.log(np.expm1(0.02))), device=dev,
                          requires_grad=True)
     opt = torch.optim.Adam([{"params": sensor.parameters()},
-                            {"params": [raw_tau_i, raw_tau_b, pedestal, raw_eta]}],
+                            {"params": [pedestal, raw_eta]}],
                            lr=0.03)
 
     bodies = {}
@@ -132,9 +140,8 @@ def main():
         """Reduced curves for one body, chunked over cameras.
 
         The cached radiance lives on the CPU and only a few cameras at a time are moved to
-        the GPU: 3 bodies x 28 cameras x 16 phases of 192x320 is about 1 GB before the
-        sensor chain allocates its intermediates, which does not fit alongside the model on
-        an 8 GB card.
+        the GPU. All three bodies at every camera and phase does not fit on the card
+        alongside the sensor chain's intermediates.
         """
         b = bodies[M]
         C, P, H, W = b["imgs"].shape
@@ -156,7 +163,7 @@ def main():
         cur = torch.cat(inten + binar, 0)
         return cur / cur.mean(1, keepdim=True).clamp_min(1e-9)
 
-    print("[fit] optimising sensor + thresholds + pedestals on cached radiance", flush=True)
+    print("[fit] optimising sensor + pedestals + eta on cached radiance", flush=True)
     for step in range(a.steps):
         opt.zero_grad()
         tot = 0.0

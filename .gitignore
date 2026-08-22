@@ -15,3 +15,15 @@ dataset/*
 # asset instead; the stable ones live in models/.
 runs/
 
+# Written into the repo root by a run, not source.
+calibration.json
+logs/
+projection_scores.json
+
+# Local scratch: put one-off benchmarks and probes in scratch/ so they cannot be
+# committed by accident. The two named files were session benchmarks; `trimesh` is a
+# stray download, not the package.
+scratch/
+bench_raster.py
+surrogate_check.py
+/trimesh

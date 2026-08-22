@@ -56,7 +56,7 @@ def metric_medoid(occupancies, outlines=None, side_n_dirs: int = 36,
 
     `outlines` is an optional list of surface-point arrays, one per sample, in the same order
     as `occupancies`. Without it this reduces to the volume-only medoid. The side-view
-    settings are passed through to hac26.scoring.side_view.side_view_measure.
+    settings are passed through to hac26.scoring.side_view.
     """
     s = len(occupancies)
     if s == 1:
@@ -74,12 +74,19 @@ def metric_medoid(occupancies, outlines=None, side_n_dirs: int = 36,
     if outlines is None:
         return int(np.argmax(mean_dice))
 
-    from hac26.scoring.side_view import side_view_measure
+    from hac26.scoring.side_view import measure_outlines, outline_set
+
+    # Project each cloud ONCE, not once per pair: only S x n_dirs silhouettes are distinct.
+    # Sharing one `ext` across all draws is what makes the contours pair-independent, and it
+    # is also the right grid -- a per-pair ext puts each pair on a different pixel pitch, the
+    # same mismatch the shared occupancy grid fixes on the volume side.
+    ext = 1.05 * max(float(np.abs(o).max()) for o in outlines)
+    sets = [outline_set(o, ext, n_dirs=side_n_dirs, res=side_res, mode=side_mode)
+            for o in outlines]
     mean_bd = np.zeros(s)
     for i in range(s):
         for j in range(i + 1, s):
-            bd = side_view_measure(outlines[i], outlines[j], n_dirs=side_n_dirs,
-                                   res=side_res, mode=side_mode)["assd_mean"]
+            bd = measure_outlines(sets[i], sets[j])["assd_mean"]
             mean_bd[i] += bd
             mean_bd[j] += bd
     mean_bd /= (s - 1)
@@ -140,7 +147,7 @@ def planar_snap(verts, faces, planes, misfit_fn=None, eta: float = None, tol: fl
     """Project vertices onto accepted planes; a plane is accepted only on evidence.
 
     misfit_fn(verts) -> float is the data misfit of a candidate body. A plane is kept only
-    if it does not raise that misfit past the calibrated floor eta. With no misfit_fn the
+    if the TOTAL misfit stays within eta of the unsnapped mesh. With no misfit_fn the
     snap is applied unconditionally, which is only appropriate in tests.
     """
     v = np.asarray(verts, dtype=np.float64).copy()
@@ -160,15 +167,17 @@ def planar_snap(verts, faces, planes, misfit_fn=None, eta: float = None, tol: fl
             continue
         new = float(misfit_fn(trial))
         if new <= base + (eta if eta is not None else 0.0):
-            v, base, accepted = trial, new, accepted + 1
+            # base is NOT advanced: eta bounds the total rise over the unsnapped mesh, not
+            # each step. Advancing it let N planes cost N*eta.
+            v, accepted = trial, accepted + 1
     return v, accepted
 
 
 def restore_constraints(verts: np.ndarray, radius: float, tol: float = 0.03) -> np.ndarray:
     """The LAST operation: z-extent equality, then the radius bound with its tolerance.
 
-    The published radius is treated as an approximation with tolerance `tol`: two of the
-    three public bodies exceed their own R when posed this way.
+    The published radius is treated as an approximation with tolerance `tol`: public bodies
+    posed this way can sit slightly outside their own R.
     """
     v = np.asarray(verts, dtype=np.float64).copy()
     zmin, zmax = v[:, 2].min(), v[:, 2].max()

@@ -3,7 +3,7 @@
 
 There is no decoder. The previous field decoded a code through cross-attention weights that
 had to be fitted jointly across the library, so a code only meant something together with the
-decoder it came from -- hence an autodecoder, a shared `runs/token_decoder.pt`, and a
+decoder it came from -- hence an autodecoder, a shared decoder checkpoint, and a
 `--decoder-file` threaded through every downstream script. With a fixed lattice the code IS
 the amplitude vector: site k always means the same place, so codes are portable by
 construction and every body can be fitted independently.
@@ -37,6 +37,7 @@ import torch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+from hac26.shapes import canonicalize_r, rescale_touch_z   # noqa: E402
 from hac26.field import (CODE_DIM, DESIGN_N, LATTICE_ALPHA, LATTICE_EXTENT,   # noqa: E402
                          LATTICE_SHAPE, N_DIR, N_SITES, ImplicitBody, design_sha,
                          dir_design)
@@ -83,7 +84,7 @@ class BatchedFit:
     deleting that decoder is what makes the whole fit embarrassingly parallel.
 
     The sample points are stacked once onto the device and stay there: 600 bodies x 6000
-    points is 43 MB, so nothing is gained by streaming them.
+    points is a few tens of MB, so nothing is gained by streaming them.
 
     THE ENCODER IS SEQUENTIAL, NOT JOINT. h is pinned to the analytic support of the body's
     own convex hull and never moves; only g is fitted. Two independent reasons, and the second
@@ -91,22 +92,22 @@ class BatchedFit:
 
     1. h and g overlap. Any body can be written as a larger core carved more deeply or a
        smaller core carved less, and the two blocks agree exactly in the low spherical-harmonic
-       degrees -- principal cosines 1.00000 at l=0, 0.996 for the three l=1 translations,
-       0.987-0.993 at l=2. Solved jointly, the SAME body at the SAME accuracy admits a whole
-       family of (h, g) pairs, and a flow trained on that family faithfully learns the
-       ambiguity as spurious multimodality.
+       degrees: the principal angles between the two blocks are near zero up to l=2. Solved
+       jointly, the SAME body at the SAME accuracy admits a whole family of (h, g) pairs, and
+       a flow trained on that family faithfully learns the ambiguity as spurious
+       multimodality.
 
     2. Worse, and specific to this pipeline: at reconstruction h does not come from the fit at
        all. It comes from support_from_convex(), which is the convex stage's estimate of the
        body's HULL. If the corpus's h were free to drift away from the hull, every corpus g
        would have been fitted against a core that means something different from the core it
-       is decoded against. Measured on the smoke library, joint fitting drifts h by 0.35 in
-       units where h itself is order 1 -- a third of the support, silently.
+       is decoded against. On the smoke library, joint fitting drifts h by a sizeable
+       fraction of the support itself, silently.
 
-    The cost is convergence rate, not accuracy: joint reached 0.000231 by step 250 and frozen
-    was still at 0.000446, but frozen passes it by step 800 (0.000089) with only g to fit.
-    |g| is larger, as it must be -- the core is now the full hull, so every concavity has to
-    be carved rather than partly absorbed by shrinking the core.
+    The cost is convergence rate, not accuracy: joint starts faster, and frozen overtakes it
+    later in the run with only g left to fit. |g| is larger, as it must be -- the core is now
+    the full hull, so every concavity has to be carved rather than partly absorbed by
+    shrinking the core.
     """
 
     def __init__(self, n, data, h0s, dev):
@@ -166,8 +167,8 @@ def report_corpus(bodies, data, codes, trace) -> bool:
     gvar = float(codes[:, N_DIR:].var(0).mean())
     gmax = float(np.abs(codes[:, N_DIR:]).max())
     # medians, not the first and last step: each step's loss is one random minibatch of
-    # `--batch` bodies out of `--bodies`, and per-body SDF loss spans two orders of magnitude,
-    # so consecutive converged steps differ by up to 34x. Comparing single steps false-fails.
+    # `--batch` bodies out of `--bodies`, and per-body SDF loss spans orders of magnitude,
+    # so consecutive converged steps differ wildly. Comparing single steps false-fails.
     k = max(1, min(25, len(trace) // 4))
     l0 = float(np.median(trace[:k])) if trace else float("nan")
     l1 = float(np.median(trace[-k:])) if trace else float("nan")
@@ -198,7 +199,8 @@ def main():
     ap.add_argument("--workers", type=int, default=1,
                     help="parallel workers for independent SDF/support preprocessing")
     ap.add_argument("--points", type=int, default=6000,
-                    help="SDF sample points per body")
+                    help="uniform SDF sample points per body; half as many jittered "
+                         "surface points are added on top")
     ap.add_argument("--out", default="runs/corpus_codes.npz")
     ap.add_argument("--device", default=None,
                     help="cuda when available, else cpu. The fit is "
@@ -224,6 +226,33 @@ def main():
         from train_surrogate import shapes
         print(f"[1] sampling SDF for {a.bodies} bodies", flush=True)
         shape_list = shapes(a.bodies, seed=0)
+
+    # EVERY body into the canonical frame, whichever source it came from.
+    #
+    # The correction lattice is FRAME-FIXED (hac26/field.py: LATTICE_EXTENT is not scaled by
+    # radius, because every call site decodes at radius 1.0), so site k only means the same
+    # place across bodies if the bodies share a frame. The --shapes-dir library is posed;
+    # train_surrogate.shapes(), which is what this falls back to and what README documents
+    # for a quick run, is not. Fitting those puts every body at its own arbitrary scale
+    # inside a fixed lattice.
+    #
+    # canonicalize_r(rescale_touch_z(v)) is the frame reconstruct_lpd.support_from_convex
+    # restores and the one hac26/shapes.py::canonicalize_r documents. It is idempotent, so
+    # an already-posed body is untouched.
+    n_posed = 0
+    posed = []
+    for v, f in shape_list:
+        v = np.asarray(v, dtype=np.float64)
+        # faces passed: without them rescale_touch_z centres on the VERTEX MEAN, which would
+        # shift every already-posed library body off the solid centroid pose() put it on.
+        c = canonicalize_r(rescale_touch_z(v, np.asarray(f, dtype=np.int64)))
+        if float(np.abs(c - v).max()) > 1e-9:
+            n_posed += 1
+        posed.append((c, f))
+    shape_list = posed
+    if n_posed:
+        print(f"  posed {n_posed}/{len(shape_list)} bodies into the canonical frame "
+              f"(z span 2, xy r_max 1)", flush=True)
 
     data, h0s = [None] * len(shape_list), [None] * len(shape_list)
     ref = ImplicitBody(radius=1.0)

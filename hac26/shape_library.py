@@ -6,7 +6,7 @@ closed surface, a chosen non-convexity. On an occupancy grid all four are decida
 repairable with `scipy.ndimage` before a single triangle exists, and marching cubes then
 returns a closed oriented manifold by construction. The alternative -- concatenating or
 booleaning meshes -- is what the previous corpus did, and it produced bodies that are two
-interpenetrating closed surfaces (see `docs/shape_library.md`); a signed distance sampled
+interpenetrating closed surfaces; a signed distance sampled
 against such a mesh is not a signed distance, so the codes fitted to it were fitted to noise.
 
 Bodies are built compositionally as fields f(x) with f < 0 inside. Unions are min, cuts are
@@ -33,7 +33,7 @@ import numpy as np
 from scipy import ndimage
 from scipy.spatial import ConvexHull
 
-from .shapes import icosphere, real_sh_basis
+from .shapes import icosphere, real_sh_basis, solid_centroid
 
 __all__ = [
     "Body", "LibrarySpec", "sample_body", "build_library",
@@ -229,8 +229,7 @@ def hull_volume(verts: np.ndarray) -> float:
 
 
 def convexity_ratio(verts: np.ndarray, faces: np.ndarray) -> float:
-    """volume / hull volume. 1 for a convex body; the gate (LibrarySpec.convexity_max)
-    defaults to 0.98."""
+    """volume / hull volume. 1 for a convex body; LibrarySpec.convexity_max is the gate."""
     hv = hull_volume(verts)
     return abs(mesh_volume(verts, faces)) / hv if hv > 0 else 1.0
 
@@ -271,7 +270,7 @@ def decimate_mesh(verts: np.ndarray, faces: np.ndarray, extent: float, res: int)
     thousands of faces; both the Dice/inertia metrics and the ray-cast curve renderer only
     need geometry resolved to their own, much coarser, grid, so snapping vertices to a cell
     a few times finer than that grid and dropping the triangles it degenerates cuts face
-    count by 1-2 orders of magnitude with no visible effect on either. One representative
+    count by orders of magnitude with no visible effect on either. One representative
     vertex per cell (the first one seen) rather than a centroid: cheap, and the sub-cell
     displacement it introduces is below the resolution the caller reads the result at.
 
@@ -350,13 +349,22 @@ def _repair(vol: np.ndarray, eps: float) -> tuple:
 
 
 def extract(f: Field, extent: float = 1.6, res: int = 96) -> tuple:
-    """Level set of f as a closed, single-component, void-free mesh.
+    """Level set of f as a closed mesh.
+
+    _repair leaves one solid voxel component and no interior void, but the extracted SURFACE
+    can still split at a voxel-scale pinch -- callers that need one component check it.
 
     Returns (verts, faces, info).
     """
     from skimage import measure
 
     vol, spacing, origin = voxelise(f, extent, res)
+    # Did the body run past what was sampled? voxelise pads with a positive ring, so a field
+    # still negative on the outermost real shell gets closed off with a flat wall -- and that
+    # wall then reads as real faceting to everything downstream. Index 1 and -2 are the first
+    # and last real shells; 0 and -1 are the pad.
+    clipped = bool(min(vol[1].min(), vol[-2].min(), vol[:, 1].min(), vol[:, -2].min(),
+                       vol[:, :, 1].min(), vol[:, :, -2].min()) < 0.0)
     eps = 1e-3 * max(float(np.abs(vol).max()), 1e-9)
     vol, n_solid, n_void = _repair(vol, eps)
     if not (vol < 0).any():
@@ -368,7 +376,8 @@ def extract(f: Field, extent: float = 1.6, res: int = 96) -> tuple:
     faces = faces[:, ::-1].copy()
     if mesh_volume(verts, faces) < 0:
         faces = faces[:, ::-1].copy()
-    return verts, faces, {"n_solid_components": n_solid, "n_voids_filled": n_void}
+    return verts, faces, {"n_solid_components": n_solid, "n_voids_filled": n_void,
+                          "clipped": clipped}
 
 
 # --------------------------------------------------------------------------- posing
@@ -387,16 +396,10 @@ def pose(verts: np.ndarray, radius: float | None = 1.0,
     R at reconstruction time.
     """
     v = np.asarray(verts, float).copy()
-    if centre == "volume" and faces is not None:
-        v0, v1, v2 = v[faces[:, 0]], v[faces[:, 1]], v[faces[:, 2]]
-        # centroid of the solid, by the divergence theorem on each coordinate
-        cr = np.cross(v1 - v0, v2 - v0)
-        tet = (v0 + v1 + v2) / 4.0
-        w = np.einsum("ij,ij->i", v0 + v1 + v2, cr) / 18.0
-        tot = w.sum()
-        c = (tet * w[:, None]).sum(0) / tot if abs(tot) > 1e-12 else v.mean(0)
-    else:
-        c = v.mean(0)
+    # Shared with hac26.shapes.rescale_touch_z: a body posed here and re-posed there must
+    # not move.
+    c = (solid_centroid(v, faces) if centre == "volume" and faces is not None
+         else v.mean(0))
     v[:, 0] -= c[0]
     v[:, 1] -= c[1]
     zmin, zmax = v[:, 2].min(), v[:, 2].max()
@@ -466,18 +469,22 @@ def _base(rng: np.random.Generator, kind: str, s: float) -> tuple:
         d = s * rng.uniform(0.55, 1.15, n)
         return sd_convex(u, d), {"n_planes": n}
     if kind == "contact_binary":
-        # Two ellipsoids forced APART, with the fillet capped low. `lobes` cannot produce this
-        # shape: its centres are drawn N(0,I) * U(0.25,0.55) against semi-axes U(0.35,0.75),
-        # so the components fuse, and op_smooth_union with a fillet up to 0.18 fills whatever
-        # crease survives. Measured over the library as shipped, the MEDIAN body has a neck
-        # ratio of about 1.0 -- deep necks exist only in the tail -- while a deep central cut
-        # is exactly what the hard public body needs. Separation >= 0.9 (a1x + a2x) puts the
-        # components at or past tangency, so the waist is a real pinch rather than a dimple.
+        # Two ellipsoids held near tangency, with the fillet capped low, so the waist is a
+        # real pinch. `lobes` cannot make this: its centres are close enough that the
+        # components fuse and its larger fillet fills whatever crease survives.
         a1 = s * rng.uniform(0.42, 0.62, 3)
         a2 = s * rng.uniform(0.34, 0.55, 3)
-        sep = rng.uniform(0.90, 1.02) * (a1[0] + a2[0])
+        frac = rng.uniform(0.90, 1.02)
         k_fill = float(rng.uniform(0.01, 0.05))
         u = rng.normal(size=3); u /= np.linalg.norm(u)
+        # Separation is keyed to each ellipsoid's radius ALONG u, not to its x semi-axis.
+        # The offset direction is random and both lobes are rotated, so the x semi-axis is
+        # not the radius that decides whether they touch, and keying to it made the pair
+        # overlap most of the time -- a dimple, and often no neck at all after the fillet.
+        ub = R @ u
+        r1 = 1.0 / np.sqrt(((ub / a1) ** 2).sum())
+        r2 = 1.0 / np.sqrt(((ub / a2) ** 2).sum())
+        sep = frac * (r1 + r2)
         c = 0.5 * sep * u
         f = op_smooth_union(sd_ellipsoid(centre=-c, axes=a1, rot=R),
                             sd_ellipsoid(centre=c, axes=a2, rot=R), k=k_fill)
@@ -538,9 +545,9 @@ def min_feature_radius(res: int, extent: float, voxels_across: float = 2.5) -> f
 
     A feature narrower than a couple of grid cells doesn't get enough sample points on its
     boundary for marching cubes to reconstruct a round surface -- it comes out as jagged
-    voxel-aligned facets instead, which is the opposite of "small and clean." 2.5 voxels
-    across the radius (5 across the diameter) is a practical floor, not a hard
-    mathematical one: below it, quality visibly degrades before the feature disappears.
+    voxel-aligned facets instead, which is the opposite of "small and clean." The default
+    `voxels_across` is a practical floor, not a hard mathematical one: below it, quality
+    visibly degrades before the feature disappears.
     """
     spacing = 2.0 * extent / max(res - 1, 1)
     return voxels_across * spacing
@@ -663,9 +670,8 @@ def sample_body(rng: np.random.Generator, spec: LibrarySpec | None = None) -> Bo
     spec = spec or LibrarySpec()
     last = None
     # Drawn ONCE, outside the retry loop. Redrawing it per attempt biases the realised base
-    # distribution towards whatever survives the non-convexity gate first: measured, prism
-    # fell from its nominal 0.12 to 0.037 and polytope rose from 0.12 to 0.225, while
-    # write_report printed base_weights as though it had been honoured.
+    # distribution towards whatever survives the non-convexity gate first: write_report would still print
+    # base_weights as though they had been honoured.
     base_kind = _draw(spec.base_weights, rng)
     for attempt in range(spec.max_attempts):
         strength = 1.0 + 0.25 * attempt
@@ -684,6 +690,9 @@ def sample_body(rng: np.random.Generator, spec: LibrarySpec | None = None) -> Bo
             continue
         if len(fc) < 100:
             last = "degenerate: too few faces"
+            continue
+        if info.get("clipped"):
+            last = f"body reaches the extraction boundary at extent {spec.extent}"
             continue
         v = pose(v, radius=spec.radius, faces=fc)
         c = convexity_ratio(v, fc)
@@ -814,44 +823,90 @@ def body_from_convex_points(points: np.ndarray, rng: np.random.Generator,
     raise RuntimeError("convex basis never brought below the non-convexity gate")
 
 
+PARITY_TILE = 8          # see _parity_occupancy
+
+# Sub-voxel offsets on the sample columns, to break exact coincidences. The barycentric test
+# is closed on all three edges, so a column landing exactly on an edge shared by two triangles
+# is counted by both and the whole column inverts. Displacing it makes that unreachable. The
+# two must DIFFER or a column on a face diagonal (x == y, which every axis-aligned box has) is
+# still degenerate. Fixed, so results stay reproducible.
+_JITTER = 1e-7
+_JX = _JITTER * 0.6180339887498949           # 1/phi
+_JY = _JITTER * 0.4142135623730951           # sqrt(2) - 1
+
+
 def _parity_occupancy(verts: np.ndarray, faces: np.ndarray, extent: float,
-                      res: int) -> np.ndarray:
+                      res: int, axis: np.ndarray | None = None,
+                      max_elems: float = 4e6) -> np.ndarray:
     """Occupancy by counting triangle crossings along +z through each (x, y) column.
 
-    Parity, not winding: a point is inside when the number of crossings above it is odd.
-    Correct for any closed surface regardless of orientation, and it is the reason ingestion
-    does not need trimesh.
+    Parity, not winding: a point is inside when the number of crossings STRICTLY ABOVE it is
+    odd. Correct for any closed surface regardless of orientation, and it is the reason
+    ingestion does not need trimesh.
+
+    Strictly above is what the extra leading bin is for. searchsorted puts a crossing in the
+    first bin whose plane is at or above it, so that bin's own plane sits below the crossing
+    and must not see it; the returned slice drops it.
+
+    Columns are walked in tiles, each tile seeing only the triangles whose xy box reaches it.
+    That is exact -- a triangle is only crossed by columns inside its own projection.
+
+    `axis` overrides the sample coordinates, for a caller whose grid is cell centres rather
+    than linspace endpoints. Scoring compares two meshes on one grid, so the grid has to be
+    the caller's.
     """
-    a = np.linspace(-extent, extent, res)
+    a = np.linspace(-extent, extent, res) if axis is None else np.asarray(axis, float)
+    if len(a) != res:
+        raise ValueError(f"axis has {len(a)} samples but res is {res}")
     zs = a
     v0, v1, v2 = verts[faces[:, 0]], verts[faces[:, 1]], verts[faces[:, 2]]
-    X, Y = np.meshgrid(a, a, indexing="ij")
-    px, py = X.ravel(), Y.ravel()
-    count = np.zeros((len(px), res), dtype=np.int32)
-    for t in range(0, len(faces), 3000):
-        A, B, C = v0[t:t + 3000], v1[t:t + 3000], v2[t:t + 3000]
-        d = ((B[:, 1] - C[:, 1]) * (A[:, 0] - C[:, 0])
-             + (C[:, 0] - B[:, 0]) * (A[:, 1] - C[:, 1]))
-        ok = np.abs(d) > 1e-14
-        if not ok.any():
+    tmin = np.minimum(np.minimum(v0, v1), v2)
+    tmax = np.maximum(np.maximum(v0, v1), v2)
+    count = np.zeros((res * res, res + 1), dtype=np.int32)
+    # Tile side in voxels. Work scales as res * tile * n_faces, so smaller is better until
+    # per-tile overhead takes over. Any tile size returns the same array.
+    tile = max(1, min(res, PARITY_TILE))
+    spacing = float(a[1] - a[0]) if res > 1 else 2.0 * extent
+    jx, jy = _JX * spacing, _JY * spacing        # see _JITTER
+    for i0 in range(0, res, tile):
+        xs = a[i0:i0 + tile]
+        in_x = (tmin[:, 0] <= xs[-1]) & (tmax[:, 0] >= xs[0])
+        if not in_x.any():
             continue
-        A, B, C, d = A[ok], B[ok], C[ok], d[ok]
-        l1 = ((B[None, :, 1] - C[None, :, 1]) * (px[:, None] - C[None, :, 0])
-              + (C[None, :, 0] - B[None, :, 0]) * (py[:, None] - C[None, :, 1])) / d
-        l2 = ((C[None, :, 1] - A[None, :, 1]) * (px[:, None] - C[None, :, 0])
-              + (A[None, :, 0] - C[None, :, 0]) * (py[:, None] - C[None, :, 1])) / d
-        l3 = 1.0 - l1 - l2
-        inside = (l1 >= 0) & (l2 >= 0) & (l3 >= 0)
-        if not inside.any():
-            continue
-        zh = l1 * A[None, :, 2] + l2 * B[None, :, 2] + l3 * C[None, :, 2]
-        col, tri = np.nonzero(inside)
-        zc = zh[col, tri]
-        idx = np.clip(np.searchsorted(zs, zc), 0, res - 1)      # crossings above each plane
-        np.add.at(count, (col, idx), 1)
-    occ = (np.cumsum(count[:, ::-1], axis=1)[:, ::-1] % 2 == 1)
+        for j0 in range(0, res, tile):
+            ys = a[j0:j0 + tile]
+            sel = np.nonzero(in_x & (tmin[:, 1] <= ys[-1]) & (tmax[:, 1] >= ys[0]))[0]
+            if not len(sel):
+                continue
+            X, Y = np.meshgrid(xs, ys, indexing="ij")
+            px, py = X.ravel() + jx, Y.ravel() + jy
+            # global column index of each tile column: i * res + j
+            gcol = ((np.arange(i0, i0 + len(xs))[:, None] * res)
+                    + np.arange(j0, j0 + len(ys))[None, :]).ravel()
+            chunk = max(1, int(max_elems // max(len(px), 1)))
+            for t in range(0, len(sel), chunk):
+                k = sel[t:t + chunk]
+                A, B, C = v0[k], v1[k], v2[k]
+                d = ((B[:, 1] - C[:, 1]) * (A[:, 0] - C[:, 0])
+                     + (C[:, 0] - B[:, 0]) * (A[:, 1] - C[:, 1]))
+                ok = np.abs(d) > 1e-14
+                if not ok.any():
+                    continue
+                A, B, C, d = A[ok], B[ok], C[ok], d[ok]
+                l1 = ((B[None, :, 1] - C[None, :, 1]) * (px[:, None] - C[None, :, 0])
+                      + (C[None, :, 0] - B[None, :, 0]) * (py[:, None] - C[None, :, 1])) / d
+                l2 = ((C[None, :, 1] - A[None, :, 1]) * (px[:, None] - C[None, :, 0])
+                      + (A[None, :, 0] - C[None, :, 0]) * (py[:, None] - C[None, :, 1])) / d
+                l3 = 1.0 - l1 - l2
+                inside = (l1 >= 0) & (l2 >= 0) & (l3 >= 0)
+                if not inside.any():
+                    continue
+                zh = l1 * A[None, :, 2] + l2 * B[None, :, 2] + l3 * C[None, :, 2]
+                col, tri = np.nonzero(inside)
+                idx = np.clip(np.searchsorted(zs, zh[col, tri]), 0, res)
+                np.add.at(count, (gcol[col], idx), 1)
+    occ = (np.cumsum(count[:, ::-1], axis=1)[:, ::-1] % 2 == 1)[:, 1:]
     return occ.reshape(res, res, res)
-
 
 def _field_from_occupancy(occ: np.ndarray, extent: float, res: int) -> Field:
     """A smooth signed field from a binary occupancy, by the distance transform.

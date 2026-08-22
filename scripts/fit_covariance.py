@@ -107,7 +107,7 @@ def main():
           f"{56 + 3} parameters", flush=True)
     fit = fit_model_error(rhat, sigma2_m, steps=a.steps)
 
-    eta2, s2 = fit["eta2"], fit["s2"]
+    eta2 = fit["eta2"]
     print(f"\n  tau0 {float(fit['tau0']):.5f}   m0 {float(fit['m0']):.3f}   "
           f"p {float(fit['p']):.3f}")
     print(f"  median sigma^2_m {float(sigma2_m.median()):.3e}   "

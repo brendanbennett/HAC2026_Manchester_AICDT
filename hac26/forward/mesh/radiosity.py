@@ -3,8 +3,9 @@
 The body, mount and turntable are mutually rigid, and the solve is done in the body frame, so the
 geometry between facets never changes as the turntable turns. Everything that depends only
 on that geometry -- the form-factor matrix F, and therefore the factorisation of
-(I - rho F) -- is computed once per candidate shape. Each phase is then a back-substitution,
-and the adjoint solve (I - rho F)^T lambda = dJ/dB reuses the same factors.
+(I - rho F) -- is computed once per candidate shape. The phases are then back-substitutions
+against that one factorisation, and can go through it as a single right-hand-side block; the
+adjoint solve (I - rho F)^T lambda = dJ/dB reuses the same factors.
 
     F_ij = (1/A_i) int int V(x,y) cos(theta_x) cos(theta_y) / (pi r^2) dA_i dA_j
     A_i F_ij = A_j F_ji                          (reciprocity)
@@ -14,7 +15,7 @@ and the adjoint solve (I - rho F)^T lambda = dJ/dB reuses the same factors.
 
 Only the emission e depends on the phase, and only through which source samples each facet
 can see. That is the whole reason this decomposition is worth the trouble: the expensive
-object is phase-independent and the phase-dependent object is a matrix-vector product.
+object is phase-independent and the phase-dependent one is a triangular solve.
 
 Two checks, both asserted rather than repaired:
   * F is symmetrised through reciprocity before use, since the centroid quadrature below
@@ -65,8 +66,9 @@ def _visibility_matrix(centroids: np.ndarray, normals: np.ndarray,
         eps = 1e-4 * np.maximum(r[ii, jj], 1e-9)
         o = centroids[ii] + normals[ii] * eps[:, None]
         dirs = u[ii, jj]
-        hit = m.ray.intersects_any(o, dirs)          # blocked if anything is hit at all
-        # a hit beyond the partner does not block; test distance explicitly
+        # a hit beyond the partner does not block, so the distance is tested explicitly.
+        # One cast: an intersects_any pass over the same rays answers a weaker question and
+        # its result was thrown away.
         loc, idx_ray, _ = m.ray.intersects_location(o, dirs, multiple_hits=False)
         blocked = np.zeros(len(ii), dtype=bool)
         if len(idx_ray):
@@ -98,8 +100,8 @@ def form_factors(verts: np.ndarray, faces: np.ndarray, occlusion: bool = True,
     (centroid) quadrature is the usual first-order approximation and is exact only for
     facets small relative to their separation; on a coarse mesh it OVERESTIMATES near-field
     pairs badly enough to push row sums above 1, which the diagnostic in RadiositySolver
-    then correctly rejects (measured 1.038 on a subdivision-1 icosphere). Four points per
-    facet integrates the 1/r^2 kernel over the facet instead of sampling it at one point,
+    then correctly rejects. Four points per facet integrates the 1/r^2 kernel over the
+    facet instead of sampling it at one point,
     which is what fixes it. Visibility is still evaluated at the centroids: it is a binary
     quantity that varies far more slowly than 1/r^2.
     """
@@ -108,15 +110,24 @@ def form_factors(verts: np.ndarray, faces: np.ndarray, occlusion: bool = True,
     P = _barycentric_samples(verts, faces[np.arange(len(faces))], n_samples)
     if len(P) != len(c):                      # facet_geometry drops degenerate faces
         P = _barycentric_samples(verts, faces, n_samples)[: len(c)]
-    S = P.shape[1]
-    d = P[None, :, None, :, :] - P[:, None, :, None, :]        # (i,j,si,sj,3)
-    rr = np.linalg.norm(d, axis=-1)
-    np.fill_diagonal(rr.reshape(len(c), len(c), -1)[..., 0].reshape(len(c), len(c)), np.inf)
-    u = d / np.maximum(rr, 1e-12)[..., None]
-    ci = np.einsum("ijabk,ik->ijab", u, n)
-    cj = -np.einsum("ijabk,jk->ijab", u, n)
+    # No (i,j,si,sj,3) difference is formed. cos_i * cos_j / r^2 is
+    #     clip(d.n_i, 0) * clip(-d.n_j, 0) / (pi * r^4)
+    # and both dot products factorise -- d.n_i = P_j.n_i - P_i.n_i -- while r^2 comes from
+    # the expanded square. The largest array is then (i,j,si,sj) instead of that times three,
+    # and no square root is taken. Same result to the last bit.
+    nf, S = len(c), P.shape[1]
+    flat = P.reshape(nf * S, 3)
+    sq = (flat ** 2).sum(1)
+    rr2 = (sq[:, None] + sq[None, :]
+           - 2.0 * (flat @ flat.T)).reshape(nf, S, nf, S).transpose(0, 2, 1, 3)
+    np.maximum(rr2, 0.0, out=rr2)
+    rr2[np.arange(nf), np.arange(nf)] = np.inf
+    dni = (np.einsum("jbk,ik->ijb", P, n)[:, :, None, :]
+           - np.einsum("iak,ik->ia", P, n)[:, None, :, None])
+    dnj = (np.einsum("jbk,jk->jb", P, n)[None, :, None, :]
+           - np.einsum("iak,jk->ija", P, n)[:, :, :, None])
     with np.errstate(divide="ignore", invalid="ignore"):
-        k = np.clip(ci, 0, None) * np.clip(cj, 0, None) / (np.pi * rr ** 2)
+        k = np.clip(dni, 0, None) * np.clip(-dnj, 0, None) / (np.pi * rr2 ** 2)
     k[~np.isfinite(k)] = 0.0
     K = V * k.mean(axis=(2, 3))
     F = K * a[None, :]                       # F_ij = K_ij A_j
@@ -149,7 +160,7 @@ class RadiositySolver:
         self._lu = lu_factor(np.eye(len(F)) - self.rho * F)
 
     def solve(self, e: np.ndarray) -> np.ndarray:
-        """B from emission e: (I - rho F) B = rho e."""
+        """B from emission e: (I - rho F) B = rho e. e may be (F,) or (F, n_rhs)."""
         from scipy.linalg import lu_solve
         return lu_solve(self._lu, self.rho * np.asarray(e, dtype=float))
 
@@ -167,10 +178,17 @@ def emission(normals: np.ndarray, source_dirs: np.ndarray, vis: np.ndarray | Non
              e0: float = 1.0) -> np.ndarray:
     """e_i = (E0/K) sum_k (n_i . omega_k)+ V_i(omega_k).
 
-    vis is (n_facets, K) in {0,1}; None means unoccluded, which is the "all visibility set
-    to 1" branch.
+    source_dirs (K, 3) with vis (n_facets, K) gives one emission vector. source_dirs
+    (P, K, 3) with vis (n_facets, P, K) gives (n_facets, P) -- every phase at once, so
+    RadiositySolver.solve can take them as one right-hand-side block. None means unoccluded.
     """
-    mu = np.clip(np.asarray(normals) @ np.asarray(source_dirs).T, 0.0, None)
+    d = np.asarray(source_dirs)
+    if d.ndim == 2:
+        mu = np.clip(np.asarray(normals) @ d.T, 0.0, None)
+        if vis is not None:
+            mu = mu * np.asarray(vis, dtype=float)
+        return e0 / d.shape[0] * mu.sum(-1)
+    mu = np.clip(np.einsum("fk,pjk->fpj", np.asarray(normals), d), 0.0, None)
     if vis is not None:
         mu = mu * np.asarray(vis, dtype=float)
-    return e0 / source_dirs.shape[0] * mu.sum(1)
+    return e0 / d.shape[1] * mu.sum(-1)

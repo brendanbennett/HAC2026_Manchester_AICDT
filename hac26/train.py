@@ -46,8 +46,8 @@ class Preset:
     n_phi: int = 48
     lr: float = 1e-3
     c_lambert: float = 0.1  # weakly identified on Blender curves; refit on real data
-    sigma: float = -1.0     # FITTED on public models 1-3 (see data/conventions.json)
-    delta: float = 1.0      # FITTED on public models 1-3 (see data/conventions.json)
+    sigma: float = -1.0     # fitted on public models 1-3 by data_io.fit_conventions
+    delta: float = 1.0      # same
     eps_norm: float = 1e-3
     # None = the per-camera heteroscedastic profile from hac26.noise;
     # "flat" = homoscedastic, i.e. what a noiseless-generation pipeline effectively assumes.
@@ -77,8 +77,8 @@ class Preset:
     n_rays: int = 1024           # sphere quadrature for the Dice loss
     dice_chunk: int = 256        # ray-axis chunking, keeps (B,V,N) off the GPU at once
     p_flat: float = 0.0          # fraction of flat-faced / few-face training bodies
-    gate_rank: int = 0           # rank of the occlusion gate (0 = off); see lpd.LPDNet
-    gate_bias: float = 3.0       # gate CNN output bias at init; see lpd.LPDNet
+    gate_rank: int = 0           # rank of the occlusion gate (0 = off); see solvers/lpd_convex
+    gate_bias: float = 3.0       # gate CNN output bias at init; same
 
 
 PRESETS = {
@@ -305,10 +305,9 @@ def _assert_finite(net, step: int) -> None:
                            f"({bad[:4]}); refusing to checkpoint")
 
 
-# Buffers that build_model() regenerates exactly from the preset, so they never need to
-# be carried in a checkpoint. op.A alone is (56, 360, 1152) float32 = 92.9 MB, against
-# 2.4 MB of actual learned weights -- 97% of a saved checkpoint is a tensor that is a
-# pure function of the preset.
+# Buffers that build_model() regenerates exactly from the preset, so they never need to be
+# carried in a checkpoint. op.A is (curves, frames, normals) float32, which dwarfs the
+# learned weights -- most of a naively saved checkpoint is a pure function of the preset.
 REGENERABLE_BUFFERS = ("op.A", "tags", "coords")
 
 
@@ -321,10 +320,11 @@ def warm_start(net, ckpt_path: str, gate_rank: int, n_primal: int) -> dict:
     leading-slice copy would silently feed coords into the wrong filters.
 
     The mapping is explicit: f and back-rank-0 keep their slots, the new back ranks get
-    ZERO weight, and coords move to their new offset. Zero weight on the new ranks means
-    the network computes exactly what the ungated one did -- combined with gate_scale=0
-    (rank 0 gated to 1, higher ranks to 0), the warm-started model is bit-identical to
-    the checkpoint it came from, at any rank.
+    ZERO weight, and coords move to their new offset. So the new ranks contribute nothing
+    at the first step and the warm start begins from the old solution rather than from
+    noise. It is not bit-identical to the checkpoint: the gate is a sigmoid whose init
+    splits a fixed budget across ranks, so rank 0 comes in scaled slightly below one.
+    See lpd_convex for why a multiplicative scalar was not used instead.
     """
     src = torch.load(ckpt_path, map_location="cpu")["model"]
     tgt = net.state_dict()
@@ -339,7 +339,6 @@ def warm_start(net, ckpt_path: str, gate_rank: int, n_primal: int) -> dict:
             loaded += 1
         elif (k.startswith("primals.") and k.endswith("c1.weight")
               and w.shape[1] == v.shape[1] + gate_rank - 1):
-            n_c = v.shape[1] - n_primal - 1          # coords (+ optional log R) channels
             w.zero_()
             w[:, :n_primal] = v[:, :n_primal]                     # f
             w[:, n_primal] = v[:, n_primal]                       # back, rank 0

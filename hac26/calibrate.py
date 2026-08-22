@@ -4,8 +4,12 @@ Fitted, and at what scope:
 
     shared, transfers to all ten   rho, source angular radius, PSF width, vignetting,
                                    OETF knots, clip knee
-    per curve                      tau_I, tau_B, pedestal C
+    per curve                      pedestal C, model error eta
     per body                       psi0
+
+Held fixed rather than fitted, despite looking fittable: tau_I and tau_B (a hard threshold
+passes no gradient), rho and the source angular radius (passed in on the command line), and
+psi0 (never applied at all, so it is always zero). See scripts/calibrate.py.
 
 A pedestal and not a gain. With val = g L + C the two reductions give I = g I_raw + C N and
 N = N. Mean normalisation divides each curve by its own mean and so removes g entirely, which
@@ -22,23 +26,18 @@ terms, so on a mean-normalised curve it becomes large where the body is faint, a
 geometries -- to zero weight. The whitening therefore uses s^2 = sigma^2 + eta^2 with eta the
 fitted model error, which bounds the weight from above.
 
-Radiosity runs on a decimated mesh out of necessity: a dense form-factor matrix on a
-800,000-facet ground truth is not storable. Interreflection is smooth and low-frequency,
+Radiosity runs on a decimated mesh out of necessity: a dense form-factor matrix on a full
+ground-truth mesh is not storable. Interreflection is smooth and low-frequency,
 unlike the silhouette, which is still rasterised from the full mesh.
 """
 from __future__ import annotations
 
 import numpy as np
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
 
 from .conventions import source_directions, to_body
 from hac26.forward.mesh.radiosity import RadiositySolver, emission, form_factors
-from hac26.forward.mesh.sensor import SensorModel
 
-__all__ = ["CalibrationParams", "decimate", "light_visibility", "body_radiance",
-           "residual_to_noise"]
+__all__ = ["decimate", "light_visibility", "body_radiance", "residual_to_noise"]
 
 N_CURVES = 56
 
@@ -65,50 +64,20 @@ def decimate(verts: np.ndarray, faces: np.ndarray, target: int = 1200,
     return np.asarray(m.vertices, dtype=np.float64), np.asarray(m.faces, dtype=np.int64)
 
 
-class CalibrationParams(nn.Module):
-    """Every fitted quantity, at its correct scope. Nothing here is per-curve gain."""
-
-    def __init__(self, n_bodies: int = 3, n_curves: int = N_CURVES,
-                 rho_prior: float = 0.85, rho_sd: float = 0.05):
-        super().__init__()
-        self.sensor = SensorModel()
-        self.raw_rho = nn.Parameter(torch.tensor(float(np.log(rho_prior / (1 - rho_prior)))))
-        self.raw_delta = nn.Parameter(torch.tensor(-4.0))       # source angular radius, rad
-        self.raw_tau_i = nn.Parameter(torch.full((n_curves,), -2.0))
-        self.raw_tau_b = nn.Parameter(torch.full((n_curves,), -1.0))
-        self.pedestal = nn.Parameter(torch.zeros(n_curves))
-        self.psi0 = nn.Parameter(torch.zeros(n_bodies))
-        self.rho_prior, self.rho_sd = rho_prior, rho_sd
-
-    @property
-    def rho(self) -> torch.Tensor:
-        return torch.sigmoid(self.raw_rho)
-
-    @property
-    def delta(self) -> torch.Tensor:
-        return F.softplus(self.raw_delta)
-
-    @property
-    def tau_i(self) -> torch.Tensor:
-        return torch.sigmoid(self.raw_tau_i)
-
-    @property
-    def tau_b(self) -> torch.Tensor:
-        return torch.sigmoid(self.raw_tau_b)
-
-    def rho_penalty(self) -> torch.Tensor:
-        return ((self.rho - self.rho_prior) / self.rho_sd) ** 2
-
-
 def light_visibility(verts, faces, centroids, normals, source_dirs, eps=1e-4):
-    """V_i(omega_k): can facet i see source sample k? Ray cast per facet per sample."""
+    """V_i(omega_k): can facet i see source sample k?
+
+    source_dirs (K, 3) -> (facets, K); (P, K, 3) -> (facets, P, K). Every ray goes in one
+    cast either way -- the ray tracer is far happier with one large batch than with K small
+    ones, and it is the same set of rays.
+    """
     import trimesh
     m = trimesh.Trimesh(verts, faces, process=False)
-    vis = np.ones((len(centroids), len(source_dirs)))
-    o = centroids + normals * eps
-    for k, d in enumerate(source_dirs):
-        vis[:, k] = (~m.ray.intersects_any(o, np.tile(d, (len(o), 1)))).astype(float)
-    return vis
+    d = np.asarray(source_dirs, dtype=float)
+    tail = d.shape[:-1]
+    o = np.repeat(centroids + normals * eps, int(np.prod(tail)), axis=0)
+    dirs = np.tile(d.reshape(-1, 3), (len(centroids), 1))
+    return (~m.ray.intersects_any(o, dirs)).astype(float).reshape(len(centroids), *tail)
 
 
 def body_radiance(verts, faces, rho: float, delta_rad: float, psi: np.ndarray,
@@ -122,13 +91,12 @@ def body_radiance(verts, faces, rho: float, delta_rad: float, psi: np.ndarray,
     F_, area, nrm, cen = form_factors(dv, df, occlusion=True)
     solver = RadiositySolver(F_, rho=max(rho, 1e-9))
     s_dirs_lab = source_directions(delta_rad, n_source)
-    out = np.zeros((len(psi), len(nrm)))
-    for j, p in enumerate(psi):
-        dirs = np.stack([to_body(d, np.array([p]), psi0)[0] for d in s_dirs_lab])
-        vis = light_visibility(dv, df, cen, nrm, dirs)
-        e = emission(nrm, dirs, vis)
-        out[j] = solver.radiance(solver.solve(e))
-    return dv, df, out
+    # One right-hand-side block, not one solve per phase: the factorisation is shared.
+    dirs = np.stack([np.stack([to_body(d, np.array([p]), psi0)[0] for d in s_dirs_lab])
+                     for p in psi])                                   # (phases, K, 3)
+    vis = light_visibility(dv, df, cen, nrm, dirs)                    # (facets, phases, K)
+    e = emission(nrm, dirs, vis)                                      # (facets, phases)
+    return dv, df, solver.radiance(solver.solve(e)).T
 
 
 def residual_to_noise(pred: np.ndarray, real: np.ndarray, sigma: np.ndarray,

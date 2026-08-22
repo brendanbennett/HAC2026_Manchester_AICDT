@@ -28,7 +28,7 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from hac26.field import DESIGN_ITERS, DESIGN_T, design_energy      # noqa: E402
+from hac26.field import DESIGN_ITERS, DESIGN_T, _design_residual, design_energy      # noqa: E402
 
 
 def build(n: int, t: int = DESIGN_T, iters: int = DESIGN_ITERS, lr: float = 1e-2,
@@ -61,6 +61,9 @@ def build(n: int, t: int = DESIGN_T, iters: int = DESIGN_ITERS, lr: float = 1e-2
     return best_x.cpu().numpy()
 
 
+TOL = 1e-5      # the bound tests/test_field.py asserts on a published design
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--n", type=int, required=True, help="number of normals")
@@ -68,7 +71,9 @@ def main():
     ap.add_argument("--iters", type=int, default=DESIGN_ITERS)
     ap.add_argument("--lr", type=float, default=1e-2)
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
-    ap.add_argument("--out", default=None)
+    ap.add_argument("--out", default=None,
+                    help="write somewhere other than the hac26/design<n>.npy cache; the "
+                         "quality gate below still applies")
     a = ap.parse_args()
 
     out = Path(a.out) if a.out else Path(__file__).resolve().parents[1] / "hac26" / \
@@ -76,13 +81,28 @@ def main():
     print(f"building a strength-{a.t} design of {a.n} normals on {a.device}", flush=True)
     x = build(a.n, a.t, a.iters, a.lr, a.device)
 
-    # report the residual the design is supposed to kill, and the facet geometry it implies
-    res = float(design_energy(torch.tensor(x, dtype=torch.float64), a.t))
+    # Report the WORST SINGLE-DEGREE residual, which is what defines a t-design and what the
+    # tests gate on -- not design_energy, which is the SUM over degrees and was printed here
+    # under the label "design residual".
+    xt = torch.tensor(x, dtype=torch.float64)
+    res = _design_residual(x, a.t)
+    energy = float(design_energy(xt, a.t))
     half = np.degrees(np.arccos(1.0 - 2.0 / a.n))
-    print(f"\n  design residual      {res:.3e}")
+    print(f"\n  worst-degree residual {res:.3e}   (summed energy {energy:.3e})")
     print(f"  facet half-angle     {half:.2f} deg")
     print(f"  facet width          {2*np.sin(np.radians(half)):.3f} R")
     print(f"  bulge at face centre {2.0/a.n*100:.2f}% of the support distance")
+
+    # Refuse to publish a short build. field.py::_write_design_cache already will not cache
+    # one, for the same reason: the filename keys on n alone and the design_sha is identical,
+    # so nothing downstream could tell a short build from a good one. This script is the only
+    # route to design4096.npy, since spherical_design refuses n > 512.
+    if res > TOL:
+        raise SystemExit(
+            f"worst-degree residual {res:.3e} exceeds {TOL:.0e}: this design is not good "
+            f"enough to publish as hac26/design{a.n}.npy, and nothing downstream could tell "
+            f"it apart from a good one. Raise --iters (default {DESIGN_ITERS}) and rerun, or "
+            f"pass --out to write it somewhere that is not the cache.")
     np.save(out, x)
     print(f"  wrote {out}")
 

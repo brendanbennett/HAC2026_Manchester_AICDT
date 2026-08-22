@@ -2,9 +2,8 @@
 """Train the surrogate against the physical forward model and measure held-out agreement.
 
 The gate is agreement well below sigma. sigma here is the measured per-curve replicate
-noise of the real instrument, 0.005-0.03 in mean-normalised units, so "well below" means
-the surrogate must reproduce the physical model to a few times 1e-3 or better, otherwise the LPD would be
-inverting an operator whose own error exceeds the noise it is trying to fit.
+noise of the real instrument, in mean-normalised units. If the surrogate misses that gate,
+the LPD is inverting an operator whose own error exceeds the noise it is trying to fit.
 
 A CUBE IS IN THE HELD-OUT SET DELIBERATELY. It is the shape whose curves are most unlike
 the smooth bodies that dominate any random training corpus, and the one whose flat faces and
@@ -16,6 +15,7 @@ import argparse
 import sys
 from pathlib import Path
 
+from multiprocessing import Pool
 import numpy as np
 import torch
 
@@ -23,17 +23,18 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from hac26.conventions import S_LAB, cameras, psi_grid, source_directions, to_body  # noqa
 from hac26.forward.mesh.radiosity import RadiositySolver, emission, facet_geometry, form_factors  # noqa
-from hac26.calibrate import decimate                                         # noqa
+from hac26.calibrate import decimate, light_visibility                       # noqa
 from hac26.forward.mesh.raster import Rasteriser                                          # noqa
-from hac26.forward.learned_surrogate import Surrogate, trace_features                        # noqa
+from hac26.forward.learned_surrogate import (Surrogate, camera_features,   # noqa
+                                             save_surrogate, sun_features)
 
 
 def shapes(n: int, seed: int = 0):
     """Training corpus plus a held-out set that always contains a cube.
 
     Six archetypes, every one PARAMETERISED. The previous version built the contact binary
-    and the cylinder from fixed constants, so 40% of any corpus was two identical meshes
-    under random rotation -- diversity the overfitting gap could not use. Neck depth, crater
+    and the cylinder from fixed constants, so a large slice of any corpus was two identical
+    meshes under random rotation -- diversity the overfitting gap could not use. Neck depth, crater
     count and depth, prism section count and overhang overlap all vary now, and the
     the overhang class was missing entirely.
     """
@@ -79,11 +80,61 @@ def shapes(n: int, seed: int = 0):
     return out
 
 
-def m2_curves(v, f, ras, psi, rho=0.85, delta=np.radians(1.0), target=600):
-    """Reference curves from the physical pipeline."""
+def _sensed(ras, sensor, px, fv_t, ff_t, vr, eyes, fov):
+    """All the cameras of one phase, through the SHARED half of the sensor chain if given.
+
+    Shared, and only shared: cos^4 falloff, vignetting, PSF, OETF, saturation and
+    quantisation are the same for every camera, so a camera-agnostic surrogate can carry
+    them. The per-curve terms -- tau_I, tau_B, the pedestal, psi0 -- are NOT applied here
+    and must not be: the surrogate's inputs are mu, mu0 and visibility, which is what makes
+    one network serve all 28 geometries, and a per-curve target is not a function of those.
+
+    Nothing applies them afterwards either. The inversion reads only the fitted model error
+    eta out of the calibration, and this reduction thresholds the binary channel relative to
+    the body's own peak rather than at the calibration's tau_B, so the surrogate is
+    self-consistent but does not reproduce the calibration's reduction. That gap sits inside
+    the surrogate's accuracy gap and is not separately corrected for.
+
+    Worth carrying because the binary channel is a pixel COUNT above a threshold and the PSF
+    spreads the silhouette edge across pixels. The intensity curve barely notices -- summing
+    pixels is insensitive to a convolution -- but the binary curve moves by more than the
+    measurement noise, so it is worth carrying.
+    """
+    img, _ = ras.render_batch(fv_t, ff_t, vr, np.asarray(eyes) * 8.0, fov_y_rad=fov)
+    if sensor is None:
+        return img
+    cos_off, radius = px
+    with torch.no_grad():
+        return sensor(img, cos_off.expand(len(img), -1, -1),
+                      radius.expand(len(img), -1, -1), supersample=ras.ss)
+
+
+RENDER_CACHE_BYTES = 512e6   # above this the frames are re-rendered instead of kept
+
+
+def _cpu_job(job):
+    j, v, f, psi = job
+    return j, cpu_half(v, f, psi)
+
+
+def cpu_half(v, f, psi, target=600):
+    """Everything in m2_curves that needs no GPU, so a pool can do it while one process
+    renders. form_factors is O(facets^2) and is what a shape actually costs here."""
     from hac26.calibrate import decimate
     dv, df = decimate(v, f, target)
-    F_, area, nrm, cen = form_factors(dv, df, occlusion=True)
+    F_, _, nrm, cen = form_factors(dv, df, occlusion=True)
+    return (dv, df, F_, nrm, cen), features_for(v, f, psi)
+
+
+def m2_curves(v, f, ras, psi, rho=0.85, delta=np.radians(1.0), target=600, sensor=None,
+              pre=None):
+    """Reference curves from the physical pipeline."""
+    if pre is None:
+        from hac26.calibrate import decimate
+        dv, df = decimate(v, f, target)
+        F_, _, nrm, cen = form_factors(dv, df, occlusion=True)
+    else:
+        dv, df, F_, nrm, cen = pre
     solver = RadiositySolver(F_, rho=rho)
     s_lab = source_directions(delta, 8)
     from scipy.spatial import cKDTree
@@ -96,23 +147,59 @@ def m2_curves(v, f, ras, psi, rho=0.85, delta=np.radians(1.0), target=600):
     cams = cameras()
     ext = float(np.abs(v).max())
     fov = 2.0 * np.arctan(1.6 * ext / 8.0)
+    px = ras.pixel_geometry(fov) if sensor is not None else None
     I = np.zeros((28, len(psi))); N = np.zeros((28, len(psi)))
-    peak = 0.0   # set on the first frame; an ABSOLUTE binary threshold empties
-                 # the whole channel whenever the radiance scale changes
-    for j, p in enumerate(psi):
-        dirs = np.stack([to_body(d, np.array([p]))[0] for d in s_lab])
-        import trimesh
-        mm = trimesh.Trimesh(dv, df, process=False)
-        vis = np.stack([(~mm.ray.intersects_any(cen + nrm * 1e-4, np.tile(d, (len(cen), 1))))
-                        .astype(float) for d in dirs], 1)
-        L = solver.radiance(solver.solve(emission(nrm, dirs, vis)))
-        vr = torch.tensor(np.repeat(L[idx], 3).astype(np.float32), device=dev)
-        for c, cam in enumerate(cams):
-            vb = to_body(np.asarray(cam.v), np.array([p]))[0]
-            img, _ = ras.render(fv_t, ff_t, vr, eye=vb * 8.0, fov_y_rad=fov)
-            peak = max(peak, float(img.max()))
-            I[c, j] = float(img.sum())
-            N[c, j] = float((img > 1e-3 * peak).sum())
+
+    # ONE threshold for the whole body, fixed BEFORE any pixel is counted.
+    #
+    # `peak` used to be a running maximum: initialised outside both loops and updated inside
+    # them, so frame (j, c) was thresholded against the brightest frame seen SO FAR, not
+    # against the body's own peak. The comment said "set on the first frame"; the code did
+    # not do that. Every frame before the brightest one was thresholded too low, and where in
+    # the sweep the peak happens to fall is a property of the shape, so on some bodies most
+    # of the frames were thresholded low and the binary curve moved by well over the noise.
+    #
+    # Two passes rather than a buffer of every rendered image: the per-phase radiance is what
+    # costs anything here (one ray cast per source direction plus a radiosity solve), so it
+    # is computed once and cached, and the second pass only re-runs the rasteriser.
+    cam_v = np.stack([np.asarray(c.v) for c in cams])
+    P = len(psi)
+
+    # ALL PHASES AT ONCE. The transport matrix is phase-independent -- that is the whole
+    # point of hac26.forward.mesh.radiosity -- so every phase's right-hand side goes through
+    # the one factorisation in a single call, and every shadow ray through a single cast.
+    # to_body is vectorised over phase, so these are one call per direction rather than one
+    # per (phase, direction) pair.
+    dirs_p = np.stack([to_body(d, psi) for d in s_lab], 1)                 # (P, K, 3)
+    eyes_p = np.stack([to_body(cv, psi) for cv in cam_v], 1)               # (P, cams, 3)
+    vis = light_visibility(dv, df, cen, nrm, dirs_p)                       # one ray cast
+    L = solver.radiance(solver.solve(emission(nrm, dirs_p, vis)))          # (facets, phases)
+    L_t = torch.tensor(np.ascontiguousarray(np.repeat(L[idx], 3, axis=0).T,
+                                            dtype=np.float32), device=dev)   # one H2D copy
+
+    # What is left is the rasteriser, which genuinely differs per phase: different radiance,
+    # different camera positions. All the cameras of a phase go in one call.
+    #
+    # The binary threshold is 1e-3 of the body's PEAK, which is not known until every frame
+    # has been rendered. Keeping the frames is what lets that be one render pass instead of
+    # two; when they would not fit, the fallback re-renders and gets the same answer.
+    imgs, sums, maxes = None, [], []
+    for j in range(P):
+        img = _sensed(ras, sensor, px, fv_t, ff_t, L_t[j], eyes_p[j], fov)
+        if j == 0 and P * img.numel() * img.element_size() <= RENDER_CACHE_BYTES:
+            imgs = torch.empty((P, *img.shape), dtype=img.dtype, device=img.device)
+        if imgs is not None:
+            imgs[j] = img
+        sums.append(img.sum((-2, -1)))
+        maxes.append(img.max())
+    I[:] = torch.stack(sums, 1).cpu().numpy()
+    thr = 1e-3 * float(torch.stack(maxes).max())         # one sync, not one per phase
+    if imgs is not None:
+        N[:] = (imgs > thr).sum((-2, -1)).T.cpu().numpy()
+    else:
+        for j in range(P):
+            img = _sensed(ras, sensor, px, fv_t, ff_t, L_t[j], eyes_p[j], fov)
+            N[:, j] = (img > thr).sum((-2, -1)).cpu().numpy()
     cur = np.concatenate([I, N], 0)
     return cur / np.maximum(cur.mean(1, keepdims=True), 1e-9)
 
@@ -122,8 +209,8 @@ def features_for(v, f, psi, n_tokens=600, seed=0):
 
     The tokens are the facets of the decimated mesh, not random surface samples, and each
     carries its own area. That makes the token sum a quadrature of the surface integral
-    rather than a Monte-Carlo estimate of it -- which is what capped the first attempt at
-    1/sqrt(128) = 0.088 no matter how well the network fitted.
+    rather than a Monte-Carlo estimate of it. Random samples put a 1/sqrt(n_tokens) floor
+    under the error that no amount of network capacity can get below.
     """
     from hac26.calibrate import decimate
     from hac26.forward.mesh.radiosity import facet_geometry
@@ -133,14 +220,22 @@ def features_for(v, f, psi, n_tokens=600, seed=0):
     # construction -- its inputs are mu, mu0 and visibility, which already encode where the
     # camera is -- so one network serves all 28, and training it on all of them is what
     # makes it valid off azimuth 0. Conditioning the LPD on a single geometry gives the dual
-    # 160 numbers to determine 1856 code dimensions, and the flow correspondingly learned
-    # 5.4% of the target variance.
+    # far fewer numbers than the code has dimensions, and the flow correspondingly learned
+    # almost none of the target variance.
+    # sun_features + camera_features, NOT trace_features. The two compute the same map, and
+    # that was checked, but trace_features re-casts the CAMERA-INDEPENDENT sun
+    # rays inside the per-camera loop and casts per phase rather than per call: 2*G*T*P rays
+    # in many small calls against (G+1)*T*P in one, i.e. roughly half the rays.
+    # It is also the exact pair curves_from_mesh uses, so the surrogate is now trained
+    # through the same code path the inversion evaluates it with.
+    import trimesh
+    mesh = trimesh.Trimesh(dv, df, process=False)
     sun_d = np.stack([to_body(S_LAB, np.array([p]))[0] for p in psi])
+    sun = sun_features(mesh, pts, nrm, sun_d)
     out = []
     for cam in cameras():
         cam_d = np.stack([to_body(np.asarray(cam.v), np.array([p]))[0] for p in psi])
-        out.append(trace_features(dv, df, pts, nrm, cam_d, sun_d,
-                                  areas=area / area.sum()))
+        out.append(camera_features(mesh, pts, nrm, cam_d, sun, areas=area / area.sum()))
     return np.stack(out), area / area.sum()          # (28, T, P, F)
 
 
@@ -148,7 +243,13 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--train", type=int, default=12)
     ap.add_argument("--held", type=int, default=4)
-    ap.add_argument("--phases", type=int, default=16)
+    ap.add_argument("--phases", type=int, default=96,
+                    help="frames per revolution. MUST match what the inversion uses -- "
+                         "train_lpd.py and reconstruct_lpd.py both default to 96. Sampling "
+                         "at P aliases every rotation order above P/2 into the band the "
+                         "spectral conv keeps, so a net fitted at 16 or 32 learned to "
+                         "reproduce aliased curves and is then asked for unaliased ones. "
+                         "The raw data is 360 frames; everything resamples from it.")
     ap.add_argument("--steps", type=int, default=400)
     ap.add_argument("--no-attn", action="store_true",
                     help="pointwise + spectral only. The photometric response of a\n"
@@ -159,13 +260,26 @@ def main():
     ap.add_argument("--batch", type=int, default=4,
                     help="micro-batch; memory-bound by O(T^2) attention")
     ap.add_argument("--accum", type=int, default=1,
-                    help="gradient accumulation steps. Batch 6 out of 5040\n"
-                         "examples is 0.1% of the data per step, and the train\n"
-                         "loss swung 0.067-0.195 between logged steps purely\n"
-                         "from that. Accumulation buys a larger EFFECTIVE batch\n"
-                         "without the attention memory a larger real one needs.")
-    ap.add_argument("--width", type=int, default=64)
-    ap.add_argument("--blocks", type=int, default=2)
+                    help="gradient accumulation steps. The micro-batch is a tiny\n"
+                         "fraction of the data, so the train loss swings between\n"
+                         "logged steps from batch composition alone. Accumulation\n"
+                         "buys a larger EFFECTIVE batch without the attention\n"
+                         "memory a larger real one needs.")
+    # The architecture goes into the checkpoint and every consumer reads it back through
+    # load_surrogate, so these defaults only decide what a fresh run builds. They were once
+    # smaller than what the callers constructed, and a rerun without explicit flags then
+    # overwrote runs/surrogate.pt with a file the pipeline refused to load.
+    ap.add_argument("--workers", type=int, default=1,
+                    help="processes for the CPU half of the dataset build (form factors and "
+                         "the ray-traced features). The rendering stays in this process, "
+                         "since it holds the CUDA context.")
+    ap.add_argument("--calibration", default="models/instrument_calibration.pt")
+    ap.add_argument("--sensor", action="store_true", default=True,
+                    help="apply the shared half of the fitted sensor chain to the training "
+                         "target (default on when the calibration exists)")
+    ap.add_argument("--no-sensor", dest="sensor", action="store_false")
+    ap.add_argument("--width", type=int, default=96)
+    ap.add_argument("--blocks", type=int, default=3)
     ap.add_argument("--modes", type=int, default=8)
     ap.add_argument("--rho", type=float, default=0.85,
                     help="albedo of the reference. The surrogate sees one\n"
@@ -176,31 +290,71 @@ def main():
     psi = psi_grid(a.phases)
     ras = Rasteriser(64, 96, 2, device=dev)
 
+    # The shared half of the fitted sensor chain, applied to the training TARGET. Without it
+    # the surrogate is fitted to a sensor-free render and then compared, at inversion, with
+    # curves that came through the instrument. See _sensed for what "shared" excludes and for
+    # what it excludes and why.
+    sensor = None
+    cal_path = Path(a.calibration)
+    if a.sensor and cal_path.exists():
+        from hac26.forward.mesh.sensor import SensorModel
+        cal = torch.load(cal_path, map_location="cpu", weights_only=False)
+        if "sensor" in cal:
+            sensor = SensorModel(quantise=True)
+            sensor.load_state_dict(cal["sensor"])
+            sensor = sensor.to(dev).eval()
+            print(f"  sensor chain ON, from {cal_path}", flush=True)
+        else:
+            print(f"  WARNING: {cal_path} has no 'sensor' entry; training WITHOUT the "
+                  f"sensor chain", flush=True)
+    elif a.sensor:
+        print(f"  {cal_path} not found: training WITHOUT the sensor chain. Run "
+              f"scripts/calibrate.py first, or pass --no-sensor to make this deliberate.",
+              flush=True)
+    else:
+        print("  sensor chain OFF (--no-sensor)", flush=True)
+
     allsh = shapes(a.train + a.held, seed=1)
     import trimesh
     cube = trimesh.creation.box(extents=(0.9, 0.9, 0.9))
-    allsh[a.train] = (np.asarray(cube.vertices, float), np.asarray(cube.faces, np.int64))
+    # INTO THE TEST SET, not the validation set. The split below is
+    # train = [:n_tr], val = [n_tr : n_tr+n_val], test = [n_tr+n_val :], and the cube used to
+    # go in at index a.train = n_tr -- the first VALIDATION example. It therefore only ever
+    # drove early stopping and was never in the set the accuracy gate is computed on, which
+    # is the opposite of what this module's docstring promises it does.
+    cube_at = a.train + max(1, (a.held) // 2)
+    cube_at = min(cube_at, len(allsh) - 1)
+    allsh[cube_at] = (np.asarray(cube.vertices, float), np.asarray(cube.faces, np.int64))
 
-    cache = Path(f"/tmp/surr_cache_v7_{a.train}_{a.held}_{a.phases}_{a.rho}.npz")
+    cache = Path(f"/tmp/surr_cache_v8_{a.train}_{a.held}_{a.phases}_{a.rho}"
+                 f"_{'sensor' if sensor is not None else 'raw'}.npz")
     if cache.exists():
         z = np.load(cache, allow_pickle=True)
         X, Y, A = list(z['X']), list(z['Y']), list(z['A'])
         print(f"  loaded {len(X)} shapes from cache", flush=True)
     else:
         X, Y, A = [], [], []
-    for i, (v, f) in enumerate(allsh if not X else []):
-        try:
-            # ONE mesh for both sides. The reference was rendering the full mesh while the
-            # tokeniser described a 600-face decimation of it, so the surrogate was asked to
-            # predict a silhouette belonging to geometry it had never been shown -- a
-            # mismatch no amount of training can absorb.
-            v, f = decimate(v, f, 600)
-            cur = m2_curves(v, f, ras, psi, rho=max(a.rho, 1e-9))
-            fe, ar = features_for(v, f, psi)
-        except Exception as e:
-            print(f"  shape {i}: skipped ({type(e).__name__})", flush=True); continue
-        X.append(fe); Y.append(cur); A.append(ar)
-        print(f"  shape {i}: features {fe.shape}, curves {cur.shape}", flush=True)
+    # ONE mesh for both sides. The reference used to render the full mesh while the
+    # tokeniser described a 600-face decimation of it, so the surrogate was asked to predict
+    # a silhouette belonging to geometry it had never been shown.
+    todo = [(i, *decimate(v, f, 600)) for i, (v, f) in enumerate(allsh if not X else [])]
+    pool = Pool(a.workers) if a.workers > 1 and todo else None
+    it = ((j, cpu_half(vv, ff, psi)) for j, vv, ff in todo) if pool is None else \
+        pool.imap(_cpu_job, [(j, vv, ff, psi) for j, vv, ff in todo])
+    meshes = {j: (vv, ff) for j, vv, ff in todo}
+    try:
+        for i, res in it:
+            v, f = meshes[i]
+            try:
+                pre, (fe, ar) = res
+                cur = m2_curves(v, f, ras, psi, rho=max(a.rho, 1e-9), sensor=sensor, pre=pre)
+            except Exception as e:
+                print(f"  shape {i}: skipped ({type(e).__name__})", flush=True); continue
+            X.append(fe); Y.append(cur); A.append(ar)
+            print(f"  shape {i}: features {fe.shape}, curves {cur.shape}", flush=True)
+    finally:
+        if pool is not None:
+            pool.close(); pool.join()
     n_tr = min(a.train, len(X))
     if not cache.exists() and X:
         # np.array(list_of_ragged, dtype=object) tries to BROADCAST when the entries share
@@ -246,8 +400,8 @@ def main():
     opt = torch.optim.Adam(net.parameters(), lr=2e-3, weight_decay=a.wd)
 
     def eval_rms(X_, A_, T_, chunk=8):
-        """Chunked evaluation: the validation and test sets are 28x larger now that every
-        (shape, camera) pair is an example, and attention is O(T^2) per phase."""
+        """Chunked evaluation: every (shape, camera) pair is its own example now, so the
+        validation and test sets grew by the camera count, and attention is O(T^2) per phase."""
         outs = []
         with torch.no_grad():
             for i in range(0, X_.shape[0], chunk):
@@ -268,8 +422,8 @@ def main():
     Xva, Ava, tva = flat(Xva, Yva, Ava)
     Xte, Ate, tte = flat(Xte, Yte, Ate)
     print(f"  training examples: {Xtr.shape[0]} (shape x camera pairs)", flush=True)
-    # Mini-batched over shapes. Attention is O(T^2) per phase, so 600 tokens across all
-    # 64 shapes at once asks for 5.5 GiB in a single allocation and OOMs an 8 GB card.
+    # Mini-batched over shapes. Attention is O(T^2) per phase, so the whole set at once
+    # asks for one allocation far larger than a single card has.
     bs = a.batch
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=a.steps)
     best_val, best_state = float("inf"), None
@@ -298,22 +452,30 @@ def main():
     if best_state is not None:
         net.load_state_dict(best_state)
         print(f"\n  restored the checkpoint with the best VALIDATION RMS {best_val:.5f}")
-    torch.save(net.state_dict(), "runs/surrogate.pt")
     with torch.no_grad():
         err = eval_rms(Xte, Ate, tte).abs()
     # sigma comes from the DATA, not from a constant. The measured replicate noise at
-    # azimuth 0 -- the geometry these features describe -- is 0.0034 to 0.0240 across the
-    # three public bodies (median 0.0124), so a single hard-coded "typical sigma" decides
-    # the verdict by itself. Report against the range and say which end is which.
+    # azimuth 0 -- the geometry these features describe -- spans nearly an order of magnitude
+    # across the three public bodies, so a single hard-coded "typical sigma" would decide the
+    # verdict by itself. Report against the range and say which end is which.
     SIG = {"model 1 intensity": 0.0034, "model 1 binary": 0.0043,
            "model 2 intensity": 0.0195, "model 2 binary": 0.0240,
            "model 3 intensity": 0.0173, "model 3 binary": 0.0075}
     sig_med = float(np.median(list(SIG.values())))
-    print(f"\nheld-out shapes: {Xte.shape[0]} (index {n_tr} is the CUBE)")
-    for i in range(Xte.shape[0]):
-        tag = " <- cube" if i == 0 else ""
-        print(f"  shape {n_tr+i}: RMS {float(err[i].pow(2).mean().sqrt()):.5f}  "
-              f"max {float(err[i].max()):.5f}{tag}")
+    # Xte is FLATTENED to (shapes x 28 cameras), so row i is shape (n_tr+n_val + i//28) seen
+    # from camera i%28 -- not "shape n_tr+i", which is what this used to print: at the
+    # documented --train 256 --held 16 it emitted 224 rows labelled "shape 256"..."shape 479"
+    # for 8 real shapes, and put "<- cube" on row 0, which is not the cube.
+    n_cam = len(cameras())
+    n_sh = Xte.shape[0] // n_cam
+    print(f"\nheld-out shapes: {n_sh} ({Xte.shape[0]} shape-camera pairs); "
+          f"shape index {cube_at} is the CUBE")
+    for k in range(n_sh):
+        sl = slice(k * n_cam, (k + 1) * n_cam)
+        si = n_tr + n_val + k
+        tag = " <- cube" if si == cube_at else ""
+        print(f"  shape {si}: RMS {float(err[sl].pow(2).mean().sqrt()):.5f}  "
+              f"max {float(err[sl].max()):.5f}{tag}")
     rms = float(err.pow(2).mean().sqrt())
     ri = float(err[:, 0].pow(2).mean().sqrt())
     rb = float(err[:, 1].pow(2).mean().sqrt())
@@ -326,9 +488,23 @@ def main():
     print(f"  median sigma {sig_med:.4f}  ->  {rms/sig_med:.2f} sigma")
     n_below = sum(1 for v in SIG.values() if rms < v)
     print(f"  below sigma for {n_below} of {len(SIG)} model/channel pairs")
-    print("  GATE " + ("PASS" if rms < 0.3 * sig_med else
+    gate = rms < 0.3 * sig_med
+    print("  GATE " + ("PASS" if gate else
                        "FAIL (not WELL below sigma; below it, but not by the "
                        "required margin)"))
+
+    # Written AFTER the gate is computed, so the checkpoint records the number it scored --
+    # the weights and the verdict cannot then disagree. Written either way: a failing
+    # surrogate is still the best one available, and refusing to save it would only mean the
+    # pipeline silently reuses an older file whose provenance nobody knows.
+    save_surrogate(net, "runs/surrogate.pt", {
+        "width": int(a.width), "modes": int(a.modes), "blocks": int(a.blocks),
+        "attention": not a.no_attn, "phases": int(a.phases), "rho": float(a.rho),
+        "sensor": sensor is not None, "train": int(a.train), "held": int(a.held),
+        "test_rms": float(rms), "gate_pass": bool(gate),
+    })
+    print(f"  wrote runs/surrogate.pt (phases {a.phases}, sensor "
+          f"{'on' if sensor is not None else 'off'}, RMS {rms:.5f})")
 
 
 if __name__ == "__main__":

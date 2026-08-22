@@ -38,9 +38,9 @@ from hac26.covariance import load_covariance, whitened_misfit          # noqa: E
 from hac26.recon import dice, fit_to_cylinder                          # noqa: E402
 from hac26.scoring.voxel import occupancy as _occupancy           # noqa: E402
 from hac26.shapes import canonicalize_r, mesh_support, rescale_touch_z   # noqa: E402
-from hac26.forward.learned_surrogate import Surrogate                                  # noqa: E402
+from hac26.forward.learned_surrogate import load_surrogate                    # noqa: E402
 from train_lpd import (cond_channels, curves_from_code, curves_from_mesh,   # noqa: E402
-                       set_code)                                      # noqa: E402
+                       set_code, support_residual_channel)            # noqa: E402
 
 CYLINDER_R = {1: 1.12, 2: 1.42, 3: 0.88, 4: 1.475, 5: 1.22,
               6: 0.925, 7: 1.205, 8: 1.24, 9: 0.67, 10: 3.95}
@@ -51,10 +51,9 @@ PUBLIC = {1: "AsteroidModel01_shape_public/asteroid1.stl",
 SPREAD_MAX = 0.95   # mean Dice of the OFF-MEDOID draws against the medoid, above which the
                     # draws are one body rather than a posterior. Gated on the off-medoid mean
                     # and not on `spread`, which includes the medoid's Dice against itself and
-                    # is therefore sample-count dependent (at 2 draws `spread > 0.95` needs
-                    # 0.900, at 16 it needs 0.947). The committed runs sat at 0.991-0.994 with
-                    # a token correction that was identically zero; a live channel has to
-                    # disagree with itself somewhere.
+                    # is therefore sample-count dependent. Runs made with a correction
+                    # channel that was identically zero sat just under 1 here; a live channel
+                    # has to disagree with itself somewhere.
 
 
 def data_modes(curves56: np.ndarray, n_modes: int):
@@ -78,7 +77,7 @@ def geom_tag_and_mask(mask56: np.ndarray):
 def support_from_convex(stl: str) -> torch.Tensor:
     """h for a competition body, taken from the convex stage's own reconstruction.
 
-    The flow generates the token correction, not h.
+    The flow generates the correction -- dh on the support and g on the lattice -- not h.
     It does not follow that h is a sphere: it has to come from somewhere, and the convex
     stage already predicts it from these same 56 curves. Evaluated on the design normals,
     which is the basis ConvexCore stores its support in.
@@ -94,56 +93,88 @@ def support_from_convex(stl: str) -> torch.Tensor:
     """
     import trimesh
     m = trimesh.load(stl, process=False)
-    v = canonicalize_r(rescale_touch_z(np.asarray(m.vertices)))
+    v = canonicalize_r(rescale_touch_z(np.asarray(m.vertices), np.asarray(m.faces)))
     n = ImplicitBody(radius=1.0).core.n.detach().cpu().numpy()
     h = mesh_support(v, n)
     return torch.tensor(np.maximum(h, 1e-3), dtype=torch.float32)
 
 
-def make_resid_fn(net, g_dat, surro, psi, M, radius, support=None):
+def make_resid_fn(net, g_dat, real_g, geom_mask, surro, psi, M, radius, cond, support=None):
     """resid_fn(z, t) -> (residual features, sphere channels, volume channels).
 
     `z` is the flow's WHITENED code; it is decoded here, so nothing in the sampling loop has
     to know which space it is holding. `support` is the BASE h from the convex stage; the
     code's dh block corrects it, exactly as the perturbation did during training.
+
+    THE ADJOINT CHANNEL IS FILLED HERE. sph[..., 4] is A^T r on the dh directions, and
+    train_lpd.flow_loss sets it on every training step. This function left it at the zero slot
+    cond_channels returns, so the whole reconstruction ran with a channel the network was
+    trained to read held at zero. It is not a minor channel: every _FiLM in the primal is
+    zero-initialised, so the dual's summary reaches the velocity only through weights that
+    start at zero, and until they move this channel is the ONLY path by which the curves
+    affect the answer at all.
+
+    Geometries absent from the data are masked out of the residual before the adjoint. The
+    dual path already respects the mask, through the pooling in LPDFlow._summary; this one
+    would otherwise read a missing curve's zero as a full-amplitude disagreement.
     """
-    sph0, vol0 = cond_channels(support)
+    sph0, vol0 = cond
+    C = len(cameras())
+    gmask = geom_mask.reshape(1, C, 1, 1)
+
     def fn(z, t):
         raw = net.codec.decode(z.detach())
-        preds = []
+        preds, live = [], torch.ones(len(z), 1, 1, 1)
         for b in range(len(z)):
             cur = curves_from_code(raw[b], radius, surro, psi, support=support)
-            preds.append(torch.zeros(28, 2, len(psi)) if cur is None else cur)
-        g_cur = torch.fft.rfft(torch.stack(preds), dim=-1)[..., 1:M + 1]
-        r = g_dat.expand_as(g_cur) - g_cur
+            if cur is None:
+                # A(x) is unavailable, not zero. Zeroing `live` presents the draw as carrying
+                # no operator information for this step, rather than as a body that reflects
+                # no light -- which would be a full-amplitude phantom residual.
+                live[b] = 0.0
+                cur = torch.zeros(C, 2, len(psi))
+            preds.append(cur)
+        pred_stack = torch.stack(preds)
+        g_cur = torch.fft.rfft(pred_stack, dim=-1)[..., 1:M + 1]
+        r = (g_dat.expand_as(g_cur) - g_cur) * live
         B = len(z)
-        feats = torch.zeros(B, 28, N_MODES, 6)
+        feats = torch.zeros(B, C, N_MODES, 6)
         for ch in range(2):
             feats[:, :, :M, 2 * ch] = r[:, :, ch].real
             feats[:, :, :M, 2 * ch + 1] = r[:, :, ch].imag
         feats[:, :, :M, 4] = g_dat[:, :, 0].real.expand(B, -1, -1)
         feats[:, :, :M, 5] = g_dat[:, :, 1].real.expand(B, -1, -1)
-        return feats, sph0.expand(B, -1, -1), vol0.expand(B, -1, -1, -1, -1)
+        sph = sph0.expand(B, -1, -1).clone()
+        sph[..., 4] = support_residual_channel(
+            (real_g[None] - pred_stack) * gmask * live, real_g.shape[-1])
+        return feats, sph, vol0.expand(B, -1, -1, -1, -1)
     return fn
 
 
 def decode(code, radius, res=64, misfit_fn=None, eta=None, support=None, snap: bool = False,
            snap_planes: int = 12, snap_tol: float = 0.02,
-           snap_min_frac: float = 0.02):
-    """Token code -> constrained mesh, with optional planar snapping."""
-    body = ImplicitBody(radius=radius)
+           snap_min_frac: float = 0.02, device=None):
+    """Code -> constrained mesh, with optional planar snapping.
+
+    `device` defaults to the accelerator. This used to be pinned to "cpu" while the very same
+    field evaluation inside curves_from_code ran on CUDA. The extraction is (points x 4096
+    normals) plus (points x sites), which is seconds per draw on a CPU and negligible on a
+    card.
+    """
+    device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+    body = ImplicitBody(radius=radius).to(device)
     n_norm = body.core.n.shape[0]
     if support is None:
-        h = torch.full((n_norm,), 0.8 * radius)
+        h = torch.full((n_norm,), 0.8 * radius, device=device)
     else:
-        h = torch.as_tensor(support, dtype=torch.float32)
+        h = torch.as_tensor(support, dtype=torch.float32, device=device)
         if h.numel() != n_norm:
             raise ValueError(f"support has {h.numel()} entries, but this field uses "
                              f"{n_norm} normals; rerun the convex/support stage after "
                              "changing DESIGN_N")
     body.set_support(h)
-    set_code(body, code)
-    v, f = extract_mesh(lambda y: body(y), radius * 1.6, res=res, device="cpu")
+    set_code(body, code.to(device))
+    v, f = extract_mesh(lambda y: body(y), radius * 1.6, res=res, device=device)
     if len(f) < 8:
         return None, None, 0
     v = apply_constraints(v, radius)
@@ -159,8 +190,17 @@ def decode(code, radius, res=64, misfit_fn=None, eta=None, support=None, snap: b
     return v, f, kept
 
 
-def occupancy(v, f, n=64, extent=None):
-    return _occupancy(v, f, n, extent or float(np.abs(v).max()) * 1.05)
+def occupancy(v, f, n, extent):
+    """Occupancy on an EXPLICIT grid. The extent is never defaulted per mesh.
+
+    It used to default to `abs(v).max() * 1.05` of the mesh being voxelised, which gave every
+    draw its own grid: voxel (i, j, k) then meant a different place in each, and the pairwise
+    Dice that picks the medoid -- and `spread_off_medoid`, which decides whether the posterior
+    has collapsed -- were comparing meshes through a scale mismatch. After apply_constraints
+    and fit_to_cylinder a draw's max coordinate is max(1, max|x|, max|y|), which varies with
+    where the widest point sits in azimuth -- so the grid pitch differed from draw to draw.
+    """
+    return _occupancy(v, f, n, extent)
 
 
 def _enable_tf32():
@@ -212,9 +252,8 @@ def main():
     M = min(N_MODES, a.phases // 2)
 
     gdev = "cuda" if torch.cuda.is_available() else "cpu"
-    surro = Surrogate(width=96, modes=8, blocks=3)
-    surro.load_state_dict(torch.load(a.surrogate, map_location="cpu"))
-    surro = surro.to(gdev).eval()
+    surro, smeta = load_surrogate(a.surrogate, phases=a.phases, device=gdev)
+    print(f"  surrogate {smeta}", flush=True)
 
     net = LPDFlow()
     sd = torch.load(a.ckpt, map_location="cpu", weights_only=False)
@@ -245,13 +284,17 @@ def main():
     # operator was trained in (train_lpd.py calls curves_from_code(code, 1.0, ...)). The width
     # is restored from the published R afterwards, by fit_to_cylinder -- exactly the split
     # hac26/shapes.py::canonicalize_r describes and scripts/eval_exact.py already uses for the
-    # convex path. Decoding at radius=R instead left the token positions in canonical units
-    # inside a body R times wider while sigma and s were scaled by R, so at R=3.95 all 32
-    # tokens sat in the inner 18% of the width with sigma ~ the entire z half-height.
+    # convex path. Decoding at radius=R instead left the lattice sites in canonical units
+    # inside a body R times wider while sigma and s were scaled by R, so on a wide body every
+    # site sat bunched near the axis with a sigma spanning most of the height.
     t0 = time.time()
-    codes = net.sample(make_resid_fn(net, g_dat, surro, psi, M, 1.0, support=support),
+    real = torch.tensor(d["curves"], dtype=torch.float32)
+    real_g = torch.stack([real[:28], real[28:]], dim=1)              # (28, 2, P)
+    cond = cond_channels(support)                    # constant per body: h is fixed here
+    codes = net.sample(make_resid_fn(net, g_dat, real_g, mask, surro, psi, M, 1.0,
+                                     cond, support=support),
                        tag.expand(a.samples, -1, -1), mask.expand(a.samples, -1),
-                       batch=a.samples)
+                       cond, batch=a.samples)
     print(f"  {a.samples} draws x {N_STEPS} steps in {time.time()-t0:.0f}s", flush=True)
 
     # The snap is gated on the data: the misfit of a candidate mesh against the real curves,
@@ -261,23 +304,27 @@ def main():
     if COV is None:
         print("  no fitted covariance yet; the snap gate falls back to an unweighted RMS",
               flush=True)
-    real = torch.tensor(d["curves"], dtype=torch.float32)
-    real_g = torch.stack([real[:28], real[28:]], dim=1)              # (28, 2, P)
     eta = float(torch.nn.functional.softplus(
         torch.load("models/instrument_calibration.pt", map_location="cpu",
                    weights_only=False)["raw_eta"]).mean())
 
     def misfit(w, faces):
-        """Whitened by the measured covariance, which is the only weight in play here.
+        """Whitened by the fitted covariance when there is one.
 
-        An unweighted curve-space RMS would weight every curve and every rotation order
-        equally, which is a prior on the data that was never measured.
+        The unweighted fallback weights every curve and rotation order equally, which is a
+        prior nobody measured -- but models/data_covariance.pt is not in the repo and is only
+        produced by scripts/fit_covariance.py, so a fresh clone gets the fallback.
         """
         c = curves_from_mesh(np.asarray(w), np.asarray(faces), surro, psi)
         pred56 = torch.cat([c[:, 0], c[:, 1]], dim=0)
+        # Masked, both branches. hac26/data_io.py fills an absent curve with zeros and sets
+        # its mask to 0, so an unmasked average counts a full-amplitude prediction against
+        # nothing as real disagreement -- on every geometry the model does not have.
+        m56 = torch.cat([mask[0], mask[0]], 0)
         if COV is None:
-            return float(((c - real_g) ** 2).mean().sqrt())
-        return float(whitened_misfit(pred56, real, COV["s2"]))
+            return float((((c - real_g) ** 2).mean((1, 2))
+                          * mask[0]).sum().div(mask.sum().clamp_min(1)).sqrt())
+        return float(whitened_misfit(pred56, real, COV["s2"], mask=m56))
 
     raw_codes = net.codec.decode(codes)     # out of the flow's whitened space, once
 
@@ -314,7 +361,7 @@ def main():
         codes_path = None
         print(f"  WARNING: could not save the codes to {codes_path}: {exc}", flush=True)
 
-    meshes, occs, snaps = [], [], []
+    meshes, snaps = [], []
     for i in range(a.samples):
         v, f, kept = decode(raw_codes[i], 1.0, res=a.res, misfit_fn=misfit, eta=eta,
                             support=support,
@@ -323,9 +370,13 @@ def main():
         if v is None:
             print(f"  draw {i}: degenerate, dropped", flush=True); continue
         v = fit_to_cylinder(v, R)            # canonical -> physical, xy only, z untouched
-        meshes.append((v, f)); occs.append(occupancy(v, f)); snaps.append(kept)
+        meshes.append((v, f)); snaps.append(kept)
     if not meshes:
         raise SystemExit("every draw was degenerate")
+    # ONE grid for every draw, sized to the widest of them, so the pairwise Dice below
+    # compares the same places. See occupancy().
+    occ_extent = max(float(np.abs(mv).max()) for mv, _ in meshes) * 1.05
+    occs = [occupancy(mv, mf, 64, occ_extent) for mv, mf in meshes]
 
     medoid_metric = "volume"
     if a.medoid_volume_only:
@@ -344,6 +395,7 @@ def main():
         k = metric_medoid(occs, outlines, side_n_dirs=a.medoid_side_dirs,
                           side_res=a.medoid_side_res, side_mode=a.medoid_side_mode)
         medoid_metric = "volume+side_view"
+        del outlines            # nothing reads it after the medoid, and it is not small
 
     v, f = meshes[k]
     if a.snap:
@@ -387,8 +439,8 @@ def main():
     if a.model in PUBLIC:
         import trimesh
         t = trimesh.load(Path(a.data_dir) / PUBLIC[a.model], process=False)
-        tv = rescale_touch_z(np.asarray(t.vertices))
-        rv = rescale_touch_z(v)
+        tv = rescale_touch_z(np.asarray(t.vertices), np.asarray(t.faces))
+        rv = rescale_touch_z(v, f)
         e = max(float(np.abs(tv).max()), float(np.abs(rv).max())) * 1.05
         res["dice"] = float(dice(occupancy(tv, np.asarray(t.faces), 128, e),
                                  occupancy(rv, f, 128, e)))

@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """Evaluate checkpoints (singly or as an ensemble) with the exact closed-form Dice.
 
-Two things differ from eval_ckpt.py:
+Two things worth knowing:
 
-1. The metric is computed in closed form from radial functions (hac26.radial), which
-   agrees with the 128^3 voxel Dice to 2.5e-4 but costs milliseconds instead of minutes.
-   That is what makes a 60-shape selection set affordable.
+1. The metric is computed in closed form from radial functions (hac26.radial). It agrees
+   closely with the voxel Dice and costs a tiny fraction of the time, which is what makes
+   scoring a large selection set affordable.
 
 2. Several checkpoints can be combined by averaging their SUPPORT FUNCTIONS.  This is
    not a heuristic: support functions of convex bodies form a convex cone, so the mean
@@ -47,8 +47,8 @@ def predict_h(net, grid, d, mask, radius):
     the Minkowski solve, so the support function is taken from that body. Every
     checkpoint therefore lands in the same representation, which is what lets the
     EGI-only baseline take part in the Minkowski-average ensemble alongside the
-    support-head models. Their failure modes differ sharply (the cube's EGI ceiling is
-    0.99 against 0.82 for the support grid), so the combination is worth having.
+    support-head models. Their failure modes differ sharply -- on a flat-faced body the two
+    heads have very different ceilings -- so the combination is worth having.
     """
     with torch.no_grad():
         dd = torch.as_tensor(d, dtype=torch.float32)[None]
@@ -100,11 +100,10 @@ def main() -> None:
     ap.add_argument("--ensemble", action="store_true",
                     help="combine all --ckpt by Minkowski average instead of scoring "
                          "each separately")
-    # NOTE: the group name a run is selected on is Path(root).name, so this must point
-    # at .../external (where the team renderer writes, and where finish2.sh puts the
-    # matching meshes) and not at its parent -- otherwise the group is called "dataset",
-    # select_final.py finds no "external" group, and selection silently falls back to
-    # the 6-shape set this whole exercise was meant to replace.
+    # NOTE: these defaults point outside the repo, at a team directory layout that is not
+    # shipped here, so pass --heldout explicitly. The group a run is selected on is
+    # Path(root).name, so point at the leaf directory holding the meshes and not at its
+    # parent, or every run lands in one group named after the parent.
     ap.add_argument("--heldout", nargs="*",
                     default=["../data/team/heldout2/dataset/external",
                              "../data/team/split_test"])

@@ -71,8 +71,8 @@ def smooth_support(h: np.ndarray, n_theta: int, n_phi: int, k: int = 1) -> np.nd
     The half-space decoder is a MIN over constraints, so one spuriously low h_n shears
     a slab off the whole body -- it is max-norm sensitive, not L2 sensitive. Genuine
     support functions of bounded bodies are Lipschitz on the sphere while the error is
-    not, so a mild low-pass removes exactly the outliers that do the damage. Measured
-    on held-out shapes: at 40% relative error this recovers Dice 0.57 -> 0.74."""
+    not, so a mild low-pass removes exactly the outliers that do the damage. On held-out
+    shapes it recovers a large part of the Dice lost to a noisy h."""
     H = np.asarray(h, dtype=float).reshape(n_theta, n_phi)
     acc, cnt = np.zeros_like(H), 0
     for dt in range(-k, k + 1):
@@ -114,17 +114,12 @@ def reconstruct_from_support(net, grid, curves56: np.ndarray, mask56: np.ndarray
 
 
 def fit_to_cylinder(verts: np.ndarray, radius: float) -> np.ndarray:
-    """Scale x,y so the body's max axis distance equals the a-priori cylinder radius.
+    """Scale x,y so the body's max axis distance equals the published cylinder radius.
 
-    The challenge publishes a bounding-cylinder base radius R per model. Measured on
-    the public models, that bound is *tight* in the challenge pose (z in [-1,1]):
-    official r/R = 0.99 / 1.03 / 1.01 for models 1/2/3. So R is not a loose box, it
-    pins the aspect ratio -- information the scale-free EGI inversion cannot recover
-    on its own (normalization cancels overall scale, and the pose then fixes only z).
-
-    Applying it is anisotropic (xy only), which is exactly the missing degree of
-    freedom: the EGI fixes the *shape* of the hull up to scale, the pose fixes the
-    height, and R fixes the width. z is untouched so the pose stays valid.
+    The published R is tight in the challenge pose, so it pins the aspect ratio -- which the
+    scale-free EGI inversion cannot recover on its own, since normalisation cancels overall
+    scale and the pose only fixes z. Applying it xy-only is exactly that missing degree of
+    freedom: EGI gives the hull shape, the pose gives the height, R gives the width.
     """
     v = verts.copy()
     r = float(np.sqrt((v[:, :2] ** 2).sum(1)).max())
@@ -158,10 +153,9 @@ def voxelize_convex(verts: np.ndarray, faces: np.ndarray, pts: np.ndarray,
                     max_elems: int = 1 << 24) -> np.ndarray:
     """Inside test for a convex mesh via its facet halfspaces (exact for convex).
 
-    The `pts @ n.T` temporary is (block, n_facets), so the block size has to shrink
-    as the facet count grows — a fixed block overflows RAM on the challenge STLs
-    (asteroid1's hull has 2.4e4 facets: 2.6e5 x 2.4e4 float64 = 47 GiB). Cap the
-    temporary at max_elems entries (default 2^24 ~ 128 MB) instead.
+    The `pts @ n.T` temporary is (block, n_facets), so the block size has to shrink as the
+    facet count grows -- a fixed block overflows RAM on the hull of a challenge STL. Cap the
+    temporary at max_elems entries instead.
     """
     n, a = face_normals_areas(verts, faces)
     keep = a > 1e-14
@@ -185,23 +179,38 @@ def dice(a: np.ndarray, b: np.ndarray) -> float:
 # Scoring utility: mesh -> occupancy -> signed distance, to voxelise a reconstruction and
 # a ground truth onto a common grid. numpy, scipy and trimesh only.
 
+def mesh_occupancy(verts: np.ndarray, faces: np.ndarray, n: int, extent: float,
+                   decimate: bool = True) -> np.ndarray:
+    """Which cell centres of an n^3 grid over [-extent, extent] lie inside the mesh.
+
+    Parity scan up each (x, y) column, not trimesh's `contains`. contains() is one ray cast
+    per query point; on the ground-truth meshes it runs out of memory long before it
+    finishes. The scan agrees with it voxel for voxel where both can be run.
+
+    A mesh much finer than the grid is vertex-clustered first, at half the voxel pitch, so
+    the occupancy cannot move by more than half a voxel. Coarser meshes are left alone.
+    """
+    from .shape_library import _parity_occupancy, decimate_mesh
+
+    v = np.ascontiguousarray(verts, dtype=np.float64)
+    f = np.ascontiguousarray(faces, dtype=np.int64)
+    if decimate and len(f) > 4 * n * n:
+        v, f = decimate_mesh(v, f, extent, 2 * n)
+    axis = (np.arange(n) + 0.5) / n * 2.0 * extent - extent   # cell centres, the scoring grid
+    return _parity_occupancy(v, f, extent, n, axis=axis)
+
+
 def mesh_to_sdf(verts: np.ndarray, faces: np.ndarray, n: int, extent: float) -> np.ndarray:
     """Signed distance field of a mesh on a cubic grid, negative inside.
 
-    Occupancy by point-in-mesh test, then a Euclidean distance transform on each side.
-    Accurate to about one voxel, which is the resolution the field is stored at anyway.
+    Occupancy, then a Euclidean distance transform on each side; accurate to about one voxel.
+    If you only want the sign, call mesh_occupancy and skip both transforms.
+
+    Currently unused.
     """
-    import trimesh
     from scipy.ndimage import distance_transform_edt
 
-    ax = (np.arange(n) + 0.5) / n * 2.0 * extent - extent
-    pts = np.stack(np.meshgrid(ax, ax, ax, indexing="ij"), axis=-1).reshape(-1, 3)
-    mesh = trimesh.Trimesh(vertices=verts, faces=faces, process=False)
-    inside = np.zeros(len(pts), dtype=bool)
-    for i in range(0, len(pts), 200_000):         # contains() is memory-hungry
-        sl = slice(i, i + 200_000)
-        inside[sl] = mesh.contains(pts[sl])
-    inside = inside.reshape(n, n, n)
+    inside = mesh_occupancy(verts, faces, n, extent)
     voxel = 2.0 * extent / n
     d_out = distance_transform_edt(~inside) * voxel
     d_in = distance_transform_edt(inside) * voxel

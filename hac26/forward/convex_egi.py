@@ -125,9 +125,9 @@ try:
     class ConvexPhotometricOperator(torch.nn.Module):
         """T = N_eps o A as a torch module; closed-form derivative adjoint.
 
-        Buffers:
-            A     (C, m, N) float32
-            mask  broadcastable (C,) default ones -- 0 marks curves absent from a file.
+        One buffer, A (C, m, N) float32. The curve mask is not stored here -- it is an
+        argument to the calls that need it, broadcastable over (C,), 0 marking a curve
+        absent from the file.
         """
 
         def __init__(self, A: np.ndarray, eps: float = 1e-3):

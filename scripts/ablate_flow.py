@@ -3,27 +3,20 @@
 
 Beating the data-free bar is necessary evidence that the data contributes, and not
 sufficient. The flow sees x_t = (1-t) x0 + t x1, which leaks x1 directly as t grows, and with
-a corpus of only 40 bodies a network can identify WHICH body it is near without ever
+a small corpus a network can identify WHICH body it is near without ever
 consulting a curve. This ablation separates the two: evaluate the trained flow twice on the
 same draws, once with the curves and once without them.
 
     if the two are close      the curves are decoration and the flow is memorising
     if zeroing hurts          the operator is contributing, by that margin
 
-WHAT "WITHOUT" MEANS. Every channel that carries curve information: the Fourier residual, the
-raw data coefficients that share the same tensor (feats channels 4 and 5 are g_dat, not r),
-and the adjoint channel on the sphere branch. Not just the residual, despite the name this
-test has always had -- an arm that keeps the raw coefficients is not data-free.
+"Without" means every channel that carries curve information: the Fourier residual, the raw
+data coefficients sharing the same tensor (feats channels 4 and 5 are g_dat, not r), and the
+adjoint channel on the sphere branch. An arm that keeps the raw coefficients is not data-free.
 
-BOTH ARMS COME FROM ONE flow_loss CALL, off one operator call, so they differ by the switch
-and by nothing else.
-This file used to re-implement the objective, and every part it duplicated has since moved:
-the operator is applied at x1_hat rather than x_t, the dh block is supervised against a
-perturbation instead of against zero, and the residual reaches the network through a second
-path (the adjoint channel on the sphere branch) that a copy did not know about. All three
-drifts pushed the same way -- they made the operator look worthless -- so the copy could
-report a MEMORISING verdict on a flow that was using the curves correctly. There is now one
-implementation, in train_lpd.flow_loss, and this file only supplies the draws.
+Both arms come from ONE flow_loss call off ONE operator call, so they differ by the switch and
+nothing else. This file used to re-implement the objective and drifted from it; there is now
+one implementation, in train_lpd.flow_loss, and this file only supplies the draws.
 """
 from __future__ import annotations
 
@@ -41,7 +34,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from hac26.conventions import cameras, psi_grid          # noqa: E402
 from hac26.field import DESIGN_N                         # noqa: E402
 from hac26.solvers.lpd_flow import CODE_DIM, N_MODES, LPDFlow   # noqa: E402
-from hac26.forward.learned_surrogate import Surrogate            # noqa: E402
+from hac26.forward.learned_surrogate import load_surrogate       # noqa: E402
 from train_lpd import (_dh_perturbation, corpus_cache_path,      # noqa: E402
                        flow_loss)                                # noqa: E402
 
@@ -68,6 +61,7 @@ def main():
               flush=True)
     else:
         expected = {
+            "schema": 5,            # A(x) changed; a schema-4 cache is a different operator
             "phases": int(a.phases),
             "n_geoms": int(len(cameras())),
             "operator_res": int(a.operator_res),
@@ -91,9 +85,8 @@ def main():
     psi = psi_grid(a.phases); M = min(N_MODES, a.phases // 2)
 
     gdev = "cuda" if torch.cuda.is_available() else "cpu"
-    surro = Surrogate(width=96, modes=8, blocks=3)
-    surro.load_state_dict(torch.load("runs/surrogate.pt", map_location="cpu"))
-    surro = surro.to(gdev).eval()
+    surro, smeta = load_surrogate("runs/surrogate.pt", phases=a.phases, device=gdev)
+    print(f"  surrogate {smeta}", flush=True)
     net = LPDFlow(); net.load_state_dict(torch.load(a.ckpt, map_location="cpu")); net.eval()
 
     C = len(cameras())
@@ -111,14 +104,15 @@ def main():
     perm = torch.randperm(len(codes), generator=torch.Generator().manual_seed(0))
     pool = perm[max(0, min(a.val_bodies, len(codes) - 1)):]
 
-    # STRATIFIED OVER t, not sampled, and t is CONTINUOUS -- the flow is trained that way, so
-    # scoring it on six discrete times would score a different objective. What varies with t
-    # is how informative the operator call is, which is why the bins are reported separately.
+    # t stratified over the bins and continuous within each, matching how the flow is
+    # trained. The bins are only for reporting: what varies with t is how informative the
+    # operator call is.
     n_bins = 6
     gen = torch.Generator().manual_seed(0)
     idx = pool[torch.randint(0, len(pool), (a.draws,), generator=gen)]
     x0 = torch.randn(a.draws, codes.shape[1], dtype=codes.dtype, generator=gen)
-    t = ((torch.arange(a.draws) % n_bins).to(codes.dtype) + 0.5) / n_bins
+    t = ((torch.arange(a.draws) % n_bins).to(codes.dtype)
+         + torch.rand(a.draws, generator=gen).to(codes.dtype)) / n_bins
     eps = _dh_perturbation(a.draws, generator=gen)
 
     real_loss, zero_loss, n_bad = [], [], 0

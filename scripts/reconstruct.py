@@ -5,7 +5,7 @@ Shares its decode path with eval_exact.py, so what is scored is exactly what is
 written -- the two previous shipping bugs in this project were both cases of the
 evaluated configuration and the written configuration silently diverging.
 
-    python reconstruct_final.py --ckpt a.pt b.pt --ensemble --smooth 1 --fit-cylinder \
+    python scripts/reconstruct.py --ckpt a.pt b.pt --ensemble --smooth 1 --fit-cylinder \
         --model 4 --out results/lpd/Asteroid04.stl
 """
 import argparse
@@ -28,7 +28,7 @@ def main() -> None:
     ap.add_argument("--ckpt", nargs="+", required=True)
     ap.add_argument("--model", type=int, required=True)
     ap.add_argument("--out", required=True)
-    ap.add_argument("--data-dir", default="../data/raw")
+    ap.add_argument("--data-dir", default="dataset/raw")
     ap.add_argument("--ensemble", action="store_true")
     ap.add_argument("--smooth", type=int, default=0)
     ap.add_argument("--fit-cylinder", action="store_true")

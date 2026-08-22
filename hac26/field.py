@@ -35,48 +35,44 @@ __all__ = ["spherical_design", "design_sha", "DESIGN_N", "DESIGN_T", "DESIGN_ITE
            "apply_constraints", "LATTICE_SHAPE", "LATTICE_EXTENT", "LATTICE_ALPHA",
            "N_SITES", "N_DIR", "CODE_DIM", "SH_DEGREE", "dir_design", "sh_expand"]
 
-DESIGN_N = 4096        # a design of N normals gives facets ~4/sqrt(N) across and leaves a
-                       # bulge ~2/N of the support distance at each face centre. This size
-                       # needs a committed hac26/design4096.npy: above 512 the build is ~15 h
-                       # on a CPU core, so spherical_design() refuses it rather than hanging.
+DESIGN_N = 4096        # a design of N normals gives facets ~4/sqrt(N) across. Each plane is
+                       # tangent at its own normal, so a face centre is exact and the ~2/N
+                       # error sits at the facet CORNERS. This size needs a committed
+                       # hac26/design4096.npy: past a few hundred normals the build takes
+                       # hours on a CPU core, so spherical_design() refuses it rather than
+                       # hanging.
 DESIGN_T = 10          # spherical design strength
 DESIGN_ITERS = 4000    # the only iteration count whose result is allowed into the cache
-CORE_CHUNK_ELEMS = 6e7 # cap on the (points x normals) intermediate, ~240 MB in float32
+CORE_CHUNK_ELEMS = 6e7 # cap on the (points x normals) intermediate, in float32 elements
 
 # ------------------------------------------------------------------- the correction
 #
 # Delta(y) = sum_k g_k exp(-||(y - p_k)/sigma||^2 / 2)   on a FIXED lattice of sites p_k.
 #
-# The sites are not learned and are not part of the code; the code IS g. The predecessor was
-# 32 cross-attention tokens whose softmax weights sum to one, so co-located tokens AVERAGED
-# rather than added -- you could not carve deeper by clustering, and `sigma` was not a reach
-# but the softness of a Voronoi partition of all space. Measured, a surface arrangement
-# saturates at 0.36 R of carve depth (identical to four decimals from N=513 to N=4095; the
-# shell's numerical rank saturates at 838) while a volumetric lattice reaches 0.64 R. At the
-# body centre a shell's reachability is 0.47 against a lattice's 1690.
-LATTICE_SHAPE = (12, 12, 12)      # 8^3 leaves 9 disconnected components at extreme aspect,
-N_SITES = 12 * 12 * 12            # 10^3 leaves 1, and 12^3 -> 16^3 buys under 0.003 Dice
+# The sites are not learned and are not part of the code; the code IS g. Amplitudes ADD where
+# kernels overlap, so clustering carves deeper. A volumetric lattice reaches roughly twice the
+# carve depth of a surface arrangement, and unlike a shell it can reach the body centre.
+LATTICE_SHAPE = (12, 12, 12)      # smaller leaves the level set disconnected at extreme
+N_SITES = 12 * 12 * 12            # aspect; larger buys almost no Dice
 LATTICE_EXTENT = 1.1              # half-width of the site box. The challenge pose puts every
-                                  # body inside [-1,1]^3 (z exactly, xy by canonicalize_r), so
-                                  # cell centres at +-1.008 straddle the surface rather than
-                                  # sitting on it. The lattice is FRAME-FIXED: it is not
+                                  # body inside [-1,1]^3 (z exactly, xy by canonicalize_r).
+                                  # Slightly wider than that, so cell CENTRES straddle the
+                                  # surface rather than sitting on it. The lattice is FRAME-FIXED: it is not
                                   # scaled by `radius`, because every call site now decodes at
                                   # radius 1.0 and restores the width with fit_to_cylinder.
 LATTICE_ALPHA = 0.9               # sigma = LATTICE_ALPHA * spacing, per axis. Monotone in
-                                  # alpha; at alpha <= 0.6 and N >= 1728 the fit punches a
-                                  # hole clean through a bilobe waist (Dice 0.95-0.97).
-LATTICE_CHUNK_ELEMS = 6e6         # cap on the (points x sites) intermediate. NOT the same as
-                                  # CORE_CHUNK_ELEMS: measured at a 64^3 grid, 6e6 beats 6e7
-                                  # by 3.3x on CPU (cache-bound) while a GPU wants the
-                                  # opposite, so this is raised on CUDA in GaussianLattice.
+                                  # alpha; too small and the kernels stop overlapping, and
+                                  # the fit punches a hole through a bilobe waist.
+LATTICE_CHUNK_ELEMS = 6e6         # cap on the (points x sites) intermediate. Small is faster
+                                  # on CPU (cache-bound) and slower on a GPU, so
+                                  # GaussianLattice raises it on CUDA. Not CORE_CHUNK_ELEMS.
 
 # ------------------------------------------------------------------- the support correction
-SH_DEGREE = 5                     # dh is band-limited to this spherical-harmonic degree.
-                                  # White dh at 2% R kills 3% of facets at N=64, 7% at 128,
-                                  # 27% at 256 and 53% at 512 -- and a dead facet has an
-                                  # exactly zero row in J, i.e. no gradient at all. Degree <= 4
-                                  # kills 0% at every N up to 512, and (5+1)^2 = 36 is about
-                                  # the 35-40 dh directions the curves actually constrain.
+SH_DEGREE = 5                     # dh is band-limited to this spherical-harmonic degree. A
+                                  # white dh kills facets, and a dead facet has an exactly
+                                  # zero row in J -- no gradient at all rather than a bad one.
+                                  # Band-limiting kills none, and (5+1)^2 = 36 is about as
+                                  # many dh directions as the curves actually constrain.
 N_DIR = 128                       # dh is carried as samples on this many design directions,
                                   # which is what SphereConv needs; the band limit is enforced
                                   # structurally by sh_expand(), not by a penalty.
@@ -106,8 +102,8 @@ def design_energy(x, t: int = DESIGN_T):
 
     Minimising raw monomial means instead is wrong: for even
     l the points being unit vectors forces sum_i x_i^2 = n/3, so the target is unreachable.
-    It did not converge, and left the residual WORSE than the Fibonacci spiral it started
-    from (1.043 against 0.062).
+    It did not converge, and left the residual worse than the Fibonacci spiral it started
+    from.
     """
     xt = torch.as_tensor(x, dtype=torch.float64)
     g = (xt @ xt.T).clamp(-1.0, 1.0)
@@ -144,10 +140,9 @@ def spherical_design(n: int = DESIGN_N, t: int = DESIGN_T, seed: int = 0,
     build at n=512 is paid once per checkout rather than once per ImplicitBody().
 
     Above n=512 it is refused rather than built. The objective is a pair of n x n Gram
-    matrices per Legendre order: measured on one CPU core at n=4096 that is 13.8 s and 3.6 GB
-    per iteration, so the default 4000 iterations take about 15 hours. Building that silently
-    inside a constructor is indistinguishable from a hang, and it would run inside every
-    worker of a process pool. The error names the one command that fixes it.
+    matrices per Legendre order, so at n=4096 a full build takes hours and several GB per
+    iteration. Doing that silently inside a constructor is indistinguishable from a hang, and
+    it would run in every worker of a process pool. The error names the command that fixes.
     """
     cache = Path(__file__).with_name(f"design{n}.npy")
     if cache.exists() and t == DESIGN_T:
@@ -189,9 +184,8 @@ def _write_design_cache(cache: Path, x: np.ndarray) -> None:
     """Publish the design atomically, so a concurrent process cannot read a half-written file.
 
     Only ever called for the default `iters`: the filename keys on `n` alone, so caching a
-    short debug or test build would silently become what every later caller gets. A 20-iter
-    design has residual 7.7e-04 against 4.8e-07 for a full one -- 1600x worse, below what the
-    tests demand, and with an identical `design_sha`, so nothing downstream could detect it.
+    short debug build would silently become what every later caller gets -- and it has the
+    same `design_sha` as a good one, so nothing downstream could tell them apart.
 
     Generation is deterministic (fixed Fibonacci start, Adam on float64), so two processes that
     race produce the same array and whichever `os.replace` lands last is still correct. The
@@ -257,10 +251,10 @@ class ConvexCore(nn.Module):
         dh-corrected support that way, so the correction stays differentiable without
         ConvexCore having to know dh exists.
 
-        The intermediate is (points x normals). At a 64^3 extraction grid that is 275k
-        points, so it is 0.07 GB at 64 normals and 4.50 GB at 4096 -- the term that decides
-        whether a large design is usable at all. Chunking bounds it without changing the
-        result: the max is taken per point, so points never interact.
+        The intermediate is (points x normals), and it is the term that decides whether a
+        large design is usable at all: it grows with the cube of the extraction resolution
+        and linearly in the design size. Chunking bounds it without changing the result --
+        the max is taken per point, so points never interact.
         """
         n_norm = self.n.shape[0]
         hh = self.h if h is None else h
@@ -275,9 +269,9 @@ class ConvexCore(nn.Module):
 def _grid_lattice(shape=LATTICE_SHAPE, extent: float = LATTICE_EXTENT):
     """Cell centres of an axis-aligned grid over [-extent, extent]^3, and the spacing.
 
-    Centres, not corners: with 12 cells over +-1.1 the outermost centre is at +-1.0083, so
-    the lattice straddles the surface of a posed body (which reaches exactly 1.0) instead of
-    placing a site exactly on it, where its gradient with respect to the surface is weakest.
+    Centres, not corners: with the box a little wider than the posed body, the outermost
+    centre lands just outside the surface, so the lattice straddles it instead of putting a
+    site exactly on it, where its gradient with respect to the surface is weakest.
     """
     axes, spacing = [], []
     for n_ax in shape:
@@ -317,6 +311,36 @@ def _real_sh(x: np.ndarray, degree: int = SH_DEGREE) -> np.ndarray:
             else:
                 cols.append(p_lm)
     return np.stack(cols, 1)                       # (len(x), (degree+1)^2)
+
+
+def support_resample(src: np.ndarray, dst: np.ndarray, k: int = 6) -> np.ndarray:
+    """Matrix resampling a SUPPORT FUNCTION from `src` directions onto `dst` directions.
+
+    Not sh_expand. That is a degree-<=5 harmonic projector, which is right for dh -- an
+    out-of-band dh kills facets -- and wrong for h: the support function of a flat-faced body
+    is not band-limited, and every challenge ground truth is faceted.
+
+    A support function is affine in the direction on the interior of each flat face, so
+    weights over the k nearest source directions that reproduce an affine function are exact
+    there and a smooth interpolant elsewhere. Least-norm solution of
+
+        sum_i w_i = 1,      sum_i w_i n_i = u
+
+    k = 6, not 4: four points span the three constraints exactly, so a near-degenerate
+    quadruple makes the weights blow up. Wider stencils are slightly worse.
+    """
+    src = np.asarray(src, dtype=np.float64)
+    dst = np.asarray(dst, dtype=np.float64)
+    idx = np.argsort(-(dst @ src.T), axis=1)[:, :k]
+    # One batched pseudo-inverse rather than a least-squares solve per direction. pinv gives
+    # the least-norm solution of the underdetermined system, which is what lstsq returns.
+    A = np.concatenate([np.ones((len(dst), 1, k)),
+                        src[idx].transpose(0, 2, 1)], axis=1)         # (D, 4, k)
+    b = np.concatenate([np.ones((len(dst), 1)), dst], axis=1)         # (D, 4)
+    w = np.einsum("dkj,dj->dk", np.linalg.pinv(A), b)                 # (D, k)
+    W = np.zeros((len(dst), len(src)), dtype=np.float32)
+    np.put_along_axis(W, idx, w.astype(np.float32), axis=1)
+    return W
 
 
 def sh_expand(src: np.ndarray, dst: np.ndarray, degree: int = SH_DEGREE) -> np.ndarray:
@@ -366,10 +390,9 @@ class GaussianLattice(nn.Module):
 
             ||(y - p)/s||^2 = sum_d y_d^2/s_d^2 + sum_d p_d^2/s_d^2 - 2 (y/s^2).p
 
-        The obvious form materialises a (points x sites x 3) intermediate. Measured on two
-        CPU cores at a 64^3 extraction grid: 14,573 ms for the broadcast against 3,773 ms
-        here, agreeing to 1.7e-05 (float32 noise). The cross term is a (n,3) @ (3,S) matmul,
-        which is what BLAS and cuBLAS exist for.
+        The obvious broadcast form materialises a (points x sites x 3) intermediate and is
+        several times slower. The cross term here is a (n,3) @ (3,S) matmul, which is what
+        BLAS and cuBLAS exist for.
         """
         if chunk is None:
             elems = LATTICE_CHUNK_ELEMS * (16.0 if y.is_cuda else 1.0)
@@ -387,9 +410,9 @@ class ImplicitBody(nn.Module):
     """f(y) = max_j (n_j . y - h_j) + Delta(y).
 
     There is no scale factor in front of Delta any more. `s = CORE_SCALE * radius` was
-    algebraically redundant -- s * sum_k g_k E_k is identically sum_k (s g_k) E_k, and fits at
-    s = 0.15 R and s = 1 agreed to 8.7e-11 -- but it silently set the units g had to learn in,
-    and therefore the effective learning rate and the scale the flow had to whiten away.
+    algebraically redundant -- s * sum_k g_k E_k is identically sum_k (s g_k) E_k, and fits
+    at two different s agreed to round-off -- but it silently set the units g had to learn
+    in, and therefore the effective learning rate and the scale the flow had to whiten away.
 
     h carries an optional band-limited correction dh, sampled on `dir_design(N_DIR)` and
     expanded onto the full design by sh_expand. It is applied INSIDE the softplus, so
@@ -404,9 +427,9 @@ class ImplicitBody(nn.Module):
 
     The band limit is EXACT on the argument of the softplus and approximate on h itself:
     d/dx softplus = sigmoid is not constant, and h varies across normals, so the induced
-    change in h carries about 5% out-of-band content. That is first-order -- it does not
-    shrink with the perturbation -- and it is small against the fully-white dh that kills 7%
-    of facets at N=128, but it is not zero.
+    change in h carries a little out-of-band content. That is first-order -- it does not
+    shrink with the perturbation -- and it is small against the fully-white dh it replaced,
+    which killed facets outright, but it is not zero.
     """
 
     def __init__(self, radius: float = 1.0, normals: np.ndarray | None = None,
@@ -431,12 +454,15 @@ class ImplicitBody(nn.Module):
     def support(self) -> torch.Tensor:
         """The support actually used: softplus(raw_h + expand(dh)).
 
-        The base is `core.raw_h` itself, NOT a frozen copy of it. An earlier draft kept a
-        separate non-persistent `raw_h_base` buffer, which made `core.raw_h` unreachable from
-        the loss -- and `scripts/fit_shapes.py` optimises exactly that tensor, so the corpus
-        fit would have silently stopped learning h while still reporting a falling loss. The
-        two roles are separable by call, not by storage: the corpus fit leaves dh at zero and
-        learns raw_h, and reconstruction pins raw_h to the convex stage's answer and learns dh.
+        The base is `core.raw_h` itself, NOT a frozen copy of it. An earlier draft shadowed
+        it with a non-persistent buffer, which cut the parameter out of the graph: anything
+        wanting to learn h through this call would have stopped learning it while still
+        reporting a falling loss.
+
+        Nothing in the current pipeline does learn it that way. scripts/fit_shapes.py pins h
+        to the body's own convex hull and fits only the lattice; reconstruction pins h to the
+        convex stage's answer and fits only dh. The parameter stays reachable so that the
+        choice is the caller's.
         """
         if not self.with_dh:
             return self.core.h
@@ -448,6 +474,26 @@ class ImplicitBody(nn.Module):
 
 # ----------------------------------------------------------------- extraction
 
+_GRID_CACHE: dict = {}
+_REACH = None
+
+
+def _voxel_grid(res: int, device):
+    """FlexiCubes plus its voxel grid, cached on (res, device).
+
+    `construct_voxel_grid` runs torch.unique(..., dim=0) over res^3 * 8 rows and depends on
+    nothing else, yet it used to be rebuilt on every extraction -- and training calls the
+    operator thousands of times.
+    """
+    from .vendor.flexicubes import FlexiCubes
+
+    key = (int(res), str(device))
+    if key not in _GRID_CACHE:
+        fc = FlexiCubes(device=device)
+        _GRID_CACHE[key] = (fc,) + tuple(fc.construct_voxel_grid(res))
+    return _GRID_CACHE[key]
+
+
 def extract_mesh(field, extent: float, res: int = 128, device: str = "cpu",
                  chunk: int = 262144):
     """FlexiCubes on a res^3 grid. Not Marching Cubes -- see the module docstring of
@@ -456,7 +502,10 @@ def extract_mesh(field, extent: float, res: int = 128, device: str = "cpu",
     `extent` must cover the correction lattice and its kernels, or sites near the edge of the
     box are evaluated nowhere and the surface they shape is silently absent from the mesh.
     """
-    reach = LATTICE_EXTENT + 3.0 / float(np.sqrt(GaussianLattice().inv2.min()))
+    global _REACH
+    if _REACH is None:      # a whole GaussianLattice was constructed per call for one number
+        _REACH = LATTICE_EXTENT + 3.0 / float(np.sqrt(GaussianLattice().inv2.min()))
+    reach = _REACH
     if extent < reach - 1e-6:
         raise ValueError(
             f"extract_mesh extent {extent:.3f} does not cover the correction lattice, which "
@@ -464,8 +513,7 @@ def extract_mesh(field, extent: float, res: int = 128, device: str = "cpu",
             f"outside the grid shape a surface the extraction cannot see.")
     from .vendor.flexicubes import FlexiCubes
 
-    fc = FlexiCubes(device=device)
-    x_nx3, cube_fx8 = fc.construct_voxel_grid(res)
+    fc, x_nx3, cube_fx8 = _voxel_grid(res, device)
     x_nx3 = x_nx3 * (2.0 * extent)                       # grid spans [-extent, extent]
     vals = []
     with torch.no_grad():
@@ -483,8 +531,8 @@ def apply_constraints(verts: np.ndarray, radius: float, tol: float = 0.03) -> np
     as equalities. The radius is then brought inside R only if it exceeds it.
 
     The published radius is treated as an approximation with tolerance `tol` rather than a
-    hard bound: two of the three public bodies exceed their own published R when posed this
-    way, so clamping would shrink true geometry.
+    hard bound: a posed public body can sit right at or slightly past its published R,
+    depending on how the pose centres it, so clamping hard would shrink true geometry.
     """
     v = np.asarray(verts, dtype=np.float64).copy()
     zmin, zmax = v[:, 2].min(), v[:, 2].max()

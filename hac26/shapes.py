@@ -125,13 +125,39 @@ def mesh_to_egi(verts: np.ndarray, faces: np.ndarray, grid: NormalGrid,
     return project_closure(g, grid.normals) if close else g
 
 
-def rescale_touch_z(verts: np.ndarray) -> np.ndarray:
+def solid_centroid(verts: np.ndarray, faces: np.ndarray) -> np.ndarray:
+    """Centroid of the SOLID a closed mesh bounds, by the divergence theorem.
+
+    Tessellation-independent, which the vertex mean is not. Same expression as
+    hac26.shape_library.pose, which is the point: the two have to agree or a body posed by
+    one and re-posed by the other moves.
+    """
+    v = np.asarray(verts, float)
+    v0, v1, v2 = v[faces[:, 0]], v[faces[:, 1]], v[faces[:, 2]]
+    cr = np.cross(v1 - v0, v2 - v0)
+    tet = (v0 + v1 + v2) / 4.0
+    w = np.einsum("ij,ij->i", v0 + v1 + v2, cr) / 18.0
+    tot = w.sum()
+    return (tet * w[:, None]).sum(0) / tot if abs(tot) > 1e-12 else v.mean(0)
+
+
+def rescale_touch_z(verts: np.ndarray, faces: np.ndarray | None = None) -> np.ndarray:
     """Uniform scale + translation so that min z = -1, max z = +1 (challenge pose),
     xy-centroid at the rotation axis. Photometrically this only changes overall scale,
-    which the normalization cancels (scale-invariance lemma)."""
+    which the normalization cancels (scale-invariance lemma).
+
+    PASS `faces` WHENEVER TWO MESHES WILL BE COMPARED. Without them the xy centre is the
+    vertex mean, which depends on how the surface happens to be triangulated: posing a body
+    and a decimation of the SAME body independently puts them at different centres, and the
+    Dice between them drops by a wide margin on identical geometry -- pure pose error. The
+    scoring path compares a ground truth of hundreds of thousands of triangles against a
+    few-hundred-face reconstruction, which is the worst case for it. Vertex-only callers
+    keep the old behaviour.
+    """
     v = verts.copy()
-    v[:, 0] -= v[:, 0].mean()
-    v[:, 1] -= v[:, 1].mean()
+    c = v.mean(0) if faces is None else solid_centroid(v, faces)
+    v[:, 0] -= c[0]
+    v[:, 1] -= c[1]
     zmin, zmax = v[:, 2].min(), v[:, 2].max()
     v[:, 2] -= 0.5 * (zmin + zmax)
     return v * (2.0 / (zmax - zmin))
@@ -234,7 +260,11 @@ def sample_training_shape(rng: np.random.Generator, grid: NormalGrid,
 
 
 def _random_rotation(rng: np.random.Generator) -> np.ndarray:
-    """Uniform random rotation matrix (QR of a Gaussian, sign-fixed)."""
+    """Uniform random ORTHOGONAL matrix (QR of a Gaussian, sign-fixed). Includes reflections.
+
+    O(3), not SO(3). Fine for orienting a randomly generated body, which is all this is used
+    for; do not use it where a proper rotation is required.
+    """
     q, r = np.linalg.qr(rng.standard_normal((3, 3)))
     return q * np.sign(np.diag(r))
 
@@ -310,7 +340,8 @@ def faceted_mesh(rng: np.random.Generator) -> np.ndarray:
 
 
 def bilobe_mesh(rng: np.random.Generator) -> np.ndarray:
-    """Hull of two overlapping ellipsoids -- a contact-binary silhouette."""
+    """Hull of two offset ellipsoids -- a contact-binary silhouette. They need not overlap;
+    the hull bridges them either way."""
     u, _ = icosphere(2)
     out = []
     sep = rng.uniform(0.4, 1.1)

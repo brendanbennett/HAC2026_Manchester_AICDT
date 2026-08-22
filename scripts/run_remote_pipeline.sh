@@ -273,9 +273,22 @@ run_stage fit "$CODES_FILE" \
 # corpus before training a single step. The master copy therefore lives in runs/ (EOS,
 # persistent) and is copied -- never moved -- into /tmp here, so the persistent one still
 # stands if this job dies mid-run.
+# ASKED FOR, not re-derived. This used to spell the name out here and omit the _c<CODE_DIM>
+# field that corpus_cache_path adds, so TMP_CACHE was never the file train_lpd.py reads or
+# writes: the seed-in below and the save-on-exit trap were both no-ops, and every pre-empted
+# job rebuilt the entire corpus. corpus_cache_path's own docstring says it exists to be the
+# one definition; this is the caller that was still not using it.
 N_GEOM=$($PY -c 'from hac26.conventions import cameras; print(len(cameras()))' 2>/dev/null \
          || echo 28)
-CACHE_NAME=lpd_corpus_${FLOW_PHASES}_g${N_GEOM}_res${FLOW_OPERATOR_RES}_n${DESIGN_N}_shared.npz
+CACHE_NAME=$($PY -c "import sys; sys.path.insert(0,'scripts')
+from train_lpd import corpus_cache_path
+import os
+print(os.path.basename(corpus_cache_path($FLOW_PHASES, $N_GEOM, $FLOW_OPERATOR_RES, 'shared')))" 2>/dev/null)
+if [ -z "$CACHE_NAME" ]; then
+  log "WARNING: could not ask train_lpd.py for the corpus cache name; the /tmp cache will"
+  log "         not be preserved across jobs this run"
+  CACHE_NAME=lpd_corpus_unavailable.npz
+fi
 TMP_CACHE=/tmp/$CACHE_NAME
 KEEP_CACHE=${FLOW_CACHE_KEEP:-runs/$CACHE_NAME}
 
