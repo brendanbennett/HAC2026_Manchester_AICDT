@@ -28,54 +28,55 @@ from hac26.forward.mesh.raster import Rasteriser                                
 from hac26.forward.learned_surrogate import Surrogate, trace_features                        # noqa
 
 
-# --------------------------------------------------------------------------------------
-# Training corpus
-#
-# The bodies here are the only place the surrogate -- and downstream `fit_shapes.py`'s
-# token library and `train_lpd.py`'s non-convex flow -- ever see what a target looks like,
-# so this corpus IS the shape prior. It is now generated and, crucially, FILTERED by
-# `hac26.shapes_nonconvex`, on the statistic the flow actually has to reproduce: the radial
-# hull-deficit field D(u) = (r_hull(u) - r_body(u)) / mean(r_hull).
-#
-# Measured on the public STLs in the challenge pose:
-#     model 1  D_rms 0.003  D_lo 0.17      model 2  D_rms 0.000  D_lo 0.00
-#     model 3  D_rms 0.201  D_lo 0.91
-# where D_lo is the fraction of D's power at spherical-harmonic degrees l <= 4.
-#
-# The previous archetype corpus is retired because measurement showed it did not do what
-# it looked like it did: five of its seven classes came in at D_rms <= 0.021 with silhouette
-# convexity deficit at the rasterisation noise floor. `faceted_rock` was a convex hull, so
-# exactly 1.000 convex; `basin` measured 0.008; the craters measured 0.004. They were
-# convex training examples, and the flow spent most of its gradient learning to emit zero.
-# Boring holes into a convex body -- the approach before that -- gave D_rms 0.060 at
-# D_lo 0.36: a third of model 3's amplitude, and in the part of the spectrum model 3 does
-# not occupy. Craters and holes are also invisible to the challenge's side-view measure,
-# which compares silhouette boundary curves.
-#
-# `sample_corpus` replaces the fixed archetype cycle with quota-filled strata on D_rms
-# (model 3's 0.201 is an anchor in the middle, not a target -- the secret models are
-# ordered by increasing difficulty), a lower bound on D_lo, a deliberate 40% near-convex
-# fraction so models 1, 2 and 4 do not regress, and R drawn from a prior shaped by the
-# published bounding-cylinder table including its two tails at 0.67 and 3.95.
-
-
 def shapes(n: int, seed: int = 0):
     """Training corpus plus a held-out set that always contains a cube.
 
-    Thin wrapper over `hac26.shapes_nonconvex.sample_corpus`, which returns bodies already
-    in the challenge pose (rotation axis = z, touching z = +-1) with the bounding-cylinder
-    radius imposed exactly. No random rotation is applied any more: the real targets are
-    always in that pose, so rotating the corpus off it trains on geometry the test set
-    never contains.
+    Six archetypes, every one PARAMETERISED. The previous version built the contact binary
+    and the cylinder from fixed constants, so 40% of any corpus was two identical meshes
+    under random rotation -- diversity the overfitting gap could not use. Neck depth, crater
+    count and depth, prism section count and overhang overlap all vary now, and the
+    the overhang class was missing entirely.
     """
-    from hac26.shapes_nonconvex import sample_corpus
-    return [(v, f) for v, f, _ in sample_corpus(n, seed=seed)]
-
-
-def shapes_with_meta(n: int, seed: int = 0):
-    """Same corpus, keeping each body's (kind, R, D_rms, D_lo) for diagnostics."""
-    from hac26.shapes_nonconvex import sample_corpus
-    return sample_corpus(n, seed=seed)
+    import trimesh
+    rng = np.random.default_rng(seed)
+    out = []
+    for i in range(n):
+        k = i % 6
+        if k == 0:                                      # near-convex smooth
+            m = trimesh.creation.icosphere(subdivisions=2, radius=rng.uniform(0.45, 0.7))
+            m.vertices *= (1 + rng.uniform(0.05, 0.35) * rng.normal(size=(len(m.vertices), 1)))
+        elif k == 1:                                    # polyhedron
+            m = (trimesh.creation.box(extents=rng.uniform(0.5, 1.2, 3)) if rng.random() < 0.6
+                 else trimesh.creation.icosahedron().apply_scale(rng.uniform(0.4, 0.8)))
+        elif k == 2:                                    # contact binary, neck depth varying
+            r1, r2 = rng.uniform(0.30, 0.50), rng.uniform(0.25, 0.45)
+            sep = rng.uniform(0.55, 0.95) * (r1 + r2)
+            a_ = trimesh.creation.icosphere(subdivisions=2, radius=r1)
+            b_ = trimesh.creation.icosphere(subdivisions=2, radius=r2)
+            a_.apply_translation([-sep / 2, 0, 0]); b_.apply_translation([sep / 2, 0, 0])
+            m = trimesh.util.concatenate([a_, b_])
+        elif k == 3:                                    # off-axis craters
+            m = trimesh.creation.icosphere(subdivisions=2, radius=rng.uniform(0.5, 0.7))
+            for _ in range(int(rng.integers(1, 4))):
+                c = rng.normal(size=3); c /= np.linalg.norm(c)
+                c *= float(np.abs(m.vertices).max())
+                rad = rng.uniform(0.20, 0.40)
+                d = np.linalg.norm(m.vertices - c, axis=1)
+                m.vertices[d < rad] += (m.vertices[d < rad] - c) * -rng.uniform(0.25, 0.5)
+        elif k == 4:                                    # prism
+            m = trimesh.creation.cylinder(radius=rng.uniform(0.3, 0.55),
+                                          height=rng.uniform(0.8, 1.5),
+                                          sections=int(rng.integers(5, 14)))
+        else:                                           # overhang
+            base = trimesh.creation.cylinder(radius=rng.uniform(0.35, 0.55),
+                                             height=rng.uniform(0.6, 1.0), sections=12)
+            cap = trimesh.creation.cylinder(radius=rng.uniform(0.6, 0.85),
+                                            height=rng.uniform(0.15, 0.3), sections=12)
+            cap.apply_translation([0, 0, rng.uniform(0.3, 0.5)])
+            m = trimesh.util.concatenate([base, cap])
+        m.apply_transform(trimesh.transformations.random_rotation_matrix(rng.random(3)))
+        out.append((np.asarray(m.vertices, float), np.asarray(m.faces, np.int64)))
+    return out
 
 
 def m2_curves(v, f, ras, psi, rho=0.85, delta=np.radians(1.0), target=600):
@@ -132,7 +133,7 @@ def features_for(v, f, psi, n_tokens=600, seed=0):
     # construction -- its inputs are mu, mu0 and visibility, which already encode where the
     # camera is -- so one network serves all 28, and training it on all of them is what
     # makes it valid off azimuth 0. Conditioning the LPD on a single geometry gives the dual
-    # 160 numbers to determine 608 code dimensions, and the flow correspondingly learned
+    # 160 numbers to determine 1856 code dimensions, and the flow correspondingly learned
     # 5.4% of the target variance.
     sun_d = np.stack([to_body(S_LAB, np.array([p]))[0] for p in psi])
     out = []
@@ -180,7 +181,7 @@ def main():
     cube = trimesh.creation.box(extents=(0.9, 0.9, 0.9))
     allsh[a.train] = (np.asarray(cube.vertices, float), np.asarray(cube.faces, np.int64))
 
-    cache = Path(f"/tmp/surr_cache_v9_{a.train}_{a.held}_{a.phases}_{a.rho}.npz")
+    cache = Path(f"/tmp/surr_cache_v7_{a.train}_{a.held}_{a.phases}_{a.rho}.npz")
     if cache.exists():
         z = np.load(cache, allow_pickle=True)
         X, Y, A = list(z['X']), list(z['Y']), list(z['A'])

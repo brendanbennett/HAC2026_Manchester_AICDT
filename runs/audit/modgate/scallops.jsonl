@@ -1,0 +1,26 @@
+{"body": 0, "kind": "scallops", "attempt": 0, "base": "rubble", "n_mods": 3, "ok": true, "convexity": 0.6793045784876838, "n_faces": 19780}
+{"body": 1, "kind": "scallops", "attempt": 0, "base": "slab", "n_mods": 2, "ok": true, "convexity": 0.8745813169966554, "n_faces": 18546}
+{"body": 2, "kind": "scallops", "attempt": 0, "base": "polytope", "n_mods": 2, "ok": true, "convexity": 0.8339811431420036, "n_faces": 50696}
+{"body": 3, "kind": "scallops", "attempt": 0, "base": "contact_binary", "n_mods": 2, "ok": true, "convexity": 0.794958144236336, "n_faces": 14204}
+{"body": 4, "kind": "scallops", "attempt": 0, "base": "ellipsoid", "n_mods": 6, "ok": true, "convexity": 0.7697505329219098, "n_faces": 37188}
+{"body": 5, "kind": "scallops", "attempt": 0, "base": "star_sh", "n_mods": 6, "ok": true, "convexity": 0.6257457904233467, "n_faces": 45456}
+{"body": 6, "kind": "scallops", "attempt": 0, "base": "lobes", "n_mods": 2, "ok": true, "convexity": 0.9776426795934436, "n_faces": 13288}
+{"body": 7, "kind": "scallops", "attempt": 0, "base": "star_sh", "n_mods": 5, "ok": true, "convexity": 0.7407892318405418, "n_faces": 38300}
+{"body": 8, "kind": "scallops", "attempt": 0, "base": "rubble", "n_mods": 5, "ok": true, "convexity": 0.8843852874200746, "n_faces": 9764}
+{"body": 9, "kind": "scallops", "attempt": 0, "base": "slab", "n_mods": 4, "ok": true, "convexity": 0.8259002641627632, "n_faces": 24506}
+{"body": 10, "kind": "scallops", "attempt": 0, "base": "rubble", "n_mods": 4, "ok": true, "convexity": 0.6859181694196494, "n_faces": 12700}
+{"body": 11, "kind": "scallops", "attempt": 0, "base": "star_sh", "n_mods": 6, "ok": true, "convexity": 0.5396999787038596, "n_faces": 42226}
+{"body": 12, "kind": "scallops", "attempt": 0, "base": "star_sh", "n_mods": 5, "ok": true, "convexity": 0.6490980365477287, "n_faces": 42542}
+{"body": 13, "kind": "scallops", "attempt": 0, "base": "lobes", "n_mods": 3, "ok": false, "reason": "convexity gate", "convexity": 0.9961822108764601}
+{"body": 13, "kind": "scallops", "attempt": 1, "base": "lobes", "n_mods": 3, "ok": true, "convexity": 0.5610852930330819, "n_faces": 26748}
+{"body": 14, "kind": "scallops", "attempt": 0, "base": "prism", "n_mods": 6, "ok": true, "convexity": 0.7572457979985671, "n_faces": 30710}
+{"body": 15, "kind": "scallops", "attempt": 0, "base": "rubble", "n_mods": 3, "ok": true, "convexity": 0.792256038192017, "n_faces": 13272}
+{"body": 16, "kind": "scallops", "attempt": 0, "base": "rubble", "n_mods": 2, "ok": true, "convexity": 0.7590356942891066, "n_faces": 6712}
+{"body": 17, "kind": "scallops", "attempt": 0, "base": "arch", "n_mods": 4, "ok": true, "convexity": 0.6308231709515119, "n_faces": 40840}
+{"body": 18, "kind": "scallops", "attempt": 0, "base": "contact_binary", "n_mods": 5, "ok": true, "convexity": 0.740333366690887, "n_faces": 13032}
+{"body": 19, "kind": "scallops", "attempt": 0, "base": "contact_binary", "n_mods": 4, "ok": true, "convexity": 0.7994580436364344, "n_faces": 14288}
+{"body": 20, "kind": "scallops", "attempt": 0, "base": "prism", "n_mods": 2, "ok": true, "convexity": 0.9600697592770268, "n_faces": 29132}
+{"body": 21, "kind": "scallops", "attempt": 0, "base": "star_sh", "n_mods": 2, "ok": true, "convexity": 0.8414976594137376, "n_faces": 43460}
+{"body": 22, "kind": "scallops", "attempt": 0, "base": "rubble", "n_mods": 4, "ok": true, "convexity": 0.5375522962930401, "n_faces": 23910}
+{"body": 23, "kind": "scallops", "attempt": 0, "base": "lobes", "n_mods": 6, "ok": true, "convexity": 0.5502532027054224, "n_faces": 33412}
+{"body": 24, "kind": "scallops", "attempt": 0, "base": "contact_binary", "n_mods": 5, "ok": true, "convexity": 0.8770078619611006, "n_faces": 9848}

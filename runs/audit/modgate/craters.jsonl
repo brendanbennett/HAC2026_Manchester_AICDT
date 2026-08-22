@@ -1,0 +1,26 @@
+{"body": 0, "kind": "craters", "attempt": 0, "base": "rubble", "n_mods": 3, "ok": true, "convexity": 0.5147618693290947, "n_faces": 18586}
+{"body": 1, "kind": "craters", "attempt": 0, "base": "slab", "n_mods": 2, "ok": true, "convexity": 0.8538690387192497, "n_faces": 19418}
+{"body": 2, "kind": "craters", "attempt": 0, "base": "polytope", "n_mods": 2, "ok": true, "convexity": 0.9797852694584799, "n_faces": 41856}
+{"body": 3, "kind": "craters", "attempt": 0, "base": "contact_binary", "n_mods": 2, "ok": true, "convexity": 0.8340324595656371, "n_faces": 13636}
+{"body": 4, "kind": "craters", "attempt": 0, "base": "ellipsoid", "n_mods": 6, "ok": true, "convexity": 0.5898609452054354, "n_faces": 50326}
+{"body": 5, "kind": "craters", "attempt": 0, "base": "star_sh", "n_mods": 6, "ok": true, "convexity": 0.591771155725821, "n_faces": 54958}
+{"body": 6, "kind": "craters", "attempt": 0, "base": "lobes", "n_mods": 2, "ok": false, "reason": "convexity gate", "convexity": 0.9925501854776089}
+{"body": 6, "kind": "craters", "attempt": 1, "base": "lobes", "n_mods": 6, "ok": true, "convexity": 0.32976280280741316, "n_faces": 28268}
+{"body": 7, "kind": "craters", "attempt": 0, "base": "star_sh", "n_mods": 5, "ok": true, "convexity": 0.7183268601144239, "n_faces": 46436}
+{"body": 8, "kind": "craters", "attempt": 0, "base": "rubble", "n_mods": 5, "ok": true, "convexity": 0.7164354473339083, "n_faces": 9346}
+{"body": 9, "kind": "craters", "attempt": 0, "base": "slab", "n_mods": 4, "ok": true, "convexity": 0.7048989495193042, "n_faces": 28082}
+{"body": 10, "kind": "craters", "attempt": 0, "base": "rubble", "n_mods": 4, "ok": true, "convexity": 0.7299862060454474, "n_faces": 12140}
+{"body": 11, "kind": "craters", "attempt": 0, "base": "star_sh", "n_mods": 6, "ok": true, "convexity": 0.4650367818713039, "n_faces": 55294}
+{"body": 12, "kind": "craters", "attempt": 0, "base": "star_sh", "n_mods": 5, "ok": true, "convexity": 0.5154412407236842, "n_faces": 46702}
+{"body": 13, "kind": "craters", "attempt": 0, "base": "lobes", "n_mods": 3, "ok": true, "convexity": 0.7536497270341165, "n_faces": 10940}
+{"body": 14, "kind": "craters", "attempt": 0, "base": "prism", "n_mods": 6, "ok": true, "convexity": 0.49933502766568283, "n_faces": 34446}
+{"body": 15, "kind": "craters", "attempt": 0, "base": "rubble", "n_mods": 3, "ok": true, "convexity": 0.8007802023277701, "n_faces": 13224}
+{"body": 16, "kind": "craters", "attempt": 0, "base": "rubble", "n_mods": 2, "ok": true, "convexity": 0.7857514573223786, "n_faces": 6040}
+{"body": 17, "kind": "craters", "attempt": 0, "base": "arch", "n_mods": 4, "ok": true, "convexity": 0.6016939209277238, "n_faces": 44858}
+{"body": 18, "kind": "craters", "attempt": 0, "base": "contact_binary", "n_mods": 5, "ok": true, "convexity": 0.511079098073802, "n_faces": 12222}
+{"body": 19, "kind": "craters", "attempt": 0, "base": "contact_binary", "n_mods": 4, "ok": true, "convexity": 0.6649420835568244, "n_faces": 15604}
+{"body": 20, "kind": "craters", "attempt": 0, "base": "prism", "n_mods": 2, "ok": true, "convexity": 0.9017639128763578, "n_faces": 31858}
+{"body": 21, "kind": "craters", "attempt": 0, "base": "star_sh", "n_mods": 2, "ok": true, "convexity": 0.7741710793221269, "n_faces": 49906}
+{"body": 22, "kind": "craters", "attempt": 0, "base": "rubble", "n_mods": 4, "ok": true, "convexity": 0.5208504959194337, "n_faces": 25828}
+{"body": 23, "kind": "craters", "attempt": 0, "base": "lobes", "n_mods": 6, "ok": true, "convexity": 0.5851166421504553, "n_faces": 33160}
+{"body": 24, "kind": "craters", "attempt": 0, "base": "contact_binary", "n_mods": 5, "ok": true, "convexity": 0.9170982731125773, "n_faces": 10288}

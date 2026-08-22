@@ -1,0 +1,37 @@
+--- /tmp/orig/hac-2026-main/hac26/shape_library.py	2026-08-21 15:26:31.000000000 +0000
++++ hac26/shape_library.py	2026-08-22 19:45:16.881548675 +0000
+@@ -316,9 +316,12 @@
+ def _repair(vol: np.ndarray, eps: float) -> tuple:
+     """Force one solid component and no interior void, by editing the field.
+ 
+-    Solid uses 6-connectivity and background 26-connectivity: the complementary pair, so a
+-    solid touching only at a corner counts as two pieces and is discarded rather than being
+-    welded into a pinch point that marching cubes would have to resolve.
++    Solid uses 6-connectivity, so a solid touching only at a corner counts as two pieces and
++    is discarded rather than being welded into a pinch point that marching cubes would have to
++    resolve. Background uses 6-connectivity TOO. That is deliberately not the complementary
++    pair: the complementary pair is correct digital topology but marching cubes does not
++    implement it, and the mismatch cost 71% of `pitted` attempts -- see the comment on the
++    background label call below.
+ 
+     Discarded pieces are removed by raising f above zero on exactly the voxels that belong to
+     them. Editing everything outside a dilation of the kept piece instead is wrong and was
+@@ -340,7 +343,17 @@
+     vol = np.where(solid & ~keep, np.maximum(vol, eps), vol)
+ 
+     bg = vol >= 0.0
+-    lab_b, kb = ndimage.label(bg, structure=ndimage.generate_binary_structure(3, 3))
++    # 6-connectivity for the background, NOT 26. The complementary pair (6-solid,
++    # 26-background) is the right one for digital topology, but marching cubes does not
++    # implement that pairing: a background pocket joined to the outside only corner-wise is
++    # judged "not a void" here and is then SEALED by the trilinear interpolant, which returns
++    # a second, closed, interior surface component -- and `sample_body` rejects the body on
++    # n_components. Measured on `pitted`, whose many small subtractions produce exactly this
++    # pocket: 71% of attempts were discarded, every one of them for multi-component, against
++    # 3.8% for craters and scallops. Five reproductions, including one with a single solid
++    # component and no voids reported, all go to a single surface under 6-connectivity, at a
++    # cost of 56-3015 extra voxels filled out of 96^3.
++    lab_b, kb = ndimage.label(bg, structure=ndimage.generate_binary_structure(3, 1))
+     outer = lab_b[0, 0, 0]
+     void = bg & (lab_b != outer)
+     n_void = int(kb - 1)

@@ -1,0 +1,32 @@
+{
+ "name": "ctrl1",
+ "group": "in_family",
+ "base": "star_sh",
+ "mods": [
+  "tunnel",
+  "boulders",
+  "craters",
+  "craters",
+  "groove"
+ ],
+ "convexity": 0.6412336098413546,
+ "attempt": 0,
+ "n_faces": 58754,
+ "n_verts": 29355,
+ "components": 1,
+ "edge_manifold": true,
+ "seconds": 70.6,
+ "points": 6000,
+ "ridge": 1e-06,
+ "sdf_mse_core_only": 0.02416485585741079,
+ "sdf_mse_fitted": 5.858977253483238e-05,
+ "g_absmax": 0.3463798247897022,
+ "g_rms": 0.06450685099577487,
+ "truth_convexity": 0.6412336098413546,
+ "dice_core_only": 0.780606274144635,
+ "convexity_core_only": 0.9997954911066437,
+ "volume_ratio_core_only": 1.5590584143749597,
+ "dice_fitted": 0.9603904485317845,
+ "convexity_fitted": 0.6394534695361268,
+ "volume_ratio_fitted": 0.9958781477426418
+}

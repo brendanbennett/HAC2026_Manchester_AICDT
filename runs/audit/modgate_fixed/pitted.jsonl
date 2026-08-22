@@ -1,0 +1,27 @@
+{"body": 0, "kind": "pitted", "attempt": 0, "base": "rubble", "n_mods": 3, "ok": true, "convexity": 0.7341983341902244, "n_faces": 22226}
+{"body": 1, "kind": "pitted", "attempt": 0, "base": "slab", "n_mods": 2, "ok": true, "convexity": 0.9704645134297001, "n_faces": 20164}
+{"body": 2, "kind": "pitted", "attempt": 0, "base": "polytope", "n_mods": 2, "ok": false, "reason": "convexity gate", "convexity": 0.983312094950742}
+{"body": 2, "kind": "pitted", "attempt": 1, "base": "polytope", "n_mods": 4, "ok": true, "convexity": 0.9140881405102953, "n_faces": 30108}
+{"body": 3, "kind": "pitted", "attempt": 0, "base": "contact_binary", "n_mods": 2, "ok": true, "convexity": 0.8338537088052541, "n_faces": 14932}
+{"body": 4, "kind": "pitted", "attempt": 0, "base": "ellipsoid", "n_mods": 6, "ok": true, "convexity": 0.8679195943848226, "n_faces": 65258}
+{"body": 5, "kind": "pitted", "attempt": 0, "base": "star_sh", "n_mods": 6, "ok": true, "convexity": 0.8091279075909192, "n_faces": 79858}
+{"body": 6, "kind": "pitted", "attempt": 0, "base": "lobes", "n_mods": 2, "ok": true, "convexity": 0.9790538993466235, "n_faces": 14172}
+{"body": 7, "kind": "pitted", "attempt": 0, "base": "star_sh", "n_mods": 5, "ok": true, "convexity": 0.8614935388958811, "n_faces": 74762}
+{"body": 8, "kind": "pitted", "attempt": 0, "base": "rubble", "n_mods": 5, "ok": true, "convexity": 0.9077380487376, "n_faces": 10068}
+{"body": 9, "kind": "pitted", "attempt": 0, "base": "slab", "n_mods": 4, "ok": true, "convexity": 0.9073601693149416, "n_faces": 35242}
+{"body": 10, "kind": "pitted", "attempt": 0, "base": "rubble", "n_mods": 4, "ok": true, "convexity": 0.7228918729016401, "n_faces": 15094}
+{"body": 11, "kind": "pitted", "attempt": 0, "base": "star_sh", "n_mods": 6, "ok": true, "convexity": 0.8195990669059905, "n_faces": 85554}
+{"body": 12, "kind": "pitted", "attempt": 0, "base": "star_sh", "n_mods": 5, "ok": true, "convexity": 0.8497623093825667, "n_faces": 76178}
+{"body": 13, "kind": "pitted", "attempt": 0, "base": "lobes", "n_mods": 3, "ok": true, "convexity": 0.9659210783001085, "n_faces": 10724}
+{"body": 14, "kind": "pitted", "attempt": 0, "base": "prism", "n_mods": 6, "ok": true, "convexity": 0.9146745759504821, "n_faces": 40498}
+{"body": 15, "kind": "pitted", "attempt": 0, "base": "rubble", "n_mods": 3, "ok": true, "convexity": 0.7926980108096477, "n_faces": 15482}
+{"body": 16, "kind": "pitted", "attempt": 0, "base": "rubble", "n_mods": 2, "ok": true, "convexity": 0.8774063667885218, "n_faces": 7180}
+{"body": 17, "kind": "pitted", "attempt": 0, "base": "arch", "n_mods": 4, "ok": true, "convexity": 0.7903908406010882, "n_faces": 58116}
+{"body": 18, "kind": "pitted", "attempt": 0, "base": "contact_binary", "n_mods": 5, "ok": true, "convexity": 0.7624929626365242, "n_faces": 16714}
+{"body": 19, "kind": "pitted", "attempt": 0, "base": "contact_binary", "n_mods": 4, "ok": true, "convexity": 0.8012080216655132, "n_faces": 17042}
+{"body": 20, "kind": "pitted", "attempt": 0, "base": "prism", "n_mods": 2, "ok": false, "reason": "convexity gate", "convexity": 0.9849662268033552}
+{"body": 20, "kind": "pitted", "attempt": 1, "base": "prism", "n_mods": 3, "ok": true, "convexity": 0.9716124762835749, "n_faces": 62650}
+{"body": 21, "kind": "pitted", "attempt": 0, "base": "star_sh", "n_mods": 2, "ok": true, "convexity": 0.9419646919346376, "n_faces": 43344}
+{"body": 22, "kind": "pitted", "attempt": 0, "base": "rubble", "n_mods": 4, "ok": true, "convexity": 0.6485735924386211, "n_faces": 30058}
+{"body": 23, "kind": "pitted", "attempt": 0, "base": "lobes", "n_mods": 6, "ok": true, "convexity": 0.7312506640758438, "n_faces": 43096}
+{"body": 24, "kind": "pitted", "attempt": 0, "base": "contact_binary", "n_mods": 5, "ok": true, "convexity": 0.9255769454396482, "n_faces": 12120}

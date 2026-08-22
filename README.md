@@ -1,7 +1,14 @@
-# hac26
+Surrogate trained on: 
+python scripts/train_surrogate.py --width 96 --blocks 3 --modes 8 --train 256 --held 16 --phases 32 --steps 6000
 
+Main body trained with:
+export N_BODIES=1000
+export RECON_RES=64
 Shape reconstruction from lightcurves for the
 [Helsinki Asteroid Challenge 2026](https://fips.fi/data-challenges/helsinki-asteroid-challenge-2026/).
+
+
+
 
 Ten 3D-printed asteroids were filmed on a turntable from 28 camera geometries. Each frame is
 reduced to two values, summed intensity and lit-pixel count, giving 56 curves per body.
@@ -38,23 +45,6 @@ python scripts/reconstruct.py --ckpt models/lpd_convex.pt --model 4 --out result
 python scripts/reconstruct_lpd.py --model 4 --out results/lpd/Asteroid04.stl
 ```
 
-`reconstruct_lpd.py` imposes the published bounding-cylinder radius on export (it did not
-before; see `CHANGES.md`). `--no-fit-cylinder` turns that off for ablations. To re-pose STLs
-that were written before the fix:
-
-```
-python scripts/fix_pose.py --stl results/lpd/Asteroid0{1,2,3}.stl --models 1 2 3 \
-    --out-dir results/lpd_fitted
-```
-
-Score a run against the recorded baseline. The gate requires model 3 to improve *and*
-models 1 and 2 not to regress, and exits non-zero when either half fails:
-
-```
-python scripts/eval_gate.py --stl runs/new/Asteroid0{1,2,3}.stl --models 1 2 3 \
-    --label new_corpus --out runs/gate_new.json --baseline runs/gate_lpd_fitted.json
-```
-
 Retrain the flow solver. The first step builds the set of surface normals the shape
 representation is defined on and only needs running once per size:
 
@@ -73,9 +63,7 @@ hac26/scoring/    voxel, side_view
 hac26/            conventions, geometry, field, shapes, calibrate, noise, covariance
 scripts/          entry points
 models/           trained convex solver, instrument calibration; load with models/load.py
-results/          reconstructions: convex/ is the submitted set, lpd/ the flow solver's,
-                  lpd_fitted/ the same flow meshes re-posed onto the published cylinder
-runs/gate_*.json  recorded acceptance-gate baselines (the rest of runs/ is not tracked)
+results/          reconstructions: convex/ is the submitted set, lpd/ the flow solver's
 dataset/          challenge data, not tracked
 runs/             training output, not tracked
 tests/

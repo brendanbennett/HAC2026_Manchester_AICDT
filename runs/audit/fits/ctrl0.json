@@ -1,0 +1,33 @@
+{
+ "name": "ctrl0",
+ "group": "in_family",
+ "base": "contact_binary",
+ "mods": [
+  "cuts",
+  "craters",
+  "cuts",
+  "pitted",
+  "cuts",
+  "waist"
+ ],
+ "convexity": 0.5437836118021845,
+ "attempt": 0,
+ "n_faces": 4780,
+ "n_verts": 2392,
+ "components": 1,
+ "edge_manifold": true,
+ "seconds": 50.6,
+ "points": 6000,
+ "ridge": 1e-06,
+ "sdf_mse_core_only": 0.009966484278411195,
+ "sdf_mse_fitted": 0.00021426728953388425,
+ "g_absmax": 0.6708179556354396,
+ "g_rms": 0.059558704061993824,
+ "truth_convexity": 0.5437836118021845,
+ "dice_core_only": 0.6989265575107004,
+ "convexity_core_only": 0.9987046630051529,
+ "volume_ratio_core_only": 1.8525193798449613,
+ "dice_fitted": 0.9782028253798728,
+ "convexity_fitted": 0.5728351917543724,
+ "volume_ratio_fitted": 0.9960271317829458
+}

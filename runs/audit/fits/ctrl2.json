@@ -1,0 +1,29 @@
+{
+ "name": "ctrl2",
+ "group": "in_family",
+ "base": "contact_binary",
+ "mods": [
+  "boulders",
+  "bite"
+ ],
+ "convexity": 0.9173524395237489,
+ "attempt": 1,
+ "n_faces": 9170,
+ "n_verts": 4587,
+ "components": 1,
+ "edge_manifold": true,
+ "seconds": 54.1,
+ "points": 6000,
+ "ridge": 1e-06,
+ "sdf_mse_core_only": 0.0025733669334821567,
+ "sdf_mse_fitted": 0.0001301306493838876,
+ "g_absmax": 0.6898606922662991,
+ "g_rms": 0.04076980085021227,
+ "truth_convexity": 0.9173524395237489,
+ "dice_core_only": 0.9550430745779154,
+ "convexity_core_only": 0.9996670869969236,
+ "volume_ratio_core_only": 1.0929063444108762,
+ "dice_fitted": 0.9972417130413743,
+ "convexity_fitted": 0.9317285735864022,
+ "volume_ratio_fitted": 0.9978247734138973
+}

@@ -1,14 +1,8 @@
 numpy>=1.24
-# sph_harm_y (hac26/shapes_nonconvex.py) replaced the old sph_harm in SciPy 1.15.
-scipy>=1.15
+scipy>=1.10
 torch>=2.1
 pytest>=7.0
-# Mesh IO, booleans and ray casting. Already used by hac26.recon, hac26.solvers.output
-# and scripts/eval_gate.py; it was never declared.
-trimesh>=4.0
-# trimesh's pure-python ray engine needs an rtree index. Without it every
-# mesh.ray.intersects_location call raises, and hac26.shapes_nonconvex.sample_corpus
-# catches that and returns an EMPTY corpus rather than an error -- verified here.
-rtree>=1.0
-# marching cubes, for the implicit corpus
-scikit-image>=0.22
+trimesh
+scikit-image
+rtree
+fast_simplification
