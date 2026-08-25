@@ -137,6 +137,34 @@ def main():
         help="Whether to use spherical harmonics (sh) or deform the surface (surface)",
     )
 
+    parser.add_argument(
+        "--deform-width",
+        type=float,
+        default=0.5,
+        help="Sigma for dents/bulges in units of characteristic length",
+    )
+
+    parser.add_argument(
+        "--n-cpts",
+        type=int,
+        default=100,
+        help="Number of control points for surface deformation",
+    )
+
+    parser.add_argument(
+        "--max-amp",
+        type=float,
+        default=0.5,
+        help="Max amplitude for dents/bulges in units of characteristic length",
+    )
+
+    parser.add_argument(
+        "--mutation-decay",
+        type=float,
+        default=0.98,
+        help="Decay rate of mutation noise",
+    )
+
     # load args
     args = parser.parse_args()
 
@@ -314,7 +342,7 @@ def main():
         initial_mesh.merge_vertices()
 
         # select number of points to deform on surface 
-        n_control_points = 100
+        n_control_points = args.n_cpts
         control_point_indices = sample_surface_control_points(
             initial_mesh,
             n_points=n_control_points,
@@ -325,7 +353,7 @@ def main():
         characteristic_length = np.max(initial_mesh.extents)
 
         # Width of each deformation
-        sigma = 0.05 * characteristic_length
+        sigma = args.deform_width* characteristic_length
 
         influence = build_surface_influence_matrix(
             initial_mesh,
@@ -352,7 +380,7 @@ def main():
         )
 
         # set mutation bounds
-        max_amplitude = 0.10 * characteristic_length
+        max_amplitude = args.max_amp * characteristic_length
         bounds = np.array(
             [
                 [-max_amplitude, max_amplitude]
@@ -519,7 +547,7 @@ def main():
         population_size=args.population_size,
         n_parents=args.parents,
         n_generations=args.generations,
-        mutation_decay=0.98,
+        mutation_decay=args.mutation_decay,
         bounds=bounds,
         seed=args.seed,
     )
