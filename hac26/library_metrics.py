@@ -1,26 +1,20 @@
 """How varied a shape library is, and whether each body is admissible.
 
-Two questions, kept apart.
+Validity is per body and binary: closed, one component, correctly posed. `check_body`
+returns each answer separately so a failure says which constraint broke, and measures the
+convexity ratio alongside.
 
-VALIDITY is per body and binary: closed, one component, strictly non-convex, correctly posed.
-`check_body` returns the individual answers rather than a single bool so a failure says which
-constraint broke.
-
-DIVERSITY is a property of the set. The headline number is the participation ratio
+Diversity is a property of the set. The headline number is the participation ratio
 
     PR = (sum_i lambda_i)^2 / sum_i lambda_i^2
 
-of the eigenvalues of the library's covariance -- the number of directions that actually carry
-variance, equal to D for an isotropic cloud and to 1 for a cloud on a line. PR is the right
-statistic here because the shape prior Gamma in `map_gauss_newton` IS that covariance: a
-library with PR = 4 gives a prior that is nearly a four-parameter family, and every direction
-outside it is pinned to the library mean no matter what the data says.
+of the eigenvalues of the library's covariance: the number of directions that carry
+variance, equal to D for an isotropic cloud in D dimensions and to 1 for a cloud on a line.
+A library with a small PR is close to a few-parameter family.
 
-A caution that decides how the numbers below are read: PR is not invariant to what the code
-measures. A library whose bodies differ mostly in overall SIZE scores its top eigenvalue on a
-degree of freedom the challenge normalisation removes anyway, so PR on unposed bodies flatters
-a library that is not actually varied in shape. Everything here is therefore measured on
-posed bodies, and `descriptor_support` is normalised by construction.
+PR depends on what is measured. Bodies that differ mostly in overall size put their largest
+eigenvalue on a degree of freedom the challenge pose removes, so the descriptors here are
+meant for posed bodies.
 """
 from __future__ import annotations
 
@@ -38,13 +32,12 @@ __all__ = ["participation_ratio", "spectrum", "descriptor_support", "descriptor_
 
 
 def design_normals(n: int = 256) -> np.ndarray:
-    """A spherical design for the descriptors below.
+    """`n` design normals for the descriptors below, from the cached `design{n}.npy` next to
+    this module, or built with `hac26.field.spherical_design` if the cache is absent.
 
-    NOT DESIGN_N. These are library statistics, not the solver's core: the participation
-    ratio of the support descriptor is capped by this count, so it has to be large enough to
-    resolve the structure being measured -- but building a design the size of DESIGN_N takes
-    hours, which is too much for a diagnostic. An earlier default was small enough that the
-    cap was hit in practice.
+    Smaller than the solver's `DESIGN_N`, which is slow to build: these are library
+    statistics, not the core. The participation ratio of the support descriptor is capped by
+    this count, so it must be large enough to resolve the structure being measured.
     """
     p = Path(__file__).with_name(f"design{n}.npy")
     if p.exists():
@@ -71,11 +64,10 @@ def participation_ratio(X: np.ndarray) -> float:
 
 
 def descriptor_support(verts: np.ndarray, normals: np.ndarray | None = None) -> np.ndarray:
-    """h(n) = max_v <v, n> on the design normals.
+    """h(n) = max_v <v, n> on the design normals: the support function of the convex hull.
 
-    This is not a proxy: `scripts/fit_shapes.py` computes exactly this vector as `h0s` and
-    computes the same quantity for its own normals, so it IS the convex half of the code,
-    obtainable without running the autodecoder.
+    `scripts/fit_shapes.py` pins each body's core support to this same quantity (on the
+    solver's own normals), so this is the convex part of a code without running the fit.
     """
     n = design_normals() if normals is None else np.asarray(normals, float)
     return (np.asarray(verts, float) @ n.T).max(axis=0)
@@ -84,14 +76,12 @@ def descriptor_support(verts: np.ndarray, normals: np.ndarray | None = None) -> 
 def descriptor_concavity(verts: np.ndarray, faces: np.ndarray,
                          probes: np.ndarray, normals: np.ndarray | None = None,
                          res: int = 64, extent: float = 1.35) -> np.ndarray:
-    """f_body(y) - f_core(y) at fixed probe points: what the correction has to carry.
+    """f_body(y) - f_core(y) at fixed probe points, where f_core is the convex core at the
+    hull support and f_body a signed distance from the body's own occupancy.
 
-    `GaussianLattice` is fitted to exactly this difference -- the convex core explains f_core
-    and Delta makes up the rest. The lattice has a FIXED N_SITES amplitudes regardless of what
-    any body needs, so this no longer bounds a code dimension; what it bounds is whether that
-    many amplitudes, at the lattice spacing, can express the concavity a library actually
-    contains. Computed from the body's own occupancy by a distance transform, so it needs
-    neither torch nor trimesh.
+    This is the part of the field the lattice correction (`hac26.field.GaussianLattice`) has
+    to carry when `scripts/fit_shapes.py` fits a body with the core pinned to its hull.
+    Computed by a distance transform, so it needs neither torch nor trimesh.
     """
     n = design_normals() if normals is None else np.asarray(normals, float)
     h = descriptor_support(verts, n)
@@ -106,8 +96,8 @@ def descriptor_concavity(verts: np.ndarray, faces: np.ndarray,
 
 
 def _probe_points(n: int = 512, seed: int = 0, radius: float = 1.15) -> np.ndarray:
-    """A fixed cloud filling the posed body's bounding cylinder. Fixed across the library:
-    the descriptor is only comparable between bodies if the probes are the same points."""
+    """A fixed cloud of `n` points filling the cylinder a posed body sits in. The same points
+    are used for every body, or the concavity descriptors would not be comparable."""
     rng = np.random.default_rng(seed)
     t = rng.uniform(0, 2 * np.pi, n)
     r = radius * np.sqrt(rng.uniform(0, 1, n))
@@ -115,14 +105,14 @@ def _probe_points(n: int = 512, seed: int = 0, radius: float = 1.15) -> np.ndarr
 
 
 def library_descriptors(bodies: list, n_probes: int = 512, res: int = 64) -> dict:
-    """Support, concavity and combined descriptors for a library of `Body`."""
+    """Support, concavity and combined descriptors for a library of `Body`, one row each."""
     nrm = design_normals()
     probes = _probe_points(n_probes)
     H = np.stack([descriptor_support(b.verts, nrm) for b in bodies])
     C = np.stack([descriptor_concavity(b.verts, b.faces, probes, nrm, res=res)
                   for b in bodies])
-    # scale the two blocks to equal mean variance before concatenating, so the combined PR
-    # is not simply whichever block happens to carry larger numbers
+    # Scale the two blocks to equal mean variance before concatenating, so the combined PR
+    # is not dominated by whichever block carries larger numbers.
     hs = np.sqrt(max(H.var(0).mean(), 1e-18))
     cs = np.sqrt(max(C.var(0).mean(), 1e-18))
     return {"support": H, "concavity": C, "combined": np.hstack([H / hs, C / cs])}
@@ -132,6 +122,8 @@ def library_descriptors(bodies: list, n_probes: int = 512, res: int = 64) -> dic
 
 def occupancy(verts: np.ndarray, faces: np.ndarray, res: int = 64,
               extent: float = 1.35, decimate: bool = True) -> np.ndarray:
+    """Boolean res^3 occupancy of a mesh over [-extent, extent]^3, by ray parity. Large
+    meshes are decimated to the same grid first."""
     v, f = np.asarray(verts, float), np.asarray(faces, np.int64)
     if decimate and len(f) > 3000:
         v, f = decimate_mesh(v, f, extent, res)
@@ -140,16 +132,12 @@ def occupancy(verts: np.ndarray, faces: np.ndarray, res: int = 64,
 
 def principal_frame(verts: np.ndarray, faces: np.ndarray, res: int = 64,
                     extent: float = 1.35) -> np.ndarray:
-    """Rotation taking the body's principal axes onto the coordinate axes.
+    """Rotation matrix whose rows are the body's principal axes, largest moment first.
 
-    The inertia tensor is computed from the OCCUPANCY, not from the vertices: vertex moments
-    weight a densely tessellated region more heavily than a sparsely tessellated one of the
-    same volume, which makes the frame depend on the meshing rather than on the body.
-
-    Axes are ordered by eigenvalue. The four proper sign flips are left unresolved here and
-    maximised over in `dice`, because a body with two near-equal moments has no stable sign
-    and picking one by a skewness rule silently reports a low Dice for two bodies that are
-    the same shape.
+    The moments are computed from the occupancy, not from the vertices, so the frame depends
+    on the body rather than on how finely each region is meshed. The four proper sign flips
+    are left unresolved here and maximised over in `dice`, because a body with two near-equal
+    moments has no stable sign.
     """
     occ = occupancy(verts, faces, res, extent)
     idx = np.argwhere(occ).astype(float)
@@ -169,11 +157,9 @@ _SIGN_FLIPS = np.array([[1, 1, 1], [1, -1, -1], [-1, 1, -1], [-1, -1, 1]], float
 
 
 def occupancies_aligned(bodies: list, res: int = 48, extent: float = 1.35) -> list:
-    """Occupancy grids for all four proper sign flips of each body's principal frame.
+    """Occupancy grids of each body in its principal frame, one per proper sign flip.
 
-    Computed once per body rather than once per PAIR: `pairwise_dice` compares O(n^2) pairs
-    but each body's own alignment and rasterisation is reusable across all of them, so this
-    turns an O(pairs) cost into an O(n_bodies) one.
+    Computed once per body so `pairwise_dice` can reuse them across every pair.
     """
     out = []
     for b in bodies:
@@ -184,6 +170,7 @@ def occupancies_aligned(bodies: list, res: int = 48, extent: float = 1.35) -> li
 
 
 def _dice_from_occ(occs_a: list, occs_b: list) -> float:
+    """Best Dice between the first grid of `occs_a` and any grid of `occs_b`."""
     A = occs_a[0]
     na = A.sum()
     best = 0.0
@@ -196,16 +183,11 @@ def _dice_from_occ(occs_a: list, occs_b: list) -> float:
 
 
 def dice(a, b, res: int = 64, extent: float = 1.35, align: bool = True) -> float:
-    """Voxel Dice between two bodies, after aligning both on their principal axes.
+    """Voxel Dice between two bodies (`Body` or (verts, faces) pairs).
 
-    Intersection is not rotation-invariant, so comparing two library bodies in their stored
-    poses measures how they happen to be oriented as much as how they are shaped. Both are
-    carried into their own principal frame first; the residual four-fold sign ambiguity is
-    resolved by taking the best of the four proper flips.
-
-    For many pairs from the same library, `pairwise_dice` is the right entry point: it
-    shares each body's alignment and rasterisation across every pair instead of repeating
-    them, which is what this function does independently for one pair.
+    With `align`, both are first carried into their principal frames, so the score measures
+    shape rather than stored orientation, and the best of the four proper sign flips is
+    taken. For many pairs from one library use `pairwise_dice`, which aligns each body once.
     """
     va, fa = (a.verts, a.faces) if hasattr(a, "verts") else a
     vb, fb = (b.verts, b.faces) if hasattr(b, "verts") else b
@@ -223,10 +205,10 @@ def dice(a, b, res: int = 64, extent: float = 1.35, align: bool = True) -> float
 
 def pairwise_dice(bodies: list, res: int = 48, extent: float = 1.35,
                   max_pairs: int | None = 300, seed: int = 0) -> np.ndarray:
-    """Dice over a random sample of distinct pairs. Aligned, so this measures shape spread.
+    """Aligned Dice over up to `max_pairs` randomly chosen distinct pairs of bodies.
 
-    A library is varied when this distribution is broad and centred well below 1; a library
-    of near-copies concentrates near 1 whatever its codes look like.
+    A varied library gives a broad distribution centred well below 1; a library of
+    near-copies concentrates near 1.
     """
     n = len(bodies)
     pairs = [(i, j) for i in range(n) for j in range(i + 1, n)]
@@ -239,16 +221,16 @@ def pairwise_dice(bodies: list, res: int = 48, extent: float = 1.35,
 
 # --------------------------------------------------------------------------- validity
 
-def check_body(body, radius: float = 1.0, convexity_max: float = 0.98,
-               pose_tol: float = 1e-6, radius_tol: float = 1e-6) -> dict:
-    """Every per-body constraint, reported separately."""
+def check_body(body, radius: float = 1.0, pose_tol: float = 1e-6,
+               radius_tol: float = 1e-6) -> dict:
+    """Every per-body constraint as its own bool, plus the measured values behind them."""
     v, f = body.verts, body.faces
     z0, z1 = float(v[:, 2].min()), float(v[:, 2].max())
     rmax = float(np.hypot(v[:, 0], v[:, 1]).max())
     cx, cy = float(v[:, 0].mean()), float(v[:, 1].mean())
     c = convexity_ratio(v, f)
     return {
-        "non_convex": bool(c < convexity_max), "convexity": float(c),
+        "convexity": float(c),
         "closed": bool(is_edge_manifold(f)),
         "single_component": bool(n_components(v, f) == 1),
         "z_span": bool(abs(z0 + 1.0) <= pose_tol and abs(z1 - 1.0) <= pose_tol),
@@ -261,7 +243,7 @@ def check_body(body, radius: float = 1.0, convexity_max: float = 0.98,
 def check_library(bodies: list, **kw) -> dict:
     """`check_body` over a library, plus the indices that failed each constraint."""
     rows = [check_body(b, **kw) for b in bodies]
-    keys = ["non_convex", "closed", "single_component", "z_span", "inside_cylinder", "on_axis"]
+    keys = ["closed", "single_component", "z_span", "inside_cylinder", "on_axis"]
     return {"n": len(bodies),
             "pass": {k: int(sum(r[k] for r in rows)) for k in keys},
             "failed": {k: [i for i, r in enumerate(rows) if not r[k]] for k in keys},

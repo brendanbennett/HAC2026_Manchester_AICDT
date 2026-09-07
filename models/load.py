@@ -1,18 +1,14 @@
-"""Load the two artefacts that are meant to be reused outside this repository.
+"""Loaders for the two model files shipped in this directory.
 
-    lpd_convex.pt                trained convex LPD; produced every reconstruction in
-                                 results/convex. Carries its own `preset`, so the
-                                 architecture is rebuilt from the file with no other input.
+    lpd_convex.pt                the trained convex LPD, written by scripts/export_model.py.
+                                 It carries its own `preset`, so the network is rebuilt from
+                                 the file alone.
 
-    instrument_calibration.pt    fitted to the real lab curves of models 1-3: vignetting,
-                                 PSF width, OETF knots, clip knee, per-curve pedestal and
-                                 per-curve model error. Independent of any reconstruction
-                                 method.
-
-                                 Also in the file but NOT fitted: the two per-curve
-                                 thresholds (a hard comparison passes no gradient), and rho
-                                 and delta_deg, which are whatever was passed on the command
-                                 line. There is no psi0 in the file. See scripts/calibrate.py.
+    instrument_calibration.pt    the Instrument fitted to the public models' real curves by
+                                 scripts/calibrate.py: albedo, source radius, camera distance,
+                                 intensity threshold, per-curve pedestal and model error, and
+                                 the sensor chain. The fitted start phases live in the
+                                 report next to it, instrument_calibration.json.
 
 Both are torch pickles, so torch.load executes their contents; load only copies you trust.
 """
@@ -20,21 +16,20 @@ from __future__ import annotations
 
 from pathlib import Path
 
-import torch
-
 HERE = Path(__file__).resolve().parent
 
 
 def load_lpd(device: str = "cpu"):
-    """Return (net, preset, grid) for the trained convex LPD."""
+    """(net, preset, grid) for the trained convex LPD, via hac26.train.load_net."""
     import sys
     sys.path.insert(0, str(HERE.parent))
     from hac26.train import load_net
     return load_net(str(HERE / "lpd_convex.pt"), device=device)
 
 
-def load_calibration() -> dict:
-    """Fitted instrument parameters. Keys: sensor, raw_tau_i, raw_tau_b, pedestal,
-    raw_eta, rho, delta_deg."""
-    return torch.load(HERE / "instrument_calibration.pt", map_location="cpu",
-                      weights_only=False)
+def load_calibration(device: str = "cpu"):
+    """The calibrated Instrument."""
+    import sys
+    sys.path.insert(0, str(HERE.parent))
+    from hac26.forward.mesh.instrument import Instrument
+    return Instrument.load(HERE / "instrument_calibration.pt", device=device)

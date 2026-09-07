@@ -1,23 +1,25 @@
-"""Learned Primal-Dual network for HAC 2026 (Adler & Oektem, arXiv:1707.06474, Alg. 3).
+"""Learned primal-dual network on the convex operator (Adler & Oektem, arXiv:1707.06474,
+Alg. 3).
 
-Unrolled scheme (I iterations, per-iteration parameters):
+Unrolled scheme, I iterations with their own parameters:
     h_i = h_{i-1} + Gamma_i( h_{i-1}, T(softplus(f_{i-1}^{(2)})), d, tags, mask )
     f_i = f_{i-1} + Lambda_i( f_{i-1}, [dT(softplus(f_{i-1}^{(1)}))]^T h_i^{(1)}, coords )
     return p = softplus(f_I^{(1)}) / sum(...)
-where T = N_eps o A is the exact convex photometric operator (forward/convex_egi.py) and the
+where T = N_eps o A is the convex photometric operator (forward/convex_egi.py) and the
 derivative adjoint is the closed form A^T o DN^T, chained with softplus' = sigmoid.
 
-Design choices tied to exact structure of the problem:
-- Dual nets use 1D convolutions along the frame axis with *circular* padding
-  (curves are exactly one revolution; azimuthal equivariance lemma).
-- Primal nets are 2D CNNs on the (theta, phi) EGI grid, circular in phi.
-- Per-curve conditioning channels ("tags"): azimuth/360, elevation/90, phase/180,
-  is_binary; plus the availability mask (missing files at higher difficulty levels).
-- The network predicts the *scale-free* EGI direction p = g/sum(g): absolute scale is
-  provably unidentifiable from mean-normalized curves; final size comes from the
-  z in [-1,1] prior downstream.
-Deviation from the paper: the last conv of each block is zero-initialized (stabilizes
-deep unrolls; the paper used Xavier everywhere).
+Design choices:
+- Dual blocks convolve along the frame axis only, with circular padding, because a curve
+  is one full revolution.
+- Primal blocks are 2D CNNs on the (theta, phi) grid of normals, circular in phi.
+- Each curve carries conditioning channels ("tags"): azimuth/360, elevation/90, phase/180,
+  is_binary; plus the availability mask for curves missing from the data.
+- The network predicts the scale-free EGI direction p = g/sum(g), since mean-normalised
+  curves carry no absolute scale; the size is fixed downstream by posing to z in [-1, 1].
+- The last conv of each block is zero-initialised, so every update starts at zero.
+
+Optional parts, all off by default: conditioning on the a-priori bounding radius (r_cond), a
+support-function head, and a low-rank occlusion gate; see LPDNet.
 """
 from __future__ import annotations
 
@@ -32,6 +34,8 @@ from hac26.forward.convex_egi import ConvexPhotometricOperator
 
 
 def make_tags(cameras: list, curve_types: list) -> torch.Tensor:
+    """Per-curve conditioning channels, shape (C, 4): azimuth/360, elevation/90, phase/180,
+    is_binary."""
     rows = []
     for cam, ctype in zip(cameras, curve_types):
         rows.append([cam.azimuth_deg / 360.0,
@@ -42,7 +46,9 @@ def make_tags(cameras: list, curve_types: list) -> torch.Tensor:
 
 
 class DualBlock(nn.Module):
-    """Residual CNN on (B, ch, C, m); convolutions along frames only, circular."""
+    """Three 1x3 convolutions along the frame axis with circular padding,
+    (B, n_in, C, m) -> (B, n_dual, C, m). The caller adds the output to its state; the last
+    conv starts at zero so the update starts at zero."""
 
     def __init__(self, n_dual: int, n_in: int, ch: int):
         super().__init__()
@@ -64,7 +70,9 @@ class DualBlock(nn.Module):
 
 
 class PrimalBlock(nn.Module):
-    """Residual CNN on (B, ch, n_theta, n_phi); circular in phi, replicate in theta."""
+    """Three 3x3 convolutions on the (theta, phi) grid, circular in phi and replicate-padded
+    in theta, (B, n_in, n_theta, n_phi) -> (B, n_primal, n_theta, n_phi). The last conv
+    starts at zero."""
 
     def __init__(self, n_primal: int, n_in: int, ch: int):
         super().__init__()
@@ -87,6 +95,10 @@ class PrimalBlock(nn.Module):
 
 
 class LPDNet(nn.Module):
+    """The unrolled network of the module docstring. forward() returns (p, g), or
+    (p, g, h) with a support head, where p is the scale-free EGI direction, g the
+    unnormalised facet areas and h the support function on the normal grid."""
+
     def __init__(self, op: ConvexPhotometricOperator, n_theta: int, n_phi: int,
                  cameras: list, curve_types: list, n_iter: int = 15,
                  n_primal: int = 7, n_dual: int = 7, ch: int = 48,
@@ -98,11 +110,10 @@ class LPDNet(nn.Module):
         self.n_theta, self.n_phi = n_theta, n_phi
         self.n_iter, self.n_primal, self.n_dual = n_iter, n_primal, n_dual
         self.support_head = support_head
-        # Conditioning on the a-priori bounding radius R. Per-curve mean normalization
-        # destroys the cross-camera amplitudes that encode the body's latitude profile,
-        # so the aspect ratio is close to unidentifiable from the curves alone. R
-        # supplies exactly that missing number, and supplying it as an INPUT lets the
-        # network use it while reading the curves -- not merely when writing the answer.
+        # Optional conditioning on the a-priori bounding radius R. Per-curve mean
+        # normalization removes the cross-camera amplitudes that carry the body's width
+        # relative to its height, so log R is given to the primal blocks as an extra
+        # input channel.
         self.r_cond = r_cond
         self.register_buffer("tags", make_tags(cameras, curve_types))  # (C,4)
         th = (np.arange(n_theta) + 0.5) * np.pi / n_theta
@@ -116,33 +127,27 @@ class LPDNet(nn.Module):
         n_back = max(1, gate_rank)
         self.primals = nn.ModuleList(
             [PrimalBlock(n_primal, n_primal + n_back + 2 + n_r, ch) for _ in range(n_iter)])
-        # Support-function head. The unroll still reasons in EGI space (that is where
-        # the photometric operator lives), but the *prediction* is h(u), which is the
-        # better-conditioned description of a convex body: any h yields a valid body
-        # by half-space intersection, and support functions form a convex cone so an
-        # L2-optimal (posterior-mean) h is itself a support function. The EGI of a
-        # polytope is a sum of deltas, whose posterior mean is a smeared non-shape.
+        # Optional support-function head. The unroll works in EGI space, where the
+        # operator lives, but the prediction is the support function h(u): any positive
+        # h gives a valid convex body by half-space intersection, and an average of
+        # support functions is again a support function, which an average of polytope
+        # EGIs is not.
         self.head_h = (PrimalBlock(1, n_primal + 2 + n_r, ch) if support_head else None)
 
         # --- occlusion gate ---------------------------------------------------------
-        # Self-occlusion and cast shadow act as an entrywise gate on the operator,
-        # L = sum_k A g_k v_k. Writing v as a rank-R sum v = sum_r d1^(r) (x) d2^(r) puts the
-        # shape-space factor into R primal channels (w_r = d2^(r) * g) and the data-space
-        # factor into the dual, so K = A stays fixed with its exact adjoint and every
-        # iteration is still one Chambolle-Pock step:
+        # Self-occlusion and cast shadow multiply the operator entrywise. The gate models
+        # that factor as a rank-R product: R shape-space factors w_r live in primal
+        # channels 1..R and a data-space factor d1 (B, R, C, m) is predicted by a dual-side
+        # CNN, so the forward is
         #
         #     y = N( sum_r d1^(r) * (A w_r) )
         #
-        # R is bounded by identifiability rather than compute: R*N unknowns against C*m
-        # measurements.
+        # and A itself, with its exact adjoint, stays fixed.
         #
-        # d1 is a visibility factor and must stay in [0, 1], so it is a sigmoid with no
-        # clamp and no branch. Unconstrained, y can go negative, normalize() hits its
-        # clamp_min(eps) floor and the adjoint's fallback branch multiplies the backward
-        # pass by 1/eps. The gate CNN's output bias starts at +gate_bias at rank 0 and small
-        # and positive above it, so every rank starts the same distance from open. A
-        # multiplicative scalar in front of the sigmoid is not used: its gradient carries
-        # its own value, so one initialised near zero cannot open.
+        # d1 is a sigmoid, so it stays in (0, 1) and y stays positive; a negative y would
+        # push normalize() onto its eps floor and dn_adjoint onto its 1/eps branch. The
+        # gate CNN's output bias starts at +gate_bias for rank 0 and at a small positive
+        # value for the other ranks, chosen so the ranks' initial gates sum to one.
         self.gate_rank = gate_rank
         self.gate_bias = gate_bias
         if gate_rank:
@@ -163,8 +168,8 @@ class LPDNet(nn.Module):
         return (d1 * y).sum(1)
 
     def _gated_back(self, g1, h0, mask, d1):
-        """[d(N o A~)(g1)]^T h0 per rank -> (B,R,N). Uses the fixed A both ways, so the
-        adjoint identity holds exactly; only the gate weights differ per rank."""
+        """Adjoint of the gated forward at g1 applied to h0, per rank: (B,R,N). The same
+        fixed A is used forward and backward; only the gate weights differ per rank."""
         R = d1.shape[1]
         raw = self._gated_raw(g1[:, None].expand(-1, R, -1), d1)
         r = self.op.dn_adjoint(raw, h0)
@@ -174,7 +179,7 @@ class LPDNet(nn.Module):
 
     def forward(self, d: torch.Tensor, mask: torch.Tensor,
                 log_r: torch.Tensor | None = None) -> tuple:
-        """d: (B, C, m) normalized curves (zeros where missing); mask: (B, C) in {0,1}.
+        """d: (B, C, m) normalised curves, zero where missing; mask: (B, C) in {0, 1};
         log_r: (B,) log of the a-priori bounding radius, required when r_cond=True."""
         B, C, m = d.shape
         nt, nph = self.n_theta, self.n_phi
@@ -191,13 +196,10 @@ class LPDNet(nn.Module):
         R = self.gate_rank
         for i in range(self.n_iter):
             if R:
-                # d1 in (0,1) identically -- it is a sigmoid, nothing else. That is
-                # what makes the forward, and its adjoint, defined everywhere.
-                #
-                # mch appears twice on purpose. gate_d1 is declared with the same input
-                # width as duals, but it cannot take y2: y2 is computed FROM d1 two lines
-                # down. So the y2 slot gets a filler, and mask is the cheapest one to hand.
-                # Do not "tidy" this -- the shipped checkpoint was trained on this layout.
+                # mch appears twice on purpose: gate_d1 has the same input width as the
+                # dual blocks, but y2 is not available yet (it is computed from d1), so
+                # the mask fills that slot. The shipped checkpoint was trained with this
+                # layout.
                 d1 = torch.sigmoid(
                     self.gate_d1[i](torch.cat([h, d[:, None], mch, tags, mch], dim=1)))
                 w = F.softplus(f[:, 1:1 + R].reshape(B, R, -1))
@@ -221,7 +223,7 @@ class LPDNet(nn.Module):
         p = g_out / g_out.sum(dim=1, keepdim=True).clamp_min(1e-12)
         if self.head_h is None:
             return p, g_out
-        # softplus keeps h > 0 so the origin stays interior to every half-space set;
-        # +1 centres the initial prediction near a unit sphere (zero-init last conv).
+        # softplus keeps h > 0, so the origin is inside the body; the +1 makes the initial
+        # prediction (zero-initialised last conv) a sphere of radius softplus(1).
         h = F.softplus(self.head_h(torch.cat([f, coords], dim=1))[:, 0] + 1.0)
         return p, g_out, h.reshape(B, -1)

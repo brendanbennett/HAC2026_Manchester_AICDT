@@ -1,20 +1,19 @@
 #!/usr/bin/env python3
-"""Build a spherical t-design of N normals and cache it beside hac26/field.py.
+"""Build a spherical t-design of n normals and cache it as hac26/design<n>.npy.
 
     python scripts/make_design.py --n 4096 --device cuda
 
-The design is a fixed asset: generate once, commit the .npy, and every run loads it. The
-energy is a pair of N x N Gram matrices per Legendre order, so the cost grows as N^2 and a
-large design is worth generating on a GPU.
+The design is a fixed asset: generate it once, commit the .npy, and every run loads it. The
+energy holds an n x n Gram matrix per Legendre degree, so the cost grows as n^2 and a large
+design is worth building on a GPU.
 
-A t-design integrates every spherical harmonic up to order t exactly, which keeps the
-support-function quadrature unbiased; a Fibonacci spiral is only asymptotically uniform and
-leaves a low-order residual.
+A t-design integrates every spherical harmonic up to degree t exactly, which keeps the
+support-function quadrature unbiased; the Fibonacci spiral it starts from is only
+approximately uniform.
 
 The six axis directions are pinned. The core is an intersection of half-spaces, so it
-reproduces a flat face exactly only when that face's normal is present; a design free to
-drift leaves the nearest normal a few degrees off and the intersection bulges at the face
-centre.
+reproduces a flat face exactly only when that face's normal is in the design; left free, the
+nearest normal ends up a few degrees off and the intersection bulges at the face centre.
 """
 from __future__ import annotations
 
@@ -33,12 +32,14 @@ from hac26.field import DESIGN_ITERS, DESIGN_T, _design_residual, design_energy 
 
 def build(n: int, t: int = DESIGN_T, iters: int = DESIGN_ITERS, lr: float = 1e-2,
           device: str = "cpu", seed: int = 0, report: int = 250) -> np.ndarray:
+    """Optimise n - 6 free normals plus the six pinned axis directions to minimise
+    design_energy; returns the best iterate as an (n, 3) array."""
     axes = np.array([[1., 0, 0], [-1., 0, 0], [0, 1., 0],
                      [0, -1., 0], [0, 0, 1.], [0, 0, -1.]])
     m = n - len(axes)
     i = np.arange(m) + 0.5
     phi = np.arccos(1 - 2 * i / m)
-    tht = np.pi * (1 + 5 ** 0.5) * i           # golden angle: the spiral start point
+    tht = np.pi * (1 + 5 ** 0.5) * i           # Fibonacci spiral as the starting point
     free = np.stack([np.cos(tht) * np.sin(phi),
                      np.sin(tht) * np.sin(phi), np.cos(phi)], 1)
 
@@ -51,9 +52,9 @@ def build(n: int, t: int = DESIGN_T, iters: int = DESIGN_ITERS, lr: float = 1e-2
         x = torch.cat([fixed, p / p.norm(dim=1, keepdim=True)], 0)
         loss = design_energy(x, t)
         opt.zero_grad(); loss.backward(); opt.step()
-        v = abs(float(loss.detach()))   # the sum cancels to ~1e-15 and can go slightly
-        if v < best:                    # negative; selecting on the signed value latches
-                                        # onto numerical noise rather than the minimum
+        v = abs(float(loss.detach()))   # near the optimum the energy is a sum that cancels
+        if v < best:                    # to nearly zero and can come out slightly negative,
+                                        # so the best iterate is chosen by magnitude
             best, best_x = v, x.detach().clone()
         if report and (k % report == 0 or k == iters - 1):
             print(f"  iter {k:>5}  energy {v:.6e}  best {best:.6e}  "
@@ -61,19 +62,19 @@ def build(n: int, t: int = DESIGN_T, iters: int = DESIGN_ITERS, lr: float = 1e-2
     return best_x.cpu().numpy()
 
 
-TOL = 1e-5      # the bound tests/test_field.py asserts on a published design
+TOL = 1e-5      # the bound tests/test_field.py asserts on the cached design
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--n", type=int, required=True, help="number of normals")
     ap.add_argument("--t", type=int, default=DESIGN_T, help="design strength")
-    ap.add_argument("--iters", type=int, default=DESIGN_ITERS)
-    ap.add_argument("--lr", type=float, default=1e-2)
-    ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    ap.add_argument("--iters", type=int, default=DESIGN_ITERS, help="optimiser iterations")
+    ap.add_argument("--lr", type=float, default=1e-2, help="Adam learning rate")
+    ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu",
+                    help="torch device to optimise on")
     ap.add_argument("--out", default=None,
-                    help="write somewhere other than the hac26/design<n>.npy cache; the "
-                         "quality gate below still applies")
+                    help="write here instead of the hac26/design<n>.npy cache")
     a = ap.parse_args()
 
     out = Path(a.out) if a.out else Path(__file__).resolve().parents[1] / "hac26" / \
@@ -81,9 +82,8 @@ def main():
     print(f"building a strength-{a.t} design of {a.n} normals on {a.device}", flush=True)
     x = build(a.n, a.t, a.iters, a.lr, a.device)
 
-    # Report the WORST SINGLE-DEGREE residual, which is what defines a t-design and what the
-    # tests gate on -- not design_energy, which is the SUM over degrees and was printed here
-    # under the label "design residual".
+    # The quality figure is the worst single-degree residual, which is what defines a
+    # t-design and what the tests check; design_energy is the sum over degrees.
     xt = torch.tensor(x, dtype=torch.float64)
     res = _design_residual(x, a.t)
     energy = float(design_energy(xt, a.t))
@@ -93,10 +93,9 @@ def main():
     print(f"  facet width          {2*np.sin(np.radians(half)):.3f} R")
     print(f"  bulge at face centre {2.0/a.n*100:.2f}% of the support distance")
 
-    # Refuse to publish a short build. field.py::_write_design_cache already will not cache
-    # one, for the same reason: the filename keys on n alone and the design_sha is identical,
-    # so nothing downstream could tell a short build from a good one. This script is the only
-    # route to design4096.npy, since spherical_design refuses n > 512.
+    # Refuse to write a poor design: the cache filename keys on n alone, so nothing downstream
+    # could tell a poor build from a good one. hac26.field.spherical_design refuses to build
+    # large n itself, so this script is the only route to the large cached designs.
     if res > TOL:
         raise SystemExit(
             f"worst-degree residual {res:.3e} exceeds {TOL:.0e}: this design is not good "

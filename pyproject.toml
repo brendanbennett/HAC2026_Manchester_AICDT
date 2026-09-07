@@ -14,6 +14,7 @@ dependencies = [
     "scikit-image",
     "rtree",
     "fast_simplification",
+    "embreex",
 ]
 
 [project.optional-dependencies]

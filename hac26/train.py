@@ -1,19 +1,20 @@
-"""Training of the LPD on simulated shapes (only 3 public models exist, so the
-training distribution is synthetic; see shapes.sample_training_shape).
+"""Training of the convex LPD (solvers/lpd_convex.py).
 
-Optimizer settings follow arXiv:1707.06474: ADAM with beta2 = 0.99, cosine-annealed
-learning rate from 1e-3, global gradient-norm clipping at 1. Loss = N * MSE on the
-scale-free EGI direction p, plus a closure penalty |sum_i p_i u_i|^2 (the Minkowski
-feasibility defect).
+Only three public models have a released shape, so the training shapes are synthetic
+(shapes.sample_training_shape), optionally mixed with a mesh dataset through hac26.adapter.
+The loss is N * MSE on the scale-free EGI direction p plus a closure penalty
+|sum_i p_i u_i|^2; with a support head it adds an MSE on the support function and,
+optionally, the Dice loss of hac26.radial. Optimiser settings follow arXiv:1707.06474:
+Adam with beta2 = 0.99, a cosine-annealed learning rate and global gradient-norm clipping.
 
-Augmentations model the documented lab unidealities: additive noise on raw curves
-before normalization, small independent per-curve cyclic shifts (residual alignment
-error), and random curve dropout (missing files at higher difficulty levels).
+Augmentations: additive noise on the raw curves before normalisation (hac26.noise), small
+independent cyclic shifts per curve, and random curve dropout, standing in for the files
+missing at higher difficulty levels.
 """
 from __future__ import annotations
 
 import time
-from dataclasses import asdict, dataclass, field, fields
+from dataclasses import asdict, dataclass, fields
 from pathlib import Path
 
 import numpy as np
@@ -34,6 +35,8 @@ from .noise import NOISE_PROFILE, apply_noise
 
 @dataclass
 class Preset:
+    """Architecture, operator and training settings; saved into every checkpoint so
+    load_net can rebuild the network."""
     name: str = "gpu"
     steps: int = 100_000
     batch: int = 16
@@ -45,12 +48,12 @@ class Preset:
     n_theta: int = 24
     n_phi: int = 48
     lr: float = 1e-3
-    c_lambert: float = 0.1  # weakly identified on Blender curves; refit on real data
-    sigma: float = -1.0     # fitted on public models 1-3 by data_io.fit_conventions
-    delta: float = 1.0      # same
+    c_lambert: float = 0.1  # Lambert weight of the intensity kernel (convex_egi.kernel)
+    sigma: float = -1.0     # rotation sense, fitted on the public models by data_io.fit_conventions
+    delta: float = 1.0      # azimuth handedness, fitted the same way
     eps_norm: float = 1e-3
-    # None = the per-camera heteroscedastic profile from hac26.noise;
-    # "flat" = homoscedastic, i.e. what a noiseless-generation pipeline effectively assumes.
+    # "measured" = the per-curve profile hac26.noise.NOISE_PROFILE;
+    # "flat" = the same noise level on every curve.
     noise_profile_mode: str = "measured"
     noise_lo: float = 0.005
     noise_hi: float = 0.03
@@ -63,20 +66,18 @@ class Preset:
     seed: int = 0
     amp: bool = True
     amp_dtype: str = "bf16"   # "bf16" | "fp16"; see the note in train()
-    support_head: bool = False   # predict h(u) instead of scoring only the EGI
-    canonical_r: bool = False    # train on the r_max=1 canonical shape (see shapes.canonicalize_r)
-    r_cond: bool = False         # feed the bounding radius R to the network as an input
+    support_head: bool = False   # add the head that predicts the support function h(u)
+    canonical_r: bool = False    # train on the shape scaled to xy radius 1 (shapes.canonicalize_r)
+    r_cond: bool = False         # give the bounding radius R to the network as an input
     r_jitter: float = 0.05       # lognormal jitter on R during training, so a slightly
-                                 # mis-specified R at test time does not derail the model
-    egi_weight: float = 1.0      # weight on the EGI objective
-    dice_weight: float = 0.0     # weight on the EXACT Dice metric (hac26.radial); this is
-                                 # the scoring function itself, not a surrogate
-    h_mse_weight: float = 1.0    # weight on the support MSE (kept small but non-zero when
-                                 # training on Dice: it anchors the scale, which Dice --
-                                 # being a ratio -- is completely blind to)
-    n_rays: int = 1024           # sphere quadrature for the Dice loss
-    dice_chunk: int = 256        # ray-axis chunking, keeps (B,V,N) off the GPU at once
-    p_flat: float = 0.0          # fraction of flat-faced / few-face training bodies
+                                 # wrong R at test time does not derail the model
+    egi_weight: float = 1.0      # weight on the EGI loss (MSE plus closure)
+    dice_weight: float = 0.0     # weight on the Dice loss of hac26.radial (needs support_head)
+    h_mse_weight: float = 1.0    # weight on the support MSE; keep it non-zero with a Dice
+                                 # loss, since Dice is a ratio and cannot fix the scale
+    n_rays: int = 1024           # number of sphere directions for the Dice loss
+    dice_chunk: int = 256        # ray-axis chunk of the Dice loss, bounding its memory
+    p_flat: float = 0.0          # fraction of flat-faced training bodies
     gate_rank: int = 0           # rank of the occlusion gate (0 = off); see solvers/lpd_convex
     gate_bias: float = 3.0       # gate CNN output bias at init; same
 
@@ -92,6 +93,7 @@ PRESETS = {
 
 
 def auto_device() -> str:
+    """'cuda', 'mps' or 'cpu', whichever is available first."""
     if torch.cuda.is_available():
         return "cuda"
     if getattr(torch.backends, "mps", None) is not None and torch.backends.mps.is_available():
@@ -100,7 +102,9 @@ def auto_device() -> str:
 
 
 class SyntheticCurves(IterableDataset):
-    """Streams (d, mask, p) triples; A is shared read-only numpy."""
+    """Endless stream of synthetic training samples (d, mask, p, h, log_r, rho): normalised
+    curves, availability mask, EGI direction, support function, log of the jittered bounding
+    radius, and the radial function on the Dice rays (a single zero when Dice is off)."""
 
     def __init__(self, A: np.ndarray, grid, pr: Preset):
         self.A, self.grid, self.pr = A, grid, pr
@@ -118,12 +122,12 @@ class SyntheticCurves(IterableDataset):
                 else np.ones_like(NOISE_PROFILE)
             raw = apply_noise(raw, rng, self.pr.noise_lo, self.pr.noise_hi,
                               profile=prof)
-            for c in range(C):  # independent residual alignment errors
+            for c in range(C):  # independent small alignment errors per curve
                 sh = int(rng.integers(-self.pr.shift_max, self.pr.shift_max + 1))
                 if sh:
                     raw[c] = np.roll(raw[c], sh)
             mask = (rng.random(C) >= self.pr.drop_p).astype(np.float32)
-            if mask.sum() < 8:  # keep at least a workable subset
+            if mask.sum() < 8:  # never drop almost every curve
                 mask[rng.choice(C, 8, replace=False)] = 1.0
             mbar = np.maximum(raw.mean(axis=1, keepdims=True), self.pr.eps_norm)
             d = (raw / mbar * mask[:, None]).astype(np.float32)
@@ -131,15 +135,15 @@ class SyntheticCurves(IterableDataset):
             tv, tf = s["verts"], s["faces"]
             p_t = s["p"].astype(np.float32)
             if self.pr.canonical_r:
-                # curves above come from the TRUE body; the target is its canonical form
+                # the curves above come from the body itself; the target is its canonical form
                 tv = canonicalize_r(tv)
                 tv, tf = hull_mesh(tv)
                 gc = mesh_to_egi(tv, tf, self.grid)
                 p_t = (gc / max(gc.sum(), 1e-12)).astype(np.float32)
             h = mesh_support(tv, self.grid.normals).astype(np.float32)
             r_in = r_true * float(np.exp(rng.normal(0.0, self.pr.r_jitter)))
-            # rho_true comes from the TRUE mesh, not from its 1152-normal support
-            # approximation, so the Dice target is not capped by the grid.
+            # rho comes from the mesh itself, not from its support values on the normal
+            # grid, so the Dice target is not limited by the grid.
             rho = (mesh_radial(tv, tf, self.rays).astype(np.float32)
                    if self.rays is not None else np.zeros(1, dtype=np.float32))
             yield (torch.from_numpy(d), torch.from_numpy(mask),
@@ -149,6 +153,7 @@ class SyntheticCurves(IterableDataset):
 
 
 def build_model(pr: Preset, device: str) -> tuple:
+    """Operator and network for a preset; returns (net, grid, A, cameras, curve_types)."""
     grid = make_grid(pr.n_theta, pr.n_phi)
     cameras = build_cameras()
     A, types = stack_A(grid, cameras, pr.m, c_lambert=pr.c_lambert,
@@ -165,6 +170,9 @@ def build_model(pr: Preset, device: str) -> tuple:
 def train(pr: Preset, out_dir: str = "checkpoints", device: str | None = None,
           resume: str | None = None, dataset=None,
           warm_start_from: str | None = None) -> Path:
+    """Train for pr.steps steps, writing checkpoints to out_dir, and return the path of the
+    final one. `dataset` replaces SyntheticCurves; `resume` continues from a checkpoint with
+    its optimiser state; `warm_start_from` copies weights only (see warm_start)."""
     device = device or auto_device()
     torch.manual_seed(pr.seed)
     out = Path(out_dir)
@@ -190,12 +198,10 @@ def train(pr: Preset, out_dir: str = "checkpoints", device: str | None = None,
         opt.load_state_dict(ck["opt"])
         sched.load_state_dict(ck["sched"])
         step0 = ck["step"]
-    # bf16, not fp16. The forward divides by mean.clamp_min(1e-3), so a curve the gate has
-    # nearly closed produces ratios of order 1e3-1e5; fp16 tops out at 65504 and returns
-    # inf, which is where the NaNs came from. bf16 carries fp32's exponent range (~3e38)
-    # at fp16's speed on tensor cores, so that overflow cannot happen, and it needs no
-    # GradScaler -- removing the scale/unscale sawtooth that made the failures look
-    # intermittent. fp16 stays available for hardware without bf16.
+    # bf16 by default. The forward divides by mean.clamp_min(eps), so a curve the gate has
+    # nearly closed gives ratios far beyond fp16's range; bf16 has fp32's exponent range,
+    # so it cannot overflow there, and it needs no GradScaler. fp16 stays available for
+    # hardware without bf16.
     use_amp = pr.amp and device == "cuda"
     amp_dtype = torch.float16
     if use_amp and pr.amp_dtype == "bf16":
@@ -228,30 +234,23 @@ def train(pr: Preset, out_dir: str = "checkpoints", device: str | None = None,
             loss = pr.egi_weight * (mse + pr.closure_weight * closure)
             h_mse = None
             if pr.support_head and h_true is not None:
-                # sum over directions (h ~ O(1) per direction), mean over batch --
-                # comparable in magnitude to the N*MSE used for the EGI.
+                # sum over directions, mean over the batch: the same scaling as the
+                # N * MSE on the EGI
                 h_mse = ((pred[2] - h_true) ** 2).sum(dim=1).mean()
                 loss = loss + pr.h_mse_weight * h_mse
             dice_l = None
             if pr.dice_weight and rho_true is not None and rho_true.shape[1] > 1:
-                # the scoring function itself. Computed in fp32 even under autocast:
-                # rho is a ratio of a max, and fp16 rounding there is visible in the
-                # third decimal of the score.
+                # computed in fp32 even under autocast: rho is a ratio of maxima and is
+                # sensitive to half-precision rounding
                 with torch.autocast(device_type=d.device.type, enabled=False):
                     dice_l = torch_dice_loss(pred[2].float(), rho_true.float(),
                                              M_rays, chunk=pr.dice_chunk)
                 loss = loss + pr.dice_weight * dice_l
-        # A non-finite loss must never reach the weights. clip_grad_norm_ cannot help --
-        # it rescales by a norm that is itself NaN -- and once the weights are NaN every
-        # later step and every later checkpoint is poisoned. So check, drop the step, and
-        # abort if it is not a one-off: a run that skips thousands of steps is
-        # not training, it is pretending to.
+        # A non-finite loss must not reach the weights: clip_grad_norm_ would rescale by a
+        # norm that is itself NaN, and once the weights are NaN every later checkpoint is
+        # ruined. Drop the step, and abort if it keeps happening. Nothing has been scaled
+        # yet at this point, so the GradScaler's state is untouched and `continue` is safe.
         if not torch.isfinite(loss):
-            # A non-finite FORWARD is a genuine fault -- the model produced a number that
-            # does not exist -- and no scaler can repair it. Drop the step so the weights
-            # stay clean, and abort if it recurs: a run that skips steps is not training,
-            # it is pretending to. Nothing has been scaled or unscaled yet at this point,
-            # so the GradScaler's state is untouched and `continue` is safe.
             nonfinite += 1
             opt.zero_grad(set_to_none=True)
             print(f"step {step:>7d}  NON-FINITE loss, step dropped "
@@ -265,10 +264,9 @@ def train(pr: Preset, out_dir: str = "checkpoints", device: str | None = None,
         scaler.scale(loss).backward()
         scaler.unscale_(opt)
         gnorm = torch.nn.utils.clip_grad_norm_(net.parameters(), 1.0)
-        # Under fp16 an occasional inf gradient is the GradScaler's designed operating
-        # point, not a fault: step() inspects found_inf and skips the update itself. So
-        # count it for visibility and let the scaler do its job -- never `continue` here,
-        # which would strand the scaler between unscale_ and update.
+        # Under fp16 an occasional inf gradient is expected: scaler.step() detects it and
+        # skips the update itself. Count it and carry on; a `continue` here would leave
+        # the scaler between unscale_ and update.
         if not torch.isfinite(gnorm):
             inf_grads += 1
         scaler.step(opt)
@@ -296,8 +294,7 @@ def train(pr: Preset, out_dir: str = "checkpoints", device: str | None = None,
 
 
 def _assert_finite(net, step: int) -> None:
-    """Refuse to write a poisoned checkpoint. A NaN weight on disk is worse than a
-    crashed run: it looks like a result and silently ruins everything downstream."""
+    """Raise if any weight is non-finite, so such a checkpoint is never written."""
     bad = [k for k, v in net.state_dict().items()
            if v.is_floating_point() and not torch.isfinite(v).all()]
     if bad:
@@ -305,26 +302,23 @@ def _assert_finite(net, step: int) -> None:
                            f"({bad[:4]}); refusing to checkpoint")
 
 
-# Buffers that build_model() regenerates exactly from the preset, so they never need to be
-# carried in a checkpoint. op.A is (curves, frames, normals) float32, which dwarfs the
-# learned weights -- most of a naively saved checkpoint is a pure function of the preset.
+# Buffers that build_model() regenerates from the preset, so a checkpoint need not carry
+# them; op.A is by far the largest tensor in a training checkpoint.
 REGENERABLE_BUFFERS = ("op.A", "tags", "coords")
 
 
 def warm_start(net, ckpt_path: str, gate_rank: int, n_primal: int) -> dict:
-    """Load ungated weights into a gated network, exactly.
+    """Copy the weights of an ungated checkpoint into `net`, which may be gated.
 
-    The primal block's input is cat([f, back, coords]) and `back` widens from 1 channel
-    to `gate_rank`, so the first conv's weight grows in its input dimension and the
-    coords channels shift. A plain load_state_dict therefore fails, and a naive
-    leading-slice copy would silently feed coords into the wrong filters.
+    The primal blocks read cat([f, back, coords]) and `back` widens from one channel to
+    `gate_rank`, so the first conv of each primal block grows in its input dimension and
+    the coords channels move. Those weights are mapped explicitly: f and back rank 0 keep
+    their slots, the new back ranks get zero weight, and coords move to their new offset.
+    Every other tensor is copied when its shape matches and skipped otherwise. Returns the
+    counts of copied and widened tensors and the list of skipped keys.
 
-    The mapping is explicit: f and back-rank-0 keep their slots, the new back ranks get
-    ZERO weight, and coords move to their new offset. So the new ranks contribute nothing
-    at the first step and the warm start begins from the old solution rather than from
-    noise. It is not bit-identical to the checkpoint: the gate is a sigmoid whose init
-    splits a fixed budget across ranks, so rank 0 comes in scaled slightly below one.
-    See lpd_convex for why a multiplicative scalar was not used instead.
+    The result is not identical to the checkpoint: the gate's rank-0 factor starts at
+    sigmoid(gate_bias), slightly below one.
     """
     src = torch.load(ckpt_path, map_location="cpu")["model"]
     tgt = net.state_dict()
@@ -351,11 +345,12 @@ def warm_start(net, ckpt_path: str, gate_rank: int, n_primal: int) -> dict:
 
 
 def load_net(ckpt_path: str, device: str | None = None) -> tuple:
+    """Load a checkpoint written by train() or scripts/export_model.py and return
+    (net, preset, grid) with the network in eval mode."""
     device = device or auto_device()
     ck = torch.load(ckpt_path, map_location=device)
-    # Ignore preset keys this version no longer defines, so a checkpoint keeps loading
-    # if a field is ever retired. Without this, deleting a single Preset field silently
-    # breaks every checkpoint ever written.
+    # Ignore preset keys this version no longer defines, so retiring a Preset field does
+    # not break old checkpoints.
     known = {f.name for f in fields(Preset)}
     stale = sorted(set(ck["preset"]) - known)
     if stale:
@@ -363,8 +358,8 @@ def load_net(ckpt_path: str, device: str | None = None) -> tuple:
     pr = Preset(**{k: v for k, v in ck["preset"].items() if k in known})
     net, grid, A, cameras, types = build_model(pr, device)
     missing, unexpected = net.load_state_dict(ck["model"], strict=False)
-    # strict=False is only safe because the missing keys are checked: anything
-    # other than a regenerable buffer means the checkpoint really is incomplete.
+    # strict=False only to allow the regenerable buffers to be absent; any other
+    # missing key means the checkpoint is incomplete.
     bad = [k for k in missing if k not in REGENERABLE_BUFFERS]
     if bad or unexpected:
         raise RuntimeError(f"checkpoint mismatch: missing {bad}, unexpected {list(unexpected)}")

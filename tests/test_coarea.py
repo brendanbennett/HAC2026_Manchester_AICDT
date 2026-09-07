@@ -1,13 +1,13 @@
-"""Analytic coarea derivative against finite differences.
+"""The coarea derivative against finite differences.
 
-100 randomly chosen parameters, analytic versus FD within 1%.
+A smooth image is built from N_PARAM random bumps, and the analytic derivative of each
+thresholded reduction with respect to the bump amplitudes is compared with a central finite
+difference.
 
-The subtlety in testing this at all is that N(tau) is an integer, so a finite difference of
-it is quantised. The derivative being checked is that of the CONTINUUM area whose pixel
-count is an approximation, so the FD step has to be large enough that the count moves by
-many pixels (making quantisation a small relative error) while still small enough to stay
-in the linear regime. The step below is chosen on that basis and the test reports the
-achieved agreement rather than only asserting it.
+The pixel count is an integer, so a finite difference of it is quantised. The derivative
+being checked is that of the continuum area the count approximates, so the finite difference
+is taken on an up-sampled image, with a step large enough that the count moves by many pixels
+and small enough to stay in the linear regime.
 """
 import numpy as np
 import pytest
@@ -21,20 +21,16 @@ TAU = 0.5
 
 
 def _field(theta: torch.Tensor, centres: torch.Tensor, widths: torch.Tensor) -> torch.Tensor:
-    """A smooth image built from N_PARAM broad bumps: u(x) = sum_k theta_k G_k(x).
+    """A smooth image built from N_PARAM broad Gaussian bumps, u(x) = sum_k theta_k G_k(x).
 
-    Smooth on the pixel scale, which is the same condition the PSF guarantees in the real
-    pipeline and which is what makes the finite-difference gradient magnitude meaningful.
+    Smooth on the pixel scale, so the finite-difference gradient magnitude is meaningful.
     """
     yy, xx = torch.meshgrid(torch.linspace(0, 1, H, dtype=theta.dtype),
                             torch.linspace(0, 1, W, dtype=theta.dtype), indexing="ij")
     d2 = ((yy[None] - centres[:, 0, None, None]) ** 2
           + (xx[None] - centres[:, 1, None, None]) ** 2)
-    # Divided by the number of bumps so u spans roughly [0, 1] and the level set at
-    # tau = 0.5 is a substantial closed contour INSIDE the frame. Without this the summed
-    # bumps put u in [0.27, 9.83], the level set covers 65450 of 65536 pixels, the contour
-    # is a sliver at the border, and a finite difference of the count moves by 3 -- the test
-    # then measures quantisation rather than the derivative.
+    # Scaled so u spans roughly [0, 1] and the level set at TAU is a substantial closed
+    # contour inside the frame rather than a sliver at the border.
     bumps = theta[:, None, None] * torch.exp(-d2 / (2 * widths[:, None, None] ** 2))
     return bumps.sum(0) / theta.shape[0] * 8.0
 
@@ -49,14 +45,12 @@ def setup():
 
 
 def _reference(fn, field, up=8):
-    """Near-continuum value of the reduction, by evaluating it on an up-sampled field.
+    """Near-continuum value of the reduction, evaluated on an `up`-times up-sampled field and
+    scaled back to the original pixel area.
 
-    THE REFERENCE HAS TO BE THE CONTINUUM QUANTITY. The coarea formula differentiates the
-    AREA of the level set; the pixel count is an integer approximation to it. Finite
-    differences of that integer are quantised, and at a step small enough to stay linear the
-    count moves by only a few, so the comparison measures quantisation rather than the
-    derivative: it reported 10% error while the derivative was in fact correct to 0.6%.
-    Up-sampling 8x makes the reference 64x finer and the discrepancy converges properly.
+    The coarea formula differentiates the area of the level set, and the pixel count is an
+    integer approximation of it; on the original grid a finite difference of the count is
+    quantised and measures that quantisation rather than the derivative.
     """
     import torch.nn.functional as Fn
     u = Fn.interpolate(field[None, None], scale_factor=up, mode="bicubic",
@@ -65,6 +59,7 @@ def _reference(fn, field, up=8):
 
 
 def _fd_vs_analytic(fn, setup, step):
+    """Analytic gradient of fn with respect to theta, and its central finite difference."""
     centres, widths, theta = setup
     t = theta.clone().requires_grad_(True)
     fn(_field(t, centres, widths), TAU).backward()
@@ -80,8 +75,10 @@ def _fd_vs_analytic(fn, setup, step):
 
 @pytest.mark.slow
 def test_count_derivative_matches_finite_differences(setup):
+    """dN/dtheta: correlation above 0.999 and median relative error below 1% over the
+    parameters that move the contour."""
     ana, fd = _fd_vs_analytic(threshold_count, setup, step=1e-1)
-    keep = fd.abs() > 0.02 * fd.abs().max()      # parameters that actually move the contour
+    keep = fd.abs() > 0.02 * fd.abs().max()      # parameters that move the contour
     rel = ((ana[keep] - fd[keep]).abs() / fd[keep].abs()).median()
     corr = float(np.corrcoef(ana.numpy(), fd.numpy())[0, 1])
     print(f"\n  dN/dtheta : {int(keep.sum())} active params, median rel err {float(rel):.4f}, "
@@ -92,6 +89,7 @@ def test_count_derivative_matches_finite_differences(setup):
 
 @pytest.mark.slow
 def test_sum_derivative_matches_finite_differences(setup):
+    """dI/dtheta: the same bounds as for the count."""
     ana, fd = _fd_vs_analytic(threshold_sum, setup, step=1e-1)
     keep = fd.abs() > 0.02 * fd.abs().max()
     rel = ((ana[keep] - fd[keep]).abs() / fd[keep].abs()).median()
@@ -103,21 +101,60 @@ def test_sum_derivative_matches_finite_differences(setup):
 
 
 def test_contour_weights_reproduce_the_level_set_length(setup):
-    """Sanity on the weights themselves: sum w |grad u| must equal the contour length."""
+    """sum_k w_k |grad u|(rows_k, cols_k) must equal the total contour length to within 5%."""
     centres, widths, theta = setup
-    u = _field(theta, centres, widths).numpy()
-    r, c, w = contour_weights(u, TAU)
+    u = _field(theta, centres, widths)
+    b, r, c, w = contour_weights(u[None], torch.tensor([TAU], dtype=u.dtype))
     from skimage.measure import find_contours
     length = sum(float(np.sqrt(((k[1:] - k[:-1]) ** 2).sum(1)).sum())
-                 for k in find_contours(u, TAU))
-    gy, gx = np.gradient(u)
-    g = np.sqrt(gx ** 2 + gy ** 2)
+                 for k in find_contours(u.numpy(), TAU))
+    gy, gx = np.gradient(u.numpy())
+    g = torch.as_tensor(np.sqrt(gx ** 2 + gy ** 2))
     recovered = float((w * g[r, c]).sum())
     assert recovered == pytest.approx(length, rel=0.05)
 
 
 def test_no_softening_anywhere():
-    """The forward pass must be the hard count, not a sigmoid of it."""
+    """The forward values are the hard count and the hard sum, not softened versions."""
     u = torch.tensor([[0.0, 0.4], [0.6, 1.0]], dtype=torch.float64, requires_grad=True)
     assert float(threshold_count(u, 0.5)) == 2.0
     assert float(threshold_sum(u, 0.5)) == pytest.approx(1.6)
+
+
+def test_batched_images_and_thresholds(setup):
+    """A batch with one threshold per image gives the same counts, sums and gradients as the
+    images one at a time."""
+    centres, widths, theta = setup
+    u = _field(theta, centres, widths)
+    ub = torch.stack([u, 0.7 * u]).requires_grad_(True)
+    taus = torch.tensor([TAU, 0.3], dtype=u.dtype, requires_grad=True)
+    n = threshold_count(ub, taus)
+    assert n.shape == (2,)
+    assert float(n[0]) == float((u > TAU).sum()) and float(n[1]) == float((0.7 * u > 0.3).sum())
+    (n.sum() + threshold_sum(ub, taus).sum()).backward()
+    g_batch, gt_batch = ub.grad.clone(), taus.grad.clone()
+    for k, (img, t) in enumerate(((u, TAU), (0.7 * u, 0.3))):
+        x = img.detach().clone().requires_grad_(True)
+        tt = torch.tensor(t, dtype=u.dtype, requires_grad=True)
+        (threshold_count(x, tt) + threshold_sum(x, tt)).backward()
+        assert torch.allclose(x.grad, g_batch[k])
+        assert torch.allclose(tt.grad, gt_batch[k])
+
+
+def test_threshold_derivative_matches_finite_differences(setup):
+    """d/dtau of the count equals minus the contour weight, checked against a central
+    finite difference of the near-continuum area."""
+    centres, widths, theta = setup
+    u = _field(theta, centres, widths)
+    tau = torch.tensor(TAU, dtype=u.dtype, requires_grad=True)
+    threshold_count(u, tau).backward()
+    step = 2e-3
+    fd = (_ref_at(u, TAU + step) - _ref_at(u, TAU - step)) / (2 * step)
+    assert float(tau.grad) == pytest.approx(fd, rel=0.1)
+
+
+def _ref_at(u, tau, up=8):
+    import torch.nn.functional as Fn
+    uu = Fn.interpolate(u[None, None], scale_factor=up, mode="bicubic",
+                        align_corners=True)[0, 0]
+    return float((uu > tau).sum()) / up ** 2

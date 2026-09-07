@@ -1,33 +1,32 @@
-"""Measurement noise for the HAC 2026 lightcurves.
-
-Depends on numpy only, so it can be dropped into any pipeline.
+"""Measurement noise of the lightcurves.
 
 At each azimuth two cameras sit at the same place and see the same body at the same instant,
 so their difference is measurement noise with no geometry in it:
 
     sigma_c^2 = mean( (x_a - x_b)^2 ) / 2
 
-`replicate_offset_r2` checks the pair really is co-located rather than assuming it; a pair at
-slightly different azimuths would differ by geometry, and calling that noise would inflate
-sigma.
+This only holds because the pair is co-located: two cameras at slightly different azimuths
+would differ by geometry, and calling that noise would inflate sigma.
 
-The noise is strongly heteroscedastic across the array and concentrates at the high-phase
-azimuths, so treating all 56 curves as equally reliable is wrong. NOISE_PROFILE carries the
-per-azimuth shape, normalised to mean 1 so applying it changes the distribution of noise
-across the array without changing its overall level.
+The noise level differs a lot between azimuths. NOISE_PROFILE is its per-azimuth shape,
+measured on the public models with sigma_from_replicates and normalised to mean 1; training
+uses it to distribute synthetic noise across the curves, at an overall level drawn per body
+from [NOISE_LO, NOISE_HI], a range that covers the levels measured on the public models. It
+is a snapshot of the data and can be recomputed from the public curves with
+sigma_from_replicates.
 """
 from __future__ import annotations
 
 import numpy as np
 
-__all__ = ["AZIMUTHS_DEG", "NOISE_PROFILE", "sigma_from_replicates",
-           "replicate_offset_r2", "apply_noise"]
+__all__ = ["AZIMUTHS_DEG", "NOISE_PROFILE", "NOISE_LO", "NOISE_HI", "sigma_from_replicates",
+           "apply_noise"]
 
 AZIMUTHS_DEG = (0.0, 45.0, 90.0, 135.0, 225.0, 270.0, 315.0)
+NOISE_LO, NOISE_HI = 0.005, 0.03      # range of the mean noise level of a mean-normalised curve
 
-# Per-azimuth median over the three public models, normalised to mean 1 so that applying it
-# changes the DISTRIBUTION of noise across the array without changing its overall scale.
-# Curve layout: 28 intensity curves then 28 binary, four cameras per azimuth in the order
+# Per-azimuth median of sigma over the public models, normalised to mean 1. Curve layout:
+# the intensity curves then the binary curves, four cameras per azimuth in the order
 # (horizontal a, horizontal b, top, bottom).
 _AZ_INTENSITY = (0.831, 0.234, 0.425, 2.449, 2.579, 0.263, 0.220)
 _AZ_BINARY = (0.314, 1.153, 0.597, 1.843, 2.081, 0.703, 0.309)
@@ -64,51 +63,15 @@ def sigma_from_replicates(curves: np.ndarray, mask: np.ndarray | None = None) ->
     return np.maximum(out, 1e-6)
 
 
-def replicate_offset_r2(curves: np.ndarray, mask: np.ndarray | None = None) -> np.ndarray:
-    """Guard on `sigma_from_replicates`: is the pair difference noise, or geometry?
-
-    Rotating the body by dpsi is equivalent to moving a camera in azimuth, so to first
-    order a genuine offset gives  x_a - x_b = dpsi * d/dpsi(mean curve).  Regressing the
-    difference on that derivative returns R^2 = the FRACTION of the difference explained by
-    a rigid offset. Near 0 means the pair is co-located and the difference is honest noise;
-    near 1 means the cameras are not where they are documented to be and sigma is inflated.
-
-    On the public models this comes out near zero on the geometric (binary) channel and at
-    the noisy azimuths, so the spread across curves is noise rather than geometry.
-    """
-    C, m = curves.shape
-    mask = np.ones(C) if mask is None else np.asarray(mask)
-    out = np.zeros(C)
-    for _, a, b in _pairs(C):
-        if not (mask[a] > 0 and mask[b] > 0):
-            continue
-        mean = 0.5 * (curves[a] + curves[b])
-        der = np.gradient(mean) * m / (2.0 * np.pi)
-        diff = curves[a] - curves[b]
-        den = float(der @ der)
-        k = float(der @ diff) / den if den > 1e-12 else 0.0
-        res = diff - k * der
-        r2 = 1.0 - float(res @ res) / max(float(diff @ diff), 1e-12)
-        out[(a // 4) * 4: (a // 4) * 4 + 4] = r2
-    return out
-
-
 def apply_noise(curves: np.ndarray, rng: np.random.Generator,
-                scale_lo: float = 0.005, scale_hi: float = 0.03,
+                scale_lo: float = NOISE_LO, scale_hi: float = NOISE_HI,
                 profile: np.ndarray | None = None,
                 relative: bool = True) -> np.ndarray:
-    """Add heteroscedastic noise to generated curves.
-
-    One overall scale is drawn per body from [scale_lo, scale_hi]; `profile` then
-    redistributes it across the array. With the default profile the near-backlit curves
-    receive more noise than the well-lit ones, while the mean level
-    is unchanged -- so switching a pipeline from homoscedastic to this changes only WHERE
-    the noise goes, and any existing noise-scale tuning stays valid.
-
-    relative=True scales the noise by each curve's own mean, appropriate before the
-    organisers' per-curve mean normalisation; pass False if the curves are already
-    normalised.
-    """
+    """Add Gaussian noise to generated curves. One overall scale is drawn per body from
+    [scale_lo, scale_hi]; `profile` (default NOISE_PROFILE) distributes it across the curves
+    without changing its mean level. relative=True scales the noise by each curve's own mean,
+    which is right before the per-curve mean normalisation; pass False for curves that are
+    already normalised."""
     curves = np.asarray(curves, dtype=np.float64)
     C = curves.shape[0]
     p = NOISE_PROFILE if profile is None else np.asarray(profile)

@@ -1,8 +1,7 @@
 """Disk format for a saved shape library: one .npz per body, plus a JSON manifest.
 
-Kept separate from `shape_library.py`'s generation code because it has nothing to do with
-CSG or extraction -- it's read by `scripts/fit_shapes.py` too, which should not have to
-import the generator to load a library someone already built.
+Kept separate from the generator in `shape_library.py` because reading a saved library, as
+`scripts/fit_shapes.py` does, has nothing to do with building one.
 """
 from __future__ import annotations
 
@@ -17,6 +16,8 @@ __all__ = ["save_body", "load_body", "write_manifest", "read_manifest", "load_li
 
 
 def save_body(path: str, body: Body) -> None:
+    """Write one body as a compressed .npz: float32 verts, int32 faces, recipe and info as
+    JSON strings."""
     np.savez_compressed(
         path,
         verts=body.verts.astype(np.float32),
@@ -28,19 +29,22 @@ def save_body(path: str, body: Body) -> None:
 
 
 def load_body(path: str) -> Body:
+    """Read a body written by `save_body`, with verts as float64 and faces as int64."""
     z = np.load(path, allow_pickle=False)
     return Body(z["verts"].astype(np.float64), z["faces"].astype(np.int64),
                json.loads(str(z["recipe"])), json.loads(str(z["info"])))
 
 
 def write_manifest(directory: str, entries: list[dict]) -> None:
-    """`entries`: list of {"file": ..., "index": ..., "base": ..., "convexity": ..., ...}."""
+    """Write `manifest.json` in `directory`. Each entry is a dict with at least "file",
+    "index", "base" and "convexity"."""
     Path(directory).mkdir(parents=True, exist_ok=True)
     with open(Path(directory) / "manifest.json", "w") as fh:
         json.dump({"n": len(entries), "entries": entries}, fh, indent=1)
 
 
 def read_manifest(directory: str) -> dict:
+    """The manifest written by `write_manifest`; raises FileNotFoundError if there is none."""
     p = Path(directory) / "manifest.json"
     if not p.exists():
         raise FileNotFoundError(
@@ -49,13 +53,14 @@ def read_manifest(directory: str) -> dict:
         return json.load(fh)
 
 
-def load_library_dir(directory: str, n: int | None = None, seed: int | None = None) -> list:
-    """Bodies from a directory `build_shape_library.py` wrote, as (verts, faces) pairs --
-    the exact tuple shape `train_surrogate.shapes()` returns, so it's a drop-in source.
+def load_library_dir(directory: str, n: int | None = None, seed: int | None = None,
+                     with_entries: bool = False) -> list:
+    """Bodies from a directory `scripts/build_shape_library.py` wrote, as (verts, faces)
+    pairs, or (verts, faces, manifest entry) triples with `with_entries`; the entry carries
+    the body's family under "base".
 
-    `seed` shuffles the manifest order before truncating to `n`, so different callers (or
-    different `--bodies` counts against the same directory) don't all get the library's
-    first N regardless of how many they asked for.
+    `seed` shuffles the manifest order before truncating to `n`, so two callers asking for
+    different counts do not both get the library's first bodies.
     """
     man = read_manifest(directory)
     entries = list(man["entries"])
@@ -66,5 +71,5 @@ def load_library_dir(directory: str, n: int | None = None, seed: int | None = No
     out = []
     for e in entries:
         b = load_body(str(Path(directory) / e["file"]))
-        out.append((b.verts, b.faces))
+        out.append((b.verts, b.faces, e) if with_entries else (b.verts, b.faces))
     return out

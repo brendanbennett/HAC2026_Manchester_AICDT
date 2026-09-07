@@ -1,24 +1,22 @@
-"""Minkowski reconstruction: EGI weights -> convex polytope mesh.
+"""Minkowski reconstruction: facet areas on fixed normals -> convex polytope mesh.
 
-Solves the classical variational form of Minkowski's problem (existence/uniqueness:
-Minkowski 1897; Schneider, Brunn-Minkowski Theory, 2nd ed., sec. 8.2):
+Given unit normals u_i and areas g_i with sum_i g_i u_i = 0, Minkowski's problem asks for
+the convex polytope whose facet with outward normal u_i has area g_i. Its variational form
+(Minkowski 1897; Schneider, Brunn-Minkowski Theory, sec. 8.2) is
 
     minimize   sum_i g_i h_i
     subject to vol(P(h)) >= 1,      P(h) = { x : <u_i, x> <= h_i  for all i }
 
-What is actually solved is the scale-free quotient just below the imports, which is
-equivalent by homogeneity and needs no constraint -- L-BFGS-B with box bounds, and the
-exact gradient d vol / d h_i = area of facet i (a.e.).
-{vol >= 1} is a convex feasible set because vol^{1/3} is concave in h
-(Brunn-Minkowski inequality). A minimizer with vol = 1 has surface area measure
-proportional to sum_i g_i delta_{u_i}; the absolute scale is irrelevant here because
-the final model is rescaled to touch z = +-1 (challenge pose) downstream.
+and a minimiser has facet areas proportional to g. solve_minkowski minimises the equivalent
+scale-free quotient written out below the imports with L-BFGS-B, using the exact gradient
+d vol / d h_i = area of facet i, and rescales the result to unit volume. The absolute scale
+does not matter here because the mesh is posed to z in [-1, 1] downstream.
 
-Numerical safeguards: normals with tiny weight are dropped from the objective and
-from the halfspace list (their facets have ~zero area); a fixed large 'cage' box of
-six halfspaces keeps the intersection bounded during iterations (inactive at the
-optimum); the polytope geometry per h is computed by scipy HalfspaceIntersection
-from a Chebyshev-center interior point.
+Safeguards: normals with tiny weight are dropped from the objective and the half-space list
+(their facets would have almost no area); six extra half-spaces forming a large box keep the
+intersection bounded at every iterate and are inactive at the optimum; the polytope for a
+given h comes from scipy's HalfspaceIntersection, started from the origin when every h_i is
+positive and from a Chebyshev centre otherwise.
 """
 from __future__ import annotations
 
@@ -26,18 +24,18 @@ import numpy as np
 from scipy.optimize import linprog, minimize
 from scipy.spatial import ConvexHull, HalfspaceIntersection
 
-# Scale-free formulation used by solve_minkowski (equivalent to the constrained
-# form by homogeneity: V is 3-homogeneous, g.h is 1-homogeneous):
+# Scale-free form used by solve_minkowski (equivalent to the constrained form because
+# V scales as the cube of h and g.h linearly):
 #     minimize  F(h) = (g . h) / V(h)^{1/3}   over  h > 0,
 #     grad F    = g V^{-1/3} - (g . h)/3 * V^{-4/3} * areas(h),
-# stationarity <=> areas proportional to g, i.e. the discrete Minkowski problem.
+# so grad F = 0 exactly when the facet areas are proportional to g.
 
 CAGE_NORMALS = np.array([[1, 0, 0], [-1, 0, 0], [0, 1, 0],
                          [0, -1, 0], [0, 0, 1], [0, 0, -1]], dtype=float)
 
 
 def chebyshev_center(U: np.ndarray, h: np.ndarray) -> np.ndarray:
-    """Interior point maximizing the inscribed-ball radius: max r s.t. Ux + r <= h."""
+    """Centre of the largest ball inside {x : U x <= h}: max r subject to U x + r <= h."""
     n = U.shape[0]
     A_ub = np.hstack([U, np.ones((n, 1))])
     res = linprog(c=[0, 0, 0, -1.0], A_ub=A_ub, b_ub=h,
@@ -48,8 +46,10 @@ def chebyshev_center(U: np.ndarray, h: np.ndarray) -> np.ndarray:
 
 
 def polytope_geometry(U: np.ndarray, h: np.ndarray) -> dict:
-    """Vertices, faces, volume and per-halfspace facet areas of P(h)."""
-    # all h_i > 0  =>  the origin is interior (U x = 0 < h); LP only as fallback
+    """Vertices, outward-oriented triangles, volume and per-half-space facet areas of P(h).
+
+    Each hull triangle is assigned to the half-space whose normal is closest to its own."""
+    # all h_i > 0  =>  the origin is interior (U x = 0 < h); the LP is only a fallback
     ip = np.zeros(3) if h.min() > 1e-9 else chebyshev_center(U, h)
     hs = HalfspaceIntersection(np.hstack([U, -h[:, None]]), ip)
     pts = hs.intersections
@@ -70,7 +70,13 @@ def polytope_geometry(U: np.ndarray, h: np.ndarray) -> dict:
 
 def solve_minkowski(normals: np.ndarray, g: np.ndarray, drop_tol: float = 1e-4,
                     cage: float = 50.0, maxiter: int = 300, verbose: bool = False) -> dict:
-    """EGI (normals, g>=0, sum g_i u_i ~ 0) -> polytope mesh (centered at centroid)."""
+    """Polytope of unit volume whose facet areas on `normals` are proportional to g >= 0
+    (with sum g_i u_i close to 0). Normals with g below drop_tol times the largest weight
+    are left out.
+
+    Returns a dict with 'verts' (shifted to zero mean), 'faces', 'volume', the kept
+    normals, weights, areas and support values, 'egi_l1' (L1 distance between the
+    normalised areas and the normalised weights), 'success' and the optimiser message."""
     g = np.asarray(g, dtype=float)
     keep = g > drop_tol * g.max()
     Uk, gk = normals[keep], g[keep]
@@ -102,7 +108,7 @@ def solve_minkowski(normals: np.ndarray, g: np.ndarray, drop_tol: float = 1e-4,
     res = minimize(fun_grad, h0, jac=True, bounds=bounds, method="L-BFGS-B",
                    options={"maxiter": maxiter, "ftol": 1e-14, "gtol": 1e-10,
                             "disp": verbose})
-    # rescale so that vol = 1 exactly (h -> lambda h scales P(h) linearly)
+    # rescale to unit volume (h -> lambda h scales P(h) by lambda)
     hk = res.x * (1.0 / max(geom(res.x)["volume"], 1e-12)) ** (1.0 / 3.0)
     G = geom(hk)
     verts = G["verts"] - G["verts"].mean(axis=0)

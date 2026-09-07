@@ -1,21 +1,17 @@
 #!/usr/bin/env python3
-"""Validate the new generator's conventions against a public body's true shape and curves.
+"""Check the rotation and camera conventions against a public body's true shape and curves.
 
     PYTHONPATH=. python scripts/validate_generation.py --model 1 --data dataset/raw
 
-This is the "generation" test from the shape-library requirements: run the true STL of a
-public model through `hac26.curves_mesh.render_curves_mesh` and compare against the
-organisers' own measured curves for that model. Agreement here is evidence about
-CONVENTIONS (rotation sense, camera geometry, thresholds), not about the physical fidelity
-of any particular scattering law -- the renderer has no interreflection and no sensor chain,
-so a residual offset after the best-fit (delta, c_lambert) is expected and is not itself a
-bug; a SIGN or PHASE error is.
+The true STL of a public model is rendered with `hac26.curves_mesh.render_curves_mesh`, a
+CPU renderer, and compared with the measured curves for that model. Agreement is evidence
+about the conventions (rotation sense, camera geometry, thresholds), not about the scattering
+law: the renderer has no interreflection and no sensor chain, so a residual offset after the
+best-fit (delta, c_lambert) is expected; a sign or phase error is not.
 
-Needs the public model's ground-truth STL and `dataset/raw` populated per the README; both
-are challenge data not included in this repository, so this script cannot be exercised here
-and is meant to be run once the data is downloaded. `--stl` takes a path; without it, every
-.stl under --data is searched for one whose name ends in the model number, case and
-zero-padding ignored. Only the public models ship with ground truth.
+Needs the challenge data under --data (see the README). `--stl` takes a path; without it,
+every .stl under --data is searched for one whose name ends in the model number, ignoring
+case and zero-padding. Only the public models come with a true shape.
 """
 from __future__ import annotations
 
@@ -38,16 +34,17 @@ from hac26.stl_io import load_stl                                  # noqa: E402
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--model", type=int, required=True)
-    ap.add_argument("--data", default="dataset/raw")
-    ap.add_argument("--stl", default=None)
-    ap.add_argument("--m", type=int, default=360)
-    ap.add_argument("--res", type=int, default=128)
+    ap.add_argument("--model", type=int, required=True, help="public model number")
+    ap.add_argument("--data", default="dataset/raw", help="challenge data directory")
+    ap.add_argument("--stl", default=None,
+                    help="path of the true STL; searched for under --data if omitted")
+    ap.add_argument("--m", type=int, default=360, help="frames per revolution")
+    ap.add_argument("--res", type=int, default=128, help="renderer image size in pixels")
     a = ap.parse_args()
 
     stl_path = a.stl
     if stl_path is None:
-        # Case and zero-padding both vary in the release, so match on the number.
+        # Case and zero-padding vary in the release, so match on the number alone.
         pat = re.compile(rf"asteroid0*{a.model}$", re.IGNORECASE)
         hits = sorted(p for p in Path(a.data).rglob("*.stl") if pat.match(p.stem))
         if not hits:

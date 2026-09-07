@@ -1,32 +1,30 @@
 #!/usr/bin/env python3
-"""The challenge's second scoring measure: the distance between projection boundary curves.
+"""The challenge's second scoring measure: the distance between the boundary curves of two
+bodies' side-view projections.
 
-The score is the sum over the secret bodies of two measures, so this is half of it.
-
-Side views are taken as horizontal directions, elevation 0. Distance between two closed
-boundary curves is reported as the symmetric mean nearest-neighbour distance and the
-Hausdorff distance, in model units; the body spans z in [-1, 1], so 0.01 is 0.5% of its
-height.
+Side views are taken along horizontal directions, at elevation 0. The distance between two
+closed boundary curves is reported as the symmetric mean nearest-neighbour distance (ASSD)
+and the Hausdorff distance, both in model units.
 
 This measure sees non-convexity directly: the projection of a convex hull is the convex hull
-of the projection, so a neck or waist appears as a concave stretch of the outline that no
-convex reconstruction can produce.
+of the projection, so a neck or waist shows as a concave stretch of the outline that no convex
+reconstruction can produce.
 """
 import argparse
-import glob
 import json
-import sys
 from pathlib import Path
 
 import numpy as np
 from scipy import ndimage
 from scipy.spatial import cKDTree
 
+from hac26.data_io import public_stl  # noqa: E402
 from hac26.shapes import hull_mesh, rescale_touch_z  # noqa: E402
 from hac26.stl_io import load_stl  # noqa: E402
 
 
 def surface_points(verts, faces, n=1_000_000, seed=0):
+    """Uniform random points on the mesh surface, shape (n, 3)."""
     import trimesh
     m = trimesh.Trimesh(vertices=verts, faces=faces, process=False)
     pts, _ = trimesh.sample.sample_surface(m, n, seed=seed)
@@ -34,7 +32,8 @@ def surface_points(verts, faces, n=1_000_000, seed=0):
 
 
 def silhouette_contours(pts, e1, e2, ext, res):
-    """Binary silhouette from projected surface samples, then its boundary curves."""
+    """Project the points onto the (e1, e2) image plane, fill the silhouette, and return its
+    boundary curves in model units (None if the silhouette is empty)."""
     u = pts @ e1
     v = pts @ e2
     ix = np.clip(((u / ext) * 0.5 + 0.5) * (res - 1), 0, res - 1).astype(int)
@@ -62,25 +61,21 @@ def boundary_distance(ca, cb):
     return assd, haus
 
 
-GOLDEN = 0.5 * (5 ** 0.5 - 1.0)          # 0.6180339887..., the golden ratio conjugate
+GOLDEN = 0.5 * (5 ** 0.5 - 1.0)          # the golden ratio conjugate
 
 
 def projection_directions(n: int = 36, mode: str = "side"):
-    """The viewing directions whose outlines are compared. Returns (n, 3) unit vectors.
+    """Unit viewing directions whose outlines are compared, shape (n, 3).
 
-    NOT UNIFORM. Azimuths at 2 pi k / n resonate with any body whose symmetry order shares a
-    factor with n: at n = 36 a 4-fold body -- a cube, which challenge model 2 is -- yields
-    only 9 distinct outlines, each sampled four times. The worst direction is then invisible
-    and the spread is understated, both in the direction that flatters the reconstruction.
+    Azimuths advance by the golden angle, theta_k = 2 pi frac(k * GOLDEN), rather than by
+    2 pi / n. Equally spaced azimuths resonate with a body whose symmetry order shares a factor
+    with n, so several views repeat the same outline and the worst direction can be missed. An
+    irrational step cannot resonate with any symmetry, and the sequence is low-discrepancy, so
+    a given number of views estimates the mean outline distance more tightly.
 
-    Azimuths advance by the golden angle instead, theta_k = 2 pi frac(k * GOLDEN). An
-    irrational rotation number cannot resonate with any integer symmetry, and the sequence is
-    low-discrepancy: its star discrepancy falls as log(n)/n against 1/sqrt(n) for random
-    directions, so a given number of views estimates the mean outline distance more tightly.
-
-    mode "side" keeps elevation 0, which is what a side view is and what the rules say. mode
-    "sphere" spreads directions over the whole sphere by the same golden-angle spiral, for
-    checking that a result is not an artefact of the equatorial band.
+    mode "side" keeps elevation 0, which is what a side view is. mode "sphere" spreads the
+    directions over the whole sphere by the same spiral, for checking that a result is not an
+    artefact of the equatorial band.
     """
     k = np.arange(n)
     if mode == "sphere":
@@ -108,18 +103,18 @@ def view_frames(n_dirs=36, mode="side"):
 
 
 def outline_set(pts, ext, n_dirs=36, res=512, mode="side"):
-    """One cloud's boundary curves, one per viewing direction (None where empty).
+    """One cloud's boundary curves, one per viewing direction (None where the view is empty).
 
-    Split out of side_view_measure so a caller comparing S clouds pairwise projects each of
-    them ONCE rather than S-1 times. `ext` must be shared across the clouds being compared,
-    for the same reason the voxel grid is: the contours are returned in model units, and a
-    per-pair ext puts each pair on a different pixel pitch.
+    Split out of side_view_measure so a caller comparing several clouds pairwise projects each
+    of them once. `ext` must be shared across the clouds being compared: the contours are in
+    model units, and a per-pair ext would put each pair on a different pixel pitch.
     """
     return [silhouette_contours(pts, e1, e2, ext, res) for e1, e2 in view_frames(n_dirs, mode)]
 
 
 def measure_outlines(oa, ob):
-    """Aggregate boundary distance between two outline sets from `outline_set`."""
+    """Mean and worst ASSD and Hausdorff distance between two outline sets from `outline_set`,
+    over the directions where both outlines exist."""
     assds, hauss = [], []
     for ca, cb in zip(oa, ob):
         if ca is None or cb is None:
@@ -136,7 +131,7 @@ def measure_outlines(oa, ob):
 
 
 def side_view_measure(pts_a, pts_b, n_dirs=36, res=512, mode="side"):
-    """Aggregate boundary distance over well-spread viewing directions."""
+    """Aggregate boundary distance between two point clouds over the viewing directions."""
     ext = 1.05 * max(np.abs(pts_a).max(), np.abs(pts_b).max())
     return measure_outlines(outline_set(pts_a, ext, n_dirs, res, mode),
                             outline_set(pts_b, ext, n_dirs, res, mode))
@@ -144,29 +139,34 @@ def side_view_measure(pts_a, pts_b, n_dirs=36, res=512, mode="side"):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--models", type=int, nargs="+", default=[1, 2, 3])
-    ap.add_argument("--recon-dir", default="results/lpd")
-    ap.add_argument("--data-dir", default="dataset/raw")
-    ap.add_argument("--n-dirs", type=int, default=36)
-    ap.add_argument("--res", type=int, default=512)
-    ap.add_argument("--out", default="projection_scores.json")
+    ap.add_argument("--models", type=int, nargs="+", default=[1, 2, 3],
+                    help="public models to score")
+    ap.add_argument("--recon-dir", default="results/lpd",
+                    help="directory holding the reconstructed Asteroid<NN>.stl files")
+    ap.add_argument("--data-dir", default="dataset/raw", help="challenge data directory")
+    ap.add_argument("--n-dirs", type=int, default=36, help="number of viewing directions")
+    ap.add_argument("--res", type=int, default=512, help="silhouette image size in pixels")
+    ap.add_argument("--out", default="projection_scores.json", help="output JSON file")
     args = ap.parse_args()
 
     out = {}
     for M in args.models:
-        tf = glob.glob(f"{args.data_dir}/AsteroidModel0{M}_shape_public/asteroid{M}.stl")
-        if not tf:
+        try:
+            tf = public_stl(args.data_dir, M)
+        except ValueError:
+            tf = None
+        if tf is None or not Path(tf).exists():
             print(f"model {M}: no truth STL", flush=True)
             continue
-        tv, tfc = load_stl(tf[0])
+        tv, tfc = load_stl(tf)
         tv = rescale_touch_z(tv, tfc)
         tp = surface_points(tv, tfc)
 
         rows = {}
-        # self-distance: the resolution floor of this implementation, for calibration
+        # the truth against a second sampling of itself: the floor set by sampling and pixels
         rows["truth_vs_truth"] = side_view_measure(
             tp, surface_points(tv, tfc, seed=1), args.n_dirs, args.res)
-        # the convex ceiling under THIS measure: what hulling the truth costs
+        # the convex hull of the truth: what a convex reconstruction costs under this measure
         hv, hf = hull_mesh(tv)
         rows["hull_vs_truth"] = side_view_measure(
             surface_points(hv, hf), tp, args.n_dirs, args.res)
