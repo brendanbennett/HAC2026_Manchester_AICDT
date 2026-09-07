@@ -19,10 +19,13 @@ from hac26.geometry import build_cameras
 from hac26.recon import dice
 from hac26.scoring.voxel import score_mesh, prepare_truth
 from hac26.data_io import load_model_curves
-from hac26.genetic_utils import make_target_coefficients, lightcurve_fitness, \
+from hac26.genetic_utils import make_target_coefficients, sh_fitness, surface_fitness, \
                                 save_shape_stl,  load_truth_mesh, \
                                 plot_lightcurve_comparison, plot_genetic_convergence, \
-                                save_checkpoint_results, load_initialisation_mesh
+                                save_checkpoint_results, load_initialisation_mesh, \
+                                sample_surface_control_points, build_surface_influence_matrix, \
+                                deform_surface
+                                
 
 
 
@@ -121,10 +124,45 @@ def main():
     )
 
     parser.add_argument(
-    "--initial-stl",
-    type=str,
-    default=None,
-    help="STL file to use as the initial shape.",
+        "--initial-stl",
+        type=str,
+        default=None,
+        help="STL file to use as the initial shape.",
+    )
+
+    parser.add_argument(
+        "--mode",
+        type=str,
+        default='surface',
+        help="Whether to use spherical harmonics (sh) or deform the surface (surface)",
+    )
+
+    parser.add_argument(
+        "--deform-width",
+        type=float,
+        default=0.5,
+        help="Sigma for dents/bulges in units of characteristic length",
+    )
+
+    parser.add_argument(
+        "--n-cpts",
+        type=int,
+        default=100,
+        help="Number of control points for surface deformation",
+    )
+
+    parser.add_argument(
+        "--max-amp",
+        type=float,
+        default=0.5,
+        help="Max amplitude for dents/bulges in units of characteristic length",
+    )
+
+    parser.add_argument(
+        "--mutation-decay",
+        type=float,
+        default=0.98,
+        help="Decay rate of mutation noise",
     )
 
     # load args
@@ -135,6 +173,7 @@ def main():
 
     # time computation
     start_time = time.perf_counter()
+
 
     # configure directory
     data_dir = Path(args.data_dir)
@@ -160,6 +199,12 @@ def main():
     # make an output path for the stl files
     stl_dir = output_dir / Path('stl')
     stl_dir.mkdir(parents=True, exist_ok=True)
+
+    if args.mode == "surface" and args.initial_stl is None:
+        raise ValueError(
+            "--initial-stl is required when mode='surface'"
+        )
+
 
     # --------------------------------------------------------
     # Load source of truth (if exists)
@@ -235,7 +280,7 @@ def main():
         target_curves = lc_dict['curves'][:28]
 
         np.save(
-        output_dir / "truth_curves.npy",
+        lc_dir / "truth_curves.npy",
         target_curves,
         )
 
@@ -258,64 +303,128 @@ def main():
     # Load initialisation
     # ------------------------------------------------------------
 
-    initial_mesh = load_initialisation_mesh(args)
+    # select which optimisation mode to use
+    
+    if args.mode == "sh":
+
+        # initialise parameters and mutation bounds
+        n_coefficients = args.L * (args.L + 2)
+        initial_params = np.zeros(n_coefficients)
+        bounds = np.array(
+            [
+                [-0.5, 0.5]
+                for _ in range(n_coefficients)
+            ]
+        )
+
+        print(f"Using L={args.L}, ({n_coefficients} SH coefficients)")
+
+        # quantify fitness from lightcurve
+        def fitness(coefficients):
+            return sh_fitness(
+                coefficients=coefficients,
+                target_curves=target_curves,
+                L=args.L,
+                subdiv=args.subdiv,
+                cameras=cameras,
+                m=args.m,
+                curve_types=curve_types,
+            )
 
 
-    # ------------------------------------------------------------
-    # SH dimensionality
-    # ------------------------------------------------------------
-
-    n_coefficients = args.L * (args.L + 2)
-
-    print(
-        f"Using L={args.L} "
-        f"({n_coefficients} SH coefficients)"
-    )
+    elif args.mode == "surface":
 
 
-    # ------------------------------------------------------------
-    # Initial genome
-    #
-    # All zeros corresponds to:
-    #
-    # r = exp(0) = 1
-    #
-    # i.e. a unit sphere.
-    # ------------------------------------------------------------
+        # load initial mesh
+        initial_mesh = load_initialisation_mesh(args)
 
-    initial_coefficients = np.zeros(
-        n_coefficients,
-    )
+        # weld vertices
+        initial_mesh.merge_vertices()
 
+        # select number of points to deform on surface 
+        n_control_points = args.n_cpts
+        control_point_indices = sample_surface_control_points(
+            initial_mesh,
+            n_points=n_control_points,
+            seed=args.seed,
+        )
 
-    # ------------------------------------------------------------
-    # Bounds
-    #
-    # Keep the mutations within a sensible range.
-    # ------------------------------------------------------------
+        # set bounds on mutations
+        characteristic_length = np.max(initial_mesh.extents)
 
-    bounds = np.array(
-        [
-            [-0.5, 0.5]
-            for _ in range(n_coefficients)
-        ]
-    )
+        # Width of each deformation
+        sigma = args.deform_width* characteristic_length
+
+        influence = build_surface_influence_matrix(
+            initial_mesh,
+            control_point_indices,
+            sigma=sigma,
+        )
 
 
-    # ------------------------------------------------------------
-    # Fitness function
-    # ------------------------------------------------------------
+        params = np.zeros(n_control_points)
+        params[0] = 0.05 * characteristic_length
 
-    def fitness(coefficients):
-        return lightcurve_fitness(
-            coefficients=coefficients,
-            target_curves=target_curves,
-            L=args.L,
-            subdiv=args.subdiv,
+        ##### to test a single bump ######
+        test_mesh = deform_surface(
+            initial_mesh,
+            params,
+            influence,
+        )
+
+        test_mesh.export(output_dir / "test_single_bump.stl")
+        #############################################
+
+        initial_params = np.zeros(
+            n_control_points
+        )
+
+        # set mutation bounds
+        max_amplitude = args.max_amp * characteristic_length
+        bounds = np.array(
+            [
+                [-max_amplitude, max_amplitude]
+                for _ in range(n_control_points)
+            ]
+        )
+
+        # define lightcurve fitness
+        def fitness(params):
+            return surface_fitness(
+                initial_mesh=initial_mesh,
+                params=params,
+                influence=influence,
+                target_curves=target_curves,
+                cameras=cameras,
+                m=args.m,
+                curve_types=curve_types
+                )
+
+
+        initial_curves = mesh_curves_convex(
+            initial_mesh.vertices,
+            initial_mesh.faces,
             cameras=cameras,
             m=args.m,
             curve_types=curve_types,
         )
+
+        initial_dice = score_mesh(
+            initial_mesh.vertices,
+            initial_mesh.faces,
+            truth_mesh_voxelised,
+        )
+
+        print(f"Initial STL Dice: {initial_dice:.4f}")
+
+
+    else:
+        raise ValueError(
+            f"Unknown genetic mode: {args.mode}"
+        )
+
+
+
 
     # ------------------------------------------------------------
     # Define how to save checkpoints in solver
@@ -330,8 +439,6 @@ def main():
         args.generations,
     ]
 
-    dice_scores = {}
-
     def checkpoint(
         generation,
         best_params,
@@ -344,27 +451,32 @@ def main():
         checkpoint_name = f"generation_{generation:04d}"
 
         # --------------------------------------------------------
-        # Save current best parameters
+        # Create current best mesh
         # --------------------------------------------------------
 
-        # np.save(
-        #     output_dir / f"{checkpoint_name}_params.npy",
-        #     best_params,
-        # )
+        if args.mode == "sh":
+
+            mesh = save_shape_stl(
+                best_params,
+                L=args.L,
+                subdiv=args.subdiv,
+                path=stl_dir / f"{checkpoint_name}.stl",
+            )
+
+        elif args.mode == "surface":
+
+            mesh = deform_surface(
+                initial_mesh,
+                best_params,
+                influence,
+            )
+
+            mesh.export(
+                stl_dir / f"{checkpoint_name}.stl"
+            )
 
         # --------------------------------------------------------
-        # Save current best STL
-        # --------------------------------------------------------
-
-        mesh = save_shape_stl(
-            best_params,
-            L=args.L,
-            subdiv=args.subdiv,
-            path=stl_dir / f"{checkpoint_name}.stl",
-        )
-
-        # --------------------------------------------------------
-        # Generate and save current best lightcurves
+        # Generate and save lightcurves
         # --------------------------------------------------------
 
         curves = mesh_curves_convex(
@@ -390,28 +502,36 @@ def main():
             truth_mesh_voxelised,
         )
 
-        dice_scores[checkpoint_name] = float(dice_score)
+        # --------------------------------------------------------
+        # Time taken
+        # --------------------------------------------------------
+
+        elapsed_time = time.perf_counter() - start_time
 
         print(
             f"Checkpoint generation {generation}: "
             f"fitness={best_fitness:.6g}, "
-            f"dice={dice_score:.4f}"
+            f"dice={dice_score:.4f}, "
+            f"time={elapsed_time:.1f}s"
         )
 
         # --------------------------------------------------------
         # Update results.json
         # --------------------------------------------------------
 
-        elapsed_time = time.perf_counter() - start_time
-
         save_checkpoint_results(
             output_dir=output_dir,
             args=args,
+            generation=generation,
             best_params=best_params,
             best_fitness=best_fitness,
-            dice_scores=dice_scores,
-            comp_t = elapsed_time
+            dice_score=dice_score,
+            time_taken=elapsed_time,
         )
+
+        # --------------------------------------------------------
+        # Save solver
+        # --------------------------------------------------------
 
         with open(output_dir / "solver.pkl", "wb") as f:
             cloudpickle.dump(solver, f)
@@ -422,12 +542,12 @@ def main():
 
     solver = GeneticSolver(
         fitness_fn=fitness,
-        initial_params=initial_coefficients,
+        initial_params=initial_params,
         mutation_scale=args.mutation_scale,
         population_size=args.population_size,
         n_parents=args.parents,
         n_generations=args.generations,
-        mutation_decay=0.98,
+        mutation_decay=args.mutation_decay,
         bounds=bounds,
         seed=args.seed,
     )
@@ -442,7 +562,7 @@ def main():
     print("\nOptimisation complete")
     print("---------------------")
 
-    if args.model is None:
+    if args.model is None and args.mode == 'sh':
         print("\nTarget coefficients:")
         print(target_coefficients)
 
@@ -459,13 +579,6 @@ def main():
     # ------------------------------------------------------------
     # Lightcurve visualisations
     # ------------------------------------------------------------
-
-
-    final_vertices, final_faces = sh_mesh_from_coefficients(
-        result.best_params,
-        L=args.L,
-        subdiv=args.subdiv,
-    )
 
     plot_lightcurve_comparison(
         target_curves=target_curves,
@@ -490,8 +603,6 @@ def main():
     # ------------------------------------------------------------
     # Save final results
     # ------------------------------------------------------------
-
-    total_time = time.perf_counter() - start_time
 
     with open(output_dir / "solver.pkl", "rb") as f:
         solver = cloudpickle.load(f)

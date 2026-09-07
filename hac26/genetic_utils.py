@@ -8,6 +8,8 @@ import json
 import matplotlib.pyplot as plt
 import numpy as np
 import trimesh
+from scipy.sparse import coo_matrix
+from scipy.sparse.csgraph import dijkstra
 
 from hac26.scoring.voxel import score_mesh
 from hac26.shapes import (
@@ -117,7 +119,7 @@ def shape_fitness(
     return -error
 
 
-def lightcurve_fitness(
+def sh_fitness(
     coefficients,
     target_curves,
     L,
@@ -174,6 +176,66 @@ def lightcurve_fitness(
     mse = np.mean(residual**2)
 
     return -mse
+
+
+def surface_fitness(
+        initial_mesh,
+        params,
+        influence,
+        target_curves,
+        cameras,
+        m,
+        curve_types
+        ):
+
+        mesh = deform_surface(
+            initial_mesh,
+            params,
+            influence,
+        )
+
+        curves = mesh_curves_convex(
+            mesh.vertices,
+            mesh.faces,
+            cameras=cameras,
+            m=m,
+            curve_types=curve_types,
+        )
+
+        residual = curves - target_curves
+
+        return -np.mean(residual ** 2)
+
+
+def deform_surface(
+    mesh,
+    amplitudes,
+    influence,
+):
+    """
+    Apply smooth signed surface deformations.
+
+    Positive amplitude = outward bulge.
+    Negative amplitude = inward indentation.
+    """
+
+    vertices = np.asarray(mesh.vertices)
+
+    # Total displacement at each vertex
+    displacement = influence @ amplitudes
+
+    # Move along the original surface normals
+    new_vertices = (
+        vertices
+        + displacement[:, None] * mesh.vertex_normals
+    )
+
+    return trimesh.Trimesh(
+        vertices=new_vertices,
+        faces=mesh.faces.copy(),
+        process=False,
+    )
+
 
 
 def plot_mesh(
@@ -280,41 +342,195 @@ def save_shape_stl(
     return mesh
 
 
+# def save_checkpoint_results(
+#     output_dir,
+#     args,
+#     generation,
+#     best_params,
+#     best_fitness,
+#     dice_score,
+#     time_taken,
+# ):
+#     """Update results.json with the current checkpoint."""
+
+#     results_path = output_dir / "results.json"
+
+#     # Load existing results so previous checkpoints are retained
+#     if results_path.exists():
+#         with open(results_path, "r") as f:
+#             results = json.load(f)
+#     else:
+#         results = {
+#             "config": vars(args).copy(),
+#             "checkpoints": {},
+#         }
+
+#     results["config"]["output_dir"] = str(output_dir)
+
+#     checkpoint_name = f"generation_{generation:04d}"
+
+#     results["checkpoints"][checkpoint_name] = {
+#         "best_fitness": float(best_fitness),
+#         "best_params": best_params.tolist(),
+#         "dice_score": float(dice_score),
+#         "time_taken": float(time_taken),
+#     }
+
+#     with open(results_path, "w") as f:
+#         json.dump(
+#             results,
+#             f,
+#             indent=2,
+#         )
+
+
 def save_checkpoint_results(
     output_dir,
     args,
+    generation,
     best_params,
     best_fitness,
-    dice_scores,
-    comp_t
-    ):
-    """Update results.json with the current optimisation state."""
+    dice_score,
+    time_taken,
+):
+    
+    """Update results.json with the current checkpoint."""
 
-    config = vars(args).copy()
-    config["n_coefficients"] = args.L * (args.L + 2)
-    config["output_dir"] = str(output_dir)
+    results_path = output_dir / "results.json"
 
-    results = {
-        "config": config,
-        "result": {
-            "best_fitness": float(best_fitness),
-            "best_params": best_params.tolist(),
-            "dice_scores": dice_scores,
-            "time_taken": float(comp_t),
-        },
+    # Load existing results so previous checkpoints are retained
+    if results_path.exists():
+        with open(results_path, "r") as f:
+            results = json.load(f)
+    else:
+        results = {
+            "config": vars(args).copy(),
+            "checkpoints": {},
+        }
+
+    # --------------------------------------------------------
+    # Current best -- overwrite these every checkpoint
+    # --------------------------------------------------------
+
+    results["best_params"] = np.asarray(best_params).tolist()
+    results["best_fitness"] = float(best_fitness)
+
+    # --------------------------------------------------------
+    # Checkpoint metrics -- retain history
+    # --------------------------------------------------------
+
+    if "checkpoints" not in results:
+        results["checkpoints"] = {}
+
+    results["checkpoints"][f"generation_{generation:04d}"] = {
+        "dice_score": float(dice_score),
+        "time_taken": float(time_taken),
+        "best_fitness": float(best_fitness)
     }
 
-    with open(output_dir / "results.json", "w") as f:
-        json.dump(
-            results,
-            f,
-            indent=2,
+    with open(results_path, "w") as f:
+        json.dump(results, f, indent=2)
+
+
+def sample_surface_control_points(mesh, n_points, seed=42):
+    """Select approximately evenly distributed vertices on a mesh."""
+
+    rng = np.random.default_rng(seed)
+
+    vertices = np.asarray(mesh.vertices)
+
+    # Start from a random vertex.
+    selected = [rng.integers(len(vertices))]
+
+    # Greedy farthest-point sampling.
+    min_distances = np.full(
+        len(vertices),
+        np.inf,
+    )
+
+    for _ in range(1, n_points):
+        last = selected[-1]
+
+        distances = np.linalg.norm(
+            vertices - vertices[last],
+            axis=1,
         )
 
+        min_distances = np.minimum(
+            min_distances,
+            distances,
+        )
 
+        selected.append(
+            np.argmax(min_distances)
+        )
 
+    return np.asarray(selected, dtype=int)
 
+def build_surface_influence_matrix(
+    mesh,
+    control_point_indices,
+    sigma,
+):
+    """
+    Calculate the influence of each surface control point on
+    every mesh vertex.
 
+    Returns
+    -------
+    influence : ndarray
+        Shape (n_vertices, n_control_points).
+    """
+
+    vertices = np.asarray(mesh.vertices)
+    edges = np.asarray(mesh.edges_unique)
+
+    # Edge lengths
+    edge_lengths = np.linalg.norm(
+        vertices[edges[:, 0]] - vertices[edges[:, 1]],
+        axis=1,
+    )
+
+    # Build weighted mesh graph
+    rows = np.concatenate(
+        [edges[:, 0], edges[:, 1]]
+    )
+
+    cols = np.concatenate(
+        [edges[:, 1], edges[:, 0]]
+    )
+
+    weights = np.concatenate(
+        [edge_lengths, edge_lengths]
+    )
+
+    graph = coo_matrix(
+        (
+            weights,
+            (rows, cols),
+        ),
+        shape=(len(vertices), len(vertices)),
+    ).tocsr()
+
+    # Geodesic distance from each control point to every vertex
+    distances = dijkstra(
+        graph,
+        directed=False,
+        indices=control_point_indices,
+    )
+
+    # Gaussian influence
+    influence = np.exp(
+        -0.5 * (distances / sigma) ** 2
+    )
+
+    # Shape:
+    # distances   = (n_control_points, n_vertices)
+    # influence   = (n_control_points, n_vertices)
+    #
+    # Transpose so that:
+    # influence[vertex, control_point]
+    return influence.T
 
 
 ## PLOTTING ## 

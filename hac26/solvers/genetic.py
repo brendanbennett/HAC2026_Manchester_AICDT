@@ -196,7 +196,7 @@ class GeneticSolver:
 
 
 
-    def run(self, checkpoint_fn):
+    def run(self, checkpoint_fn=None):
         """Run the genetic optimisation.
 
         Parameters
