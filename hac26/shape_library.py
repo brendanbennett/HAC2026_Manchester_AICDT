@@ -1,46 +1,54 @@
-"""Non-convex training bodies, generated as level sets.
+"""Training bodies for the flow, generated as level sets.
 
-Why level sets rather than mesh booleans. Every constraint the library has to satisfy is a
-statement about a SET, not about a triangulation: one connected component, no interior void,
-closed surface, a chosen non-convexity. On an occupancy grid all four are decidable and
-repairable with `scipy.ndimage` before a single triangle exists, and marching cubes then
-returns a closed oriented manifold by construction. The alternative -- concatenating or
-booleaning meshes -- is what the previous corpus did, and it produced bodies that are two
-interpenetrating closed surfaces (see `docs/shape_library.md`); a signed distance sampled
-against such a mesh is not a signed distance, so the codes fitted to it were fitted to noise.
+The secret bodies are 3-D prints, and the three public ones say of what: two real asteroid
+shape models (Vesta, a nearly convex spheroid with a polar basin; Mithra, a contact binary)
+and one geometric test solid (a sawed-off cube). So the library is drawn from the same
+sources, and from one more, since a print need not be an asteroid at all: real asteroid
+shape models and everyday printable objects, when directories of them are given, each enter
+as a family with random anisotropic scaling and mirroring (`_real`). The procedural
+families are the shapes real asteroids come in -- smooth lumpy potatoes, bilobed and
+trilobed contact binaries, spinning tops with an equatorial ridge, angular faceted bodies --
+plus geometric solids with saw cuts. The modifiers are the large features the lightcurves
+and the competition's voxel and side-view measures can see: basins, saw cuts, an added lobe,
+a ridge, moderate roughness. Nothing is generated below the scale the shape code and the
+scoring grid resolve.
 
-Bodies are built compositionally as fields f(x) with f < 0 inside. Unions are min, cuts are
-max(f, -g). These are not metric distances away from the zero set, but they are exactly
-signed, and only the sign and the location of the zero crossing matter here.
+Convex bodies are kept, since a sawed-off cube is convex and the flow has to learn when
+there is nothing to carve. What is set is the mix: `LibrarySpec.convexity_shares` gives the
+share of the library in each band of volume over hull volume, and `sample_body` redraws a
+body until it lands in the band it was dealt, so the deeply carved bands are covered whatever
+the families would give on their own. `Body.convexity` records what came out.
 
-Non-convexity is a GATE, not a hope. `sample_body` measures volume / hull volume on the
-finished mesh and redraws with intensified modifiers until it passes, so "strictly
-non-convex" is a postcondition of the sampler rather than a property the recipes are
-believed to have.
+The organisers chose per model how the body sits on its rotation axis: Vesta spins about its
+shortest axis, Mithra was mounted along its longest with a tilt. So after extraction each
+body is mounted on one of its principal axes, or at random, and tilted (`mount`);
+`LibrarySpec.mount_weights` and `tilt_deg` set that distribution.
 
-The two external sources enter through `body_from_mesh` (Thingi10K: voxelise, repair,
-re-pose) and `body_from_convex_points` (DAMIT: a convex hull used only as a starting field,
-with modifiers applied and the same gate enforced afterwards, so a DAMIT body can never
-reach the library still convex).
+Bodies are built as fields f(x) with f < 0 inside. Unions are min, cuts are max(f, -g).
+These are not true distances away from the zero set, but their sign is exact, and only the
+sign and the location of the zero crossing matter here. On the occupancy grid the solid is
+made one connected piece without voids before any triangle exists (`_repair`), and marching
+cubes returns a closed oriented surface.
 """
 from __future__ import annotations
 
 import warnings
 from dataclasses import dataclass, field as _dcfield
+from pathlib import Path
 from typing import Callable
 
 import numpy as np
 from scipy import ndimage
 from scipy.spatial import ConvexHull
 
-from .shapes import icosphere, real_sh_basis
+from .shapes import real_sh_basis, solid_centroid
 
 __all__ = [
-    "Body", "LibrarySpec", "sample_body", "build_library",
-    "body_from_mesh", "body_from_convex_points",
+    "Body", "LibrarySpec", "sample_body", "build_library", "mount",
+    "body_from_mesh", "body_from_convex_points", "read_shape_model", "load_shape_models",
     "mesh_volume", "hull_volume", "convexity_ratio", "is_edge_manifold",
-    "n_components", "pose", "extract", "voxelise",
-    "sd_sphere", "sd_ellipsoid", "sd_box", "sd_cylinder", "sd_torus",
+    "n_components", "pose", "extract", "voxelise", "solid_frame",
+    "sd_sphere", "sd_ellipsoid", "sd_box", "sd_cylinder", "sd_cone", "sd_torus",
     "sd_convex", "sd_star_sh", "op_union", "op_subtract", "op_intersect",
     "op_smooth_union", "op_displace", "decimate_mesh", "min_feature_radius",
 ]
@@ -61,13 +69,29 @@ def _rot(axis_z: np.ndarray) -> np.ndarray:
     return np.stack([u, v, w], axis=0)
 
 
+def _unit(rng: np.random.Generator) -> np.ndarray:
+    u = rng.normal(size=3)
+    return u / np.linalg.norm(u)
+
+
+def _angles(p: np.ndarray) -> tuple:
+    """(r, theta, phi) of points (..., 3), with the origin sent to r = 0, theta = 0."""
+    r = np.linalg.norm(p, axis=-1)
+    safe = np.where(r > 1e-12, r, 1.0)
+    u = p / safe[..., None]
+    theta = np.arccos(np.clip(u[..., 2], -1.0, 1.0))
+    phi = np.mod(np.arctan2(u[..., 1], u[..., 0]), 2.0 * np.pi)
+    return r, theta, phi
+
+
 def sd_sphere(centre=(0, 0, 0), radius: float = 1.0) -> Field:
     c = np.asarray(centre, float)
     return lambda p: np.linalg.norm(p - c, axis=-1) - radius
 
 
 def sd_ellipsoid(centre=(0, 0, 0), axes=(1, 1, 1), rot: np.ndarray | None = None) -> Field:
-    """Inigo Quilez's ellipsoid bound: exactly signed, and first-order correct in distance."""
+    """Ellipsoid field with the correct sign everywhere and approximately the true distance
+    near the surface (Inigo Quilez's bound)."""
     c = np.asarray(centre, float)
     a = np.asarray(axes, float)
     R = np.eye(3) if rot is None else np.asarray(rot, float)
@@ -108,6 +132,24 @@ def sd_cylinder(centre=(0, 0, 0), axis=(0, 0, 1), radius: float = 1.0,
     return f
 
 
+def sd_cone(centre=(0, 0, 0), axis=(0, 0, 1), radius: float = 1.0,
+            half_height: float = 1.0) -> Field:
+    """A cone with its base at -half_height and its apex at +half_height along `axis`. The
+    sign is exact; the value is a bound."""
+    c = np.asarray(centre, float)
+    R = _rot(axis)
+
+    def f(p):
+        q = (p - c) @ R.T
+        z = q[..., 2]
+        rad = np.linalg.norm(q[..., :2], axis=-1)
+        # radius allowed at this height, negative above the apex
+        allowed = radius * (half_height - z) / (2.0 * half_height)
+        side = (rad - allowed) * np.cos(np.arctan2(radius, 2.0 * half_height))
+        return np.maximum(side, -half_height - z)
+    return f
+
+
 def sd_torus(centre=(0, 0, 0), axis=(0, 0, 1), major: float = 1.0,
              minor: float = 0.3) -> Field:
     c = np.asarray(centre, float)
@@ -122,27 +164,26 @@ def sd_torus(centre=(0, 0, 0), axis=(0, 0, 1), major: float = 1.0,
 def sd_convex(normals: np.ndarray, offsets: np.ndarray) -> Field:
     """Intersection of half-spaces n_j . x <= d_j, as max_j (n_j . x - d_j).
 
-    The same representation `ConvexCore` uses, so a convex basis (DAMIT, or a hull of
-    sampled points) enters the generator in the solver's own parameterisation.
+    This is the representation `hac26.field.ConvexCore` uses, so a convex hull enters the
+    generator in the solver's own parameterisation.
     """
     n = np.asarray(normals, float)
     d = np.asarray(offsets, float)
     return lambda p: (p @ n.T - d).max(axis=-1)
 
 
-def sd_star_sh(coeffs: np.ndarray, l_max: int, centre=(0, 0, 0),
-               scale: float = 1.0) -> Field:
-    """|x - c| - scale * exp(sum a_lm Y_lm(u)): the star-shaped body of `hac26.shapes`."""
+def sd_star_sh(coeffs: np.ndarray, l_max: int, centre=(0, 0, 0), scale: float = 1.0,
+               axes=(1.0, 1.0, 1.0), rot: np.ndarray | None = None) -> Field:
+    """|q| - scale * exp(sum a_lm Y_lm(q/|q|)) in the ellipsoid coordinates q = R (x - c) / axes:
+    a star-shaped body about its centre, an ellipsoid when the coefficients are zero."""
     c = np.asarray(centre, float)
     a = np.asarray(coeffs, float)
+    ax = np.asarray(axes, float)
+    R = np.eye(3) if rot is None else np.asarray(rot, float)
 
     def f(p):
-        q = p - c
-        r = np.linalg.norm(q, axis=-1)
-        safe = np.where(r > 1e-12, r, 1.0)
-        u = q / safe[..., None]
-        theta = np.arccos(np.clip(u[..., 2], -1.0, 1.0))
-        phi = np.mod(np.arctan2(u[..., 1], u[..., 0]), 2.0 * np.pi)
+        q = ((p - c) @ R.T) / ax
+        r, theta, phi = _angles(q)
         B = real_sh_basis(l_max, theta.ravel(), phi.ravel())
         return r - scale * np.exp(a @ B).reshape(r.shape)
     return f
@@ -168,10 +209,9 @@ def op_subtract(a: Field, *bs: Field) -> Field:
 
 
 def op_smooth_union(a: Field, b: Field, k: float = 0.1) -> Field:
-    """Exponential smooth min: fills the crease at a neck instead of leaving a cusp.
+    """Exponential smooth min of two fields, with `k` the fillet width.
 
-    A contact binary made with a hard min has a tangent discontinuity at the joint; real
-    necks are filleted, and a cusp there is a feature no physical body has.
+    A hard min leaves a crease where two lobes meet; real necks are filleted.
     """
     def f(p):
         x, y = a(p), b(p)
@@ -184,36 +224,40 @@ def op_displace(a: Field, d: Callable[[np.ndarray], np.ndarray]) -> Field:
     return lambda p: a(p) + d(p)
 
 
-def _sh_displacement(rng: np.random.Generator, l_max: int, amp: float) -> Callable:
+def _sh_coeffs(rng: np.random.Generator, l_lo: int, l_hi: int, amp: float,
+               decay: float) -> np.ndarray:
+    """Random real-harmonic coefficients for degrees 1..l_hi, zero below l_lo, with the
+    standard deviation of degree l falling as (1 + l)^-decay."""
+    ls = np.concatenate([[l] * (2 * l + 1) for l in range(1, l_hi + 1)])
+    a = rng.normal(0.0, amp / (1.0 + ls) ** decay)
+    a[ls < l_lo] = 0.0
+    return a
+
+
+def _sh_displacement(rng: np.random.Generator, l_lo: int, l_hi: int, amp: float) -> Callable:
     """Radial roughness: a band-limited random field on the sphere, added to f."""
-    ls = np.concatenate([[l] * (2 * l + 1) for l in range(1, l_max + 1)])
-    a = rng.normal(0.0, amp / (1.0 + ls) ** 1.1)
+    a = _sh_coeffs(rng, l_lo, l_hi, amp, 1.1)
 
     def d(p):
-        r = np.linalg.norm(p, axis=-1)
-        safe = np.where(r > 1e-12, r, 1.0)
-        u = p / safe[..., None]
-        theta = np.arccos(np.clip(u[..., 2], -1.0, 1.0))
-        phi = np.mod(np.arctan2(u[..., 1], u[..., 0]), 2.0 * np.pi)
-        B = real_sh_basis(l_max, theta.ravel(), phi.ravel())
+        r, theta, phi = _angles(p)
+        B = real_sh_basis(l_hi, theta.ravel(), phi.ravel())
         return (a @ B).reshape(r.shape)
     return d
 
 
-def _fibonacci_sphere(n: int) -> np.ndarray:
-    """n directions spread quasi-uniformly over the unit sphere (the Fibonacci-lattice
-    construction). Used as `pitted`'s candidate crater-centre lattice: n independent random
-    directions cluster and leave visible gaps once n is large (the birthday-paradox effect
-    on the sphere), which is exactly wrong for a modifier whose point is even coverage. A
-    RANDOM PERMUTATION of a uniform lattice, instead of n independent draws, keeps the
-    even spacing while still varying which lattice points get used from body to body.
-    """
-    i = np.arange(n)
-    golden = (1.0 + 5.0 ** 0.5) / 2.0
-    z = 1.0 - 2.0 * (i + 0.5) / n
-    r = np.sqrt(np.clip(1.0 - z * z, 0.0, 1.0))
-    theta = 2.0 * np.pi * i / golden
-    return np.stack([r * np.cos(theta), r * np.sin(theta), z], axis=1)
+def _ray_radius(f: Field, dirs: np.ndarray, t_max: float = 4.0, iters: int = 40) -> np.ndarray:
+    """Distance from the origin to the surface along each unit direction (n, 3), by bisection
+    on f(t u) = 0. The origin must be inside. For a body that is not star-shaped about the
+    origin this is the last crossing before t_max, which is what a cutter placed from
+    outside needs."""
+    d = np.asarray(dirs, float)
+    lo = np.zeros(len(d)); hi = np.full(len(d), t_max)
+    for _ in range(iters):
+        mid = 0.5 * (lo + hi)
+        inside = f(mid[:, None] * d) < 0.0
+        lo = np.where(inside, mid, lo)
+        hi = np.where(inside, hi, mid)
+    return 0.5 * (lo + hi)
 
 
 # --------------------------------------------------------------------------- mesh measures
@@ -229,18 +273,15 @@ def hull_volume(verts: np.ndarray) -> float:
 
 
 def convexity_ratio(verts: np.ndarray, faces: np.ndarray) -> float:
-    """volume / hull volume. 1 for a convex body; the gate (LibrarySpec.convexity_max)
-    defaults to 0.98."""
+    """volume / hull volume: 1 for a convex body, smaller the more is carved away."""
     hv = hull_volume(verts)
     return abs(mesh_volume(verts, faces)) / hv if hv > 0 else 1.0
 
 
 def is_edge_manifold(faces: np.ndarray) -> bool:
-    """Every edge used exactly twice, with opposite orientation.
+    """True when every edge is used by exactly two faces, once in each direction.
 
-    This is the combinatorial half of `trimesh.is_watertight` and needs no trimesh, so the
-    tests can run in an environment where trimesh is absent. `is_watertight` is checked
-    against trimesh as well wherever it is importable.
+    This is the combinatorial part of a watertightness check and needs no trimesh.
     """
     e = np.concatenate([faces[:, [0, 1]], faces[:, [1, 2]], faces[:, [2, 0]]], axis=0)
     key = np.sort(e, axis=1)
@@ -265,22 +306,15 @@ def n_components(verts: np.ndarray, faces: np.ndarray) -> int:
 
 
 def decimate_mesh(verts: np.ndarray, faces: np.ndarray, extent: float, res: int) -> tuple:
-    """Vertex-clustering decimation to roughly one triangle per grid cell of size `res`.
+    """Vertex-clustering decimation on a grid of `res` cells across `2 * extent`.
 
-    Marching cubes at generation resolution (res=96 by default) routinely produces tens of
-    thousands of faces; both the Dice/inertia metrics and the ray-cast curve renderer only
-    need geometry resolved to their own, much coarser, grid, so snapping vertices to a cell
-    a few times finer than that grid and dropping the triangles it degenerates cuts face
-    count by 1-2 orders of magnitude with no visible effect on either. One representative
-    vertex per cell (the first one seen) rather than a centroid: cheap, and the sub-cell
-    displacement it introduces is below the resolution the caller reads the result at.
+    Vertices in the same cell are merged into the first one seen and the triangles that
+    collapse are dropped. Callers that only read the mesh on a grid of their own (occupancy,
+    the curve renderer) lose nothing they can resolve and gain a much smaller face count.
 
-    Not manifoldness-preserving: collapsing vertices can merge two originally-distinct
-    edges into one non-manifold edge. That is acceptable for both of this function's
-    callers -- parity-test occupancy and the ray-cast curve renderer -- neither of which
-    requires a manifold input, only a closed one. Do not decimate a mesh that has to stay
-    edge-manifold afterwards (e.g. anything headed for `is_edge_manifold`/`n_components`
-    validity checks); decimate a COPY for metrics and keep the original for those.
+    The result need not be edge-manifold: merging vertices can join two distinct edges into
+    one. Do not run `is_edge_manifold` or `n_components` on a decimated mesh; decimate a copy
+    for metrics and keep the original for validity checks.
     """
     cell = 2.0 * extent / max(res, 1)
     key = np.round(verts / cell).astype(np.int64)
@@ -297,10 +331,10 @@ def decimate_mesh(verts: np.ndarray, faces: np.ndarray, extent: float, res: int)
 
 def voxelise(f: Field, extent: float = 1.6, res: int = 96,
              chunk: int = 400_000) -> tuple:
-    """Sample f on a padded res^3 grid. Returns (values, spacing, origin).
+    """Sample f on a res^3 grid over [-extent, extent]^3. Returns (values, spacing, origin).
 
-    The grid is padded by one voxel of guaranteed-positive field on every side, so the
-    zero set cannot touch the boundary and marching cubes cannot produce an open surface.
+    The grid is padded by one voxel of positive field on every side, so the zero set cannot
+    touch the boundary and marching cubes cannot produce an open surface.
     """
     a = np.linspace(-extent, extent, res)
     g = np.stack(np.meshgrid(a, a, a, indexing="ij"), axis=-1).reshape(-1, 3)
@@ -314,18 +348,20 @@ def voxelise(f: Field, extent: float = 1.6, res: int = 96,
 
 
 def _repair(vol: np.ndarray, eps: float) -> tuple:
-    """Force one solid component and no interior void, by editing the field.
+    """Keep the largest solid component and fill interior voids, by editing the field.
 
-    Solid uses 6-connectivity and background 26-connectivity: the complementary pair, so a
-    solid touching only at a corner counts as two pieces and is discarded rather than being
-    welded into a pinch point that marching cubes would have to resolve.
+    Returns (vol, n_solid_components, n_voids). Solid uses 6-connectivity, so two pieces
+    touching only at a corner count as separate and the smaller is discarded rather than
+    welded into a pinch. Background uses 6-connectivity too. The complementary pair (6 for
+    solid, 26 for background) is the textbook choice, but marching cubes does not honour it:
+    a background pocket joined to the outside only through a corner is not a void by the
+    26-connected count, yet the interpolated surface seals it into an interior cavity, which
+    the lightcurves cannot see and the surface checks then reject as a second component.
+    Counting background at 6-connectivity fills those pockets instead.
 
-    Discarded pieces are removed by raising f above zero on exactly the voxels that belong to
-    them. Editing everything outside a dilation of the kept piece instead is wrong and was
-    the first version's bug: a discarded blob lying within the dilation is spared and comes
-    back as a second surface component. Voids are removed by lowering f below zero inside
-    them, which deletes the internal surface without creating a new crossing, since the
-    void's neighbours are solid on every side.
+    Discarded pieces are removed by raising f to at least `eps` on exactly their voxels.
+    Voids are filled by lowering f to at most `-eps` inside them, which deletes the internal
+    surface without creating a new crossing, since a void is surrounded by solid.
     """
     solid = vol < 0.0
     if not solid.any():
@@ -340,7 +376,7 @@ def _repair(vol: np.ndarray, eps: float) -> tuple:
     vol = np.where(solid & ~keep, np.maximum(vol, eps), vol)
 
     bg = vol >= 0.0
-    lab_b, kb = ndimage.label(bg, structure=ndimage.generate_binary_structure(3, 3))
+    lab_b, kb = ndimage.label(bg, structure=ndimage.generate_binary_structure(3, 1))
     outer = lab_b[0, 0, 0]
     void = bg & (lab_b != outer)
     n_void = int(kb - 1)
@@ -350,53 +386,52 @@ def _repair(vol: np.ndarray, eps: float) -> tuple:
 
 
 def extract(f: Field, extent: float = 1.6, res: int = 96) -> tuple:
-    """Level set of f as a closed, single-component, void-free mesh.
+    """Zero level set of f as a closed mesh. Returns (verts, faces, info).
 
-    Returns (verts, faces, info).
+    `_repair` leaves one solid voxel component and no interior void, but the extracted
+    surface can still split at a voxel-scale pinch, so callers that need one component
+    check `n_components` themselves. `info["clipped"]` is True when the body reached the
+    edge of the sampled grid.
     """
     from skimage import measure
 
     vol, spacing, origin = voxelise(f, extent, res)
+    # A field still negative on the outermost real shell gets closed off by the padding with
+    # a flat wall that downstream code would read as real geometry. Indices 1 and -2 are the
+    # first and last real shells; 0 and -1 are the pad.
+    clipped = bool(min(vol[1].min(), vol[-2].min(), vol[:, 1].min(), vol[:, -2].min(),
+                       vol[:, :, 1].min(), vol[:, :, -2].min()) < 0.0)
     eps = 1e-3 * max(float(np.abs(vol).max()), 1e-9)
     vol, n_solid, n_void = _repair(vol, eps)
     if not (vol < 0).any():
         raise ValueError("empty body: the field is positive everywhere on the grid")
     verts, faces, _, _ = measure.marching_cubes(vol, level=0.0, spacing=(spacing,) * 3)
     verts = verts + origin
-    # marching_cubes orients faces for `level` being the INSIDE-high convention; here the
-    # inside is where f < 0, so the winding comes out inward. Flip once, then verify.
+    # marching_cubes assumes the inside has the higher value; here the inside is f < 0, so
+    # the faces come out facing inward. Flip them, then check the volume sign to be sure.
     faces = faces[:, ::-1].copy()
     if mesh_volume(verts, faces) < 0:
         faces = faces[:, ::-1].copy()
-    return verts, faces, {"n_solid_components": n_solid, "n_voids_filled": n_void}
+    return verts, faces, {"n_solid_components": n_solid, "n_voids_filled": n_void,
+                          "clipped": clipped}
 
 
 # --------------------------------------------------------------------------- posing
 
 def pose(verts: np.ndarray, radius: float | None = 1.0,
          centre: str = "volume", faces: np.ndarray | None = None) -> np.ndarray:
-    """Challenge pose: z spans exactly [-1, 1], the body is centred on the rotation axis,
-    and its xy extent is brought to `radius`.
+    """Challenge pose: z spans exactly [-1, 1], the xy centroid is on the z axis, and the
+    largest xy radius is `radius`. `radius=None` leaves the xy scale alone.
 
-    `radius=None` leaves the xy scale alone and only centres, which is what the Thingi10K
-    ingestion wants when the source aspect ratio is worth keeping.
-
-    Scaling xy separately from z is `canonicalize_r`'s convention, not an accident: per-curve
-    mean normalisation destroys the cross-camera amplitudes that carry the aspect ratio, so
-    the library is built at the canonical r_max and the width is restored from the published
-    R at reconstruction time.
+    Scaling xy separately from z follows `hac26.shapes.canonicalize_r`: the library is built
+    at a canonical xy radius and the true width is restored from the published bounding
+    radius at reconstruction time.
     """
     v = np.asarray(verts, float).copy()
-    if centre == "volume" and faces is not None:
-        v0, v1, v2 = v[faces[:, 0]], v[faces[:, 1]], v[faces[:, 2]]
-        # centroid of the solid, by the divergence theorem on each coordinate
-        cr = np.cross(v1 - v0, v2 - v0)
-        tet = (v0 + v1 + v2) / 4.0
-        w = np.einsum("ij,ij->i", v0 + v1 + v2, cr) / 18.0
-        tot = w.sum()
-        c = (tet * w[:, None]).sum(0) / tot if abs(tot) > 1e-12 else v.mean(0)
-    else:
-        c = v.mean(0)
+    # Same centring rule as hac26.shapes.rescale_touch_z, so a body posed here does not move
+    # when re-posed there.
+    c = (solid_centroid(v, faces) if centre == "volume" and faces is not None
+         else v.mean(0))
     v[:, 0] -= c[0]
     v[:, 1] -= c[1]
     zmin, zmax = v[:, 2].min(), v[:, 2].max()
@@ -410,29 +445,105 @@ def pose(verts: np.ndarray, radius: float | None = 1.0,
     return v
 
 
+def solid_frame(verts: np.ndarray, faces: np.ndarray, res: int = 48) -> np.ndarray:
+    """Rows: the principal axes of the solid, longest extent first, as a proper rotation.
+    Taken from the occupancy of a grid, so a finely meshed region weighs no more than a
+    coarse one."""
+    extent = float(np.abs(verts).max()) * 1.05
+    v, f = verts, faces
+    if len(f) > 3000:
+        v, f = decimate_mesh(np.asarray(verts, float), np.asarray(faces, np.int64), extent, res)
+    occ = _parity_occupancy(np.asarray(v, float), np.asarray(f, np.int64), extent, res)
+    idx = np.argwhere(occ).astype(float)
+    if len(idx) < 4:
+        return np.eye(3)
+    p = idx * (2.0 * extent / (res - 1)) - extent
+    p -= p.mean(0)
+    _, vecs = np.linalg.eigh(np.cov(p, rowvar=False))
+    R = vecs[:, ::-1].T
+    if np.linalg.det(R) < 0:
+        R[2] *= -1.0
+    return R
+
+
+def _rotation_about(axis: np.ndarray, angle: float) -> np.ndarray:
+    """Rodrigues' rotation by `angle` about the unit vector `axis`."""
+    k = np.asarray(axis, float)
+    K = np.array([[0, -k[2], k[1]], [k[2], 0, -k[0]], [-k[1], k[0], 0]])
+    return np.eye(3) + np.sin(angle) * K + (1.0 - np.cos(angle)) * (K @ K)
+
+
+def mount(verts: np.ndarray, faces: np.ndarray, rng: np.random.Generator,
+          mount_weights: dict, tilt_deg: float, max_tilt_deg: float,
+          radius: float = 1.0) -> tuple:
+    """Put the body on its rotation axis and pose it. Returns (verts, record).
+
+    The axis is one of the body's principal axes (`mount_weights` keys "long", "middle",
+    "short") or a random direction ("random"), tilted away by an angle drawn as |N(0,
+    tilt_deg)| capped at max_tilt_deg, and spun by a random angle. Then `pose`."""
+    v = np.asarray(verts, float)
+    kind = _draw(mount_weights, rng)
+    tilt = 0.0
+    if kind == "random":
+        R = _rand_rot(rng)
+    else:
+        frame = solid_frame(v, faces)                    # rows: long, middle, short
+        axis = frame[{"long": 0, "middle": 1, "short": 2}[kind]]
+        R = _rot(axis)                                   # sends the chosen axis to z
+        tilt = min(abs(rng.normal(0.0, np.radians(tilt_deg))), np.radians(max_tilt_deg))
+        ang = rng.uniform(0.0, 2.0 * np.pi)
+        R = _rotation_about(np.array([np.cos(ang), np.sin(ang), 0.0]), tilt) @ R
+    R = _rotation_about(np.array([0.0, 0.0, 1.0]), rng.uniform(0.0, 2.0 * np.pi)) @ R
+    v = v @ R.T
+    # The published bounding-cylinder radius of a model is its largest distance from the
+    # rotation axis over half its height; posing removes it, so it is recorded here.
+    c = solid_centroid(v, faces)
+    r_xy = float(np.hypot(v[:, 0] - c[0], v[:, 1] - c[1]).max())
+    z_half = 0.5 * float(v[:, 2].max() - v[:, 2].min())
+    return pose(v, radius=radius, faces=faces), {"axis": kind, "tilt_deg": float(np.degrees(tilt)),
+                                                "cylinder_radius": r_xy / max(z_half, 1e-12)}
+
+
 # --------------------------------------------------------------------------- the recipes
 
 @dataclass
 class LibrarySpec:
-    """Everything the sampler is allowed to vary. Exposed so a run is reproducible from it."""
+    """Everything the sampler is allowed to vary, so a run is reproducible from it."""
     res: int = 96
     extent: float = 1.6
     radius: float = 1.0
-    convexity_max: float = 0.98          # volume / hull volume must fall below this
-    base_weights: dict = _dcfield(default_factory=lambda: {
-        "star_sh": 0.17, "ellipsoid": 0.08, "polytope": 0.10, "lobes": 0.15,
-        "prism": 0.10, "rubble": 0.12, "arch": 0.05, "slab": 0.07,
-        "contact_binary": 0.16})
-    n_modifiers: tuple = (2, 6)          # inclusive range, drawn per body
+    family_weights: dict = _dcfield(default_factory=lambda: {
+        "potato": 0.14, "bilobe": 0.24, "trilobe": 0.08, "top": 0.06, "faceted": 0.10,
+        "geometric": 0.12, "real": 0.14, "object": 0.12})
+    n_modifiers: tuple = (0, 3)          # inclusive range, drawn per body
     mod_weights: dict = _dcfield(default_factory=lambda: {
-        "craters": 0.18, "pitted": 0.10, "basin": 0.12, "cuts": 0.14, "groove": 0.10,
-        "waist": 0.10, "bite": 0.12, "scallops": 0.08, "boulders": 0.06,
-        "roughness": 0.06, "tunnel": 0.02})
-    max_attempts: int = 12
+        "basin": 0.35, "saw": 0.20, "bulge": 0.15, "roughness": 0.20, "ridge": 0.10})
+    mount_weights: dict = _dcfield(default_factory=lambda: {
+        "short": 0.40, "long": 0.35, "middle": 0.10, "random": 0.15})
+    tilt_deg: float = 12.0               # scale of the tilt off the principal axis
+    max_tilt_deg: float = 35.0
+    convexity_bins: tuple = (0.7, 0.85, 0.95)          # band edges of volume / hull volume
+    convexity_shares: tuple = (0.25, 0.30, 0.25, 0.20)  # share of bodies per band; () leaves
+                                                        # the mix to the families
+    band_attempts: int = 12              # draws to land in the band before taking the nearest
+    shape_models: tuple = ()             # files of real asteroid models, the "real" family
+    object_models: tuple = ()            # files of everyday objects, the "object" family
+    max_attempts: int = 8
+
+    def weights(self) -> dict:
+        """The family weights, with "real" and "object" dropped when there are no files
+        for them."""
+        w = dict(self.family_weights)
+        if not self.shape_models:
+            w.pop("real", None)
+        if not self.object_models:
+            w.pop("object", None)
+        return w
 
 
 @dataclass
 class Body:
+    """A finished library body: posed mesh, the recipe that made it, and its measurements."""
     verts: np.ndarray
     faces: np.ndarray
     recipe: dict
@@ -448,422 +559,589 @@ def _rand_rot(rng: np.random.Generator) -> np.ndarray:
     return q * np.sign(np.diag(r))
 
 
-def _base(rng: np.random.Generator, kind: str, s: float) -> tuple:
-    """A starting field of overall size ~s, plus the parameters that made it."""
-    R = _rand_rot(rng)
-    if kind == "star_sh":
-        L = int(rng.integers(3, 9))
-        ls = np.concatenate([[l] * (2 * l + 1) for l in range(1, L + 1)])
-        a = rng.normal(0.0, rng.uniform(0.15, 0.5) / (1.0 + ls) ** rng.uniform(1.0, 1.8))
-        return sd_star_sh(a, L, scale=s), {"L": L, "amp": float(np.abs(a).max())}
-    if kind == "ellipsoid":
-        ax = s * rng.uniform(0.55, 1.45, 3)
-        return sd_ellipsoid(axes=ax, rot=R), {"axes": ax.tolist()}
-    if kind == "polytope":
-        n = int(rng.integers(8, 40))
-        u = rng.normal(size=(n, 3))
-        u /= np.linalg.norm(u, axis=1, keepdims=True)
-        d = s * rng.uniform(0.55, 1.15, n)
-        return sd_convex(u, d), {"n_planes": n}
-    if kind == "contact_binary":
-        # Two ellipsoids forced APART, with the fillet capped low. `lobes` cannot produce this
-        # shape: its centres are drawn N(0,I) * U(0.25,0.55) against semi-axes U(0.35,0.75),
-        # so the components fuse, and op_smooth_union with a fillet up to 0.18 fills whatever
-        # crease survives. Measured over the library as shipped, the MEDIAN body has a neck
-        # ratio of about 1.0 -- deep necks exist only in the tail -- while a deep central cut
-        # is exactly what the hard public body needs. Separation >= 0.9 (a1x + a2x) puts the
-        # components at or past tangency, so the waist is a real pinch rather than a dimple.
-        a1 = s * rng.uniform(0.42, 0.62, 3)
-        a2 = s * rng.uniform(0.34, 0.55, 3)
-        sep = rng.uniform(0.90, 1.02) * (a1[0] + a2[0])
-        k_fill = float(rng.uniform(0.01, 0.05))
-        u = rng.normal(size=3); u /= np.linalg.norm(u)
-        c = 0.5 * sep * u
-        f = op_smooth_union(sd_ellipsoid(centre=-c, axes=a1, rot=R),
-                            sd_ellipsoid(centre=c, axes=a2, rot=R), k=k_fill)
-        return f, {"axes1": a1.tolist(), "axes2": a2.tolist(),
-                   "separation": float(sep), "fillet": k_fill}
-    if kind == "lobes":
-        k = int(rng.integers(2, 5))
-        fs, cs = [], []
-        for _ in range(k):
-            c = rng.normal(size=3) * s * rng.uniform(0.25, 0.55)
-            ax = s * rng.uniform(0.35, 0.75, 3)
-            fs.append(sd_ellipsoid(centre=c, axes=ax, rot=_rand_rot(rng)))
-            cs.append(c.tolist())
-        out = fs[0]
-        kk = s * rng.uniform(0.02, 0.18)
-        for g in fs[1:]:
-            out = op_smooth_union(out, g, k=kk)
-        return out, {"n_lobes": k, "fillet": float(kk)}
-    if kind == "prism":
-        n = int(rng.integers(3, 11))
-        ang = np.arange(n) * 2 * np.pi / n + rng.uniform(0, 2 * np.pi)
-        jit = 1.0 + rng.normal(0, 0.10, n) if rng.random() < 0.6 else np.ones(n)
-        nrm = np.stack([np.cos(ang), np.sin(ang), np.zeros(n)], 1)
-        d = s * rng.uniform(0.45, 0.95) * jit
-        caps = np.array([[0, 0, 1.0], [0, 0, -1.0]])
-        hz = s * rng.uniform(0.5, 1.4)
-        f = sd_convex(np.vstack([nrm, caps]), np.concatenate([d, [hz, hz]]))
-        return (lambda p, f=f, R=R: f(p @ R.T)), {"n_sides": n, "half_height": float(hz)}
-    if kind == "rubble":
-        k = int(rng.integers(5, 14))
-        fs = []
-        for _ in range(k):
-            c = rng.normal(size=3) * s * rng.uniform(0.15, 0.65)
-            ax = s * rng.uniform(0.18, 0.5, 3)
-            fs.append(sd_ellipsoid(centre=c, axes=ax, rot=_rand_rot(rng)))
-        out = fs[0]
-        kk = s * rng.uniform(0.01, 0.08)
-        for g in fs[1:]:
-            out = op_smooth_union(out, g, k=kk)
-        return out, {"n_grains": k}
-    if kind == "arch":
-        body = sd_ellipsoid(axes=s * rng.uniform(0.7, 1.2, 3), rot=R)
-        hole = sd_cylinder(centre=rng.normal(size=3) * s * 0.15,
-                           axis=R[rng.integers(0, 3)], radius=s * rng.uniform(0.15, 0.35),
-                           half_height=3.0 * s)
-        return op_subtract(body, hole), {"genus": 1}
-    if kind == "slab":
-        half = s * np.array([rng.uniform(0.6, 1.2), rng.uniform(0.5, 1.1),
-                             rng.uniform(0.25, 0.6)])
-        return (sd_box(half=half, rot=R, round_r=s * rng.uniform(0.0, 0.18)),
-                {"half": half.tolist()})
-    raise ValueError(kind)
-
-
-def min_feature_radius(res: int, extent: float, voxels_across: float = 2.5) -> float:
-    """Smallest sphere radius marching cubes can render as a round bowl rather than a
-    blocky/aliased lump, at a grid of `res` samples across `2*extent`.
-
-    A feature narrower than a couple of grid cells doesn't get enough sample points on its
-    boundary for marching cubes to reconstruct a round surface -- it comes out as jagged
-    voxel-aligned facets instead, which is the opposite of "small and clean." 2.5 voxels
-    across the radius (5 across the diameter) is a practical floor, not a hard
-    mathematical one: below it, quality visibly degrades before the feature disappears.
-    """
-    spacing = 2.0 * extent / max(res - 1, 1)
-    return voxels_across * spacing
-
-
-def _apply_modifier(f: Field, rng: np.random.Generator, kind: str, s: float,
-                    strength: float, res: int = 96, extent: float = 1.6) -> tuple:
-    """One geometric edit. `strength` >= 1 intensifies it when the gate has to be retried.
-
-    `res`/`extent` are only used by size-sensitive modifiers (`pitted`) to keep features
-    from being drawn smaller than marching cubes can actually resolve on the grid they'll
-    be extracted at -- see `min_feature_radius`.
-    """
-    if kind == "craters":
-        k = int(rng.integers(2, 9))
-        cuts = []
-        for _ in range(k):
-            u = rng.normal(size=3); u /= np.linalg.norm(u)
-            rad = s * rng.uniform(0.15, 0.45) * strength
-            depth = rng.uniform(0.25, 0.85)          # fraction of the cutter inside
-            cuts.append(sd_sphere(u * s * (1.0 - depth * 0.55) + u * rad * (1 - depth), rad))
-        return op_subtract(f, *cuts), {"n_craters": k}
-    if kind == "pitted":
-        # a permuted lattice, not independent random directions -- see _fibonacci_sphere
-        n_lattice = int(rng.integers(200, 361))
-        lattice = _fibonacci_sphere(n_lattice)
-        order = rng.permutation(n_lattice)
-        min_r = min_feature_radius(res, extent)
-        # coverage (~ k * r^2) is what should stay roughly constant across resolutions,
-        # not k itself: when the floor inflates r at a coarse grid, k has to shrink or the
-        # craters overlap into a jagged mass instead of staying distinct small bowls.
-        # The reference point is res=96's OWN floor, not an independent constant smaller
-        # than it -- using a smaller constant here previously meant count was shrunk even
-        # at res=96, silently undoing the "many small craters" behaviour at the one
-        # resolution meant to show it off cleanly.
-        reference_r = min_feature_radius(96, extent)
-        area_scale = 1.0 if min_r <= reference_r else (reference_r / min_r) ** 2
-        k = max(6, int(rng.integers(40, 91) * area_scale))
-        k = min(k, n_lattice)
-        cuts = []
-        for idx in order[:k]:
-            u = lattice[idx]
-            # target radius is deliberately small (asteroid regolith, not lunar maria);
-            # the max() with min_r keeps it from being drawn smaller than this grid can
-            # actually render -- at low res that floor dominates and craters come out a
-            # bit larger than the target (with k reduced above to compensate), at high
-            # res the target dominates and craters come out genuinely tiny.
-            target = s * rng.uniform(0.020, 0.055) * strength
-            rad = max(min_r, target)
-            depth = rng.uniform(0.25, 0.55)      # shallow bowls, not deep bites
-            cuts.append(sd_sphere(u * s * (1.0 - depth * 0.55) + u * rad * (1 - depth), rad))
-        return op_subtract(f, *cuts), {"n_pits": k, "lattice_n": n_lattice,
-                                       "min_r": float(min_r)}
-    if kind == "basin":
-        u = rng.normal(size=3); u /= np.linalg.norm(u)
-        rad = s * rng.uniform(0.7, 1.5) * strength
-        off = s * rng.uniform(0.75, 1.25) + rad * rng.uniform(0.35, 0.8)
-        return op_subtract(f, sd_sphere(u * off, rad)), {"basin_radius": float(rad)}
-    if kind == "cuts":
-        k = int(rng.integers(1, 5))
-        u = rng.normal(size=(k, 3))
-        u /= np.linalg.norm(u, axis=1, keepdims=True)
-        d = s * rng.uniform(0.45, 0.95, k)
-        return op_intersect(f, sd_convex(u, d)), {"n_cuts": k}
-    if kind == "groove":
-        u = rng.normal(size=3); u /= np.linalg.norm(u)
-        maj = s * rng.uniform(0.55, 1.0)
-        mnr = s * rng.uniform(0.06, 0.22) * strength
-        return op_subtract(f, sd_torus(axis=u, major=maj, minor=mnr)), {"groove": float(mnr)}
-    if kind == "waist":
-        z0 = rng.uniform(-0.5, 0.5) * s
-        w = s * rng.uniform(0.2, 0.6)
-        amp = s * rng.uniform(0.15, 0.5) * strength
-
-        def d(p, z0=z0, w=w, amp=amp):
-            return amp * np.exp(-((p[..., 2] - z0) ** 2) / (2 * w * w))
-        return op_displace(f, d), {"waist_amp": float(amp)}
-    if kind == "bite":
-        u = rng.normal(size=3); u /= np.linalg.norm(u)
-        rad = s * rng.uniform(0.45, 0.9) * strength
-        return op_subtract(f, sd_sphere(u * (s * rng.uniform(0.6, 1.0)), rad)), {"bite": 1}
-    if kind == "scallops":
-        k = int(rng.integers(2, 6))
-        cuts = []
-        for _ in range(k):
-            u = rng.normal(size=3); u /= np.linalg.norm(u)
-            ax = s * rng.uniform(0.2, 0.55, 3) * strength
-            cuts.append(sd_ellipsoid(u * s * rng.uniform(0.8, 1.15), ax, _rand_rot(rng)))
-        return op_subtract(f, *cuts), {"n_scallops": k}
-    if kind == "boulders":
-        k = int(rng.integers(2, 8))
-        adds = []
-        for _ in range(k):
-            u = rng.normal(size=3); u /= np.linalg.norm(u)
-            adds.append(sd_sphere(u * s * rng.uniform(0.7, 1.0), s * rng.uniform(0.08, 0.22)))
-        return op_union(f, *adds), {"n_boulders": k}
-    if kind == "roughness":
-        L = int(rng.integers(4, 12))
-        return op_displace(f, _sh_displacement(rng, L, s * rng.uniform(0.02, 0.10))), {"rough_L": L}
-    if kind == "tunnel":
-        u = rng.normal(size=3); u /= np.linalg.norm(u)
-        return op_subtract(f, sd_cylinder(centre=rng.normal(size=3) * s * 0.2, axis=u,
-                                          radius=s * rng.uniform(0.10, 0.25),
-                                          half_height=4.0 * s)), {"tunnel": 1}
-    raise ValueError(kind)
-
-
 def _draw(d: dict, rng: np.random.Generator) -> str:
     ks = list(d)
     w = np.array([d[k] for k in ks], float)
     return ks[int(rng.choice(len(ks), p=w / w.sum()))]
 
 
-def sample_body(rng: np.random.Generator, spec: LibrarySpec | None = None) -> Body:
-    """One posed, closed, single-component, strictly non-convex body.
+def _potato(rng: np.random.Generator, s: float, centre=(0, 0, 0),
+            rot: np.ndarray | None = None, b_min: float = 0.35) -> tuple:
+    """A smooth lumpy body: an ellipsoid of size s with its middle axis at least b_min of
+    the long one, its radius modulated by harmonics of degree 2 to 4. Returns (field,
+    record)."""
+    b = np.exp(rng.uniform(np.log(b_min), 0.0))         # elongations up to 1 / b_min
+    c = b * np.exp(rng.uniform(np.log(0.45), 0.0))
+    axes = s * np.array([1.0, b, c])
+    amp = rng.uniform(0.05, 0.28)
+    L = 4
+    a = _sh_coeffs(rng, 2, L, amp, rng.uniform(0.8, 1.5))
+    return (sd_star_sh(a, L, centre=centre, scale=1.0, axes=axes, rot=rot),
+            {"axes": (axes / s).round(3).tolist(), "amp": float(amp)})
 
-    The non-convexity gate is enforced by resampling with a larger `strength`, so the
-    returned body is guaranteed to satisfy it rather than merely likely to.
-    """
-    spec = spec or LibrarySpec()
-    last = None
-    # Drawn ONCE, outside the retry loop. Redrawing it per attempt biases the realised base
-    # distribution towards whatever survives the non-convexity gate first: measured, prism
-    # fell from its nominal 0.12 to 0.037 and polytope rose from 0.12 to 0.225, while
-    # write_report printed base_weights as though it had been honoured.
-    base_kind = _draw(spec.base_weights, rng)
+
+def _lobes(rng: np.random.Generator, s: float, k: int) -> tuple:
+    """k potatoes in a row, each touching or overlapping the next with a filleted neck, and
+    bent a little off the line: contact binaries and dog-bones."""
+    u = np.array([1.0, 0.0, 0.0])
+    fs, recs, fracs = [], [], []
+    pos = np.zeros(3)
+    r_ahead = None                                       # the previous lobe's radius along u
+    for i in range(k):
+        size = s if i == 0 else s * rng.uniform(0.4, 1.0)
+        # Each lobe's long axis lies near the line, as in the radar contact binaries, with
+        # a tilt of up to forty degrees and a random roll about the line.
+        w = _unit(rng); w -= (w @ u) * u; w /= np.linalg.norm(w)
+        R = (_rotation_about(u, rng.uniform(0.0, 2.0 * np.pi))
+             @ _rotation_about(w, rng.uniform(0.0, np.radians(30.0))))
+        f, rec = _potato(rng, size, rot=R, b_min=0.55)
+        if r_ahead is not None:
+            r_back = float(_ray_radius(f, -u[None])[0])  # this lobe's radius toward the last
+            frac = rng.uniform(0.65, 0.95)               # 1 would be touching at a point
+            fracs.append(float(frac))
+            bend = _unit(rng); bend -= (bend @ u) * u
+            pos = pos + u * frac * (r_ahead + r_back) + bend * rng.uniform(0.0, 0.15) * size
+        fs.append(_shift(f, pos))
+        recs.append(rec)
+        r_ahead = float(_ray_radius(f, u[None])[0])
+    k_fill = s * rng.uniform(0.05, 0.18)                 # the neck's fillet
+    out = fs[0]
+    for g in fs[1:]:
+        out = op_smooth_union(out, g, k=k_fill)
+    return out, {"n_lobes": k, "fillet": float(k_fill / s), "spacing": fracs, "lobes": recs}
+
+
+def _shift(f: Field, c: np.ndarray) -> Field:
+    c = np.asarray(c, float)
+    return lambda p: f(p - c)
+
+
+def _top(rng: np.random.Generator, s: float) -> tuple:
+    """A spinning top: the radius profile r(z) = R (1 - |z/h|^a)^(1/a) on each side of the
+    equator, a = 1 a double cone with a sharp ridge, a = 2 an ellipsoid, with a small
+    non-axisymmetric modulation."""
+    R_eq = s
+    h_n, h_s = s * rng.uniform(0.55, 1.0), s * rng.uniform(0.55, 1.0)
+    a = rng.uniform(1.0, 2.0)
+    L = 3
+    coef = _sh_coeffs(rng, 2, L, rng.uniform(0.0, 0.06), 1.0)
+
+    def f(p):
+        z = p[..., 2]
+        rad = np.hypot(p[..., 0], p[..., 1])
+        h = np.where(z >= 0, h_n, h_s)
+        t = np.clip(np.abs(z) / h, 0.0, 1.0)
+        prof = R_eq * (1.0 - t ** a) ** (1.0 / a)
+        _, theta, phi = _angles(p)
+        mod = np.exp((coef @ real_sh_basis(L, theta.ravel(), phi.ravel())).reshape(z.shape))
+        d = rad - prof * mod
+        return np.where(np.abs(z) > h, np.maximum(d, np.abs(z) - h), d)
+    return f, {"exponent": float(a), "heights": [float(h_n / s), float(h_s / s)]}
+
+
+def _faceted(rng: np.random.Generator, s: float) -> tuple:
+    """A potato cut by several planes, each removing a cap: an angular body."""
+    f, rec = _potato(rng, s)
+    n = int(rng.integers(4, 15))
+    dirs = np.stack([_unit(rng) for _ in range(n)])
+    r = _ray_radius(f, dirs)
+    d = r * rng.uniform(0.80, 0.97, n)
+    return op_intersect(f, sd_convex(dirs, d)), {"n_planes": n, **rec}
+
+
+def _geometric(rng: np.random.Generator, s: float) -> tuple:
+    """A test solid: box, cylinder, cone, prism, capsule, superellipsoid, or a Platonic solid,
+    with zero to three saw cuts that take a corner or an edge off."""
+    kind = _draw({"box": 0.25, "cylinder": 0.15, "cone": 0.08, "prism": 0.15,
+                  "capsule": 0.10, "superellipsoid": 0.15, "platonic": 0.12}, rng)
+    R = _rand_rot(rng)
+    rec = {"solid": kind}
+    if kind == "box":
+        half = s * np.array([1.0, rng.uniform(0.5, 1.0), rng.uniform(0.2, 1.0)])
+        f = sd_box(half=half, rot=R, round_r=s * rng.uniform(0.0, 0.12))
+        rec["half"] = (half / s).round(3).tolist()
+    elif kind == "cylinder":
+        f = sd_cylinder(axis=R[2], radius=s * rng.uniform(0.5, 1.0),
+                        half_height=s * rng.uniform(0.4, 1.2), round_r=s * rng.uniform(0.0, 0.1))
+    elif kind == "cone":
+        f = sd_cone(axis=R[2], radius=s * rng.uniform(0.6, 1.0), half_height=s * rng.uniform(0.6, 1.2))
+    elif kind == "prism":
+        n = int(rng.integers(3, 9))
+        ang = np.arange(n) * 2 * np.pi / n
+        nrm = np.stack([np.cos(ang), np.sin(ang), np.zeros(n)], 1)
+        d = s * rng.uniform(0.55, 1.0) * np.ones(n)
+        hz = s * rng.uniform(0.4, 1.2)
+        base = sd_convex(np.vstack([nrm, [[0, 0, 1.0], [0, 0, -1.0]]]),
+                         np.concatenate([d, [hz, hz]]))
+        f = (lambda p, g=base, R=R: g(p @ R.T))
+        rec["n_sides"] = n
+    elif kind == "capsule":
+        r = s * rng.uniform(0.35, 0.7); hz = s * rng.uniform(0.3, 1.0)
+        f = sd_cylinder(axis=R[2], radius=r, half_height=hz + r, round_r=r * 0.999)
+    elif kind == "superellipsoid":
+        ax = s * np.array([1.0, rng.uniform(0.5, 1.0), rng.uniform(0.4, 1.0)])
+        e = rng.uniform(2.5, 8.0)
+
+        def f(p, ax=ax, e=e, R=R):
+            q = np.abs((p @ R.T) / ax)
+            return (q ** e).sum(-1) ** (1.0 / e) - 1.0
+        rec["exponent"] = float(e)
+    else:
+        from .shapes import platonic
+        name = ["tetra", "octa", "dodeca", "icosa"][int(rng.integers(0, 4))]
+        pts = platonic(name) @ R.T
+        hull = ConvexHull(pts)
+        f = sd_convex(hull.equations[:, :3], -hull.equations[:, 3] * s)
+        rec["solid"] = name
+    n_cut = int(rng.choice(4, p=[0.35, 0.35, 0.2, 0.1]))
+    if n_cut:
+        dirs = np.stack([_unit(rng) for _ in range(n_cut)])
+        r = _ray_radius(f, dirs)
+        f = op_intersect(f, sd_convex(dirs, r * rng.uniform(0.55, 0.9, n_cut)))
+    rec["n_saw_cuts"] = n_cut
+    return f, rec
+
+
+_MODEL_CACHE: dict = {}
+
+
+def _real(rng: np.random.Generator, spec: "LibrarySpec", files: tuple) -> tuple:
+    """One of `files` (a real shape model or an everyday object), stretched by up to fifteen
+    percent along each axis of a random frame and mirrored half the time."""
+    path = files[int(rng.integers(0, len(files)))]
+    if path not in _MODEL_CACHE:
+        _MODEL_CACHE[path] = read_shape_model(path)
+    v, faces = _MODEL_CACHE[path]
+    v = v - solid_centroid(v, faces)
+    R = _rand_rot(rng)
+    stretch = rng.uniform(0.85, 1.15, 3)
+    v = (v @ R.T) * stretch
+    if rng.random() < 0.5:
+        v = v * np.array([1.0, 1.0, -1.0])
+        faces = faces[:, ::-1]
+    v = v / max(float(np.linalg.norm(v, axis=1).max()), 1e-12) * GRID_FILL * spec.extent
+    occ = _parity_occupancy(v, faces, spec.extent, spec.res)
+    return (_field_from_occupancy(occ, spec.extent, spec.res),
+            {"model": Path(path).name, "stretch": stretch.round(3).tolist()})
+
+
+def _base(rng: np.random.Generator, kind: str, s: float, spec: "LibrarySpec") -> tuple:
+    if kind == "potato":
+        return _potato(rng, s)
+    if kind == "bilobe":
+        return _lobes(rng, s, 2)
+    if kind == "trilobe":
+        return _lobes(rng, s, 3)
+    if kind == "top":
+        return _top(rng, s)
+    if kind == "faceted":
+        return _faceted(rng, s)
+    if kind == "geometric":
+        return _geometric(rng, s)
+    if kind == "real":
+        return _real(rng, spec, spec.shape_models)
+    if kind == "object":
+        return _real(rng, spec, spec.object_models)
+    raise ValueError(kind)
+
+
+GRID_FILL = 0.85         # a body's largest radius from its centroid, as a share of the
+                         # grid's half-width; the rest is margin against clipping
+
+
+def _centre_and_fit(f: Field, extent: float, res: int = 32) -> Field:
+    """Shift the field so its solid centroid is at the origin and scale it so its largest
+    radius is GRID_FILL of the grid, from a coarse sample of the solid. The sign of f is
+    unchanged, so nothing downstream cares that the values are no longer distances."""
+    a = np.linspace(-4.0, 4.0, res)
+    g = np.stack(np.meshgrid(a, a, a, indexing="ij"), axis=-1).reshape(-1, 3)
+    inside = f(g) < 0.0
+    if not inside.any():
+        return f
+    pts = g[inside]
+    c = pts.mean(0)
+    r_max = float(np.linalg.norm(pts - c, axis=1).max()) + (a[1] - a[0])
+    lam = GRID_FILL * extent / max(r_max, 1e-9)
+    return lambda p: f(p / lam + c)
+
+
+def _surface_direction(f: Field, rng: np.random.Generator, s: float) -> tuple:
+    """A random direction and the surface radius along it, redrawn while the ray finds
+    nothing but a sliver, which happens when the origin is not inside a bent body."""
+    for _ in range(8):
+        u = _unit(rng)
+        rb = float(_ray_radius(f, u[None])[0])
+        if rb > 0.25 * s:
+            return u, rb
+    return u, rb
+
+
+def min_feature_radius(res: int, extent: float, voxels_across: float = 2.5) -> float:
+    """Smallest sphere radius marching cubes can render as a round bowl on a grid of `res`
+    samples across `2 * extent`."""
+    spacing = 2.0 * extent / max(res - 1, 1)
+    return voxels_across * spacing
+
+
+def _apply_modifier(f: Field, rng: np.random.Generator, kind: str, s: float) -> tuple:
+    """One large-scale edit of `f`. Every cutter and lobe is placed relative to the body's
+    own surface along its direction, so the edit lands on the body whatever its shape."""
+    if kind == "basin":
+        k = int(rng.integers(1, 4))
+        cuts = []
+        for _ in range(k):
+            u, rb = _surface_direction(f, rng, s)
+            rho = s * rng.uniform(0.3, 0.9)                     # cutter radius
+            depth = rho * rng.uniform(0.15, 0.6)                # how far it dips in
+            cuts.append(sd_sphere(u * (rb + rho - depth), rho))
+        return op_subtract(f, *cuts), {"n_basins": k}
+    if kind == "saw":
+        k = int(rng.integers(1, 3))
+        dirs = np.stack([_unit(rng) for _ in range(k)])
+        r = _ray_radius(f, dirs)
+        return op_intersect(f, sd_convex(dirs, r * rng.uniform(0.6, 0.92, k))), {"n_saw": k}
+    if kind == "bulge":
+        u, rb = _surface_direction(f, rng, s)
+        ax = s * rng.uniform(0.2, 0.5, 3)
+        lobe = sd_ellipsoid(u * rb * rng.uniform(0.6, 0.95), ax, _rand_rot(rng))
+        return op_smooth_union(f, lobe, k=s * rng.uniform(0.03, 0.12)), {"bulge": (ax / s).round(3).tolist()}
+    if kind == "roughness":
+        L = int(rng.integers(5, 11))
+        return op_displace(f, _sh_displacement(rng, 4, L, s * rng.uniform(0.01, 0.05))), {"rough_L": L}
+    if kind == "ridge":
+        w = _unit(rng)
+        c = rng.uniform(-0.3, 0.3) * s
+        amp = s * rng.uniform(0.04, 0.12)
+        width = s * rng.uniform(0.08, 0.2)
+
+        def d(p, w=w, c=c, amp=amp, width=width):
+            return -amp * np.exp(-((p @ w - c) ** 2) / (2.0 * width * width))
+        return op_displace(f, d), {"ridge": float(amp / s)}
+    raise ValueError(kind)
+
+
+def _finish(f: Field, rng: np.random.Generator, spec: LibrarySpec, recipe: dict,
+            attempt: int) -> Body | None:
+    """Extract, check, mount and measure. None when the body fails a check."""
+    try:
+        v, fc, info = extract(f, extent=spec.extent, res=spec.res)
+    except (ValueError, RuntimeError):
+        return None
+    if len(fc) < 100 or info.get("clipped"):
+        return None
+    if not is_edge_manifold(fc) or n_components(v, fc) != 1:
+        return None
+    v, rec_mount = mount(v, fc, rng, spec.mount_weights, spec.tilt_deg, spec.max_tilt_deg,
+                         spec.radius)
+    recipe["mount"] = rec_mount
+    info.update({"convexity": convexity_ratio(v, fc), "attempt": attempt,
+                 "n_faces": len(fc), "n_verts": len(v),
+                 "cylinder_radius": rec_mount["cylinder_radius"]})
+    return Body(v, fc, recipe, info)
+
+
+def _one_body(rng: np.random.Generator, spec: LibrarySpec) -> Body:
+    """One posed, closed, single-component body of a family drawn from the weights. A body
+    that fails the checks is redrawn within the same family; RuntimeError after
+    `spec.max_attempts` failures."""
+    kind = _draw(spec.weights(), rng)
+    s = GRID_FILL * spec.extent                          # the size every body is brought to
     for attempt in range(spec.max_attempts):
-        strength = 1.0 + 0.25 * attempt
-        s = 1.0
-        f, rec = _base(rng, base_kind, s)
-        recipe = {"base": base_kind, **rec, "mods": []}
-        n_mod = int(rng.integers(spec.n_modifiers[0], spec.n_modifiers[1] + 1))
-        for _ in range(n_mod):
+        f, rec = _base(rng, kind, 1.0, spec)
+        if kind not in ("real", "object"):
+            f = _centre_and_fit(f, spec.extent)
+        recipe = {"base": kind, **rec, "mods": []}
+        for _ in range(int(rng.integers(spec.n_modifiers[0], spec.n_modifiers[1] + 1))):
             mk = _draw(spec.mod_weights, rng)
-            f, mrec = _apply_modifier(f, rng, mk, s, strength, res=spec.res, extent=spec.extent)
+            f, mrec = _apply_modifier(f, rng, mk, s)
             recipe["mods"].append({"kind": mk, **mrec})
-        try:
-            v, fc, info = extract(f, extent=spec.extent, res=spec.res)
-        except (ValueError, RuntimeError) as e:
-            last = f"extract failed: {e}"
-            continue
-        if len(fc) < 100:
-            last = "degenerate: too few faces"
-            continue
-        v = pose(v, radius=spec.radius, faces=fc)
-        c = convexity_ratio(v, fc)
-        info.update({"convexity": c, "attempt": attempt, "n_faces": len(fc),
-                     "n_verts": len(v)})
-        if c >= spec.convexity_max:
-            last = f"convexity {c:.3f} >= {spec.convexity_max}"
-            continue
-        if not is_edge_manifold(fc):
-            last = "not edge-manifold (marching-cubes pinch or crack)"
-            continue
-        if n_components(v, fc) != 1:
-            last = "surface split into >1 component (voxel-scale pinch)"
-            continue
-        return Body(v, fc, recipe, info)
-    raise RuntimeError(f"no body passed the gate in {spec.max_attempts} attempts ({last})")
+        body = _finish(f, rng, spec, recipe, attempt)
+        if body is not None:
+            return body
+    raise RuntimeError(f"no {kind} body passed the checks in {spec.max_attempts} attempts")
+
+
+def sample_body(rng: np.random.Generator, spec: LibrarySpec | None = None) -> Body:
+    """One body. With `spec.convexity_shares` set, the body is dealt a band of volume over
+    hull volume first and bodies are drawn until one lands in it, up to `spec.band_attempts`,
+    after which the nearest miss is kept; so the library's convexity mix follows the shares
+    whatever the families' own tendencies. `info["band"]` records the band dealt."""
+    spec = spec or LibrarySpec()
+    if not spec.convexity_shares:
+        return _one_body(rng, spec)
+    edges = (-np.inf,) + tuple(spec.convexity_bins) + (np.inf,)
+    shares = np.asarray(spec.convexity_shares, float)
+    band = int(rng.choice(len(shares), p=shares / shares.sum()))
+    lo, hi = edges[band], edges[band + 1]
+    best, best_miss = None, np.inf
+    for _ in range(spec.band_attempts):
+        body = _one_body(rng, spec)
+        c = body.convexity
+        miss = 0.0 if lo <= c < hi else min(abs(c - lo), abs(c - hi))
+        if miss < best_miss:
+            best, best_miss = body, miss
+        if miss == 0.0:
+            break
+    best.info["band"] = band
+    best.info["band_hit"] = bool(best_miss == 0.0)
+    return best
 
 
 def build_library(n: int, seed: int = 0, spec: LibrarySpec | None = None,
                   progress: bool = False) -> list:
-    """`n` independent bodies. Each draws its own generator, so the library is
-    reproducible from (seed, n) and any single body can be rebuilt without the rest."""
+    """`n` independent bodies. Body `i` uses its own generator seeded from (seed, i), so the
+    library is reproducible and any single body can be rebuilt without the rest."""
     spec = spec or LibrarySpec()
     out = []
     for i in range(n):
         b = sample_body(np.random.default_rng([seed, i]), spec)
         out.append(b)
         if progress and (i % 10 == 0 or i == n - 1):
-            print(f"  body {i + 1}/{n}  base={b.recipe['base']:<9} "
+            print(f"  body {i + 1}/{n}  base={b.recipe['base']:<10} "
                   f"conv={b.convexity:.3f}  faces={b.info['n_faces']}", flush=True)
     return out
 
 
 # --------------------------------------------------------------------------- ingestion
 
+def read_shape_model(path: str) -> tuple:
+    """(verts, faces) from a shape-model file: STL, Wavefront OBJ, ASCII PLY, or the plain
+    vertex and facet lists radar and PDS models come in (`.wf`, `.tab`, `.txt`: lines of
+    three numbers, or an index followed by three, with or without `v`/`f` prefixes; faces
+    numbered from one). Faces with more than three corners are fanned into triangles."""
+    p = Path(path)
+    if p.suffix.lower() == ".stl":
+        from .stl_io import load_stl
+        v, f = load_stl(str(p))
+        return np.asarray(v, float), np.asarray(f, np.int64)
+    text = p.read_text(errors="ignore").splitlines()
+    if p.suffix.lower() == ".ply":
+        return _read_ply_ascii(text)
+    v_rows, f_rows, plain = [], [], []
+    for line in text:
+        t = line.split()
+        if not t or t[0].startswith("#"):
+            continue
+        key = t[0].lower()
+        if key == "v" and len(t) >= 4:
+            v_rows.append(t[1:])
+        elif key == "f" and len(t) >= 4:
+            f_rows.append([x.split("/")[0] for x in t[1:]])
+        elif key[0] in "-+.0123456789" and len(t) in (3, 4):
+            plain.append(t)
+    verts, faces = [], []
+    if v_rows:
+        # "v i x y z" numbers its rows; then the faces are "f i a b c" too
+        indexed = all(len(r) >= 4 and _is_int(r[0]) for r in v_rows)
+        verts = [[float(x) for x in (r[1:4] if indexed else r[:3])] for r in v_rows]
+        for r in f_rows:
+            idx = [int(float(x)) for x in (r[1:] if indexed else r)]
+            faces += [[idx[0], idx[i], idx[i + 1]] for i in range(1, len(idx) - 1)]
+    else:
+        for t in plain:
+            nums = t[1:] if len(t) == 4 else t         # a leading index is dropped
+            if all(_is_int(x) for x in nums):
+                faces.append([int(float(x)) for x in nums])
+            else:
+                verts.append([float(x) for x in nums])
+    if not verts or not faces:
+        raise ValueError(f"{path}: no vertices and faces found")
+    v = np.asarray(verts, float)
+    f = np.asarray(faces, np.int64)
+    if f.min() == 1:
+        f = f - 1
+    if f.min() < 0 or f.max() >= len(v):
+        raise ValueError(f"{path}: face indices out of range")
+    return v, f
+
+
+def _is_int(x: str) -> bool:
+    try:
+        return float(x).is_integer() and "." not in x and "e" not in x.lower()
+    except ValueError:
+        return False
+
+
+def _read_ply_ascii(lines: list) -> tuple:
+    n_v = n_f = 0
+    i = 0
+    for i, line in enumerate(lines):
+        t = line.split()
+        if t[:2] == ["element", "vertex"]:
+            n_v = int(t[2])
+        elif t[:2] == ["element", "face"]:
+            n_f = int(t[2])
+        elif t and t[0] == "end_header":
+            break
+    body = lines[i + 1:]
+    v = np.array([[float(x) for x in body[k].split()[:3]] for k in range(n_v)])
+    faces = []
+    for k in range(n_v, n_v + n_f):
+        t = [int(x) for x in body[k].split()]
+        idx = t[1:1 + t[0]]
+        faces += [[idx[0], idx[j], idx[j + 1]] for j in range(1, len(idx) - 1)]
+    return v, np.asarray(faces, np.int64)
+
+
+def load_shape_models(directory: str) -> list:
+    """Paths of every readable shape model directly in `directory`. Files that cannot be
+    parsed are skipped with a warning."""
+    out = []
+    for p in sorted(Path(directory).glob("*")):
+        if p.suffix.lower() not in (".stl", ".obj", ".ply", ".wf", ".tab", ".txt"):
+            continue
+        try:
+            v, f = read_shape_model(str(p))
+            if len(f) >= 100:
+                out.append(str(p))
+                _MODEL_CACHE[str(p)] = (v, f)
+        except Exception as e:                                   # noqa: BLE001
+            warnings.warn(f"skipped {p.name}: {e}")
+    return out
+
+
 def body_from_mesh(verts: np.ndarray, faces: np.ndarray,
                    rng: np.random.Generator | None = None,
                    spec: LibrarySpec | None = None,
                    add_modifiers: int = 0) -> Body:
-    """Bring an external mesh (Thingi10K) into the library.
-
-    The source is voxelised by ray-parity along z, which needs the source to be closed but
-    tolerates self-intersection and duplicated faces; the occupancy is then repaired and
-    re-meshed exactly as a generated body is, so an ingested body carries the same
-    guarantees as a sampled one.
-
-    `add_modifiers` is a MINIMUM, not a fixed count: if the source is already non-convex
-    enough on its own, it is admitted with that many edits (0 is allowed, and keeps a
-    genuinely non-convex source unmodified); if it is not -- most Thingi10K objects that
-    happen to be printable housewares are close to convex -- edits are added and
-    intensified exactly as `sample_body` does, so ingestion is held to the same gate as
-    every other source rather than a weaker one.
-    """
+    """Bring an external mesh into the library unchanged in shape: voxelised by ray parity
+    along z (which needs it closed but not oriented), repaired, re-meshed, mounted and posed
+    like a generated body, with `add_modifiers` edits on top."""
     spec = spec or LibrarySpec()
     rng = rng or np.random.default_rng(0)
     v = np.asarray(verts, float)
-    v = v - v.mean(0)
-    v = v / max(float(np.abs(v).max()), 1e-12)
-    occ = _parity_occupancy(v, np.asarray(faces, np.int64), spec.extent, spec.res)
-    f0 = _field_from_occupancy(occ, spec.extent, spec.res)
-
-    last = None
+    v = v - solid_centroid(v, np.asarray(faces, np.int64))
+    v = v / max(float(np.linalg.norm(v, axis=1).max()), 1e-12) * GRID_FILL * spec.extent
+    f0 = _field_from_occupancy(_parity_occupancy(v, np.asarray(faces, np.int64),
+                                                 spec.extent, spec.res), spec.extent, spec.res)
     for attempt in range(spec.max_attempts):
         f = f0
-        n_mod = add_modifiers + attempt
         recipe = {"base": "mesh", "source_faces": int(len(faces)), "mods": []}
-        for _ in range(n_mod):
+        for _ in range(add_modifiers):
             mk = _draw(spec.mod_weights, rng)
-            f, mrec = _apply_modifier(f, rng, mk, 1.0, 1.0 + 0.25 * attempt,
-                                      res=spec.res, extent=spec.extent)
+            f, mrec = _apply_modifier(f, rng, mk, GRID_FILL * spec.extent)
             recipe["mods"].append({"kind": mk, **mrec})
-        try:
-            vv, ff, info = extract(f, extent=spec.extent, res=spec.res)
-        except (ValueError, RuntimeError) as e:
-            last = f"extract failed: {e}"
-            continue
-        vv = pose(vv, radius=spec.radius, faces=ff)
-        c = convexity_ratio(vv, ff)
-        if c >= spec.convexity_max:
-            last = f"convexity {c:.3f} >= {spec.convexity_max}"
-            continue
-        if not is_edge_manifold(ff):
-            last = "not edge-manifold"
-            continue
-        if n_components(vv, ff) != 1:
-            last = "surface split into >1 component"
-            continue
-        info.update({"convexity": c, "n_faces": len(ff), "n_verts": len(vv),
-                     "attempt": attempt})
-        return Body(vv, ff, recipe, info)
-    raise RuntimeError(f"ingested mesh never passed the gate in {spec.max_attempts} "
-                       f"attempts ({last})")
+        body = _finish(f, rng, spec, recipe, attempt)
+        if body is not None:
+            return body
+    raise RuntimeError(f"ingested mesh never passed the checks in {spec.max_attempts} attempts")
 
 
 def body_from_convex_points(points: np.ndarray, rng: np.random.Generator,
                             spec: LibrarySpec | None = None,
-                            n_modifiers: int = 4) -> Body:
-    """DAMIT path: a convex body used ONLY as a basis, with non-convexity added.
-
-    DAMIT shapes are convex inversions -- they carry no concavity at all, so using them
-    directly would train the prior on exactly the geometry the challenge is about
-    recovering. The hull enters as the starting field and the gate is enforced afterwards,
-    so a body that came from DAMIT cannot reach the library still convex.
-    """
+                            n_modifiers: int = 2) -> Body:
+    """A convex model (DAMIT) as the starting field, with `n_modifiers` edits on top."""
     spec = spec or LibrarySpec()
     p = np.asarray(points, float)
     p = p - p.mean(0)
     p = p / max(float(np.abs(p).max()), 1e-12)
     hull = ConvexHull(p)
-    nrm = hull.equations[:, :3]
-    off = -hull.equations[:, 3]
-    f = sd_convex(nrm, off)
-    recipe = {"base": "damit_convex", "n_planes": int(len(nrm)), "mods": []}
+    f0 = _centre_and_fit(sd_convex(hull.equations[:, :3], -hull.equations[:, 3]), spec.extent)
     for attempt in range(spec.max_attempts):
-        g = f
-        recipe["mods"] = []
-        for _ in range(max(1, n_modifiers)):
+        f = f0
+        recipe = {"base": "damit_convex", "n_planes": int(len(hull.equations)), "mods": []}
+        for _ in range(n_modifiers):
             mk = _draw(spec.mod_weights, rng)
-            g, mrec = _apply_modifier(g, rng, mk, 1.0, 1.0 + 0.3 * attempt,
-                                      res=spec.res, extent=spec.extent)
+            f, mrec = _apply_modifier(f, rng, mk, GRID_FILL * spec.extent)
             recipe["mods"].append({"kind": mk, **mrec})
-        v, fc, info = extract(g, extent=spec.extent, res=spec.res)
-        v = pose(v, radius=spec.radius, faces=fc)
-        c = convexity_ratio(v, fc)
-        if c < spec.convexity_max and is_edge_manifold(fc) and n_components(v, fc) == 1:
-            info.update({"convexity": c, "n_faces": len(fc), "n_verts": len(v)})
-            return Body(v, fc, recipe, info)
-    raise RuntimeError("convex basis never brought below the non-convexity gate")
+        body = _finish(f, rng, spec, recipe, attempt)
+        if body is not None:
+            return body
+    raise RuntimeError("convex model never passed the checks")
+
+
+PARITY_TILE = 8          # see _parity_occupancy
+
+# Sub-voxel offsets added to the sample columns so a column never lands exactly on a triangle
+# edge. The point-in-triangle test is closed on its edges, so a column on an edge shared by
+# two triangles would be counted twice and the whole column would invert. The two offsets
+# differ so that a column on a face diagonal (x == y, as in any axis-aligned box) is moved
+# off it too. Fixed constants keep results reproducible.
+_JITTER = 1e-7
+_JX = _JITTER * 0.6180339887498949           # 1/phi
+_JY = _JITTER * 0.4142135623730951           # sqrt(2) - 1
 
 
 def _parity_occupancy(verts: np.ndarray, faces: np.ndarray, extent: float,
-                      res: int) -> np.ndarray:
-    """Occupancy by counting triangle crossings along +z through each (x, y) column.
+                      res: int, axis: np.ndarray | None = None,
+                      max_elems: float = 4e6) -> np.ndarray:
+    """Occupancy of a res^3 grid by counting triangle crossings along each (x, y) column.
 
-    Parity, not winding: a point is inside when the number of crossings above it is odd.
-    Correct for any closed surface regardless of orientation, and it is the reason ingestion
-    does not need trimesh.
+    A sample point is inside when the number of crossings strictly above it is odd. This is
+    correct for any closed surface whatever its face orientation, and needs no trimesh.
+
+    Columns are walked in tiles, each tile testing only the triangles whose xy box overlaps
+    it; the result does not depend on the tile size.
+
+    `axis` replaces the default `linspace(-extent, extent, res)` sample coordinates, for a
+    caller whose grid is cell centres (`hac26.recon`). It must have `res` entries.
     """
-    a = np.linspace(-extent, extent, res)
+    a = np.linspace(-extent, extent, res) if axis is None else np.asarray(axis, float)
+    if len(a) != res:
+        raise ValueError(f"axis has {len(a)} samples but res is {res}")
     zs = a
     v0, v1, v2 = verts[faces[:, 0]], verts[faces[:, 1]], verts[faces[:, 2]]
-    X, Y = np.meshgrid(a, a, indexing="ij")
-    px, py = X.ravel(), Y.ravel()
-    count = np.zeros((len(px), res), dtype=np.int32)
-    for t in range(0, len(faces), 3000):
-        A, B, C = v0[t:t + 3000], v1[t:t + 3000], v2[t:t + 3000]
-        d = ((B[:, 1] - C[:, 1]) * (A[:, 0] - C[:, 0])
-             + (C[:, 0] - B[:, 0]) * (A[:, 1] - C[:, 1]))
-        ok = np.abs(d) > 1e-14
-        if not ok.any():
+    tmin = np.minimum(np.minimum(v0, v1), v2)
+    tmax = np.maximum(np.maximum(v0, v1), v2)
+    # One more bin than there are planes: bin i holds the crossings with zs[i-1] < z <= zs[i],
+    # so bin 0 holds crossings at or below the lowest plane, which no plane should count.
+    count = np.zeros((res * res, res + 1), dtype=np.int32)
+    # Tile side in columns. Only the speed depends on it, not the result.
+    tile = max(1, min(res, PARITY_TILE))
+    spacing = float(a[1] - a[0]) if res > 1 else 2.0 * extent
+    jx, jy = _JX * spacing, _JY * spacing        # see _JITTER
+    for i0 in range(0, res, tile):
+        xs = a[i0:i0 + tile]
+        in_x = (tmin[:, 0] <= xs[-1]) & (tmax[:, 0] >= xs[0])
+        if not in_x.any():
             continue
-        A, B, C, d = A[ok], B[ok], C[ok], d[ok]
-        l1 = ((B[None, :, 1] - C[None, :, 1]) * (px[:, None] - C[None, :, 0])
-              + (C[None, :, 0] - B[None, :, 0]) * (py[:, None] - C[None, :, 1])) / d
-        l2 = ((C[None, :, 1] - A[None, :, 1]) * (px[:, None] - C[None, :, 0])
-              + (A[None, :, 0] - C[None, :, 0]) * (py[:, None] - C[None, :, 1])) / d
-        l3 = 1.0 - l1 - l2
-        inside = (l1 >= 0) & (l2 >= 0) & (l3 >= 0)
-        if not inside.any():
-            continue
-        zh = l1 * A[None, :, 2] + l2 * B[None, :, 2] + l3 * C[None, :, 2]
-        col, tri = np.nonzero(inside)
-        zc = zh[col, tri]
-        idx = np.clip(np.searchsorted(zs, zc), 0, res - 1)      # crossings above each plane
-        np.add.at(count, (col, idx), 1)
-    occ = (np.cumsum(count[:, ::-1], axis=1)[:, ::-1] % 2 == 1)
+        for j0 in range(0, res, tile):
+            ys = a[j0:j0 + tile]
+            sel = np.nonzero(in_x & (tmin[:, 1] <= ys[-1]) & (tmax[:, 1] >= ys[0]))[0]
+            if not len(sel):
+                continue
+            X, Y = np.meshgrid(xs, ys, indexing="ij")
+            px, py = X.ravel() + jx, Y.ravel() + jy
+            # global column index of each tile column: i * res + j
+            gcol = ((np.arange(i0, i0 + len(xs))[:, None] * res)
+                    + np.arange(j0, j0 + len(ys))[None, :]).ravel()
+            chunk = max(1, int(max_elems // max(len(px), 1)))
+            for t in range(0, len(sel), chunk):
+                k = sel[t:t + chunk]
+                A, B, C = v0[k], v1[k], v2[k]
+                d = ((B[:, 1] - C[:, 1]) * (A[:, 0] - C[:, 0])
+                     + (C[:, 0] - B[:, 0]) * (A[:, 1] - C[:, 1]))
+                ok = np.abs(d) > 1e-14
+                if not ok.any():
+                    continue
+                A, B, C, d = A[ok], B[ok], C[ok], d[ok]
+                l1 = ((B[None, :, 1] - C[None, :, 1]) * (px[:, None] - C[None, :, 0])
+                      + (C[None, :, 0] - B[None, :, 0]) * (py[:, None] - C[None, :, 1])) / d
+                l2 = ((C[None, :, 1] - A[None, :, 1]) * (px[:, None] - C[None, :, 0])
+                      + (A[None, :, 0] - C[None, :, 0]) * (py[:, None] - C[None, :, 1])) / d
+                l3 = 1.0 - l1 - l2
+                inside = (l1 >= 0) & (l2 >= 0) & (l3 >= 0)
+                if not inside.any():
+                    continue
+                zh = l1 * A[None, :, 2] + l2 * B[None, :, 2] + l3 * C[None, :, 2]
+                col, tri = np.nonzero(inside)
+                idx = np.clip(np.searchsorted(zs, zh[col, tri]), 0, res)
+                np.add.at(count, (gcol[col], idx), 1)
+    # Crossings strictly above plane j are those in bins j+1 and up; the slice drops bin 0.
+    occ = (np.cumsum(count[:, ::-1], axis=1)[:, ::-1] % 2 == 1)[:, 1:]
     return occ.reshape(res, res, res)
 
 
-def _field_from_occupancy(occ: np.ndarray, extent: float, res: int) -> Field:
-    """A smooth signed field from a binary occupancy, by the distance transform.
-
-    Distance-to-boundary inside minus distance-to-boundary outside, trilinearly
-    interpolated. Meshing this rather than the raw mask is what keeps an ingested body from
-    coming out with voxel stairsteps.
-    """
+def _field_from_occupancy(occ: np.ndarray, extent: float, res: int,
+                          smooth: float = 0.7) -> Field:
+    """A signed distance field from a binary occupancy: distance to the boundary, negative
+    inside, blurred by `smooth` voxels and trilinearly interpolated. The distance of a binary
+    mask still carries the voxel steps of the mask; the blur takes them out and leaves every
+    feature wider than a voxel or two, so an ingested body comes back as smooth as it went in."""
     sp = 2.0 * extent / (res - 1)
     din = ndimage.distance_transform_edt(occ, sampling=sp)
     dout = ndimage.distance_transform_edt(~occ, sampling=sp)
-    sdf = dout - din
+    sdf = ndimage.gaussian_filter(dout - din, smooth) if smooth > 0 else dout - din
     lo = -extent
 
     def f(p):
@@ -871,28 +1149,3 @@ def _field_from_occupancy(occ: np.ndarray, extent: float, res: int) -> Field:
         return ndimage.map_coordinates(sdf, idx.reshape(-1, 3).T, order=1,
                                        mode="nearest").reshape(p.shape[:-1])
     return f
-
-
-def load_thingi10k(directory: str, limit: int | None = None,
-                   spec: LibrarySpec | None = None,
-                   rng: np.random.Generator | None = None,
-                   add_modifiers: int = 2) -> list:
-    """Every .stl under `directory`, ingested. Files that fail are skipped with a warning.
-
-    Thingi10K is not redistributed here and is not required: the procedural families alone
-    clear the diversity gate. Point this at a local copy to fold real scanned geometry in.
-    """
-    from pathlib import Path
-    from .stl_io import load_stl
-
-    rng = rng or np.random.default_rng(0)
-    out = []
-    for i, p in enumerate(sorted(Path(directory).rglob("*.stl"))):
-        if limit is not None and len(out) >= limit:
-            break
-        try:
-            v, f = load_stl(str(p))
-            out.append(body_from_mesh(v, f, rng, spec, add_modifiers))
-        except Exception as e:                                   # noqa: BLE001
-            warnings.warn(f"skipped {p.name}: {e}")
-    return out

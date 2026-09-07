@@ -1,0 +1,142 @@
+[venv] active: /home/m12567jp/dev/Helsinki/.venv/bin/python (Python 3.12.3)
+[venv] dependencies already satisfied (numpy, scipy, torch, trimesh, skimage, rtree, fast_simplification, embreex)
+[01:55:35] === models: starting
+26 models ready in dataset/shape_models:
+  psyche.v.final.mod.wf: 1148 vertices, 2292 faces
+  kleo.obj: 2048 vertices, 4092 faces
+  kleo.v2.7.1148.mod.wf: 1148 vertices, 2292 faces
+  betulia.obj: 1148 vertices, 2292 faces
+  geographos.obj: 2048 vertices, 4092 faces
+  bacchus.obj: 256 vertices, 508 faces
+  rashalom.obj: 1148 vertices, 2292 faces
+  toutatis.obj: 1600 vertices, 3196 faces
+  hirestoutatis.obj: 20000 vertices, 39996 faces
+  Nereus_alt1.mod.wf: 1148 vertices, 2292 faces
+  castalia.obj: 2048 vertices, 4092 faces
+  golevka.obj: 2048 vertices, 4092 faces
+  1996hw1.obj: 1392 vertices, 2780 faces
+  sk.obj: 510 vertices, 1016 faces
+  sf36.v.mod.wf: 1846 vertices, 3688 faces
+  1950DA_ProgradeModel.wf: 1020 vertices, 2036 faces
+  1950DA_RetrogradeModel.wf: 510 vertices, 1016 faces
+  wt24.obj: 4000 vertices, 7996 faces
+  ml14.obj: 512 vertices, 1020 faces
+  yorp.obj: 288 vertices, 572 faces
+  kw4a.obj: 4586 vertices, 9168 faces
+  kw4b.obj: 1148 vertices, 2292 faces
+  1994CC_nominal.mod.wf: 2000 vertices, 3996 faces
+  ky26.obj: 2048 vertices, 4092 faces
+  ce26.obj: 1148 vertices, 2292 faces
+  2008ev5.obj: 2000 vertices, 3996 faces
+3 not available:
+  eros022540.tab: HTTP Error 403: Forbidden
+  253mathilde.tab: HTTP Error 403: Forbidden
+  itokawa_ver64q.tab: HTTP Error 403: Forbidden
+[01:56:09] === models: done
+[01:56:09] === objects: starting
+Warning: You are sending unauthenticated requests to the HF Hub. Please set a HF_TOKEN to enable higher rate limits and faster downloads.
+Generating train split: 0 examples [00:00, ? examples/s]Generating train split: 1 examples [00:00,  6.71 examples/s]Generating train split: 1350 examples [00:00, 6605.66 examples/s]Generating train split: 2959 examples [00:00, 10506.56 examples/s]Generating train split: 4615 examples [00:00, 10752.35 examples/s]Generating train split: 6039 examples [00:00, 11825.83 examples/s]Generating train split: 7804 examples [00:00, 13605.45 examples/s]Generating train split: 9406 examples [00:00, 14337.14 examples/s]Generating train split: 9995 examples [00:00, 11846.70 examples/s]
+Filter:   0%|          | 0/9995 [00:00<?, ? examples/s]Filter: 100%|██████████| 9995/9995 [00:00<00:00, 237784.20 examples/s]
+Filter:   0%|          | 0/8860 [00:00<?, ? examples/s]Filter:  90%|█████████ | 8000/8860 [00:00<00:00, 62860.62 examples/s]Filter: 100%|██████████| 8860/8860 [00:00<00:00, 61366.92 examples/s]
+Filter:   0%|          | 0/7344 [00:00<?, ? examples/s]Filter: 100%|██████████| 7344/7344 [00:00<00:00, 62246.83 examples/s]Filter: 100%|██████████| 7344/7344 [00:00<00:00, 61104.27 examples/s]
+Filter:   0%|          | 0/7344 [00:00<?, ? examples/s]Filter: 100%|██████████| 7344/7344 [00:00<00:00, 59890.67 examples/s]Filter: 100%|██████████| 7344/7344 [00:00<00:00, 59026.37 examples/s]
+Filter:   0%|          | 0/4963 [00:00<?, ? examples/s]Filter:  81%|████████  | 4000/4963 [00:00<00:00, 31978.04 examples/s]Filter: 100%|██████████| 4963/4963 [00:00<00:00, 34314.08 examples/s]
+Filter:   0%|          | 0/3834 [00:00<?, ? examples/s]Filter: 100%|██████████| 3834/3834 [00:00<00:00, 58410.59 examples/s]
+Filter:   0%|          | 0/3666 [00:00<?, ? examples/s]Filter: 100%|██████████| 3666/3666 [00:00<00:00, 61409.72 examples/s]
+Filter:   0%|          | 0/3666 [00:00<?, ? examples/s]Filter: 100%|██████████| 3666/3666 [00:00<00:00, 60194.01 examples/s]
+Filter:   0%|          | 0/3118 [00:00<?, ? examples/s]Filter: 100%|██████████| 3118/3118 [00:00<00:00, 57603.26 examples/s]
+Filter:   0%|          | 0/3118 [00:00<?, ? examples/s]Filter: 100%|██████████| 3118/3118 [00:00<00:00, 60476.12 examples/s]
+  2174 objects in Thingi10K pass the geometry filters
+  191 objects in dataset/shape_models/objects
+[01:58:11] === objects: done
+[01:58:11] === library: starting
+[1/3] bodies: n=1000, workers=16, res=64, out=dataset/generated/shapes; 26 real shape models, 191 objects; families potato 0.14, bilobe 0.24, trilobe 0.08, top 0.06, faceted 0.10, geometric 0.12, real 0.14, object 0.12
+    100/1000  (100 generated, 0 resumed)  1.53 bodies/s  ETA 9.8 min
+    200/1000  (200 generated, 0 resumed)  1.65 bodies/s  ETA 8.1 min
+    300/1000  (300 generated, 0 resumed)  1.68 bodies/s  ETA 7.0 min
+    400/1000  (400 generated, 0 resumed)  1.71 bodies/s  ETA 5.9 min
+    500/1000  (500 generated, 0 resumed)  1.65 bodies/s  ETA 5.1 min
+    600/1000  (600 generated, 0 resumed)  1.63 bodies/s  ETA 4.1 min
+    700/1000  (700 generated, 0 resumed)  1.66 bodies/s  ETA 3.0 min
+    800/1000  (800 generated, 0 resumed)  1.68 bodies/s  ETA 2.0 min
+    900/1000  (900 generated, 0 resumed)  1.66 bodies/s  ETA 1.0 min
+   1000/1000  (1000 generated, 0 resumed)  1.70 bodies/s  ETA 0.0 min
+[2/3] wrote 1000 bodies to dataset/generated/shapes
+[3/3] validity + diversity report
+
+# Shape library report: 1000 bodies
+
+Validity, measured on 300 bodies sampled from the full library:
+
+| check | pass |
+|---|---|
+| closed | 300/300 |
+| single_component | 300/300 |
+| z_span | 300/300 |
+| inside_cylinder | 300/300 |
+| on_axis | 300/300 |
+
+Convexity (volume / hull volume) over all 1000 bodies, at the 10th, 25th, 50th, 75th and 90th percentiles: 0.577, 0.730, 0.835, 0.926, 0.989; 68% below 0.9, 12% at 0.98 or above
+
+Cylinder radius (the published-style width over half-height) at the same percentiles: 0.60, 0.87, 1.36, 2.19, 2.89
+
+Diversity, measured on the same 300-body sample:
+
+- PR(support)  = 8.91
+- PR(concavity) = 9.30
+- PR(combined)  = 15.61
+- pairwise Dice: mean 0.576, std 0.161, range [0.003, 0.908]
+
+Base archetype counts over the full library:
+
+- bilobe: 271
+- object: 186
+- potato: 119
+- trilobe: 109
+- real: 103
+- faceted: 86
+- geometric: 83
+- top: 43
+
+[02:08:43] === library: done
+[02:08:43] === design: existing hac26/design4096.npy is valid
+[02:08:43] === calibrate: starting
+  model 1: 20000 faces, 28/28 geometries, noise median 0.0050, start phase -0.0 deg (9s)
+  model 2: 20000 faces, 28/28 geometries, noise median 0.0350, start phase -0.0 deg (7s)
+  model 3: 5996 faces, 28/28 geometries, noise median 0.0140, start phase +7.5 deg (1s)
+[fit] 150 steps over 3 bodies at 48 phases
+[W907 03:09:10.474292563 CUDACachingAllocator.cpp:3933] memory allocation failed with OOM on device 0 while trying to allocate 595591168 bytes (free: 486277120, total: 8080064512).
+[W907 03:09:10.498549327 CUDACachingAllocator.cpp:3933] memory allocation failed with OOM on device 0 while trying to allocate 148897792 bytes (free: 169607168, total: 8080064512).
+[W907 03:09:10.498593189 CUDACachingAllocator.cpp:3933] memory allocation failed with OOM on device 0 while trying to allocate 148897792 bytes (free: 169607168, total: 8080064512).
+Traceback (most recent call last):
+  File "/home/m12567jp/dev/Helsinki/scripts/calibrate.py", line 221, in <module>
+    main()
+  File "/home/m12567jp/dev/Helsinki/scripts/calibrate.py", line 184, in main
+    raw, _, grads = fwd.vjp(
+                    ^^^^^^^^
+  File "/home/m12567jp/dev/Helsinki/hac26/forward/mesh/exact.py", line 366, in vjp
+    raw = self._chunk(prep, phases, psi0, geoms, tau_b)
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/m12567jp/dev/Helsinki/hac26/forward/mesh/exact.py", line 287, in _chunk
+    return self._reduce(self._images_chunk(prep, phases, psi0, geoms), geoms, tau_b)
+                        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/m12567jp/dev/Helsinki/hac26/forward/mesh/exact.py", line 268, in _images_chunk
+    return self._images(prep, self._radiance(prep, cov, cfg.n_source), angle, geoms)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/m12567jp/dev/Helsinki/hac26/forward/mesh/exact.py", line 258, in _images
+    val = inst.sensor(img[..., 0], cos_off.expand(n, -1, -1), radius.expand(n, -1, -1),
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/m12567jp/dev/Helsinki/.venv/lib/python3.12/site-packages/torch/nn/modules/module.py", line 1778, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/m12567jp/dev/Helsinki/.venv/lib/python3.12/site-packages/torch/nn/modules/module.py", line 1789, in _call_impl
+    return forward_call(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/m12567jp/dev/Helsinki/hac26/forward/mesh/sensor.py", line 139, in forward
+    x = self.oetf(x / self.saturation.clamp_min(1e-6))
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/m12567jp/dev/Helsinki/hac26/forward/mesh/sensor.py", line 120, in oetf
+    i = i.long()
+        ^^^^^^^^
+torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 142.00 MiB. GPU 0 has a total capacity of 7.53 GiB of which 161.75 MiB is free. Process 1194171 has 7.10 MiB memory in use. Including non-PyTorch memory, this process has 7.24 GiB memory in use. Of the allocated memory 5.65 GiB is allocated by PyTorch, and 357.41 MiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://docs.pytorch.org/docs/stable/notes/cuda.html#optimizing-memory-usage-with-pytorch-cuda-alloc-conf)
+[02:09:11] === calibrate: FAILED -- see logs/calibrate.log

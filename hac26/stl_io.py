@@ -1,7 +1,8 @@
-"""Minimal binary STL writer/reader (no external mesh dependency).
+"""Minimal STL writer and reader with no mesh library dependency.
 
-Binary STL: 80-byte header, uint32 triangle count, then per triangle:
-float32 normal[3], float32 v0[3], v1[3], v2[3], uint16 attribute.
+Binary STL: 80-byte header, uint32 triangle count, then per triangle
+float32 normal[3], float32 v0[3], v1[3], v2[3], uint16 attribute. The reader also accepts
+ASCII STL.
 """
 from __future__ import annotations
 
@@ -12,6 +13,7 @@ import numpy as np
 
 def save_stl(path: str, verts: np.ndarray, faces: np.ndarray,
              header: str = "hac26") -> None:
+    """Write a binary STL; facet normals follow the vertex order of each face."""
     tri = verts[faces].astype(np.float32)              # (F, 3, 3)
     n = np.cross(tri[:, 1] - tri[:, 0], tri[:, 2] - tri[:, 0])
     norm = np.linalg.norm(n, axis=1, keepdims=True)
@@ -27,7 +29,7 @@ def save_stl(path: str, verts: np.ndarray, faces: np.ndarray,
 
 
 def load_stl(path: str) -> tuple:
-    """Returns (verts (V,3), faces (F,3)) with duplicate vertices merged."""
+    """(verts (V, 3), faces (F, 3)) from a binary or ASCII STL, duplicate vertices merged."""
     with open(path, "rb") as fh:
         head = fh.read(80)
         rest = fh.read()
@@ -43,6 +45,7 @@ def load_stl(path: str) -> tuple:
 
 
 def _load_ascii(path: str) -> tuple:
+    """ASCII STL: every 'vertex' line in order, three per triangle."""
     pts = []
     with open(path) as fh:
         for line in fh:

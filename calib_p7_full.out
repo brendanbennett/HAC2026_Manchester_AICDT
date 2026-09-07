@@ -1,0 +1,15 @@
+  model 1: 20000 faces, 28/28 geometries, noise median 0.0048, start phase -0.0 deg (8s)
+  model 2: 20000 faces, 28/28 geometries, noise median 0.0351, start phase -0.0 deg (5s)
+  model 3: 5996 faces, 28/28 geometries, noise median 0.0131, start phase -0.0 deg (0s)
+[fit] 150 steps over 3 bodies at 7 phases
+/home/m12567jp/dev/Helsinki/scripts/calibrate.py:192: UserWarning: Converting a tensor with requires_grad=True to a scalar may lead to unexpected behavior.
+Consider using tensor.detach() first. (Triggered internally at /__w/pytorch/pytorch/torch/csrc/autograd/generated/python_variable_methods.cpp:822.)
+  total += float(loss)
+  step    0  -logL 46.7548  rho 0.854, source radius 1.03 deg, eye distance 7.97, tau_i 0.0194, psf sigma 0.98 px, eta median 0.0206; psi0 -0.2, -0.2, -0.2 deg
+  step   10  -logL 29.9954  rho 0.887, source radius 1.18 deg, eye distance 7.99, tau_i 0.0174, psf sigma 1.08 px, eta median 0.0273; psi0 -1.6, -1.7, -0.5 deg
+  step   20  -logL 11.7077  rho 0.909, source radius 1.36 deg, eye distance 7.75, tau_i 0.0168, psf sigma 1.19 px, eta median 0.0339; psi0 -2.9, -1.9, -0.3 deg
+  step   30  -logL 8.7776  rho 0.918, source radius 1.61 deg, eye distance 7.43, tau_i 0.0167, psf sigma 1.11 px, eta median 0.0399; psi0 -3.6, -2.1, +0.5 deg
+  step   40  -logL 4.2272  rho 0.922, source radius 1.96 deg, eye distance 7.13, tau_i 0.0168, psf sigma 1.06 px, eta median 0.0442; psi0 -4.5, -1.9, +1.5 deg
+  step   50  -logL 0.7462  rho 0.924, source radius 2.44 deg, eye distance 6.93, tau_i 0.0170, psf sigma 1.07 px, eta median 0.0482; psi0 -4.7, -1.9, +2.4 deg
+  step   60  -logL -1.6675  rho 0.924, source radius 2.91 deg, eye distance 6.79, tau_i 0.0173, psf sigma 1.09 px, eta median 0.0513; psi0 -4.5, -2.1, +3.0 deg
+  step   70  -logL -3.2608  rho 0.924, source radius 3.45 deg, eye distance 6.71, tau_i 0.0175, psf sigma 1.08 px, eta median 0.0544; psi0 -4.4, -2.2, +3.4 deg

@@ -1,19 +1,130 @@
 {
   "model": 8,
   "radius": 1.24,
-  "draws": 6,
-  "medoid": 4,
-  "spread": 0.9943483228857599,
-  "eta": 0.03558938577771187,
-  "planes_accepted": [
+  "draws": 8,
+  "answer": "draw 6",
+  "candidate": 6,
+  "consensus_levels": [
+    0.35,
+    0.5,
+    0.65
+  ],
+  "spread": 0.943118723570673,
+  "spread_off_medoid": 0.9349928269379119,
+  "collapsed": false,
+  "medoid_metric": "volume+side_view",
+  "medoid_volume_only": false,
+  "medoid_side_points": 200000,
+  "medoid_side_dirs": 36,
+  "medoid_side_res": 512,
+  "medoid_side_mode": "side",
+  "residual_scale_median": 0.043104320764541626,
+  "steps": 16,
+  "churn": 0.5,
+  "polish_steps": 30,
+  "polish_target": 1.0,
+  "polish_misfit_sigma": [
+    [
+      1.2503844499588013,
+      0.9916090369224548,
+      5
+    ],
+    [
+      1.3886173963546753,
+      0.9940270781517029,
+      7
+    ],
+    [
+      1.263318419456482,
+      0.9497143030166626,
+      4
+    ],
+    [
+      1.5194458961486816,
+      0.9959714412689209,
+      8
+    ],
+    [
+      1.1032880544662476,
+      0.9010592699050903,
+      1
+    ],
+    [
+      1.6556257009506226,
+      0.9839247465133667,
+      8
+    ],
+    [
+      1.1939315795898438,
+      0.9979512095451355,
+      2
+    ],
+    [
+      1.4558968544006348,
+      0.961085855960846,
+      5
+    ]
+  ],
+  "misfit_sigma": [
+    1.0426113605499268,
+    1.0287013053894043,
+    1.0033624172210693,
+    1.0370323657989502,
+    0.9366510510444641,
+    1.053079605102539,
+    1.0503343343734741,
+    1.0302098989486694
+  ],
+  "answer_misfit_sigma": 1.0503343343734741,
+  "held_out_geoms": [],
+  "seen_geoms": [
+    0,
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
     10,
-    12,
     11,
     12,
-    4,
-    6
+    13,
+    14,
+    15,
+    16,
+    17,
+    18,
+    19,
+    20,
+    21,
+    22,
+    23,
+    24,
+    25,
+    26,
+    27
   ],
+  "held_out_misfit_sigma": null,
+  "snap_enabled": false,
+  "snap_max_rise": 0.05,
+  "snap_planes": 12,
+  "snap_tol": 0.02,
+  "snap_min_frac": 0.02,
+  "planes_accepted": [
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0
+  ],
+  "codes_file": "results/lpd/Asteroid08.codes.npz",
   "watertight": true,
-  "volume": 3.6603204520277797,
-  "faces": 5080
+  "volume": 6.009603171428497,
+  "faces": 27556
 }

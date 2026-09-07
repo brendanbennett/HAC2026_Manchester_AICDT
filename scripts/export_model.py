@@ -1,13 +1,12 @@
 #!/usr/bin/env python3
-"""Export the shipped model as a slim checkpoint suitable for version control.
+"""Export a training checkpoint as a slim file for version control.
 
-A training checkpoint is 95 MB, of which 92.9 MB is `op.A` -- the (56, 360, 1152)
-photometric operator. That tensor is a pure function of the preset (grid resolution,
-camera list, frame count, c_lambert, sigma, delta), so `build_model` regenerates it bit
-for bit on load and there is no reason to carry it. Dropping it and the other two
-derived buffers leaves the 608,371 learned parameters, about 2.4 MB.
+The buffers in hac26.train.REGENERABLE_BUFFERS (`op.A`, `tags`, `coords`) are functions
+of the preset and are rebuilt by build_model on load, so they are dropped; `op.A` is most
+of a training checkpoint's size. The optimiser state is dropped too. The slim file is
+reloaded once to check it.
 
-    python export_model.py --ckpt <training-ckpt> --out models/lpd_convex.pt
+    python scripts/export_model.py --ckpt <training-ckpt> --out models/lpd_convex.pt
 """
 import argparse
 import sys
@@ -21,8 +20,9 @@ from hac26.train import REGENERABLE_BUFFERS, load_net  # noqa: E402
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--ckpt", default="checkpoints_dice2/lpd_gpu_final.pt")
-    ap.add_argument("--out", default="models/lpd_convex.pt")
+    ap.add_argument("--ckpt", default="checkpoints_dice2/lpd_gpu_final.pt",
+                    help="training checkpoint to export")
+    ap.add_argument("--out", default="models/lpd_convex.pt", help="slim output file")
     args = ap.parse_args()
 
     ck = torch.load(args.ckpt, map_location="cpu")
@@ -37,7 +37,7 @@ def main() -> None:
     print(f"dropped (regenerated from the preset): {dropped}")
     print(f"{before:.1f} MB -> {after:.1f} MB")
 
-    # a checkpoint that cannot be loaded is worse than no checkpoint
+    # check that the slim file loads
     net, pr, grid = load_net(str(out), device="cpu")
     n = sum(p.numel() for p in net.parameters())
     print(f"reloaded OK: {n} parameters, grid {pr.n_theta}x{pr.n_phi}, "

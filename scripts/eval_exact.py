@@ -1,20 +1,13 @@
 #!/usr/bin/env python3
-"""Evaluate checkpoints (singly or as an ensemble) with the exact closed-form Dice.
+"""Score convex checkpoints, singly or as an ensemble, with the closed-form Dice of
+hac26.radial on held-out meshes and on the public models.
 
-Two things differ from eval_ckpt.py:
+Several checkpoints are combined by averaging their support functions after posing. The
+mean of support functions is the support function of the Minkowski average of the bodies,
+so the ensemble is a convex body with no repair step. Every body is scored in four decode
+variants: with and without support smoothing, with and without the cylinder fit.
 
-1. The metric is computed in closed form from radial functions (hac26.radial), which
-   agrees with the 128^3 voxel Dice to 2.5e-4 but costs milliseconds instead of minutes.
-   That is what makes a 60-shape selection set affordable.
-
-2. Several checkpoints can be combined by averaging their SUPPORT FUNCTIONS.  This is
-   not a heuristic: support functions of convex bodies form a convex cone, so the mean
-   of support functions is itself a support function -- of the Minkowski average of the
-   bodies.  The ensemble is therefore a genuine convex body by construction, with no
-   projection or repair step, and averaging happens after posing so every member is in
-   the same frame regardless of how it was trained.
-
-    python eval_exact.py --ckpt a.pt b.pt --ensemble --tag ens
+    python scripts/eval_exact.py --ckpt a.pt b.pt --ensemble --tag ens --heldout <dir>
 """
 import argparse
 import glob
@@ -27,7 +20,8 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from hac26.adapter import curves_from_npz  # noqa: E402
-from hac26.data_io import load_model_curves  # noqa: E402
+from hac26.conventions import CYLINDER_R, PUBLIC_MODELS  # noqa: E402
+from hac26.data_io import load_model_curves, public_stl  # noqa: E402
 from hac26.radial import (dice_from_radial, fibonacci_sphere, mesh_radial)  # noqa: E402
 from hac26.recon import (body_from_support, fit_to_cylinder, smooth_support)  # noqa: E402
 from hac26.geometry import project_closure  # noqa: E402
@@ -36,19 +30,13 @@ from hac26.shapes import hull_mesh, mesh_support, rescale_touch_z  # noqa: E402
 from hac26.stl_io import load_stl  # noqa: E402
 from hac26.train import load_net  # noqa: E402
 
-CYLINDER_R = {1: 1.12, 2: 1.42, 3: 0.88, 4: 1.475, 5: 1.22,
-              6: 0.925, 7: 1.205, 8: 1.24, 9: 0.67, 10: 3.95}
-
 
 def predict_h(net, grid, d, mask, radius):
-    """Support function of the body this checkpoint predicts, whichever head it has.
+    """Support function on the grid normals of the body a checkpoint predicts.
 
-    A checkpoint without a support head still defines a convex body -- via the EGI and
-    the Minkowski solve, so the support function is taken from that body. Every
-    checkpoint therefore lands in the same representation, which is what lets the
-    EGI-only baseline take part in the Minkowski-average ensemble alongside the
-    support-head models. Their failure modes differ sharply (the cube's EGI ceiling is
-    0.99 against 0.82 for the support grid), so the combination is worth having.
+    With a support head that is the head's output. Otherwise the predicted EGI is closed,
+    solved by Minkowski and posed, and the support function of that body is taken, so
+    every checkpoint lands in the same representation and can join the ensemble.
     """
     with torch.no_grad():
         dd = torch.as_tensor(d, dtype=torch.float32)[None]
@@ -65,7 +53,8 @@ def predict_h(net, grid, d, mask, radius):
 
 
 def decode(h, grid, smooth, radius, fit):
-    """support function -> half-space intersection -> challenge pose -> cylinder fit."""
+    """Support function -> optional smoothing -> half-space intersection -> challenge pose
+    -> optional cylinder fit. Returns (verts, faces) of the hull."""
     if smooth:
         h = smooth_support(h, grid.n_theta, grid.n_phi, k=smooth)
     v, _ = body_from_support(grid.normals, h)
@@ -77,10 +66,8 @@ def decode(h, grid, smooth, radius, fit):
 
 
 def ensemble_body(h_list, grids, radius, smooth, fit):
-    """Minkowski average: pose each member, then average their support functions.
-
-    h_list is precomputed once per body; the LPD forward pass dominates the cost and
-    does not depend on the decode variant."""
+    """Minkowski average of the members: decode and pose each one, average their support
+    functions on the first grid's normals, and decode the mean the same way."""
     hs = []
     for h, grid in zip(h_list, grids):
         v, _ = decode(h, grid, smooth, radius, fit)
@@ -95,22 +82,22 @@ def ensemble_body(h_list, grids, radius, smooth, fit):
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--ckpt", nargs="+", required=True)
-    ap.add_argument("--tag", required=True)
+    ap.add_argument("--ckpt", nargs="+", required=True, help="checkpoint files to score")
+    ap.add_argument("--tag", required=True, help="name of the output json")
     ap.add_argument("--ensemble", action="store_true",
                     help="combine all --ckpt by Minkowski average instead of scoring "
-                         "each separately")
-    # NOTE: the group name a run is selected on is Path(root).name, so this must point
-    # at .../external (where the team renderer writes, and where finish2.sh puts the
-    # matching meshes) and not at its parent -- otherwise the group is called "dataset",
-    # select_final.py finds no "external" group, and selection silently falls back to
-    # the 6-shape set this whole exercise was meant to replace.
+                         "the first one")
+    # The defaults point outside the repo; pass --heldout explicitly. Results are grouped
+    # by Path(root).name, so name the directory holding the meshes, not its parent.
     ap.add_argument("--heldout", nargs="*",
                     default=["../data/team/heldout2/dataset/external",
-                             "../data/team/split_test"])
-    ap.add_argument("--data-dir", default="../data/raw")
-    ap.add_argument("--rays", type=int, default=4096)
-    ap.add_argument("--out", default="results/eval")
+                             "../data/team/split_test"],
+                    help="directories of held-out meshes with stored curves")
+    ap.add_argument("--data-dir", default="../data/raw",
+                    help="challenge data directory, for the public models")
+    ap.add_argument("--rays", type=int, default=4096,
+                    help="number of sphere directions for the Dice quadrature")
+    ap.add_argument("--out", default="results/eval", help="output directory")
     args = ap.parse_args()
 
     nets, grids, prs = [], [], []
@@ -121,7 +108,7 @@ def main() -> None:
         prs.append(p)
         print(f"loaded {c}  support={getattr(n,'support_head',False)} "
               f"r_cond={getattr(n,'r_cond',False)} canonical={getattr(p,'canonical_r',False)}")
-    torch.set_num_threads(2)   # the GPU trainer owns this machine; stay out of its way
+    torch.set_num_threads(2)   # keep the CPU footprint small
     rays = fibonacci_sphere(args.rays)
     pr = prs[0]
     results = {"tag": args.tag, "ckpts": args.ckpt, "ensemble": bool(args.ensemble),
@@ -169,11 +156,11 @@ def main() -> None:
                   gv, gf, d, mask, r_true, grp)
         print(f"  scored {grp}: {len(stls)} meshes", flush=True)
 
-    for Mno in (1, 2, 3):
+    for Mno in PUBLIC_MODELS:
         dm = load_model_curves(args.data_dir, Mno, m=pr.m)
         if not dm["files"]:
             continue
-        ov, of = load_stl(f"{args.data_dir}/AsteroidModel0{Mno}_shape_public/asteroid{Mno}.stl")
+        ov, of = load_stl(public_stl(args.data_dir, Mno))
         score(f"model{Mno}", ov, of, dm["curves"], dm["mask"], CYLINDER_R[Mno], "public")
 
     print(f"\n{'group':<14}{'variant':<12}{'n':>4}{'mean dice':>11}{'se':>9}")

@@ -1,79 +1,106 @@
-"""The LPD, as six Euler steps of a conditional flow.
+"""The learned primal-dual solver, written as a conditional flow.
 
-PRIMAL: two blocks, CODE_DIM = N_DIR + N_SITES = 128 + 1728 = 1856.
+The curves do not determine the body. The spindle r(z) = R(1 - |z|/2) and the hourglass
+r(z) = R(1/2 + |z|/2) have the same volume, the same silhouette from every equatorial
+direction, the same R and the same z extent, and both are axisymmetric, so every
+mean-normalised curve is identically one for both. A network trained to predict one shape
+from the curves learns the average of the bodies that fit, which here is neither of them and
+smoother than both. So the solver is a flow: it starts from noise and moves toward a body
+that fits, and several runs give several bodies that fit, from which the answer is chosen
+(scripts/reconstruct_lpd.py).
 
-  g  -- signed amplitudes on a fixed 12^3 lattice, which is what carries non-convexity.
-  dh -- a band-limited correction to the support function, on N_DIR design directions.
+The state is the code x = (dh, g), whitened by CodeCodec. g holds signed amplitudes on a
+fixed lattice and is the only part that can make a body non-convex. dh is a band-limited
+correction to the support function h, sampled on N_DIR directions. h itself is not in the
+flow: the convex stage recovers the hull well from a linear operator, and sampling all of h
+would make the network rederive that and would let noise move the size of the body. But the
+convex stage assumes convexity, and a non-convex body is darker than its hull because it
+shadows itself, so its h is wrong in the direction of a convex answer. dh corrects that. The
+corpus dh is the correction the convex stage's own reconstruction of each training body needs
+(scripts/build_corpus.py), so the flow learns the errors that stage makes. The two blocks
+live on different domains and have different networks: a 3-D convolution over the lattice
+for g, a convolution on the sphere over the directions for dh.
 
-dh is in the flow and h is not. The convex core is what a cheap linear operator already
-recovers well, so sampling the whole of h would make the network re-derive something already
-solvable and would let noise move the overall size of the body. But that operator ASSUMES
-convexity, and a non-convex body is darker than its own hull from self-shadowing -- so it
-explains darkness with shape and its h is wrong in a direction that always favours a convex
-answer. dh corrects that, band-limited to degree <= 5 because the curves constrain only about
-35-40 support directions and an out-of-band dh kills facets outright.
+The velocity is a prior part plus a data part, because the posterior is the prior times the
+likelihood: grad log p(x_t | d) = grad log p(x_t) + grad log p(d | x_t), and the velocity of
+the flow is an affine function of the score. The prior part (PriorNet) is the velocity of a
+flow over the corpus codes given only the published radius; it reads no data and trains
+without the operator (scripts/train_prior.py), so it can train for as long as it takes. The
+data part (Reader, PrimalNet) reads the residual and the adjoint and starts at zero, so at the
+start of its training the flow is the prior and everything it learns is a correction toward
+the data. In the terms of the learned primal-dual method, the prior part is the proximal
+step and the data part is the dual step and the adjoint.
 
-Each block gets its own network, because they are different objects on different domains: a
-3-D CNN over the lattice for g, a sphere-convolution over the design directions for dh. The
-predecessor flattened the whole code into an MLP, which is why it needed `hidden > CODE_DIM`
-("the velocity is mostly x_t rescaled"); at 1856 that rule would have cost 13.1 M parameters
-for 600 bodies. The structured branches cost about a tenth of that and the rule disappears
-with the flattening, because both branches carry the identity path for free -- from S_0 = I in
-the sphere bank and from the centre tap of the 3x3x3 kernel.
+The data the network reads are the Fourier coefficients along the rotation angle psi of the
+mean-normalised curves, orders m = 1..N_MODES: of the measured curves, and of the residual
+against the operator's prediction divided by each curve's noise and model error, so that a
+residual of one means one standard deviation for every geometry. The state itself is part
+noise, so both are taken at the body the prior's velocity says the state is heading for,
+x_t + (1 - t) v_prior (LPDFlow.sample). The network also reads the adjoint of the operator
+there applied to the whitened residual, the direction in code space along which the
+predicted curves move toward the data: its g part as a map over the lattice into the volume
+branch, its dh part into the sphere branch. The same direction enters the velocity directly
+with a learned step size per block (PrimalNet), so that a step of gradient descent on the
+misfit is available to the network as two numbers.
 
-DUAL: the psi-Fourier coefficients of the mean-normalised curves, m = 1..40, whitened by
-s_{c,m}.
+For a convex body the forward map is block-diagonal in m: rotating the body by psi
+multiplies the harmonic Y_lm by e^{-i m psi}, so Fourier order m of a curve depends only on
+the shape's harmonics of order m. The dual network therefore never mixes orders; it attends
+across geometries at fixed m, which also makes it indifferent to missing geometries. Orders
+meet only in the primal's conditioning, which reads all of them at once.
 
-The dual network is shared across m and never mixes m. Expanding a curve as
-L_g(psi) = int k_g(R_psi^-1 n) dS(n) and using Y_lm(R_psi^-1 n) = e^{-i m psi} Y_lm(n),
+Early in t the state is mostly noise and the velocity has to come from the curves; late in
+t the state is nearly the body and the velocity is a clean-up. These are different jobs, so
+t is cut into N_EXPERTS intervals with an expert (PrimalNet) each, while the reader is one
+network shared by all of them: what a residual means does not depend on t, only the response
+does. One data part is trained on all of t first and then copied into the experts, each of
+which continues on its own interval (LPDFlow.branch), so every expert starts from everything
+that was learned. Training draws t at random and trains the expert that owns it, so the cost
+of a training step does not depend on the number of experts or of sampling steps.
 
-    L-hat_g(m) = sum_l k^g_{lm} S_lm
-
-so the operator is exactly block-diagonal in m. There is no cross-m coupling to learn, and
-an architecture able to mix m would be free to model one -- fitting noise with it. So the
-set transformer runs independently at each m with weights shared across m, and m enters
-only through a Fourier embedding. Attention runs across GEOMETRIES at fixed m, which is
-precisely the cross-geometry amplitude-ratio computation that recovers the m = 0 content
-that mean normalisation appears to destroy. Permutation invariance handles missing
-geometries for free.
-
-PROFILING, REMOVED. An earlier version fed the primal a second dual pass over `r_perp`,
-described here as "the projector Pi onto the operator's range". No projector was ever
-computed: it was `r_perp[..., :4] = 0`, a hard cut of rotation orders 1-4, and if --phases was
-9 or fewer it silently became identically zero. It cost a full extra dual forward pass, two of
-its six input channels were never assigned, and the honest argument against keeping it is that
-A_conv is provably blind to concavity -- a notched cube's unshadowed curves are reproduced
-exactly, as a fatter box -- so a projector onto its range could not isolate concavity either.
-What A_conv is good for is the aligned adjoint channel J^T A^T DN^T r, which conditions the dh
-branch and is never added to the velocity.
-
-Flow matching rather than L2 or expected-DICE. Either of those computes E[x | g], and the
-posterior here provably contains indistinguishable pairs: the spindle r(z) = R(1 - |z|/2)
-and the hourglass r(z) = R(1/2 + |z|/2) have equal volume, equal silhouette area from every
-equatorial direction, equal R and equal z-extent, and being axisymmetric they give constant
-curves -- so all 28 mean-normalised curves are identically 1.0 for both, while they sit
-0.263 apart in Dice. Their conditional mean is neither of them and is smoother than both.
-A flow samples from the posterior instead of averaging over it.
+The training interpolant is the straight line x_t = (1 - t) x0 + t x1; it defines what a
+state at time t is, the body with a known share of noise mixed in, and gives the training
+target of lowest variance. Any velocity trained on it is also a denoiser, x1_hat = x_t +
+(1 - t) v, and a score. The sampler integrates the velocity in N_STEPS steps with the
+operator at each, and adds noise on the way (CHURN): the flow and the stochastic equation
+dx = (v + eps s) dt + sqrt(2 eps) dW, with s the score of the flow's marginal, have the same
+distribution at every t, so the noise changes nothing about what the draws represent and
+only decorrelates them. The noise level of a step is the one at the step's end, so the last
+step is a plain flow step (churn_step).
 """
 from __future__ import annotations
+
+from typing import NamedTuple
 
 import numpy as np
 import torch
 import torch.nn as nn
 
-from hac26.field import CODE_DIM, LATTICE_SHAPE, N_DIR, N_SITES, dir_design   # noqa: E402
+from hac26.conventions import cameras
+from hac26.field import CODE_DIM, LATTICE_SHAPE, N_DIR, N_SITES, dir_design
 
-__all__ = ["CODE_DIM", "N_DIR", "N_SITES", "N_MODES", "N_STEPS", "T_DIM",
-           "DualSetTransformer", "SphereBranch", "VolBranch", "PrimalNet", "CodeCodec",
-           "LPDFlow", "fourier_embed", "time_embed"]
+__all__ = ["CODE_DIM", "N_DIR", "N_SITES", "N_MODES", "N_STEPS", "N_EXPERTS", "CHURN", "T_DIM",
+           "T_FREQ", "N_FEAT", "N_SPHERE_CH", "N_VOL_CH", "FlowInputs", "flow_inputs",
+           "DualSetTransformer", "SphereBranch", "VolBranch", "PrimalNet", "PriorNet",
+           "Reader", "CodeCodec", "LPDFlow", "fourier_embed", "time_embed",
+           "churn_step", "geometry_tags"]
 
 N_MODES = 40
-N_STEPS = 6
+N_STEPS = 16        # sampling steps by default; the operator runs at each. Training does not
+                    # depend on it.
+N_EXPERTS = 4       # velocity networks, one per equal interval of t
+CHURN = 0.5         # noise in the sampler, eps(t) = CHURN (1 - t); 0 is the plain flow
 T_DIM = 32          # width of the TIME embedding, which is not the mode embedding
+T_FREQ = (0.5, 64.0)  # slowest and fastest time feature, in cycles across [0, 1]
+N_FEAT = 8          # per (geometry, mode) input of the dual: real and imaginary parts of the
+                    # whitened residual and of the data, for the intensity and the count
+N_SPHERE_CH = 5     # sphere-branch channels besides dh_t: h on the directions, the direction
+                    # (3), the adjoint's dh part
+N_VOL_CH = 6        # volume-branch channels besides g_t: the core field, the inside
+                    # indicator, the site coordinates (3), the adjoint's g part
 G_LIMIT = 4.0       # the decode saturates at this multiple of the corpus's largest fitted
-                    # amplitude. Measured: a body at 2.7x the corpus maximum still extracts
-                    # and decimates normally, so 4x is comfortably outside anything the flow
-                    # should ever emit and far inside where the arithmetic breaks.
+                    # amplitude: outside anything the flow should emit, well inside where
+                    # float32 sinh overflows.
 
 
 def fourier_embed(m: torch.Tensor, dim: int = 16) -> torch.Tensor:
@@ -83,19 +110,77 @@ def fourier_embed(m: torch.Tensor, dim: int = 16) -> torch.Tensor:
     return torch.cat([torch.sin(a), torch.cos(a)], -1)
 
 
-def time_embed(t: torch.Tensor, dim: int = T_DIM) -> torch.Tensor:
-    """Embedding of t in [0, 1]. Separate from fourier_embed, which is scaled for m = 1..40.
+def geometry_tags() -> torch.Tensor:
+    """(1, C, 4) per-geometry inputs of the dual: cos and sin of the azimuth, sin of the
+    elevation, and a constant one."""
+    tag = torch.zeros(1, len(cameras()), 4)
+    for i, cam in enumerate(cameras()):
+        tag[0, i] = torch.tensor([np.cos(np.radians(cam.azimuth_deg)),
+                                  np.sin(np.radians(cam.azimuth_deg)),
+                                  np.sin(np.radians(cam.elevation_deg)), 1.0])
+    return tag
 
-    Reusing the mode embedding for time was a real defect: its slowest band has period about
-    47 in its argument, so over t in [0,1] every one of its bands sits in the small-angle
-    regime. Measured on the six step times it produced singular values
-    [6.85, 1.03, 7.7e-2, 3.2e-3, 7.2e-5, 1.0e-6] -- condition number 6.7e6, effectively rank
-    four. The gain path, whose entire job is to learn a function of t alone, was reading that.
-    Here the frequencies span 1 to 2^(dim/2 - 1) cycles across the unit interval instead.
+
+class FlowInputs(NamedTuple):
+    """What the network reads besides the state and the time: the dual's input, the
+    geometry mask, the two branches' channels with the adjoint slots filled, the adjoint
+    direction (unit root mean square per block, in whitened units) and the log of its size
+    per block. flow_inputs builds one."""
+    resid: torch.Tensor        # (B, C, N_MODES, N_FEAT)
+    mask: torch.Tensor         # (B, C)
+    sphere: torch.Tensor       # (B, N_DIR, N_SPHERE_CH)
+    vol: torch.Tensor          # (B, N_VOL_CH, nx, ny, nz)
+    adj: torch.Tensor          # (B, CODE_DIM)
+    adj_log: torch.Tensor      # (B, 2)
+
+    def select(self, sel) -> "FlowInputs":
+        return FlowInputs(*(f[sel] for f in self))
+
+
+def flow_inputs(resid, mask, sphere0, vol0, grad_z) -> FlowInputs:
+    """The inputs from the dual's features (B, C, N_MODES, N_FEAT), the geometry mask (B, C),
+    the branch channels with empty adjoint slots, and the adjoint of the whitened misfit in
+    whitened units (B, CODE_DIM); zeros for a body without curves. Each block of the adjoint
+    is divided by its root mean square, which goes into adj_log: the direction is the
+    information, its size is a separate number."""
+    B = grad_z.shape[0]
+    blocks = [grad_z[:, :N_DIR], grad_z[:, N_DIR:]]
+    rms = torch.stack([b.pow(2).mean(1).sqrt() for b in blocks], 1)               # (B, 2)
+    unit = torch.cat([b / r[:, None].clamp_min(1e-12) for b, r in zip(blocks, rms.T)], 1)
+    sphere = sphere0.expand(B, -1, -1).clone()
+    vol = vol0.expand(B, -1, -1, -1, -1).clone()
+    sphere[..., -1] = unit[:, :N_DIR]
+    vol[:, -1] = unit[:, N_DIR:].reshape(B, *LATTICE_SHAPE)
+    return FlowInputs(resid, mask, sphere, vol, unit, torch.log(rms.clamp_min(1e-6)))
+
+
+def time_embed(t: torch.Tensor, dim: int = T_DIM) -> torch.Tensor:
+    """Embedding of t in [0, 1]: sines and cosines at dim/2 frequencies spaced geometrically
+    from T_FREQ[0] to T_FREQ[1] cycles across the interval. Separate from fourier_embed, whose
+    frequencies are chosen for integer m. The slowest feature tells t = 0 from t = 1; the
+    fastest resolves a few hundredths of t, finer than any step the sampler takes. Faster
+    features would differ between two nearly equal times and be noise to the network.
     """
-    k = torch.arange(dim // 2, device=t.device, dtype=torch.float32)
-    a = t[..., None].float() * (2.0 * np.pi) * (2.0 ** k)
+    n = dim // 2
+    k = torch.arange(n, device=t.device, dtype=torch.float32) / max(n - 1, 1)
+    f = T_FREQ[0] * (T_FREQ[1] / T_FREQ[0]) ** k
+    a = t[..., None].float() * (2.0 * np.pi) * f
     return torch.cat([torch.sin(a), torch.cos(a)], -1)
+
+
+def churn_step(x: torch.Tensor, v: torch.Tensor, t: float, dt: float, churn: float) -> torch.Tensor:
+    """One step of the sampler from time t with velocity v. With churn 0 it is the flow step
+    x + v dt. Otherwise it is a step of the stochastic equation of the module docstring,
+    dx = (v + eps s) dt + sqrt(2 eps) dW, with s = -(x - t v) / (1 - t) the score of the
+    flow's marginal at t and eps = churn (1 - t - dt), the noise level at the end of the step:
+    the last step, which nothing follows, is then the plain flow step. LPDFlow.sample and
+    train_lpd.rollout both step through here, so the states training sees are the states
+    reconstruction makes."""
+    if churn <= 0:
+        return x + v * dt
+    eps = churn * max(0.0, 1.0 - t - dt)
+    s = -(x - t * v) / (1.0 - t)
+    return x + (v + eps * s) * dt + np.sqrt(2.0 * eps * dt) * torch.randn_like(x)
 
 
 class DualSetTransformer(nn.Module):
@@ -105,8 +190,8 @@ class DualSetTransformer(nn.Module):
     Output (B, C, M, width). No operation mixes different m.
     """
 
-    def __init__(self, in_feat: int = 6, width: int = 96, heads: int = 4, blocks: int = 3,
-                 m_dim: int = 16):
+    def __init__(self, in_feat: int = N_FEAT, width: int = 96, heads: int = 4,
+                 blocks: int = 3, m_dim: int = 16):
         super().__init__()
         self.inp = nn.Linear(in_feat + m_dim + 4, width)
         self.att = nn.ModuleList([nn.MultiheadAttention(width, heads, batch_first=True)
@@ -125,21 +210,21 @@ class DualSetTransformer(nn.Module):
             y = x.permute(0, 2, 1, 3).reshape(B * M, C, -1)  # attend over C, at fixed m
             km = kpm[:, None, :].expand(B, M, C).reshape(B * M, C)
             km = torch.where(km.all(-1, keepdim=True), torch.zeros_like(km), km)
-            y, _ = att(y, y, y, key_padding_mask=km)
+            # need_weights=False routes to scaled_dot_product_attention instead of
+            # materialising the (B*M*heads, C, C) attention matrix and its head-mean, neither
+            # of which is read. Same output, and flash attention on CUDA.
+            y, _ = att(y, y, y, key_padding_mask=km, need_weights=False)
             x = x + y.reshape(B, M, C, -1).permute(0, 2, 1, 3)
             x = x + mlp(x)
         return x
 
 
 def _sphere_operators(dirs: np.ndarray, k: int = 8) -> np.ndarray:
-    """Five fixed (N, N) operators for a convolution on the sphere: I, a k-NN mean, two
-    tangential directional means, and a k-NN second moment.
+    """Five fixed (N, N) operators for a convolution on the sphere: the identity, the mean over
+    the k nearest directions, two tangential first moments and one second moment.
 
-    A sphere has no global grid, so a convolution has to be built from operators that are
-    equivariant under the sampling rather than from a fixed stencil. These five span the same
-    information a 3x3 stencil gives on a plane: the value, the local mean, the two tangential
-    first moments and one second moment. S_0 = I is what gives the branch its identity path
-    for free, which is why the `hidden > CODE_DIM` rule the flat MLP needed does not apply.
+    A sphere has no global grid, so a convolution is built from these fixed operators instead
+    of a stencil. Together they carry the same information a 3x3 stencil carries on a plane.
     """
     n = len(dirs)
     g = dirs @ dirs.T
@@ -179,8 +264,11 @@ class SphereConv(nn.Module):
 
 
 class _FiLM(nn.Module):
-    """Per-channel scale and shift from the conditioning vector. Zero-init, so a fresh block
-    starts as the identity and the branch starts as its own skip path."""
+    """Per-channel scale and shift computed from the conditioning vector.
+
+    Zero-initialised, so at the start it passes its input straight through and the
+    conditioning has no effect until the weights move.
+    """
 
     def __init__(self, cond_dim: int, width: int):
         super().__init__()
@@ -197,16 +285,19 @@ class _FiLM(nn.Module):
 
 
 class SphereBranch(nn.Module):
-    """Velocity for the dh block: a sphere convolution over the N_DIR design directions.
+    """Velocity for the dh block: a convolution on the sphere over the N_DIR directions.
 
-    Input channels: dh_t, the aligned adjoint channel J^T A^T DN^T r (whitened per sample --
-    its raw magnitude is order 1e2), h_base, and the three components of the direction itself.
-    The adjoint channel is CONDITIONING and is never added to the velocity: A_conv is blind to
-    concavity and under-signals a deep pit by 3x, so it can say which face is wrong but never
-    what shape the dent is.
+    Input channels, in order: dh_t, the base support resampled onto the directions, the three
+    components of the direction, and the dh part of the operator's adjoint applied to the
+    whitened residual, scaled per sample. train_lpd.cond_channels builds the middle four and
+    flow_inputs fills the last; the prior part leaves the last one out.
+
+    The adjoint channel is an input, never added to the velocity: it says in which direction
+    the misfit falls fastest, and the network decides how far to go.
     """
 
-    def __init__(self, cond_dim: int, width: int = 128, blocks: int = 4, in_ch: int = 6):
+    def __init__(self, cond_dim: int, width: int = 128, blocks: int = 4,
+                 in_ch: int = 1 + N_SPHERE_CH):
         super().__init__()
         ops = torch.from_numpy(_sphere_operators(dir_design(N_DIR)))
         self.inp = SphereConv(ops, in_ch, width)
@@ -228,18 +319,22 @@ class SphereBranch(nn.Module):
 
 
 class VolBranch(nn.Module):
-    """Velocity for the g block: a 3-D CNN over the fixed lattice.
+    """Velocity for the g block: a 3-D convolutional network over the fixed lattice.
 
-    Zero padding, not circular: the box is not periodic and a wrapped kernel would couple the
-    two sides of the body. No culling either -- it would break the fixed index set that makes
-    the code portable. The `core_sdf` channel is what replaces culling: it tells the network
-    where the convex core's surface is, so a site deep inside or far outside is identifiable
-    without removing it from the code.
+    Input channels: g_t, the convex core's field at the sites, the inside indicator, the
+    normalised site coordinates x, y, z, and the g part of the operator's adjoint applied to
+    the whitened residual, scaled per sample. The last one is the only spatially resolved
+    data channel of this branch: it says at which sites a change of amplitude would move the
+    predicted curves toward the data. The curves themselves reach this branch only through
+    the conditioning vector, which is one vector per body.
 
-    Input channels: g_t, core_sdf at the sites, the inside indicator, and normalised x, y, z.
+    Zero padding, not circular: the box is not periodic. Sites are never removed from the
+    code; the core field channel tells the network which sites are deep inside or far
+    outside.
     """
 
-    def __init__(self, cond_dim: int, width: int = 64, blocks: int = 4, in_ch: int = 6):
+    def __init__(self, cond_dim: int, width: int = 64, blocks: int = 4,
+                 in_ch: int = 1 + N_VOL_CH):
         super().__init__()
         self.shape = LATTICE_SHAPE
         self.inp = nn.Conv3d(in_ch, width, 3, padding=1)
@@ -261,29 +356,18 @@ class VolBranch(nn.Module):
 
 
 class CodeCodec(nn.Module):
-    """Between raw code units and the space the flow actually works in.
+    """Maps between raw code units and the whitened space the flow works in.
 
-    Two jobs, both required and neither previously present anywhere in the repo.
+    Whitening: x0 is drawn from N(0, I) and the target is x1 - x0, so both endpoints have to
+    live on the same scale. Raw dh and g are much narrower than a unit Gaussian.
 
-    WHITENING. x0 is drawn from N(0, I) and the target is x1 - x0, so the two endpoints have
-    to live in the same space. Measured on fitted bodies, dh has std 0.0199 and g has std
-    0.0483 in units of R -- about fifty times narrower than N(0, I). Untransformed, the flow
-    spends its whole trajectory travelling from a unit Gaussian to a spike.
+    asinh on g: the amplitudes are heavy-tailed, and the tail is the deep carves. Clipping it,
+    or modelling it as Gaussian, would push the flow toward convex answers.
 
-    ASINH on g. Measured kurtosis 14.5 and max|z| 12.98; after asinh, 3.17 and 4.53. The heavy
-    tail IS the deep carves, so the alternative -- clipping, or letting a Gaussian flow model
-    it badly -- is exactly the alternative that gives back convex answers.
-
-    Per-BLOCK SCALARS, not per-coordinate. A per-site mean and variance is body-dependent and
-    would break the weight sharing that lets a few hundred bodies teach 1728 amplitudes -- the
-    volume branch is a convolution precisely so that every site is read by the same kernel, and
-    giving each site its own affine pre-transform undoes that. It is also unestimable: a
-    600-body corpus gives 599 degrees of freedom per coordinate, and at 60 bodies the
-    per-coordinate std is mostly noise, which then multiplies a 4-sigma tail draw into a body
-    the corpus never contained.
-
-    The scale is a MEDIAN ABSOLUTE DEVIATION, not a standard deviation, for the same reason:
-    it is the amplitude distribution's own heavy tail that would otherwise set the scale.
+    One scale and one offset per block, not per coordinate: the volume branch is a convolution
+    that reads every site with the same kernel, and a per-site transform would undo that. The
+    scale is a median absolute deviation rather than a standard deviation so the heavy tail
+    does not set it.
     """
 
     def __init__(self):
@@ -294,21 +378,18 @@ class CodeCodec(nn.Module):
         self.register_buffer("u_lim", torch.full((1,), 80.0))
 
     @torch.no_grad()
-    def fit(self, codes: torch.Tensor, eps_std: float) -> None:
-        """`codes` are raw fitted codes; `eps_std` is the scale of the dh perturbation the
-        flow is trained against, because the corpus dh block is identically zero by
-        construction (the corpus h is exact, so there is nothing to correct)."""
-        g = codes[:, N_DIR:]
+    def fit(self, codes: torch.Tensor) -> None:
+        """`codes` are the raw corpus codes: dh the correction from each body's convex start
+        to its true hull, g its fitted amplitudes."""
+        dh, g = self._split(codes)
         self.g_s.fill_(float(g.abs().median().clamp_min(1e-12)))
         u = torch.asinh(g / self.g_s)
-        med = u.median()
-        mad = (u - med).abs().median().clamp_min(1e-8) * 1.4826    # -> sigma for a Gaussian
-        self.mu[0] = 0.0                      # dh is centred by construction
-        self.sd[0] = max(float(eps_std), 1e-12)
-        self.mu[1] = float(med)
-        self.sd[1] = float(mad)
-        # The saturation point of the decode, expressed as a bound on the AMPLITUDE and
-        # converted back through asinh. See decode() for why this exists.
+        for k, block in enumerate((dh, u)):
+            med = block.median()
+            mad = (block - med).abs().median().clamp_min(1e-8) * 1.4826   # sigma of a Gaussian
+            self.mu[k] = float(med)
+            self.sd[k] = float(mad)
+        # where decode saturates, as a bound on the amplitude converted through asinh
         g_lim = float(g.abs().max()) * G_LIMIT
         self.u_lim.fill_(float(np.arcsinh(g_lim / float(self.g_s))))
 
@@ -322,107 +403,255 @@ class CodeCodec(nn.Module):
                           (u - self.mu[1]) / self.sd[1]], -1)
 
     def decode(self, z: torch.Tensor) -> torch.Tensor:
-        """z -> raw code. SATURATING, and that is not optional.
+        """z -> raw code, saturating.
 
-        sinh is unbounded and its relative error grows with its argument, so an ordinary
-        regression error in z becomes an astronomical error in the field: measured, doubling
-        z takes |g| from 2.7x the corpus maximum to 545x, and tripling it to 1e5x. That alone
-        is survivable -- the level set is nonsense but a mesh still comes out. What is not
-        survivable is that float32 sinh OVERFLOWS at |u| ~ 89, i.e. |z| ~ 69: g becomes
-        +-inf, the field is non-finite, and the extracted mesh is garbage that fails inside
-        facet indexing several call frames later, long after the cause.
-
-        A single gradient spike is enough to get there, and because the training checkpoint
-        restores weights, optimiser moments and RNG together, a resume replays it exactly.
-
-        Clamping `u` fixes the whole chain at its one source: no non-finite amplitude can be
-        produced by any caller -- training probe, sampler or ablation. The limit is set from
-        the corpus's own maximum amplitude times G_LIMIT, so it cannot bind on anything the
-        flow has been taught to produce; it only saturates excursions that were already
-        meaningless. Per coordinate rather than a vector rescale, so an in-range site is
-        never touched by an out-of-range neighbour.
+        sinh is unbounded and float32 sinh overflows, so a large excursion in z would make g
+        infinite and the field non-finite. The clamp on u caps the amplitude at G_LIMIT times
+        the corpus's largest fitted amplitude: it never binds on anything the flow has been
+        taught to produce, and it stops a single spike from breaking every later stage. It is
+        applied per coordinate, so an in-range site is never touched by an out-of-range
+        neighbour.
         """
         zd, zg = self._split(z)
         u = (zg * self.sd[1] + self.mu[1]).clamp(-self.u_lim, self.u_lim)
         return torch.cat([zd * self.sd[0] + self.mu[0], self.g_s * torch.sinh(u)], -1)
 
+    def pullback(self, z: torch.Tensor, grad_raw: torch.Tensor) -> torch.Tensor:
+        """A gradient with respect to the raw code at decode(z), taken back to a gradient with
+        respect to z: the chain rule through decode, zero where the clamp binds."""
+        zd, zg = self._split(z)
+        gd, gg = self._split(grad_raw)
+        u = zg * self.sd[1] + self.mu[1]
+        inside = (u.abs() < self.u_lim).to(gg.dtype)
+        return torch.cat([gd * self.sd[0],
+                          gg * self.g_s * torch.cosh(u.clamp(-self.u_lim, self.u_lim))
+                          * self.sd[1] * inside], -1)
+
 
 class PrimalNet(nn.Module):
-    """The two branches plus the shared conditioning, and the time-dependent skip gain.
+    """The two branches, the shared conditioning, a time-dependent skip gain, and a learned
+    step along the adjoint.
 
-    The skip path survives the rewrite because the velocity target is
-    u = x1 - x0 = (x1 - x_t)/(1 - t) identically, so the dominant term is the input scaled by
-    a function of t alone. It is now per-block: dh and g have different scales and a single
-    scalar gain would have to compromise between them. Zero-initialised, so training starts
-    from the branches alone.
+    The conditioning vector is built from the dual's summary, the time embedding and the log
+    of the body's published xy radius. The radius is needed because the code describes the
+    body in the canonical frame while the curves are those of the body at its physical
+    radius, so the same curves mean a different canonical body at a different radius.
+
+    The skip path exists because the velocity target x1 - x0 equals (x1 - x_t)/(1 - t), so
+    its dominant term is the input scaled by a function of t. The gain is per block, since dh
+    and g have different scales, and zero-initialised, so training starts from the branches
+    alone.
+
+    The adjoint step adds, per block, a learned multiple of the unit adjoint direction: a
+    step of gradient descent on the whitened data misfit, with a step size that depends on t
+    and on the size of the gradient. The branches still read the direction as an input and
+    can shape it; this path makes the plain descent step available with two numbers. It is
+    zero-initialised too.
     """
 
     def __init__(self, summary_dim: int, cond_width: int = 256):
         super().__init__()
-        self.cond = nn.Sequential(nn.Linear(summary_dim + T_DIM, cond_width), nn.SiLU(),
+        self.cond = nn.Sequential(nn.Linear(summary_dim + T_DIM + 1, cond_width), nn.SiLU(),
                                   nn.Linear(cond_width, cond_width))
         self.sphere = SphereBranch(cond_width)
         self.vol = VolBranch(cond_width)
         self.gain = nn.Sequential(nn.Linear(T_DIM, 64), nn.SiLU(), nn.Linear(64, 2))
         nn.init.zeros_(self.gain[-1].weight); nn.init.zeros_(self.gain[-1].bias)
+        self.step = nn.Sequential(nn.Linear(T_DIM + 2, 64), nn.SiLU(), nn.Linear(64, 2))
+        nn.init.zeros_(self.step[-1].weight); nn.init.zeros_(self.step[-1].bias)
 
-    def forward(self, code, summary, t_embed, sphere_ch, vol_ch):
-        c = self.cond(torch.cat([summary, t_embed], -1))
-        v_dh = self.sphere(torch.cat([code[:, None, :N_DIR].transpose(1, 2), sphere_ch], -1), c)
+    def forward(self, code, summary, t_embed, log_radius, inp: FlowInputs):
+        c = self.cond(torch.cat([summary, t_embed, log_radius[:, None]], -1))
+        v_dh = self.sphere(torch.cat([code[:, None, :N_DIR].transpose(1, 2), inp.sphere], -1), c)
         g = code[:, N_DIR:].reshape(-1, 1, *LATTICE_SHAPE)
-        v_g = self.vol(torch.cat([g, vol_ch], 1), c)
+        v_g = self.vol(torch.cat([g, inp.vol], 1), c)
         gain = self.gain(t_embed)
+        step = self.step(torch.cat([t_embed, inp.adj_log], -1))
+        skip = torch.cat([gain[:, :1] * code[:, :N_DIR], gain[:, 1:] * code[:, N_DIR:]], -1)
+        descent = torch.cat([step[:, :1] * inp.adj[:, :N_DIR], step[:, 1:] * inp.adj[:, N_DIR:]], -1)
+        return skip + descent + torch.cat([v_dh, v_g], -1)
+
+
+class PriorNet(nn.Module):
+    """The velocity of the unconditional flow over codes: the two branches on the body's own
+    channels (the adjoint slot left out), conditioned on time and on the body's published
+    radius, with the same time-dependent skip gain as PrimalNet. It reads no data. It does
+    read the radius: the code describes the body in the canonical frame, where the width is
+    one and the height two, so a body mounted along its long axis and one mounted across it
+    give different canonical shapes, and the radius is what tells them apart."""
+
+    def __init__(self, cond_width: int = 256):
+        super().__init__()
+        self.cond = nn.Sequential(nn.Linear(T_DIM + 1, cond_width), nn.SiLU(),
+                                  nn.Linear(cond_width, cond_width))
+        self.sphere = SphereBranch(cond_width, in_ch=N_SPHERE_CH)
+        self.vol = VolBranch(cond_width, in_ch=N_VOL_CH)
+        self.gain = nn.Sequential(nn.Linear(T_DIM, 64), nn.SiLU(), nn.Linear(64, 2))
+        nn.init.zeros_(self.gain[-1].weight); nn.init.zeros_(self.gain[-1].bias)
+
+    def forward(self, code, t, radius, sphere_ch, vol_ch):
+        """code (B, CODE_DIM), t (B,), radius (B,), and the branch channels with or without
+        their adjoint slot, which is dropped here."""
+        te = time_embed(t)
+        c = self.cond(torch.cat([te, torch.log(radius)[:, None]], -1))
+        sph = sphere_ch[..., :N_SPHERE_CH - 1]
+        vol = vol_ch[:, :N_VOL_CH - 1]
+        v_dh = self.sphere(torch.cat([code[:, None, :N_DIR].transpose(1, 2), sph], -1), c)
+        g = code[:, N_DIR:].reshape(-1, 1, *LATTICE_SHAPE)
+        v_g = self.vol(torch.cat([g, vol], 1), c)
+        gain = self.gain(te)
         skip = torch.cat([gain[:, :1] * code[:, :N_DIR], gain[:, 1:] * code[:, N_DIR:]], -1)
         return skip + torch.cat([v_dh, v_g], -1)
 
 
-class LPDFlow(nn.Module):
-    """Six unrolled iterations, each one Euler step of a conditional flow."""
+class Reader(nn.Module):
+    """The part of the data network that interprets the curves: the dual, and the pooling of
+    its output into one summary vector per body. What a residual means does not depend on t,
+    only the response to it does, so the reader is one network shared by all experts, and it
+    trains on every sample at every time.
 
-    def __init__(self, width: int = 96, n_modes: int = N_MODES, n_steps: int = N_STEPS,
-                 mode_feat: int = 16):
+    The summary is what the curves CHANGED, not what the network emits when they are present.
+    The dual carries a mode embedding, a geometry tag and its own biases, so its output on any
+    input already contains a part that no residual influences, and that part is much the
+    larger of the two: the primal would have to read the data as a small perturbation on a
+    constant, and the smaller the residual the worse the ratio, which is exactly the late part
+    of the flow where the fine shape is settled. Subtracting the network's own response to
+    zero features leaves the response to the data. The second pass costs a fraction of one
+    operator call.
+    """
+
+    def __init__(self, width: int = 96, n_modes: int = N_MODES, mode_feat: int = 16):
         super().__init__()
         self.dual = DualSetTransformer(width=width)
-        # Pool over GEOMETRIES only, then project each mode to `mode_feat` with ONE shared
-        # Linear. The predecessor summed over geometries AND modes while dividing by the
-        # geometry count alone, so the summary was exactly N_MODES = 40 times a true mean --
-        # measured 40.000004, independent of the mask -- and which mode carried the signal was
-        # discarded. A dense Linear(n_modes*width, ...) would instead be precisely the cross-m
-        # mixing this module's docstring spends fifteen lines arguing against.
-        self.mode_proj = nn.Linear(width, mode_feat)
+        # Pool over geometries only, then project each mode with one shared Linear, so the
+        # summary keeps which mode carried the signal. Mixing across modes happens later, in
+        # the primal's conditioning. No bias: a bias is a constant the data cannot move.
+        self.mode_proj = nn.Linear(width, mode_feat, bias=False)
+        self.register_buffer("modes", torch.arange(1, n_modes + 1), persistent=False)
         self.summary_dim = n_modes * mode_feat
-        self.primal = PrimalNet(self.summary_dim)
-        self.codec = CodeCodec()
-        self.n_modes, self.n_steps = n_modes, n_steps
-        self.register_buffer("modes", torch.arange(1, n_modes + 1))
 
-    def _summary(self, resid, geom_tag, mask):
-        d = self.dual(resid, geom_tag, mask, self.modes)         # (B, C, M, width)
+    def forward(self, resid, geom_tag, mask):
+        d = (self.dual(resid, geom_tag, mask, self.modes)
+             - self.dual(torch.zeros_like(resid), geom_tag, mask, self.modes))
         w = mask[:, :, None, None]
         pooled = (d * w).sum(1) / w.sum(1).clamp_min(1e-6)       # (B, M, width) -- true mean
-        # Slots beyond M = min(N_MODES, phases//2) are zero-filled by the caller and carry no
-        # data, but the dual still emits bias + mode-embedding for them. Measured at phases=16
-        # they contributed 81.7% MORE norm than the real modes. Detect them from the input
-        # rather than from a constructor argument, so a checkpoint cannot disagree with a run.
+        # Mode slots the caller zero-filled (orders above what the phase count supports) carry
+        # no data. They are detected from the input rather than from a constructor argument,
+        # so a checkpoint cannot disagree with a run.
         live = (resid.abs().sum((1, 3)) > 0).float()[..., None]  # (B, M, 1)
         return (self.mode_proj(pooled) * live).reshape(resid.shape[0], -1)
 
-    def velocity(self, code, resid, geom_tag, mask, t, sphere_ch, vol_ch):
+
+class LPDFlow(nn.Module):
+    """The velocity field of the conditional flow: the prior part plus the data part, which is
+    one reader shared by the experts and one expert (a PrimalNet) per interval of t; and the
+    sampler that integrates it.
+
+    `edges` are the interior boundaries of the experts' intervals, equal by default. They are
+    a buffer, so a checkpoint carries its own split.
+    """
+
+    def __init__(self, width: int = 96, n_modes: int = N_MODES, n_experts: int = N_EXPERTS,
+                 mode_feat: int = 16, edges=None):
+        super().__init__()
+        self.prior = PriorNet()
+        self.reader = Reader(width, n_modes, mode_feat)
+        self.experts = nn.ModuleList([PrimalNet(self.reader.summary_dim)
+                                      for _ in range(n_experts)])
+        self.register_buffer("edges", self._edges(n_experts, edges))
+        self.codec = CodeCodec()
+        self.n_modes = n_modes
+
+    @classmethod
+    def from_state_dict(cls, state: dict, **kw) -> "LPDFlow":
+        """A network of the shape a saved state dict describes, loaded with it: the expert
+        count is read off the keys and the edges come with the buffer."""
+        n = len({k.split(".")[1] for k in state if k.startswith("experts.")})
+        net = cls(n_experts=max(n, 1), **kw)
+        net.load_state_dict(state)
+        return net
+
+    @staticmethod
+    def _edges(n: int, edges) -> torch.Tensor:
+        e = torch.arange(1, n, dtype=torch.float32) / n if edges is None \
+            else torch.as_tensor(edges, dtype=torch.float32)
+        if len(e) != n - 1 or (len(e) and not (0 < e.min() and e.max() < 1 and (e.diff() > 0).all())):
+            raise ValueError(f"{n} experts need {n - 1} increasing edges inside (0, 1), got {e.tolist()}")
+        return e
+
+    def expert_of(self, t: torch.Tensor) -> torch.Tensor:
+        """Index of the expert that owns each time in t (B,): expert k owns
+        [edges[k-1], edges[k])."""
+        return torch.bucketize(t, self.edges, right=True)
+
+    def branch(self, n: int, edges=None) -> None:
+        """Split the data part into n experts: each new interval starts as a copy of the
+        expert that owns its midpoint now, so every expert begins with everything that was
+        learned and only specialises from there (scripts/train_lpd.py --experts). The reader
+        stays shared."""
+        import copy
+        new_edges = self._edges(n, edges).to(self.edges.device)
+        ends = torch.cat([torch.zeros(1, device=new_edges.device), new_edges,
+                          torch.ones(1, device=new_edges.device)])
+        mid = 0.5 * (ends[:-1] + ends[1:])
+        owners = self.expert_of(mid).tolist()
+        self.experts = nn.ModuleList([copy.deepcopy(self.experts[k]) for k in owners])
+        self.edges = new_edges
+
+    def prior_velocity(self, code, t, radius, sphere_ch, vol_ch):
+        """The prior part alone: the flow over codes without data."""
+        return self.prior(code, t, radius, sphere_ch, vol_ch)
+
+    def data_velocity(self, code, t, radius, geom_tag, inp: FlowInputs):
+        """The data part alone: the shared reader's summary, then the expert that owns each
+        sample's t."""
+        summary = self.reader(inp.resid, geom_tag, inp.mask)
         te = time_embed(t)
-        return self.primal(code, self._summary(resid, geom_tag, mask), te, sphere_ch, vol_ch)
+        which = self.expert_of(t)
+        out = torch.zeros_like(code)
+        for e in which.unique().tolist():
+            sel = which == e
+            out[sel] = self.experts[e](code[sel], summary[sel], te[sel], torch.log(radius[sel]),
+                                       inp.select(sel))
+        return out
+
+    def velocity(self, code, t, radius, geom_tag, inp: FlowInputs):
+        """The velocity at `code` (B, CODE_DIM) and time t (B,), for bodies of published
+        radius (B,), from the geometry tags (B, C, 4) and the inputs: prior part plus data
+        part."""
+        return (self.prior_velocity(code, t, radius, inp.sphere, inp.vol)
+                + self.data_velocity(code, t, radius, geom_tag, inp))
 
     @torch.no_grad()
-    def sample(self, resid_fn, geom_tag, mask, batch: int = 1, device="cpu"):
-        """x0 ~ N(0, I) then n_steps Euler steps, in the codec's whitened space throughout.
+    def sample(self, resid_fn, geom_tag, mask, cond, radius: float, batch: int = 1,
+               n_steps: int = N_STEPS, churn: float = CHURN, device="cpu"):
+        """x0 ~ N(0, I), then n_steps steps from t = 0 to 1, in the whitened space
+        throughout, for a body of published radius `radius`.
 
-        `resid_fn(code)` returns (residual, sphere_channels, vol_channels) for the current
-        code and re-applies the operator at every step rather than linearising once. It is
-        given the WHITENED code and decodes internally, so nothing outside this loop has to
-        know which space it is holding.
+        `resid_fn(code, t)` returns the FlowInputs at that code and applies the operator; it
+        receives a whitened code and decodes it itself, and the mask it returns is `mask` with
+        the geometries of a draw whose body has no curves switched off, as
+        train_lpd.flow_loss does. `cond` is the pair of channel tensors for this body with the
+        adjoint slots still empty; h is fixed at reconstruction, so it is constant.
+
+        The operator is applied at the endpoint the prior's velocity implies,
+        x1_hat = x + (1 - t) v_prior(x), not at x, as in train_lpd.flow_loss: at the first
+        step x is the Gaussian draw, which decodes to a body unlike anything in the corpus,
+        and a residual taken there says little about the body being reconstructed. The prior
+        is a trained, frozen denoiser, so its estimate is a stable place to look; it costs one
+        network forward and no operator call.
+
+        With churn > 0 each step is churn_step's step of the stochastic equation; the last
+        step adds no noise.
         """
+        sph0, vol0 = cond
+        rad = torch.full((batch,), float(radius), device=device)
         x = torch.randn(batch, CODE_DIM, device=device)
-        for k in range(self.n_steps):
-            t = torch.full((batch,), k / self.n_steps, device=device)
-            r, sph, vol = resid_fn(x, t)
-            x = x + self.velocity(x, r, geom_tag, mask, t, sph, vol) / self.n_steps
+        dt = 1.0 / n_steps
+        for k in range(n_steps):
+            t = torch.full((batch,), k * dt, device=device)
+            x1_hat = x + (1 - t[:, None]) * self.prior_velocity(x, t, rad, sph0.expand(batch, -1, -1),
+                                                                vol0.expand(batch, -1, -1, -1, -1))
+            v = self.velocity(x, t, rad, geom_tag, resid_fn(x1_hat, t))
+            x = churn_step(x, v, k * dt, dt, churn)
         return x

@@ -22,26 +22,23 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from hac26.recon import dice, mesh_to_sdf          # noqa: E402
+from hac26.data_io import public_stl               # noqa: E402
+from hac26.recon import dice, mesh_occupancy       # noqa: E402
 from hac26.shapes import rescale_touch_z           # noqa: E402
-
-TRUTH = {1: "AsteroidModel01_shape_public/asteroid1.stl",
-         2: "AsteroidModel02_shape_public/asteroid2.stl",
-         3: "AsteroidModel03_shape_public/asteroid3.stl"}
-
-
-def occupancy(v, f, n, extent):
-    return mesh_to_sdf(np.ascontiguousarray(v), np.ascontiguousarray(f), n, extent) < 0
 
 
 def score(stl: str, model: int, data_dir: str = "dataset/raw", n: int = 128) -> float:
+    """Dice between the reconstruction and the public truth, both posed, on one n^3 grid."""
     import trimesh
     r = trimesh.load(stl, process=False)
-    t = trimesh.load(Path(data_dir) / TRUTH[model], process=False)
-    rv, tv = rescale_touch_z(np.asarray(r.vertices)), rescale_touch_z(np.asarray(t.vertices))
+    t = trimesh.load(public_stl(data_dir, model), process=False)
+    # The faces are passed so the pose centres the body by its solid centroid; a vertex-mean
+    # centre would depend on the triangulation.
+    rv = rescale_touch_z(np.asarray(r.vertices), np.asarray(r.faces))
+    tv = rescale_touch_z(np.asarray(t.vertices), np.asarray(t.faces))
     e = max(float(np.abs(rv).max()), float(np.abs(tv).max())) * 1.05
-    return float(dice(occupancy(rv, np.asarray(r.faces), n, e),
-                      occupancy(tv, np.asarray(t.faces), n, e)))
+    return float(dice(mesh_occupancy(rv, np.asarray(r.faces), n, e),
+                      mesh_occupancy(tv, np.asarray(t.faces), n, e)))
 
 
 def main():

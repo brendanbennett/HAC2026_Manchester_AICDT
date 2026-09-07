@@ -1,23 +1,15 @@
-"""Curves from a general (possibly non-convex) mesh, on the challenge's own conventions.
+"""Curves of a general, possibly non-convex, mesh by CPU ray casting on the challenge
+conventions.
 
-`hac26.shapes.mesh_curves_convex` is exact only for convex bodies: it tests visibility as
-mu > 0, which is correct exactly when facing the camera implies being seen, i.e. no
-self-occlusion. Every body this module's generator produces can occlude itself, so it needs
-a renderer that actually casts rays.
+`hac26.shapes.mesh_curves_convex` counts every facet with mu > 0 and mu0 > 0 as seen and
+lit, which is exact only for convex bodies. Bodies from hac26.shape_library can occlude and
+shadow themselves, so they need a renderer that casts rays. This one takes the rotation
+sense, camera directions and light direction from `hac26.conventions`; delta and c_lambert
+are parameters, so values fitted by `hac26.data_io.fit_conventions` can be passed in.
 
-Built on `hac26.conventions`, the module the tests pin against real data (rotation SENSE,
-camera azimuths/elevations, phase-angle identity), not the older `hac26.geometry` that
-`mesh_curves_convex` uses. `hac26.data_io.fit_conventions` calibrates delta and c_lambert
-against a public body; this module accepts them as parameters rather than re-deriving them,
-so a caller who has already fitted them (or wants the challenge defaults) gets the same
-answer either way.
-
-Scope, stated rather than assumed: single-bounce Lambert + Lommel-Seeliger radiance,
-orthographic projection, hard cast shadows, no interreflection and no sensor chain (PSF,
-vignetting, OETF, quantisation, 8-bit). That is everything `hac26.forward.polytope_raycast`
-and `hac26.forward.sdf_surface` cover and the mesh/ chain adds on top; this module exists so
-the same physics runs without torch or a GPU, which is what building and validating a shape
-library needs.
+Scope: single-bounce Lambert plus Lommel-Seeliger radiance, orthographic projection, hard
+cast shadows, no interreflection and no sensor chain. The mesh forward chain
+(hac26.forward.mesh) adds those; this module runs without torch or a GPU.
 """
 from __future__ import annotations
 
@@ -30,11 +22,9 @@ __all__ = ["render_curves_mesh", "convex_cross_check"]
 
 
 def _ray_triangle_batch(o: np.ndarray, d: np.ndarray, v0, v1, v2, eps: float = 1e-9):
-    """Moller-Trumbore, vectorised over R rays and T triangles -> (R, T) t, or inf if no hit.
-
-    o, d: (R, 3). v0, v1, v2: (T, 3). Returns t of shape (R, T), np.inf where the ray misses
-    or hits behind the origin.
-    """
+    """Moller-Trumbore ray-triangle test for R rays (o, d: (R, 3)) against T triangles
+    (v0, v1, v2: (T, 3)). Returns the hit distance t of shape (R, T), np.inf where the ray
+    misses or the hit lies behind the origin."""
     e1 = v1 - v0
     e2 = v2 - v0
     pvec = np.cross(d[:, None, :], e2[None, :, :])          # (R, T, 3)
@@ -50,7 +40,8 @@ def _ray_triangle_batch(o: np.ndarray, d: np.ndarray, v0, v1, v2, eps: float = 1
 
 
 def _first_hit(o, d, v0, v1, v2, chunk_t: int = 4000):
-    """Nearest hit per ray over all triangles, chunked over triangles to bound memory."""
+    """Nearest hit per ray: (distance, triangle index), -1 and inf where nothing is hit.
+    Triangles are processed in chunks to bound memory."""
     best_t = np.full(len(o), np.inf)
     best_f = np.full(len(o), -1, dtype=np.int64)
     for s in range(0, len(v0), chunk_t):
@@ -64,7 +55,8 @@ def _first_hit(o, d, v0, v1, v2, chunk_t: int = 4000):
 
 
 def _shadowed(hit, sun_dir, v0, v1, v2, eps: float = 1e-4, chunk_t: int = 4000):
-    """True where a ray from `hit` toward `sun_dir` meets the mesh before infinity."""
+    """True where a ray from `hit` toward `sun_dir` meets the mesh, i.e. the point is in
+    cast shadow. The ray starts a small step off the surface to avoid hitting it."""
     o = hit + eps * sun_dir
     d = np.broadcast_to(sun_dir, o.shape)
     t, _ = _first_hit(o, d, v0, v1, v2, chunk_t)
@@ -77,19 +69,18 @@ def render_curves_mesh(verts: np.ndarray, faces: np.ndarray, m: int = 360,
                        ls_weight: float = 1.0, tau_i: float = 0.0, tau_b: float = 0.02,
                        res: int = 96, extent: float | None = None, shadows: bool = True,
                        chunk_t: int = 4000, decimate_to: int | None = 4000) -> np.ndarray:
-    """Raw (unnormalised) [intensity..., binary...] curves, one row per (geometry, type).
+    """Raw (unnormalised) curves, one row per entry of `curve_types`; row i uses geometry
+    i mod len(geoms). The defaults give every geometry as intensity, then as binary.
 
-    `geoms` defaults to the 28 released camera geometries in column order; pass a subset for
-    a quick check. `delta` is the azimuth handedness `hac26.data_io.fit_conventions` fits on
-    a public body; the rotation sense is always `hac26.conventions.SENSE`, not a parameter,
-    because that one is asserted by the tests rather than left open.
+    `geoms` defaults to the released camera geometries in column order; pass a subset for a
+    quick check. `delta` is the azimuth handedness; the rotation sense is always
+    `hac26.conventions.SENSE`. Frames are `res` x `res` orthographic pixels over
+    [-extent, extent]; the intensity curve sums pixel values above tau_i, the binary curve
+    counts pixels above tau_b, both times the pixel area.
 
-    `decimate_to` bounds the triangle count the ray caster runs against: marching-cubes
-    output routinely has 10-30k faces, and this renderer's cost is triangles x pixels x
-    frames, so decimating first (see `shape_library.decimate_mesh`) is the difference
-    between a validation run finishing and not. The threshold is a triangle count, not a
-    grid resolution, because ingested meshes (Thingi10K) can already be small; pass `None`
-    to render the mesh exactly as given.
+    `decimate_to` caps the triangle count before ray casting, whose cost grows with
+    triangles x pixels x frames (see `shape_library.decimate_mesh`); pass None to render
+    the mesh as given.
     """
     geoms = cameras() if geoms is None else geoms
     curve_types = (["intensity"] * len(geoms) + ["binary"] * len(geoms)
@@ -166,13 +157,12 @@ def camera_vector_compat(cam):
 
 def convex_cross_check(hull_verts: np.ndarray, hull_faces: np.ndarray, m: int = 36,
                        geoms: list | None = None, res: int = 64, **kw) -> dict:
-    """Compare this ray-cast renderer against the exact analytic convex operator.
+    """Compare this renderer against the analytic convex operator on a convex hull.
 
-    For a convex body the two must agree up to pixel discretisation: every camera-facing,
-    sun-facing point on a convex hull is visible, so `mesh_curves_convex`'s mu>0-and-mu0>0
-    test IS the correct visibility test there, and this renderer's ray casting should return
-    the same answer by an independent method. Used as the correctness check for rotation
-    sense, camera geometry and thresholds, since real curves are not bundled with this repo.
+    On a convex body every camera-facing, sun-facing point is visible, so
+    `mesh_curves_convex` is exact there and the two must agree up to pixel discretisation.
+    Returns both raw curve stacks and the largest and mean absolute difference after
+    per-curve mean normalisation.
     """
     from .shapes import mesh_curves_convex
     from .geometry import build_cameras

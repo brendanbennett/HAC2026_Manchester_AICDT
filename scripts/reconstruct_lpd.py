@@ -1,17 +1,42 @@
 #!/usr/bin/env python3
-"""Reconstruct a competition model with the trained flow.
+"""Reconstruct a challenge model with the trained flow.
 
-Six Euler steps with the operator re-applied at each, several independent draws from x0, and
-the metric medoid of those draws as the answer. The medoid combines volume overlap with the
-side-view boundary distance used by the challenge, rather than only picking the voxel-Dice
-central sample. That matters for non-convexity because silhouettes see necks and waists that
-volume overlap can blur.
+The starting support h is the convex stage's reconstruction of the model; the flow supplies
+the correction dh and the amplitudes g. The flow is run from several independent draws of
+x0, each for --steps steps with the exact operator and its adjoint at every step and noise
+added on the way (--churn; hac26.solvers.lpd_flow). The learned steps leave a draw close to
+a body that fits the curves but not on it, so each draw is then polished: gradient steps on
+the whitened misfit through the exact operator, stopped once the misfit is at the noise level
+(polish). Along directions the curves do not constrain the gradient is zero, so the polish
+moves nothing the data cannot see. The misfit of every draw before and after is reported.
 
-Planar snapping is opt-in. It can help faceted/polyhedral targets, but it also projects
-near-coplanar vertices onto fitted planes and can turn smooth decoded surfaces into terraces.
+The curves leave several bodies possible, and the answer has to be one shape scored by voxel
+overlap and by the side-view boundary distance. The draws stand in for the bodies that fit,
+and every candidate is scored by its mean over the draws under both measures. The candidates
+are the draws and the consensus bodies: the level sets, at the levels in CONSENSUS_LEVELS,
+of the fraction of draws that contain each voxel. When the draws are the posterior, a level
+set is the body with the best expected voxel score, and it keeps a dent wherever enough
+draws agree on it; when the draws disagree on where the dents are, a level set blurs them
+and a single draw scores better. Nothing is averaged in code space.
 
-Dice is measured on a voxel grid after posing both meshes with rescale_touch_z, so they are
-compared in the frame the challenge defines.
+--hold-out-geoms K keeps K of the measured geometries away from the inversion and reports
+the answer's misfit on them beside its misfit on the ones it saw. An answer that fits the
+seen cameras and not the held-out ones has fitted curves rather than recovered a shape.
+
+The residual is divided per curve by sqrt(sigma_c^2 + eta_c^2), the measurement noise from
+this model's co-located camera pairs and the model error the calibration fitted for that
+curve, as in training (train_lpd.flow_loss).
+
+The inversion runs in the canonical frame (z in [-1, 1], xy radius 1), the frame the corpus
+was fitted and the flow trained in; the published radius is restored afterwards with
+fit_to_cylinder.
+
+Planar snapping is opt-in. It projects near-coplanar vertices onto fitted planes, which
+helps flat-faced targets and can turn a smooth surface into terraces; a plane is kept only if
+the whitened misfit does not rise by more than SNAP_MAX_RISE.
+
+For a public model the Dice against the truth is reported, both meshes posed by
+rescale_touch_z first.
 """
 from __future__ import annotations
 
@@ -27,126 +52,191 @@ import torch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from hac26.conventions import cameras, psi_grid                        # noqa: E402
-from hac26.data_io import load_model_curves                            # noqa: E402
-from hac26.field import (CODE_DIM, DESIGN_N, N_DIR, N_SITES, ImplicitBody,   # noqa: E402
-                         apply_constraints, extract_mesh)
-from hac26.solvers.lpd_flow import N_MODES, N_STEPS, LPDFlow         # noqa: E402
+from hac26.conventions import CYLINDER_R, PUBLIC_MODELS, psi_grid   # noqa: E402
+from hac26.data_io import N_CAMS, load_model_curves, public_stl        # noqa: E402
+from hac26.field import CODE_DIM, DESIGN_N, N_DIR, N_SITES, apply_constraints   # noqa: E402
+from hac26.forward.mesh.exact import normalise                         # noqa: E402
+from hac26.forward.mesh.radiosity import RadiosityError                # noqa: E402
+from hac26.noise import sigma_from_replicates                          # noqa: E402
+from hac26.solvers.lpd_flow import (CHURN, N_MODES, N_STEPS, LPDFlow, flow_inputs,   # noqa: E402
+                                    geometry_tags)
+from hac26.solvers.operator import CodeOperator                        # noqa: E402
 from hac26.solvers.output import (export_stl, metric_medoid, planar_snap,      # noqa: E402
-                          ransac_planes, restore_constraints)
-from hac26.covariance import load_covariance, whitened_misfit          # noqa: E402
-from hac26.recon import dice, fit_to_cylinder                          # noqa: E402
-from hac26.scoring.voxel import occupancy as _occupancy           # noqa: E402
-from hac26.shapes import canonicalize_r, mesh_support, rescale_touch_z   # noqa: E402
-from hac26.forward.learned_surrogate import Surrogate                                  # noqa: E402
-from train_lpd import (cond_channels, curves_from_code, curves_from_mesh,   # noqa: E402
-                       set_code)                                      # noqa: E402
+                                  ransac_planes, restore_constraints)
+from hac26.recon import dice, fit_to_cylinder, mesh_occupancy          # noqa: E402
+from hac26.shapes import rescale_touch_z                              # noqa: E402
+from train_lpd import (CALIBRATION, RENDER, _enable_tf32, cond_channels,   # noqa: E402
+                       load_instrument, residual_features, support_from_mesh)
 
-CYLINDER_R = {1: 1.12, 2: 1.42, 3: 0.88, 4: 1.475, 5: 1.22,
-              6: 0.925, 7: 1.205, 8: 1.24, 9: 0.67, 10: 3.95}
-PUBLIC = {1: "AsteroidModel01_shape_public/asteroid1.stl",
-          2: "AsteroidModel02_shape_public/asteroid2.stl",
-          3: "AsteroidModel03_shape_public/asteroid3.stl"}
-
-SPREAD_MAX = 0.95   # mean Dice of the OFF-MEDOID draws against the medoid, above which the
-                    # draws are one body rather than a posterior. Gated on the off-medoid mean
-                    # and not on `spread`, which includes the medoid's Dice against itself and
-                    # is therefore sample-count dependent (at 2 draws `spread > 0.95` needs
-                    # 0.900, at 16 it needs 0.947). The committed runs sat at 0.991-0.994 with
-                    # a token correction that was identically zero; a live channel has to
-                    # disagree with itself somewhere.
+SPREAD_MAX = 0.95    # mean Dice of the other draws against the medoid above which the draws
+                     # are reported as one body rather than a spread of answers
+SNAP_MAX_RISE = 0.05 # a snapped plane is kept if the whitened RMS misfit rises by at most
+                     # this many standard deviations
+CONSENSUS_LEVELS = (0.35, 0.5, 0.65)   # levels of the draw fraction that make a consensus body
+POLISH_TARGET = 1.0  # the polish stops once the whitened RMS misfit is at the noise level:
+                     # below it, it would be fitting noise
+POLISH_STEP = 0.1    # first step of the polish, in whitened units per coordinate (RMS)
 
 
-def data_modes(curves56: np.ndarray, n_modes: int):
-    """(56, P) real curves -> (1, 28, 2, M) complex Fourier content, intensity then binary."""
-    g = np.stack([curves56[:28], curves56[28:]], axis=1)        # (28, 2, P)
-    f = torch.fft.rfft(torch.tensor(g, dtype=torch.float32), dim=-1)
-    return f[None, ..., 1:n_modes + 1]
+def curve_pairs(curves56: np.ndarray) -> torch.Tensor:
+    """(2 * N_CAMS, P) curves in the released order to (N_CAMS, 2, P): per geometry, the
+    intensity then the binary curve."""
+    return torch.tensor(np.stack([curves56[:N_CAMS], curves56[N_CAMS:]], axis=1),
+                        dtype=torch.float32)
 
 
-def geom_tag_and_mask(mask56: np.ndarray):
-    tag = torch.zeros(1, 28, 4)
-    for i, cam in enumerate(cameras()):
-        tag[0, i] = torch.tensor([np.cos(np.radians(cam.azimuth_deg)),
-                                  np.sin(np.radians(cam.azimuth_deg)),
-                                  np.sin(np.radians(cam.elevation_deg)), 1.0])
-    # a geometry counts as present only if BOTH its channels are
-    m = torch.tensor((mask56[:28] > 0) & (mask56[28:] > 0), dtype=torch.float32)[None]
-    return tag, m
+def geometry_mask(mask56: np.ndarray) -> torch.Tensor:
+    """(1, N_CAMS): a geometry counts as present only if BOTH its curves are."""
+    return torch.tensor((mask56[:N_CAMS] > 0) & (mask56[N_CAMS:] > 0),
+                        dtype=torch.float32)[None]
+
+
+def residual_scale(curves56: np.ndarray, mask56: np.ndarray, eta56: torch.Tensor) -> torch.Tensor:
+    """sqrt(sigma_c^2 + eta_c^2) per curve as (N_CAMS, 2): the measured noise of this model's
+    co-located pairs and the calibration's per-curve model error."""
+    sigma = torch.tensor(sigma_from_replicates(curves56, mask56), dtype=torch.float32)
+    return torch.sqrt(sigma ** 2 + eta56.detach().cpu().float() ** 2).reshape(2, N_CAMS).T
 
 
 def support_from_convex(stl: str) -> torch.Tensor:
-    """h for a competition body, taken from the convex stage's own reconstruction.
-
-    The flow generates the token correction, not h.
-    It does not follow that h is a sphere: it has to come from somewhere, and the convex
-    stage already predicts it from these same 56 curves. Evaluated on the design normals,
-    which is the basis ConvexCore stores its support in.
-
-    CANONICALISED first. The convex stage writes its STL in the physical frame -- z in [-1,1]
-    but xy already scaled to the published R by `fit_to_cylinder` (scripts/eval_exact.py) --
-    while the corpus the code was fitted against is posed at xy r_max = 1. Support is a
-    max over vertices, so it does not transform under an anisotropic scale by any scalar; the
-    vertices have to be canonicalised and h recomputed. See hac26/shapes.py::canonicalize_r,
-    which states the convention this restores:
-        train target : canonicalize_r(hull)              r_max = 1
-        test  output : fit_to_cylinder(prediction, R)    r_max = R
-    """
+    """The base support h for a challenge body from the convex stage's STL for it, made the
+    way the corpus starts were (train_lpd.support_from_mesh)."""
     import trimesh
     m = trimesh.load(stl, process=False)
-    v = canonicalize_r(rescale_touch_z(np.asarray(m.vertices)))
-    n = ImplicitBody(radius=1.0).core.n.detach().cpu().numpy()
-    h = mesh_support(v, n)
-    return torch.tensor(np.maximum(h, 1e-3), dtype=torch.float32)
+    return support_from_mesh(np.asarray(m.vertices), np.asarray(m.faces))
 
 
-def make_resid_fn(net, g_dat, surro, psi, M, radius, support=None):
-    """resid_fn(z, t) -> (residual features, sphere channels, volume channels).
+def make_resid_fn(net, op: CodeOperator, data, scale, geom_mask, M, cond, support, radius):
+    """Build resid_fn(z, t) -> FlowInputs for LPDFlow.sample, feeding the network exactly
+    what train_lpd.flow_loss feeds it.
 
-    `z` is the flow's WHITENED code; it is decoded here, so nothing in the sampling loop has
-    to know which space it is holding. `support` is the BASE h from the convex stage; the
-    code's dh block corrects it, exactly as the perturbation did during training.
+    `data` (N_CAMS, 2, P) are the real curves, `scale` (N_CAMS, 2) divides the residual,
+    `geom_mask` (1, N_CAMS) says which geometries were measured, `radius` is the published
+    xy radius the body is rendered at. `z` is the whitened code and is decoded here;
+    `support` is the base h the code's dh block corrects. A draw whose body has no curves is
+    masked out for this step.
     """
-    sph0, vol0 = cond_channels(support)
+    sph0, vol0 = cond
+    C = data.shape[0]
+    geoms = torch.nonzero(geom_mask[0] > 0).flatten().tolist()
+    gsel = torch.tensor(geoms)
+    d_sel, s_sel = data[gsel].to(op.device), scale[gsel].to(op.device)
+
     def fn(z, t):
         raw = net.codec.decode(z.detach())
-        preds = []
-        for b in range(len(z)):
-            cur = curves_from_code(raw[b], radius, surro, psi, support=support)
-            preds.append(torch.zeros(28, 2, len(psi)) if cur is None else cur)
-        g_cur = torch.fft.rfft(torch.stack(preds), dim=-1)[..., 1:M + 1]
-        r = g_dat.expand_as(g_cur) - g_cur
         B = len(z)
-        feats = torch.zeros(B, 28, N_MODES, 6)
-        for ch in range(2):
-            feats[:, :, :M, 2 * ch] = r[:, :, ch].real
-            feats[:, :, :M, 2 * ch + 1] = r[:, :, ch].imag
-        feats[:, :, :M, 4] = g_dat[:, :, 0].real.expand(B, -1, -1)
-        feats[:, :, :M, 5] = g_dat[:, :, 1].real.expand(B, -1, -1)
-        return feats, sph0.expand(B, -1, -1), vol0.expand(B, -1, -1, -1, -1)
+        pred = torch.zeros(B, C, 2, data.shape[-1])
+        adj = torch.zeros(B, CODE_DIM)
+        live = torch.ones(B)
+        for b in range(B):
+            cur, grad = op.adjoint(support, raw[b], radius,
+                                   lambda c: (d_sel - c) / s_sel[..., None] ** 2, geoms=geoms)
+            if cur is None:
+                live[b] = 0.0
+                continue
+            pred[b, gsel] = cur.cpu()
+            adj[b] = grad.cpu()
+        m = geom_mask.expand(B, -1) * live[:, None]
+        feats = residual_features(data[None].expand(B, -1, -1, -1), pred,
+                                  scale[None].expand(B, -1, -1), M, m)
+        return flow_inputs(feats, m, sph0, vol0, net.codec.pullback(z.detach(), adj))
     return fn
 
 
-def decode(code, radius, res=64, misfit_fn=None, eta=None, support=None, snap: bool = False,
-           snap_planes: int = 12, snap_tol: float = 0.02,
-           snap_min_frac: float = 0.02):
-    """Token code -> constrained mesh, with optional planar snapping."""
-    body = ImplicitBody(radius=radius)
-    n_norm = body.core.n.shape[0]
-    if support is None:
-        h = torch.full((n_norm,), 0.8 * radius)
-    else:
-        h = torch.as_tensor(support, dtype=torch.float32)
-        if h.numel() != n_norm:
-            raise ValueError(f"support has {h.numel()} entries, but this field uses "
-                             f"{n_norm} normals; rerun the convex/support stage after "
-                             "changing DESIGN_N")
-    body.set_support(h)
-    set_code(body, code)
-    v, f = extract_mesh(lambda y: body(y), radius * 1.6, res=res, device="cpu")
-    if len(f) < 8:
+def whitened_misfit(pred, data, scale, geoms) -> float:
+    """RMS of (data - pred) / scale over the geometries `geoms`, in standard deviations.
+    `pred` holds those geometries only, in that order, as the operator returns them; `data`
+    and `scale` hold every geometry."""
+    r = (data[geoms] - pred) / scale[geoms][..., None]
+    return float(r.pow(2).mean().sqrt())
+
+
+def mesh_misfit_by_geom(op: CodeOperator, verts, faces, radius, data, scale) -> torch.Tensor:
+    """Whitened RMS misfit of a mesh in the canonical frame against the curves, per geometry
+    (N_CAMS,), in standard deviations; inf everywhere for a mesh that cannot be rendered, so
+    that it is never accepted."""
+    f_t = torch.tensor(np.asarray(faces), dtype=torch.long, device=op.device)
+    v_t = op.physical(torch.tensor(np.asarray(verts), dtype=torch.float32, device=op.device),
+                      f_t, radius)
+    try:
+        pred = normalise(op.forward.raw_curves(v_t, f_t)).cpu()
+    except RadiosityError:
+        return torch.full((N_CAMS,), float("inf"))
+    return ((pred - data) / scale[..., None]).pow(2).mean((1, 2)).sqrt()
+
+
+def polish(net, op: CodeOperator, z, support, radius, data, scale, geoms, steps: int):
+    """Gradient descent on the whitened misfit of one draw, in the whitened code, from where
+    the flow left it. Each iteration renders once with the adjoint, steps against the
+    gradient by POLISH_STEP per coordinate at first, and halves the step until the misfit
+    falls; a step that lowers it grows the next one. It stops when the misfit is at the noise
+    level (POLISH_TARGET), after `steps` iterations, or when no step of the allowed sizes
+    lowers it. The gradient is zero along the directions the curves do not constrain, so the
+    polish moves nothing the data cannot see. Returns (z, misfit before, misfit after,
+    iterations taken)."""
+    def misfit_of(zz):
+        cur = op.curves(support, net.codec.decode(zz), radius, geoms=geoms)
+        return float("inf") if cur is None else whitened_misfit(cur.cpu(), data, scale, geoms)
+
+    d_sel, s_sel = data[geoms].to(op.device), scale[geoms].to(op.device)
+    z = z.detach().clone()
+    alpha, chi0, chi, it = POLISH_STEP, None, None, 0
+    while it < steps:
+        cur, g = op.adjoint(support, net.codec.decode(z), radius,
+                            lambda c: (d_sel - c) / s_sel[..., None] ** 2, geoms=geoms)
+        if cur is None:
+            break
+        chi = whitened_misfit(cur.cpu(), data, scale, geoms)
+        chi0 = chi if chi0 is None else chi0
+        if chi <= POLISH_TARGET:
+            break
+        # g is the gradient of -(n/2) chi^2 with respect to the raw code; back to the
+        # whitened code, then a unit RMS descent direction
+        grad = net.codec.pullback(z, -(2.0 / d_sel.numel()) * g.cpu())
+        direction = -grad / grad.pow(2).mean().sqrt().clamp_min(1e-12)
+        accepted = False
+        for _ in range(5):
+            trial = misfit_of(z + alpha * direction)
+            if trial < chi:
+                z, chi, accepted = z + alpha * direction, trial, True
+                alpha = min(alpha * 1.5, 5.0 * POLISH_STEP)
+                break
+            alpha *= 0.5
+        it += 1
+        if not accepted:
+            break
+    if chi0 is None:                      # nothing could be rendered, or no iteration was asked
+        chi0 = chi = misfit_of(z)
+    return z, chi0, chi, it
+
+
+def consensus_bodies(occs: list, extent: float, radius: float, levels=CONSENSUS_LEVELS):
+    """Meshes of the level sets of the fraction of draws containing each voxel, for boolean
+    grids `occs` on [-extent, extent]^3, posed like the draws. Returns [(level, verts,
+    faces)]; a level with no closed surface is left out."""
+    from skimage import measure
+    prob = np.mean([o.astype(np.float32) for o in occs], axis=0)
+    n = prob.shape[0]
+    spacing = 2.0 * extent / n
+    out = []
+    for level in levels:
+        if not (prob.min() < level < prob.max()):
+            continue
+        v, f, _, _ = measure.marching_cubes(prob, level=level, spacing=(spacing,) * 3)
+        v = v - extent + spacing / 2.0                  # cell centres, not cell corners
+        out.append((float(level), restore_constraints(v, radius), np.asarray(f, dtype=np.int64)))
+    return out
+
+
+def decode(op: CodeOperator, code, support, res=64, misfit_fn=None, snap: bool = False,
+           snap_planes: int = 12, snap_tol: float = 0.02, snap_min_frac: float = 0.02):
+    """Raw code -> posed mesh in the canonical frame as numpy arrays, with optional planar
+    snapping. Returns (None, None, 0) if the extracted mesh is degenerate."""
+    m = op.mesh(support, code, res=res)
+    if m is None:
         return None, None, 0
-    v = apply_constraints(v, radius)
+    v, f = m[0].cpu().numpy(), m[1].cpu().numpy()
+    v = apply_constraints(v, 1.0)          # canonical frame: xy radius 1
     kept = 0
     planes = ransac_planes(v, f, n_planes=snap_planes, tol=snap_tol,
                            min_frac=snap_min_frac) if snap else []
@@ -154,34 +244,31 @@ def decode(code, radius, res=64, misfit_fn=None, eta=None, support=None, snap: b
         v, kept = planar_snap(v, f, planes,
                               misfit_fn=(None if misfit_fn is None
                                          else lambda w: misfit_fn(w, f)),
-                              eta=eta, tol=snap_tol)
-        v = restore_constraints(v, radius)
+                              eta=SNAP_MAX_RISE, tol=snap_tol)
+        v = restore_constraints(v, 1.0)
     return v, f, kept
-
-
-def occupancy(v, f, n=64, extent=None):
-    return _occupancy(v, f, n, extent or float(np.abs(v).max()) * 1.05)
-
-
-def _enable_tf32():
-    """TF32 on the matmul path. The operator's field evaluation is (points x normals) and
-    (points x sites) matmuls at about three decimal places of useful precision; TF32 keeps ten
-    bits of mantissa, which is more than the surrogate's own accuracy, and is several times
-    faster on any Ampere-or-later GPU. No effect on CPU or on older cards."""
-    if torch.cuda.is_available():
-        torch.backends.cuda.matmul.allow_tf32 = True
-        torch.backends.cudnn.allow_tf32 = True
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", type=int, required=True)
     ap.add_argument("--ckpt", default="runs/lpd_flow.pt")
-    ap.add_argument("--surrogate", default="runs/surrogate.pt")
+    ap.add_argument("--calibration", default=CALIBRATION,
+                    help="the Instrument written by scripts/calibrate.py; must be the one "
+                         "the flow was trained with")
     ap.add_argument("--data-dir", default="dataset/raw")
     ap.add_argument("--samples", type=int, default=8)
+    ap.add_argument("--steps", type=int, default=N_STEPS,
+                    help="steps of the sampler from noise to a body; the operator runs at "
+                         "each")
+    ap.add_argument("--churn", type=float, default=CHURN,
+                    help="noise added along the way; 0 is the deterministic flow")
     ap.add_argument("--phases", type=int, default=96)
-    ap.add_argument("--res", type=int, default=64)
+    ap.add_argument("--operator-res", type=int, default=32,
+                    help="FlexiCubes resolution of the operator inside the flow; must match "
+                         "the training run")
+    ap.add_argument("--res", type=int, default=64,
+                    help="FlexiCubes resolution the final mesh is extracted at")
     ap.add_argument("--out", required=True)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--snap", action="store_true",
@@ -190,7 +277,7 @@ def main():
     ap.add_argument("--snap-tol", type=float, default=0.02)
     ap.add_argument("--snap-min-frac", type=float, default=0.02)
     ap.add_argument("--medoid-volume-only", action="store_true",
-                    help="select the medoid by voxel Dice only, matching the old behaviour")
+                    help="select the medoid by voxel Dice only")
     ap.add_argument("--medoid-side-points", type=int, default=200000,
                     help="surface samples per draw for side-view medoid selection; use "
                          "1000000 to match hac26/scoring/side_view.py exactly")
@@ -200,6 +287,12 @@ def main():
     ap.add_argument("--support-from", default=None,
                     help="STL whose support function supplies h; defaults to the convex "
                          "stage's reconstruction of this model")
+    ap.add_argument("--polish-steps", type=int, default=30,
+                    help="most gradient steps of the polish per draw (see polish); 0 skips it")
+    ap.add_argument("--hold-out-geoms", type=int, default=0,
+                    help="keep this many measured geometries, spread evenly over the list, "
+                         "away from the inversion and report the answer's misfit on them; "
+                         "0 uses every geometry")
     a = ap.parse_args()
     _enable_tf32()
     if not a.medoid_volume_only and a.medoid_side_points <= 0:
@@ -210,24 +303,21 @@ def main():
     R = CYLINDER_R[a.model]
     psi = psi_grid(a.phases)
     M = min(N_MODES, a.phases // 2)
+    dev = "cuda" if torch.cuda.is_available() else "cpu"
 
-    gdev = "cuda" if torch.cuda.is_available() else "cpu"
-    surro = Surrogate(width=96, modes=8, blocks=3)
-    surro.load_state_dict(torch.load(a.surrogate, map_location="cpu"))
-    surro = surro.to(gdev).eval()
+    inst = load_instrument(a.calibration, dev)
+    op = CodeOperator(inst, psi, res=a.operator_res, config=RENDER, device=dev)
 
-    net = LPDFlow()
     sd = torch.load(a.ckpt, map_location="cpu", weights_only=False)
     if "net" in sd and isinstance(sd.get("step"), int):
-        # A train_lpd.py resume checkpoint rather than a finished run's weights: a job that
-        # died mid-training still left one behind, and its best held-out state is a better
-        # answer than not reconstructing at all. Prefer that state over the last step's.
+        # a train_lpd.py resume checkpoint rather than a finished run's weights: use its
+        # best held-out state if it has one
         print(f"  {a.ckpt} is a training checkpoint at step {sd['step']}"
               + (f", using its best weights from step {sd['best_step']} "
                  f"(val {sd['best']:.5f})" if sd.get("best_state") else ", using its "
                  "current weights (no held-out evaluation in it yet)"), flush=True)
         sd = sd["best_state"] or sd["net"]
-    net.load_state_dict(sd)
+    net = LPDFlow.from_state_dict(sd)
     net.eval()
 
     sup_stl = a.support_from or f"results/convex/Asteroid{a.model:02d}.stl"
@@ -236,67 +326,58 @@ def main():
           flush=True)
 
     d = load_model_curves(a.data_dir, a.model, m=a.phases)
-    g_dat = data_modes(d["curves"], M)
-    tag, mask = geom_tag_and_mask(d["mask"])
-    print(f"model {a.model}: R = {R}, {int(mask.sum())}/28 geometries present", flush=True)
+    # A curve file that is absent leaves its block at zero and masked out, which the solver
+    # would accept and reconstruct around. An answer built from half the measurement, or none
+    # of it, is worse than no answer, so say so instead.
+    if set(d["files"]) != {"intensity", "binary"}:
+        raise SystemExit(f"model {a.model} needs both measured curve files under "
+                         f"{a.data_dir}; found {sorted(d['files'])}")
+    data = curve_pairs(d["curves"])                              # (N_CAMS, 2, P)
+    mask = geometry_mask(d["mask"])
+    scale = residual_scale(d["curves"], d["mask"], inst.eta)     # (N_CAMS, 2)
+    tag = geometry_tags()
+    present = torch.nonzero(mask[0] > 0).flatten()
+    # the geometries the inversion sees, and the ones kept back to test its answer on
+    held = present[torch.linspace(0, len(present) - 1, a.hold_out_geoms).round().long()] \
+        if a.hold_out_geoms > 0 else present[:0]
+    seen = present[~torch.isin(present, held)]
+    mask_seen = torch.zeros_like(mask)
+    mask_seen[0, seen] = 1.0
+    print(f"model {a.model}: R = {R}, {len(present)}/{N_CAMS} geometries present"
+          + (f", {len(held)} of them held out: {held.tolist()}" if len(held) else "")
+          + f"; residual scale median {float(scale.median()):.4f}", flush=True)
 
-    # The whole inversion runs in the CANONICAL frame (xy r_max = 1), which is the frame the
-    # corpus was fitted in (fit_shapes.py builds every body at radius=1.0) and the frame the
-    # operator was trained in (train_lpd.py calls curves_from_code(code, 1.0, ...)). The width
-    # is restored from the published R afterwards, by fit_to_cylinder -- exactly the split
-    # hac26/shapes.py::canonicalize_r describes and scripts/eval_exact.py already uses for the
-    # convex path. Decoding at radius=R instead left the token positions in canonical units
-    # inside a body R times wider while sigma and s were scaled by R, so at R=3.95 all 32
-    # tokens sat in the inner 18% of the width with sigma ~ the entire z half-height.
     t0 = time.time()
-    codes = net.sample(make_resid_fn(net, g_dat, surro, psi, M, 1.0, support=support),
-                       tag.expand(a.samples, -1, -1), mask.expand(a.samples, -1),
-                       batch=a.samples)
-    print(f"  {a.samples} draws x {N_STEPS} steps in {time.time()-t0:.0f}s", flush=True)
+    cond = cond_channels(support)                    # constant per body: h is fixed here
+    codes = net.sample(make_resid_fn(net, op, data, scale, mask_seen, M, cond, support, R),
+                       tag.expand(a.samples, -1, -1), mask_seen.expand(a.samples, -1),
+                       cond, R, batch=a.samples, n_steps=a.steps, churn=a.churn)
+    print(f"  {a.samples} draws x {a.steps} steps (churn {a.churn:g}) in "
+          f"{time.time()-t0:.0f}s", flush=True)
 
-    # The snap is gated on the data: the misfit of a candidate mesh against the real curves,
-    # with the per-curve model error from the calibration as the tolerance it may not exceed.
-    cov_path = Path("models/data_covariance.pt")
-    COV = load_covariance(str(cov_path)) if cov_path.exists() else None
-    if COV is None:
-        print("  no fitted covariance yet; the snap gate falls back to an unweighted RMS",
-              flush=True)
-    real = torch.tensor(d["curves"], dtype=torch.float32)
-    real_g = torch.stack([real[:28], real[28:]], dim=1)              # (28, 2, P)
-    eta = float(torch.nn.functional.softplus(
-        torch.load("models/instrument_calibration.pt", map_location="cpu",
-                   weights_only=False)["raw_eta"]).mean())
+    polished = []
+    if a.polish_steps > 0:
+        t0 = time.time()
+        for i in range(a.samples):
+            codes[i], before, after, n_it = polish(net, op, codes[i], support, R, data, scale,
+                                                    seen.tolist(), a.polish_steps)
+            polished.append([before, after, n_it])
+            print(f"  draw {i}: polished from {before:.2f} to {after:.2f} sigma in {n_it} "
+                  f"steps", flush=True)
+        print(f"  polish in {time.time()-t0:.0f}s", flush=True)
+
+    def misfit_by_geom(w, faces):
+        return mesh_misfit_by_geom(op, w, faces, R, data, scale)
 
     def misfit(w, faces):
-        """Whitened by the measured covariance, which is the only weight in play here.
+        """Whitened RMS misfit of a candidate mesh over the geometries the inversion saw."""
+        return float(misfit_by_geom(w, faces)[seen].pow(2).mean().sqrt())
 
-        An unweighted curve-space RMS would weight every curve and every rotation order
-        equally, which is a prior on the data that was never measured.
-        """
-        c = curves_from_mesh(np.asarray(w), np.asarray(faces), surro, psi)
-        pred56 = torch.cat([c[:, 0], c[:, 1]], dim=0)
-        if COV is None:
-            return float(((c - real_g) ** 2).mean().sqrt())
-        return float(whitened_misfit(pred56, real, COV["s2"]))
+    raw_codes = net.codec.decode(codes)
 
-    raw_codes = net.codec.decode(codes)     # out of the flow's whitened space, once
-
-    # PERSIST THE CODES, here -- before anything is decoded.
-    #
-    # Every operator call is already spent at this line: --samples draws x N_STEPS Euler
-    # steps, all at 28 geometries, which is about a quarter of the whole pipeline's operator
-    # budget. Everything after this point is mesh extraction and scoring, which is cheap.
-    # Writing them here rather than beside the STL means they survive a degenerate-draw exit,
-    # a crash in the medoid, or an out-of-memory at a high --res -- all of which currently
-    # discard the sampling with nothing left to inspect.
-    #
-    # It is also the only record of the posterior. The STL keeps the medoid alone, so the
-    # other draws are gone: if a reconstruction comes out convex, the STL cannot distinguish
-    # a collapsed posterior from a medoid that picked badly, and these can.
-    #
-    # `codes` are RAW, so decode(codes[i], 1.0, support=support) reproduces draw i exactly and
-    # fit_to_cylinder(v, radius) returns it to the physical frame. The whitened codes are not
-    # stored: codec.encode() recovers them, and they would double the file.
+    # Save the raw codes before anything is decoded. All the operator calls are spent by this
+    # line, and the codes are the only record of all the draws: the STL keeps the medoid
+    # alone. decode(op, codes[i], support) reproduces draw i exactly.
     codes_path = Path(a.out).with_suffix(".codes.npz")
     try:
         Path(a.out).parent.mkdir(parents=True, exist_ok=True)
@@ -310,26 +391,37 @@ def main():
                                   "frame": "canonical; apply fit_to_cylinder(v, radius)"},
                                  sort_keys=True))
         print(f"  codes saved to {codes_path}", flush=True)
-    except OSError as exc:                  # never let a diagnostic cost the reconstruction
-        codes_path = None
+    except OSError as exc:                  # a diagnostic must not cost the reconstruction
         print(f"  WARNING: could not save the codes to {codes_path}: {exc}", flush=True)
+        codes_path = None
 
-    meshes, occs, snaps = [], [], []
+    meshes, snaps, fits = [], [], []
     for i in range(a.samples):
-        v, f, kept = decode(raw_codes[i], 1.0, res=a.res, misfit_fn=misfit, eta=eta,
-                            support=support,
+        v, f, kept = decode(op, raw_codes[i], support, res=a.res, misfit_fn=misfit,
                             snap=a.snap, snap_planes=a.snap_planes,
                             snap_tol=a.snap_tol, snap_min_frac=a.snap_min_frac)
         if v is None:
             print(f"  draw {i}: degenerate, dropped", flush=True); continue
-        v = fit_to_cylinder(v, R)            # canonical -> physical, xy only, z untouched
-        meshes.append((v, f)); occs.append(occupancy(v, f)); snaps.append(kept)
+        chi = misfit(v, f)                   # whitened RMS misfit of this draw, in sigmas
+        print(f"  draw {i}: misfit {chi:.2f} sigma", flush=True)
+        v = fit_to_cylinder(v, R)            # canonical -> physical: xy only
+        meshes.append((v, f)); snaps.append(kept); fits.append(chi)
     if not meshes:
         raise SystemExit("every draw was degenerate")
+    # one grid for every draw, sized to the widest of them, so the pairwise Dice below
+    # compares the same places
+    occ_extent = max(float(np.abs(mv).max()) for mv, _ in meshes) * 1.05
+    occs = [mesh_occupancy(mv, mf, 64, occ_extent) for mv, mf in meshes]
+    n_draws = len(meshes)
+    # the consensus bodies join the draws as candidates; the draws alone are the reference
+    extra = consensus_bodies(occs, occ_extent, R) if n_draws > 1 else []
+    levels = [lv for lv, _, _ in extra]
+    candidates = meshes + [(mv, mf) for _, mv, mf in extra]
+    occs = occs + [mesh_occupancy(mv, mf, 64, occ_extent) for _, mv, mf in extra]
 
     medoid_metric = "volume"
     if a.medoid_volume_only:
-        k = metric_medoid(occs)
+        k = metric_medoid(occs, n_ref=n_draws)
     else:
         try:
             from hac26.scoring.side_view import surface_points
@@ -340,37 +432,48 @@ def main():
         print(f"  side-view medoid: {a.medoid_side_points} surface points/draw, "
               f"{a.medoid_side_dirs} dirs, res {a.medoid_side_res}", flush=True)
         outlines = [surface_points(v, f, n=a.medoid_side_points, seed=a.seed + i)
-                    for i, (v, f) in enumerate(meshes)]
+                    for i, (v, f) in enumerate(candidates)]
         k = metric_medoid(occs, outlines, side_n_dirs=a.medoid_side_dirs,
-                          side_res=a.medoid_side_res, side_mode=a.medoid_side_mode)
+                          side_res=a.medoid_side_res, side_mode=a.medoid_side_mode,
+                          n_ref=n_draws)
         medoid_metric = "volume+side_view"
+        del outlines            # large, and nothing reads it after the medoid
 
-    v, f = meshes[k]
+    v, f = candidates[k]
+    chosen = f"draw {k}" if k < n_draws else f"consensus at level {levels[k - n_draws]:g}"
     if a.snap:
-        print(f"  planes accepted per draw (eta = {eta:.4f}): {snaps}", flush=True)
+        print(f"  planes accepted per draw (allowed rise {SNAP_MAX_RISE}): {snaps}", flush=True)
     else:
         print("  planar snap disabled", flush=True)
-    spread = float(np.mean([dice(occs[k], o) for o in occs]))   # includes the self-term, 1.0
-    off = ([dice(occs[k], o) for j, o in enumerate(occs) if j != k] or [0.0])
+    spread = float(np.mean([dice(occs[k], o) for o in occs[:n_draws]]))
+    off = ([dice(occs[k], o) for j, o in enumerate(occs[:n_draws]) if j != k] or [0.0])
     spread_off = float(np.mean(off))
-    print(f"  medoid = draw {k} of {len(meshes)} by {medoid_metric}; "
-          f"mean Dice to medoid {spread_off:.4f}", flush=True)
+    # a consensus body is in the physical frame; the misfit takes canonical vertices
+    chosen_fit = (fits[k] if k < n_draws
+                  else misfit(candidates[k][0] / np.array([R, R, 1.0]), candidates[k][1]))
+    print(f"  answer = {chosen} of {n_draws} draws and {len(extra)} consensus bodies by "
+          f"{medoid_metric}; mean Dice to the draws {spread_off:.4f}; misfit "
+          f"{chosen_fit:.2f} sigma (draws {min(fits):.2f}-{max(fits):.2f})", flush=True)
+    held_fit = None
+    if len(held):
+        # the answer in the canonical frame, as misfit_by_geom takes it
+        per_geom = misfit_by_geom(v / np.array([R, R, 1.0]), f)
+        held_fit = float(per_geom[held].pow(2).mean().sqrt())
+        print(f"  held-out geometries {held.tolist()}: misfit {held_fit:.2f} sigma against "
+              f"{chosen_fit:.2f} on the seen ones", flush=True)
 
-    collapsed = len(meshes) > 1 and spread_off > SPREAD_MAX
+    collapsed = n_draws > 1 and float(np.mean(
+        [dice(occs[i], occs[j]) for i in range(n_draws) for j in range(i + 1, n_draws)])) > SPREAD_MAX
     if collapsed:
-        print(f"\n  *** WARNING: mean Dice to the medoid {spread_off:.4f} > {SPREAD_MAX}: "
-              f"the draws "
-              f"are the same body.\n"
-              f"      A posterior this tight is not confidence, it is a dead channel. The "
-              f"usual cause is a\n"
-              f"      correction that is identically zero, which makes every draw "
-              f"exactly the convex core;\n"
-              f"      rerun scripts/fit_shapes.py and check its [check] line. The STL below "
-              f"is still written.\n", flush=True)
+        print(f"\n  *** WARNING: mean Dice between the draws is above {SPREAD_MAX}: the draws "
+              f"are the same body. Either the correction is dead (rerun scripts/fit_shapes.py "
+              f"and check its [check] line) or the flow has collapsed to one answer. The STL "
+              f"below is still written.\n", flush=True)
 
     Path(a.out).parent.mkdir(parents=True, exist_ok=True)
     info = export_stl(a.out, v, f)
-    res = {"model": a.model, "radius": R, "draws": len(meshes), "medoid": int(k),
+    res = {"model": a.model, "radius": R, "draws": n_draws, "answer": chosen,
+           "candidate": int(k), "consensus_levels": list(CONSENSUS_LEVELS),
            "spread": spread, "spread_off_medoid": spread_off,
            "collapsed": bool(collapsed),
            "medoid_metric": medoid_metric,
@@ -379,19 +482,26 @@ def main():
            "medoid_side_dirs": int(a.medoid_side_dirs),
            "medoid_side_res": int(a.medoid_side_res),
            "medoid_side_mode": a.medoid_side_mode,
-           "eta": eta, "snap_enabled": bool(a.snap),
+           "residual_scale_median": float(scale.median()),
+           "steps": int(a.steps), "churn": float(a.churn),
+           "polish_steps": int(a.polish_steps), "polish_target": POLISH_TARGET,
+           "polish_misfit_sigma": polished,          # per draw: before, after, iterations
+           "misfit_sigma": fits, "answer_misfit_sigma": chosen_fit,
+           "held_out_geoms": held.tolist(), "seen_geoms": seen.tolist(),
+           "held_out_misfit_sigma": held_fit,
+           "snap_enabled": bool(a.snap), "snap_max_rise": SNAP_MAX_RISE,
            "snap_planes": int(a.snap_planes), "snap_tol": float(a.snap_tol),
            "snap_min_frac": float(a.snap_min_frac), "planes_accepted": snaps,
            "codes_file": None if codes_path is None else str(codes_path), **info}
 
-    if a.model in PUBLIC:
+    if a.model in PUBLIC_MODELS:
         import trimesh
-        t = trimesh.load(Path(a.data_dir) / PUBLIC[a.model], process=False)
-        tv = rescale_touch_z(np.asarray(t.vertices))
-        rv = rescale_touch_z(v)
+        t = trimesh.load(public_stl(a.data_dir, a.model), process=False)
+        tv = rescale_touch_z(np.asarray(t.vertices), np.asarray(t.faces))
+        rv = rescale_touch_z(v, f)
         e = max(float(np.abs(tv).max()), float(np.abs(rv).max())) * 1.05
-        res["dice"] = float(dice(occupancy(tv, np.asarray(t.faces), 128, e),
-                                 occupancy(rv, f, 128, e)))
+        res["dice"] = float(dice(mesh_occupancy(tv, np.asarray(t.faces), 128, e),
+                                 mesh_occupancy(rv, f, 128, e)))
         print(f"  DICE vs truth: {res['dice']:.4f}", flush=True)
 
     print(json.dumps(res))

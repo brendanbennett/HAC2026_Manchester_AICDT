@@ -1,24 +1,19 @@
 #!/usr/bin/env python3
-"""Fit the shape library: per-body support h and per-body correction amplitudes g.
+"""Fit the implicit field to every body of the shape library, giving the training corpus.
 
-There is no decoder. The previous field decoded a code through cross-attention weights that
-had to be fitted jointly across the library, so a code only meant something together with the
-decoder it came from -- hence an autodecoder, a shared `runs/token_decoder.pt`, and a
-`--decoder-file` threaded through every downstream script. With a fixed lattice the code IS
-the amplitude vector: site k always means the same place, so codes are portable by
-construction and every body can be fitted independently.
+Per body, the support h is set to the body's own convex hull and frozen, and the lattice
+amplitudes g are fitted by regressing the field onto the body's signed distance at sampled
+points. See LatticeFit for why h is not fitted jointly with g. The dh block is stored as
+zeros: a corpus body's h is exact here, and scripts/build_corpus.py later sets dh to the
+correction from the convex stage's start to this h.
 
-What is fitted per body:
-    delta.g      N_SITES signed amplitudes on the fixed lattice
+With a fixed lattice the code is the amplitude vector itself, so every body is fitted
+independently and codes mean the same thing to every reader.
 
-What is FROZEN: h, at the analytic support of the body's own convex hull. It is not fitted --
-see BatchedFit for why solving for h and g jointly is both ambiguous and inconsistent with how
-h is obtained at reconstruction time.
-
-What is NOT fitted: dh. A corpus body's h is exact, so its dh is zero by definition. The flow
-learns dh against a fresh perturbation of the fitted h -- see flow_loss in train_lpd.py -- so
-the corpus stores a zero block and the perturbation supplies both the signal and free
-augmentation.
+After the fit, a sample of bodies is decoded and its Dice overlap with the mesh it was fitted
+to is reported by library family. This is the check that the representation can express the
+shapes at all: a family with low fitted Dice (necks, sharp craters) is a family the flow
+cannot reconstruct however well it is trained. The per-body values go into the output file.
 
 Public bodies are never in the library.
 """
@@ -35,20 +30,50 @@ import numpy as np
 import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from hac26.field import (CODE_DIM, DESIGN_N, LATTICE_ALPHA, LATTICE_EXTENT,   # noqa: E402
-                         LATTICE_SHAPE, N_DIR, N_SITES, ImplicitBody, design_sha,
-                         dir_design)
+from hac26.shapes import canonicalize_r, rescale_touch_z   # noqa: E402
+from hac26.field import (CODE_DIM, DESIGN_N, EXTRACT_EXTENT, LATTICE_ALPHA,   # noqa: E402
+                         LATTICE_EXTENT, LATTICE_SHAPE, N_DIR, N_SITES, ImplicitBody,
+                         design_sha, dir_design, extract_mesh)
+from hac26.recon import dice, mesh_occupancy                # noqa: E402
+
+DICE_RES = 64          # voxel grid of the fitted-Dice check
+DICE_EXTENT = 1.35     # half-width of that grid; covers a posed body with its published radius
+
+# Only the zero level set of the field is the body, so the fit weights a sample point by how
+# close it is to the surface. The band is about one lattice kernel width; the floor keeps far
+# points contributing, which pins the field's sign where nothing else constrains it.
+SURFACE_BAND = 0.15
+WEIGHT_FLOOR = 0.05
+RIDGE = 1e-3           # relative to the mean diagonal of the normal matrix. Neighbouring
+                       # kernels overlap, so many amplitude vectors describe nearly the same
+                       # body and the sample points alone do not choose between them: fitted
+                       # twice from different points, one body gets two different codes, and
+                       # the difference is a property of the sampling rather than of the body.
+                       # Both the ridge and more sample points settle that choice, but the
+                       # ridge also costs a little of the shape while points cost only time,
+                       # so the ridge is set low and the points carry the work.
+SOLVE_CHUNK = 20000    # sample points per block of the solve. Both the core support function
+                       # over the design normals and the normal matrix are sums or maxima over
+                       # the points, so evaluating them a block at a time bounds the memory of
+                       # the solve and leaves the point count limited only by the cost of the
+                       # signed distances.
 
 
-# The SDF supervision has to cover the correction lattice, not just the body: a site the
-# sampler never sees is an amplitude the fit cannot determine, and it is then free at sampling
-# time. The lattice reaches LATTICE_EXTENT and its kernels reach 3 sigma beyond that.
+# The sampled points have to cover the lattice and its kernels, not just the body: a site the
+# sampler never sees is an amplitude the fit cannot determine.
 SAMPLE_EXTENT = LATTICE_EXTENT + 3.0 * LATTICE_ALPHA * (2.0 * LATTICE_EXTENT / LATTICE_SHAPE[0])
+SD_CHUNK = 500         # query points per call to the mesh's signed distance; see sample_arrays
 
 
 def sample_arrays(verts, faces, n_pts=6000, seed=0):
+    """Sample points for the fit and the body's signed distance at them (positive outside):
+    n_pts uniform in a box covering the lattice, plus half as many jittered surface points.
+
+    The distances are queried a block of points at a time. The query allocates per point
+    against the whole mesh, so asking for all of them at once needs memory in proportion to
+    the point count, which is the one thing the point count must not cost; the blocks also
+    stay in cache, so they are quicker than the single call they replace."""
     import trimesh
     m = trimesh.Trimesh(verts, faces, process=False)
     rng = np.random.default_rng(seed)
@@ -56,121 +81,135 @@ def sample_arrays(verts, faces, n_pts=6000, seed=0):
     pts = rng.uniform(-ext, ext, (n_pts, 3))
     surf, _ = trimesh.sample.sample_surface(m, n_pts // 2)
     pts = np.vstack([pts, surf + rng.normal(0, 0.03, surf.shape)])
-    sd = -m.nearest.signed_distance(pts)       # trimesh: positive inside
+    sd = -np.concatenate([m.nearest.signed_distance(pts[i:i + SD_CHUNK])
+                          for i in range(0, len(pts), SD_CHUNK)])   # trimesh: positive inside
     return pts.astype(np.float32), sd.astype(np.float32)
 
 
-def samples(verts, faces, n_pts=6000, seed=0):
-    pts, sd = sample_arrays(verts, faces, n_pts=n_pts, seed=seed)
-    return torch.tensor(pts), torch.tensor(sd)
-
-
 def _prepare_shape(args):
+    """One body's sample points, signed distances and hull support, for a worker pool."""
     i, verts, faces, normals, n_pts = args
     pts, sd = sample_arrays(verts, faces, n_pts=n_pts, seed=i)
     h0 = np.maximum((verts @ normals.T).max(axis=0), 1e-3).astype(np.float32)
     return i, pts, sd, h0
 
 
-class BatchedFit:
-    """Every body's support and amplitudes as two stacked tensors, fitted in one batched pass.
+class LatticeFit:
+    """The amplitudes of every body, solved exactly rather than descended to.
 
-    The predecessor ran a Python loop over the bodies in each minibatch, so a step was B
-    separate (n_pts x 3) @ (3 x DESIGN_N) matmuls. On a GPU those are launch-bound, not
-    compute-bound: the same arithmetic as one (B*n_pts x 3) @ (3 x DESIGN_N) matmul, at a
-    fraction of the utilisation. It could not have been written this way before -- the old
-    field shared a decoder across the library, which coupled every body to every other -- and
-    deleting that decoder is what makes the whole fit embarrassingly parallel.
+    h is pinned to the support of the body's own convex hull and never moves; only g is
+    fitted. Two reasons:
 
-    The sample points are stacked once onto the device and stay there: 600 bodies x 6000
-    points is 43 MB, so nothing is gained by streaming them.
+    1. h and g overlap. The same body can be written as a larger core carved more deeply or a
+       smaller core carved less. Fitted jointly, one body admits a whole family of (h, g)
+       pairs, and a flow trained on that family learns the ambiguity as if it were real.
 
-    THE ENCODER IS SEQUENTIAL, NOT JOINT. h is pinned to the analytic support of the body's
-    own convex hull and never moves; only g is fitted. Two independent reasons, and the second
-    is the one that would have quietly ruined a run:
+    2. At reconstruction h does not come from a fit. It comes from the convex stage's estimate
+       of the hull. If the corpus's h drifted away from the hull, every corpus g would have
+       been fitted against a core that means something different from the one it is decoded
+       against.
 
-    1. h and g overlap. Any body can be written as a larger core carved more deeply or a
-       smaller core carved less, and the two blocks agree exactly in the low spherical-harmonic
-       degrees -- principal cosines 1.00000 at l=0, 0.996 for the three l=1 translations,
-       0.987-0.993 at l=2. Solved jointly, the SAME body at the SAME accuracy admits a whole
-       family of (h, g) pairs, and a flow trained on that family faithfully learns the
-       ambiguity as spurious multimodality.
+    With h fixed, the field core(y) + sum_k g_k phi_k(y) is linear in g, so the amplitudes
+    that minimise the weighted residual against the signed distance solve
 
-    2. Worse, and specific to this pipeline: at reconstruction h does not come from the fit at
-       all. It comes from support_from_convex(), which is the convex stage's estimate of the
-       body's HULL. If the corpus's h were free to drift away from the hull, every corpus g
-       would have been fitted against a core that means something different from the core it
-       is decoded against. Measured on the smoke library, joint fitting drifts h by 0.35 in
-       units where h itself is order 1 -- a third of the support, silently.
+        (Phi^T W Phi + lambda I) g = Phi^T W (S - core),
 
-    The cost is convergence rate, not accuracy: joint reached 0.000231 by step 250 and frozen
-    was still at 0.000446, but frozen passes it by step 800 (0.000089) with only g to fit.
-    |g| is larger, as it must be -- the core is now the full hull, so every concavity has to
-    be carved rather than partly absorbed by shrinking the core.
+    one small symmetric system per body. Solving it reaches whatever amplitudes a body needs,
+    however large. A gradient fit does not: each coordinate moves by about the learning rate
+    per step, so the depth a body can be carved to is capped by the steps it is given, and a
+    deeply carved body comes out shallow with no sign that anything went wrong.
+
+    The target S - core is the carve itself. It vanishes wherever the body agrees with its
+    hull and is largest in the concavities, which is what g has to supply.
     """
 
-    def __init__(self, n, data, h0s, dev):
+    def __init__(self, dev):
+        ref = ImplicitBody().to(dev)
         self.dev = dev
-        self.P = torch.stack([d[0] for d in data]).to(dev)          # (n, n_pts, 3)
-        self.S = torch.stack([d[1] for d in data]).to(dev)          # (n, n_pts)
-        ref = ImplicitBody(radius=1.0).to(dev)
-        self.n_normals = ref.core.n                                 # (DESIGN_N, 3)
+        self.normals = ref.core.n                                   # (DESIGN_N, 3)
         self.lat = ref.delta
-        h = torch.tensor(np.stack(h0s), dtype=torch.float32, device=dev).clamp_min(1e-6)
-        # FROZEN, not a parameter. h is pinned to the analytic support of the body's own
-        # convex hull, h(u) = max_v <u, v>, and only g is fitted. See the class docstring.
-        self.raw_h = h + torch.log(-torch.expm1(-h))                       # inverse softplus
-        self.g = torch.nn.Parameter(torch.zeros(n, N_SITES, device=dev))
 
-    def _delta(self, P, g):
-        """Batched lattice evaluation, same expanded-square matmul as GaussianLattice."""
+    def _phi(self, pts):
+        """The lattice kernels at the sample points, (n_pts, N_SITES): the same expanded
+        square GaussianLattice evaluates."""
         lat = self.lat
-        d2 = (P ** 2 * lat.inv2).sum(-1, keepdim=True) + lat.pb \
-            - 2.0 * ((P * lat.inv2) @ lat.p.T)                      # (B, n_pts, N_SITES)
-        return torch.einsum("bps,bs->bp", torch.exp(-0.5 * d2.clamp_min(0.0)), g)
+        d2 = (pts ** 2 * lat.inv2).sum(-1, keepdim=True) + lat.pb \
+            - 2.0 * ((pts * lat.inv2) @ lat.p.T)
+        return torch.exp(-0.5 * d2.clamp_min(0.0))
 
-    def loss(self, idx):
-        P, S = self.P[idx], self.S[idx]
-        h = torch.nn.functional.softplus(self.raw_h[idx])           # (B, DESIGN_N)
-        core = (P @ self.n_normals.T - h[:, None, :]).amax(-1)      # (B, n_pts)
-        return ((core + self._delta(P, self.g[idx]) - S) ** 2).mean(-1).mean()
+    def solve(self, pts, sd, h):
+        """One body's amplitudes from its sample points, their signed distances (positive
+        outside) and its hull support. Returns (g, rms before, rms after), the residuals
+        being the weighted root mean square of the field against the signed distance with
+        no amplitudes and with the fitted ones.
 
-    def bodies(self):
-        """Materialise per-body ImplicitBody objects for the diagnostics and the corpus."""
-        out = []
-        for i in range(len(self.raw_h)):
-            b = ImplicitBody(radius=1.0).to(self.dev)
-            with torch.no_grad():
-                b.core.raw_h.copy_(self.raw_h[i])
-                b.delta.g.copy_(self.g[i])
-            out.append(b)
-        return out
+        Both the core and the normal matrix are evaluated a block of points at a time, so
+        the memory the solve needs is set by the block size rather than by how many points
+        the body is fitted from, and the point count costs only time."""
+        pts, sd = pts.to(self.dev), sd.to(self.dev)
+        h = torch.as_tensor(h, dtype=torch.float32, device=self.dev)
+        core = torch.cat([(pts[i:i + SOLVE_CHUNK] @ self.normals.T - h[None, :]).amax(-1)
+                          for i in range(0, len(pts), SOLVE_CHUNK)])       # (n_pts,)
+        target = sd - core
+        w = torch.exp(-0.5 * (sd / SURFACE_BAND) ** 2) + WEIGHT_FLOOR
+        A = torch.zeros(N_SITES, N_SITES, dtype=torch.float64, device=self.dev)
+        b = torch.zeros(N_SITES, dtype=torch.float64, device=self.dev)
+        for i in range(0, len(pts), SOLVE_CHUNK):
+            sl = slice(i, i + SOLVE_CHUNK)
+            phi = self._phi(pts[sl])                                # (chunk, N_SITES)
+            wphi = w[sl, None] * phi
+            A += (phi.T @ wphi).double()
+            b += (wphi.T @ target[sl]).double()
+            del phi, wphi
+        A.diagonal().add_(RIDGE * A.diagonal().mean().clamp_min(1e-12))
+        try:
+            g = torch.cholesky_solve(b[:, None], torch.linalg.cholesky(A))[:, 0]
+        except RuntimeError:            # not positive definite: fall back to a general solve
+            g = torch.linalg.solve(A, b)
+        g = g.float()
+        left = torch.cat([target[i:i + SOLVE_CHUNK] - self._phi(pts[i:i + SOLVE_CHUNK]) @ g
+                          for i in range(0, len(pts), SOLVE_CHUNK)])
+        wn = w / w.sum()
+        return g, float((wn * target ** 2).sum().sqrt()), float((wn * left ** 2).sum().sqrt())
 
 
-def report_corpus(bodies, data, codes, trace) -> bool:
+def fitted_dice(bodies, shape_list, families, n_sample: int, seed: int = 0) -> np.ndarray:
+    """Dice of the decoded fitted body against the mesh it was fitted to, for a random sample
+    of n_sample bodies (NaN for the rest), printed by family."""
+    out = np.full(len(bodies), np.nan)
+    idx = np.random.default_rng(seed).permutation(len(bodies))[:n_sample]
+    for i in idx:
+        b = bodies[i]
+        v, f = extract_mesh(lambda y: b(y), EXTRACT_EXTENT, res=DICE_RES,
+                            device=str(b.delta.g.device))
+        if len(f) < 8:
+            out[i] = 0.0
+            continue
+        sv, sf = shape_list[i]
+        out[i] = dice(mesh_occupancy(v, f, DICE_RES, DICE_EXTENT),
+                      mesh_occupancy(np.asarray(sv), np.asarray(sf), DICE_RES, DICE_EXTENT))
+    print(f"  [dice] fitted body against its mesh, {len(idx)} bodies sampled:")
+    for fam in sorted(set(families[i] for i in idx)):
+        d = np.array([out[i] for i in idx if families[i] == fam])
+        print(f"    {fam:<16} n {len(d):>3}  mean {d.mean():.3f}  min {d.min():.3f}", flush=True)
+    return out
+
+
+def report_corpus(bodies, data, codes, before, after) -> bool:
     """Report on the finished corpus. Returns True if it looks usable.
 
-    Called AFTER the corpus is written, never before: a fit that took hours must be flagged,
+    Called after the corpus is written, never before: a fit that took hours must be flagged,
     not thrown away. The caller turns a False into a non-zero exit.
-
-    There is no longer a pre-training liveness check. Its predecessor existed because the old
-    cross-attention field had exactly zero gradient at its zero init -- identical tokens make
-    the softmax uniform, so Delta was identically zero AND unrecoverable. A lattice of fixed
-    sites is LINEAR in g, so dDelta/dg_k = exp(-||(y-p_k)/sigma||^2/2) is strictly positive
-    everywhere and g = 0 is a perfectly good starting point. Keeping that check would have
-    aborted every run.
     """
     with torch.no_grad():
         dmax = max(float(b.delta(data[i][0].to(b.delta.g.device)).abs().max())
                    for i, b in enumerate(bodies[:min(8, len(bodies))]))
     gvar = float(codes[:, N_DIR:].var(0).mean())
     gmax = float(np.abs(codes[:, N_DIR:]).max())
-    # medians, not the first and last step: each step's loss is one random minibatch of
-    # `--batch` bodies out of `--bodies`, and per-body SDF loss spans two orders of magnitude,
-    # so consecutive converged steps differ by up to 34x. Comparing single steps false-fails.
-    k = max(1, min(25, len(trace) // 4))
-    l0 = float(np.median(trace[:k])) if trace else float("nan")
-    l1 = float(np.median(trace[-k:])) if trace else float("nan")
+    # medians over a stretch of steps, not single steps: each step is one small random
+    # minibatch and the per-body loss varies a lot
+    r0 = float(np.median(before)) if before else float("nan")
+    r1 = float(np.median(after)) if after else float("nan")
     bad = []
     if dmax < 1e-4:
         bad.append(f"the correction is dead: max|Delta| = {dmax:.3e}. Every body in this "
@@ -178,13 +217,13 @@ def report_corpus(bodies, data, codes, trace) -> bool:
     if gvar < 1e-12:
         bad.append(f"codes do not vary across bodies: amplitude variance {gvar:.3e}. "
                    f"Every body was assigned the same code.")
-    loss_note = (f"sdf loss (median of {k}) {l0:.6f} -> {l1:.6f}" if trace
-                 else "no training steps were run")
+    loss_note = f"weighted residual (median over bodies) {r0:.4f} -> {r1:.4f}"
     print(f"  [check] max|Delta| {dmax:.4f}, |g|max {gmax:.4f}, g variance {gvar:.5f}, "
           f"{loss_note}", flush=True)
-    if trace and not (l1 < 0.8 * l0):
-        print(f"  WARNING: the sdf loss barely moved ({l0:.6f} -> {l1:.6f}). The corpus was "
-              f"still written; raise --steps if this was not deliberate.", flush=True)
+    if before and not (r1 < 0.5 * r0):
+        print(f"  WARNING: the amplitudes barely reduced the residual ({r0:.4f} -> {r1:.4f}). "
+              f"The corpus was still written, but these bodies are close to their own hulls.",
+              flush=True)
     for b_ in bad:
         print(f"  ERROR: {b_}", flush=True)
     return not bad
@@ -193,40 +232,57 @@ def report_corpus(bodies, data, codes, trace) -> bool:
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--bodies", type=int, default=40)
-    ap.add_argument("--steps", type=int, default=3000)
-    ap.add_argument("--batch", type=int, default=4, help="bodies per step")
     ap.add_argument("--workers", type=int, default=1,
                     help="parallel workers for independent SDF/support preprocessing")
-    ap.add_argument("--points", type=int, default=6000,
-                    help="SDF sample points per body")
+    ap.add_argument("--points", type=int, default=60000,
+                    help="uniform SDF sample points per body; half as many jittered "
+                         "surface points are added on top. The amplitudes are solved from "
+                         "these, and how far the code is a property of the body rather than "
+                         "of the sampling improves as their square root, so this is worth "
+                         "as much as the signed distances can be afforded")
     ap.add_argument("--out", default="runs/corpus_codes.npz")
     ap.add_argument("--device", default=None,
-                    help="cuda when available, else cpu. The fit is "
-                         "FIT_STEPS x FIT_BATCH x FIT_POINTS x (DESIGN_N + N_SITES) "
-                         "element-ops -- about 1.7e12 at the remote defaults -- so this is "
-                         "hours on a CPU and minutes on a GPU.")
-    ap.add_argument("--shapes-dir", default=None,
-                    help="directory written by scripts/build_shape_library.py; if given, "
-                         "the corpus is drawn from it instead of train_surrogate.shapes()")
+                    help="cuda when available, else cpu; the fit is hours on a CPU and "
+                         "minutes on a GPU")
+    ap.add_argument("--shapes-dir", required=True,
+                    help="directory written by scripts/build_shape_library.py")
     ap.add_argument("--seed", type=int, default=0,
-                    help="shuffle seed when reading --shapes-dir (ignored otherwise: "
-                         "train_surrogate.shapes() is deterministic in draw order already)")
+                    help="shuffle seed when reading --shapes-dir")
+    ap.add_argument("--dice-bodies", type=int, default=64,
+                    help="bodies sampled for the fitted-Dice check by family; 0 skips it")
     a = ap.parse_args()
 
-    if a.shapes_dir:
-        from hac26.library_io import load_library_dir
-        print(f"[1] loading {a.bodies} bodies from {a.shapes_dir}", flush=True)
-        shape_list = load_library_dir(a.shapes_dir, n=a.bodies, seed=a.seed)
-        if len(shape_list) < a.bodies:
-            print(f"  WARNING: only {len(shape_list)} bodies available in {a.shapes_dir}, "
-                  f"requested {a.bodies}", flush=True)
-    else:
-        from train_surrogate import shapes
-        print(f"[1] sampling SDF for {a.bodies} bodies", flush=True)
-        shape_list = shapes(a.bodies, seed=0)
+    from hac26.library_io import load_library_dir
+    print(f"[1] loading {a.bodies} bodies from {a.shapes_dir}", flush=True)
+    loaded = load_library_dir(a.shapes_dir, n=a.bodies, seed=a.seed, with_entries=True)
+    shape_list = [(v, f) for v, f, _ in loaded]
+    families = [str(e.get("base", "unknown")) for _, _, e in loaded]
+    # the width over half-height each body was mounted with; a library written before that
+    # was recorded carries none, and build_corpus.py then draws a radius instead
+    radii = np.array([float(e.get("radius", np.nan)) for _, _, e in loaded])
+    if len(shape_list) < a.bodies:
+        print(f"  WARNING: only {len(shape_list)} bodies available in {a.shapes_dir}, "
+              f"requested {a.bodies}", flush=True)
+
+    # Every body into the canonical frame, whichever source it came from: the lattice is
+    # fixed in that frame, so site k only means the same place across bodies if the bodies
+    # share it. An already-posed body is untouched.
+    n_posed = 0
+    posed = []
+    for v, f in shape_list:
+        v = np.asarray(v, dtype=np.float64)
+        # faces passed so the pose centres on the solid centroid, as the library does
+        c = canonicalize_r(rescale_touch_z(v, np.asarray(f, dtype=np.int64)))
+        if float(np.abs(c - v).max()) > 1e-9:
+            n_posed += 1
+        posed.append((c, f))
+    shape_list = posed
+    if n_posed:
+        print(f"  posed {n_posed}/{len(shape_list)} bodies into the canonical frame "
+              f"(z span 2, xy r_max 1)", flush=True)
 
     data, h0s = [None] * len(shape_list), [None] * len(shape_list)
-    ref = ImplicitBody(radius=1.0)
+    ref = ImplicitBody()
     nrm = ref.core.n.detach().cpu().numpy()
     jobs = [(i, np.asarray(v, dtype=np.float64), np.asarray(f, dtype=np.int64), nrm,
              a.points)
@@ -256,55 +312,42 @@ def main():
                 pool.close()
             pool.join()
 
-    # No shared decoder. With fixed lattice sites the code IS g, so a code means the same
-    # thing to any reader, there is nothing to fit jointly, and -- the point of this section --
-    # the bodies are now COMPLETELY INDEPENDENT of one another. That is what makes the fit
-    # vectorisable: one batched matmul over B bodies instead of B separate small ones.
     dev = torch.device(a.device or ("cuda" if torch.cuda.is_available() else "cpu"))
     if dev.type == "cuda":
-        # The SDF fit is a regression to about three decimal places; TF32 costs it nothing and
-        # is several times faster on the (points x normals) matmul that dominates.
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
-    fitter = BatchedFit(len(data), data, h0s, dev)
-    print(f"[2] fit on {dev}: {len(data)} bodies x ({DESIGN_N} support + {N_SITES} "
-          f"amplitudes), batched {a.batch} at a time", flush=True)
+    fitter = LatticeFit(dev)
+    print(f"[2] fit on {dev}: {len(data)} bodies x {N_SITES} amplitudes against "
+          f"{DESIGN_N} core normals, solved one body at a time", flush=True)
 
-    # One parameter block: g. h is frozen at the hull -- see BatchedFit. lr 0.005 because g is
-    # the SDF correction itself now rather than 0.15 R times it; deleting CORE_SCALE moved the
-    # effective step size by that factor.
-    opt = torch.optim.Adam([{"params": [fitter.g], "lr": 0.005}])
     t0 = time.time()
-    trace = []
-    for s in range(a.steps):
-        idx = torch.from_numpy(
-            np.random.default_rng(s).integers(0, len(data), a.batch)).to(dev)
-        loss = fitter.loss(idx)
-        opt.zero_grad(); loss.backward(); opt.step()
-        trace.append(float(loss.detach()))
-        if s % 250 == 0 or s == a.steps - 1:
-            print(f"    step {s:>5}  sdf loss {trace[-1]:.5f}  "
+    bodies, before, after = [], [], []
+    for i, (pts, sd) in enumerate(data):
+        g, r0, r1 = fitter.solve(pts, sd, h0s[i])
+        b = ImplicitBody().to(dev)
+        with torch.no_grad():
+            b.core.set_support(torch.as_tensor(h0s[i]))
+            b.delta.g.copy_(g)
+        bodies.append(b)
+        before.append(r0); after.append(r1)
+        if (i + 1) % 25 == 0 or i + 1 == len(data):
+            print(f"    fitted {i + 1}/{len(data)} bodies, residual median "
+                  f"{np.median(before):.4f} -> {np.median(after):.4f}  "
                   f"{time.time()-t0:.0f}s", flush=True)
-    bodies = fitter.bodies()
 
-    # The dh block is stored explicitly as zeros rather than omitted, so codes.shape[1] is
-    # CODE_DIM everywhere and one shape gate covers the whole pipeline.
+    # the dh block is stored as zeros rather than omitted, so codes.shape[1] is CODE_DIM
+    # everywhere
     codes = np.stack([torch.cat([b.dh.detach(), b.delta.g.detach()]).cpu().numpy()
                       for b in bodies])
-    sup = np.stack([b.core.h.detach().cpu().numpy() for b in bodies])   # the property
+    sup = np.stack([b.core.h.detach().cpu().numpy() for b in bodies])
 
-    # the directories the run actually writes to, not a fixed "model" that no path uses:
-    # np.savez raised on a fresh clone BEFORE the diagnostics below ever printed
     Path(a.out).parent.mkdir(parents=True, exist_ok=True)
     meta = {
         "schema": 3,
         "bodies": int(len(bodies)),
         "design_n": int(DESIGN_N),
         "design_sha": design_sha(nrm),
-        # The dh directions are a SECOND design and are just as load-bearing: sh_expand, the
-        # sphere-convolution operators and the A^T r channel are all indexed by them, so two
-        # machines that generated dir_design(N_DIR) independently would disagree about what
-        # every dh coefficient means, silently.
+        # the dh directions are a second design, and dh is indexed by them
         "dir_sha": design_sha(dir_design(N_DIR)),
         "code_dim": int(CODE_DIM),
         "n_dir": int(N_DIR),
@@ -313,15 +356,19 @@ def main():
         "lattice_extent": float(LATTICE_EXTENT),
         "lattice_alpha": float(LATTICE_ALPHA),
         "points": int(a.points),
-        "steps": int(a.steps),
-        "batch": int(a.batch),
+        "surface_band": float(SURFACE_BAND),
+        "weight_floor": float(WEIGHT_FLOOR),
+        "ridge": float(RIDGE),
         "seed": int(a.seed),
-        "shapes_dir": None if a.shapes_dir is None else str(Path(a.shapes_dir)),
+        "shapes_dir": str(Path(a.shapes_dir)),
     }
-    np.savez(a.out, codes=codes, support=sup, meta=json.dumps(meta, sort_keys=True))
+    fit_d = (fitted_dice(bodies, shape_list, families, a.dice_bodies, seed=a.seed)
+             if a.dice_bodies > 0 else np.full(len(bodies), np.nan))
+    np.savez(a.out, codes=codes, support=sup, fit_dice=fit_d, family=np.array(families),
+             radius=radii, meta=json.dumps(meta, sort_keys=True))
     print(f"  codes {codes.shape}, amplitude variance {codes[:, N_DIR:].var(0).mean():.5f}")
     print(f"  wrote {a.out}")
-    if not report_corpus(bodies, data, codes, trace):
+    if not report_corpus(bodies, data, codes, before, after):
         raise SystemExit("fit_shapes: the corpus above is degenerate. It was written so the "
                          "fit is not lost, but do not train on it.")
 

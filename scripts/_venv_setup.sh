@@ -1,22 +1,18 @@
-# Sourced by run_smoke_test.sh and run_remote_pipeline.sh -- not meant to be run directly.
-# Creates a venv if one doesn't exist, activates it, and installs dependencies if they
-# aren't already importable. Callers `cd` to the repo root before sourcing this.
+# Sourced by run_smoke_test.sh and run_remote_pipeline.sh; not meant to be run directly.
+# Creates a venv if there is none, activates it, and installs the dependencies if they are
+# not already importable. Callers cd to the repo root before sourcing this.
 #
-# Location logic: try REPO_ROOT/.venv first (the normal case, and the only thing that
-# happens on a native Linux filesystem). If that fails in the specific way WSL fails when a
-# repo lives on a Windows-mounted drive (/mnt/c/...) -- DrvFs can refuse to create symlinks
-# OR set the executable bit on copied files, so `python -m venv`, even with --copies, can
-# come back with "Operation not permitted" -- fall back automatically to a venv at
-# ~/.venvs/<reponame>, which sits on WSL's own native filesystem and therefore always
-# supports normal file permissions. That choice is remembered in .venv-external-path (a
-# one-line file at the repo root) so later runs go straight there instead of re-attempting
-# and re-failing the local .venv every time. Delete that file to make it try locally again
-# (e.g. after moving the repo itself onto a native filesystem).
+# Location: REPO_ROOT/.venv is tried first. If creating it fails, as it can under WSL when
+# the repo lives on a Windows-mounted drive (/mnt/c/...), whose filesystem may refuse to
+# create symlinks or set the executable bit, the venv is created at ~/.venvs/<reponame> on
+# WSL's own filesystem instead. That choice is recorded in .venv-external-path, a one-line
+# file at the repo root, so later runs go straight there; delete the file to try the local
+# .venv again.
 #
-# VENV_DIR overrides all of the above if set, and is tried with no fallback.
+# VENV_DIR, if set, overrides all of the above and is tried with no fallback.
 #
-# Safe to source repeatedly: activation and the dependency check are both cheap once a venv
-# exists and packages are installed, so this doesn't slow down a second run.
+# Safe to source repeatedly: activation and the dependency check are cheap once the venv
+# exists and the packages are installed.
 
 REPO_ROOT="$(pwd)"
 VENV_MARKER="$REPO_ROOT/.venv-external-path"
@@ -29,8 +25,8 @@ else
   _venv_target="$REPO_ROOT/.venv"
 fi
 
-# Creates (or repairs) a venv at $1. Returns non-zero, with $1 removed, if it doesn't end
-# up with a working bin/activate -- the one thing every failure mode has in common.
+# Creates or repairs a venv at $1. Returns non-zero, with $1 removed, if it does not end up
+# with a working bin/activate.
 _venv_create() {
   local dir="$1"
   if [ -d "$dir" ] && [ ! -f "$dir/bin/activate" ]; then
@@ -48,22 +44,18 @@ _venv_create() {
   fi
   echo "[venv] creating $dir with $boot_py" >&2
   mkdir -p "$(dirname "$dir")"
-  # --copies: real files instead of symlinks, since symlinks are the first thing a
-  # Windows-mounted WSL path refuses. Doesn't help if the mount also refuses chmod on
-  # copied files (that's the fallback's job), but it's strictly better than the default
-  # everywhere else, so it stays on unconditionally.
+  # --copies: real files instead of symlinks, which a Windows-mounted WSL path may refuse. It
+  # does not help if the mount also refuses chmod on copied files; the fallback handles that.
   "$boot_py" -m venv --copies "$dir" 2>&1 | sed 's/^/[venv]   /' >&2
   if [ -f "$dir/bin/activate" ]; then
     return 0
   fi
-  rm -rf "$dir"      # don't leave a half-created directory behind after a failed attempt
+  rm -rf "$dir"      # do not leave a half-created directory behind
   return 1
 }
 
-# The venv package is version-specific on Debian/Ubuntu (python3.12-venv, python3.14-venv,
-# ...), and the generic `python3-venv` name doesn't always resolve -- Python's own
-# ensurepip error already reports the exact one needed, this just surfaces it up front
-# instead of making the person read it out of nested pip/venv output.
+# The venv package is version-specific on Debian and Ubuntu (python3.12-venv, ...), so the
+# hint names the one for the interpreter found.
 _venv_pkg_hint() {
   local v
   v=$(python3 -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")' \
@@ -78,8 +70,7 @@ _venv_pkg_hint() {
 if [ -z "${VIRTUAL_ENV:-}" ] || [ "$VIRTUAL_ENV" != "$_venv_target" ]; then
   if ! _venv_create "$_venv_target"; then
     if [ -n "${VENV_DIR:-}" ] || [ -f "$VENV_MARKER" ]; then
-      # an explicit override or an already-recorded fallback failed too -- nothing left to
-      # try automatically
+      # an explicit override or a recorded fallback failed; nothing left to try
       echo "ERROR: could not create a working venv at $_venv_target." >&2
       echo "If python3-venv isn't installed:" >&2
       _venv_pkg_hint >&2
@@ -123,39 +114,32 @@ _ensure_pip() {
   exit 1
 }
 
-# Dependency check. Deliberately NOT `pip install -e ".[torch]"`: an editable install writes
-# hac26.egg-info/ INSIDE the repo to build its metadata, which fails with the exact same
-# "Operation not permitted" as venv creation if the repo itself is on a Windows-mounted WSL
-# path -- moving the venv doesn't help here, because this failure is about the SOURCE tree,
-# not the venv. It also turns out to be unnecessary: every script in this repo
-# (build_shape_library.py, fit_shapes.py, train_lpd.py, ...) already does its own
-# `sys.path.insert(0, str(Path(__file__).resolve().parents[1]))` to find the repo root at
-# runtime, so hac26 never needs to be an installed package at all -- only its dependencies
-# do. Installing named packages (not `.` or `-e .`) never touches the current directory:
-# pip builds them in its own temp/cache dirs regardless of where REPO_ROOT lives.
+# Dependency check. The packages are installed by name rather than with `pip install -e .`:
+# an editable install writes hac26.egg-info/ inside the repo, which fails on a Windows-mounted
+# WSL path, and it is not needed, since every script in scripts/ puts the repo root on
+# sys.path itself.
 #
-# Versions match pyproject.toml's runtime dependencies and the "torch" extra. rtree backs
-# trimesh's spatial index (nearest.signed_distance, used to build SDF training samples) and
-# fast_simplification backs simplify_quadric_decimation (used by hac26/calibrate.py's mesh
-# decimation, called from train_lpd.py's curve rendering) -- trimesh imports both lazily and
-# neither falls back gracefully, so their absence only surfaces once that specific code path
-# runs, not at trimesh's own import time. Checking importability rather than unconditionally
-# re-running pip is what makes a repeat run fast (torch is a large download).
+# Versions match pyproject.toml. rtree backs trimesh's nearest.signed_distance (used by
+# fit_shapes.py), fast_simplification backs simplify_quadric_decimation (the radiosity
+# patches and the released meshes in hac26/forward/mesh/exact.py) and embreex backs the ray
+# tests of the form factors; trimesh imports all three lazily, so their absence only shows
+# when that code runs. Importability is checked instead of running pip every time, which
+# keeps a repeat run fast.
 NEED_INSTALL=0
-python -c "import numpy, scipy, torch, trimesh, skimage, rtree, fast_simplification" \
+python -c "import numpy, scipy, torch, trimesh, skimage, rtree, fast_simplification, embreex" \
   >/dev/null 2>&1 || NEED_INSTALL=1
 if [ "$NEED_INSTALL" = "1" ] || [ "${FORCE_DEPS:-0}" = "1" ]; then
   echo "[venv] installing dependencies (this can take a while, especially torch)"
   _ensure_pip
   python -m pip install --upgrade pip -q
   python -m pip install "numpy>=1.24" "scipy>=1.10" "torch>=2.1" \
-    trimesh scikit-image rtree fast_simplification -q
-  python -c "import numpy, scipy, torch, trimesh, skimage, rtree, fast_simplification" || {
+    trimesh scikit-image rtree fast_simplification embreex -q
+  python -c "import numpy, scipy, torch, trimesh, skimage, rtree, fast_simplification, embreex" || {
     echo "ERROR: dependency install ran but imports still fail; see the pip output above." >&2
     exit 1
   }
   echo "[venv] dependencies installed"
 else
   echo "[venv] dependencies already satisfied (numpy, scipy, torch, trimesh, skimage," \
-       "rtree, fast_simplification)"
+       "rtree, fast_simplification, embreex)"
 fi

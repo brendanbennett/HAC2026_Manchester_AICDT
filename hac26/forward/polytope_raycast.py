@@ -1,12 +1,11 @@
 """Bodies as unions of convex polytopes, rendered by exact ray casting.
 
-Representation. The data carry roughly 527 usable dimensions against 262,144
-unknowns in a 64^3 SDF -- a 497:1 over-parameterisation, which is why an unregularised
-volumetric fit carves wherever the model error happens to point. Every ground
-truth is a POLYTOPE, so the natural unknown is not a level set but a finite set of face
-distances. A union of K convex polytopes on N normals has K(N+3) parameters: 207 at K=3,
-N=66. That is the same order as the information the data actually carries, so the fit is
-determined rather than regularised into shape.
+Representation. The data carry orders of magnitude fewer usable dimensions than an SDF on
+a voxel grid has unknowns, which is why an unregularised volumetric fit carves wherever the
+model error happens to point. Every ground truth is a POLYTOPE, so the natural unknown is
+not a level set but a finite set of face distances. A union of K convex polytopes on N
+normals has K(N+3) parameters, which at usable K and N is the same order as the information
+the data carries -- so the fit is determined rather than regularised into shape.
 
     K_k(h) = { x : <x - c_k, n_i> <= h_{k,i}  for all i },      body = union_k K_k
 
@@ -106,7 +105,7 @@ def render(H, C, N, view, sun, res=64, extent=None, tau_i=0.0, tau_b=0.02):
     # the analytic operator uses when it writes mu = n . omega_c. Rays therefore start on
     # the camera side and travel along -view. Starting at -extent*view and marching along
     # +view instead renders the far surface, which shows up as the near and far cameras
-    # swapping values: 0.98 against 0.00 at camera 0 and 0.05 against 0.73 at camera 17.
+    # swapping values.
     o = (gx.reshape(-1, 1) * ex + gy.reshape(-1, 1) * ey) + 2.0 * extent * view
     t, nrm, hit = raycast(o, -view, H, C, N)
     mu = nrm @ view

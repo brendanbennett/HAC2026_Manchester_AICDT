@@ -1,18 +1,18 @@
-"""Geometry test.
+"""Tests of hac26.field, the implicit shape representation.
 
-Encode a cube with h alone, tokens zero, extract, and
-require the faces planar to within one grid cell and Dice above 0.99 against the analytic
-cube. The rest pin the properties the cube test does not touch -- that the core is a plain
-max rather than log-sum-exp, that the token field is signed and zero-mean, and that the
-constraints are applied to vertices with the measured radius tolerance.
+The gate is the cube: encode it with the support h alone, extract a mesh, and require the
+faces planar to within one grid cell and Dice above 0.99 against the analytic cube. The other
+tests pin what the cube does not touch: the design of normals, that the core is a plain max,
+that the lattice correction is signed and independent of the query batch, that dh is
+band-limited, and that the pose constraints allow the published radius its tolerance.
 """
 import numpy as np
 import pytest
 import torch
 
-from hac26.field import (DESIGN_ITERS, DESIGN_N, DESIGN_T, LATTICE_EXTENT, N_SITES,
+from hac26.field import (DESIGN_N, DESIGN_T, LATTICE_EXTENT, N_SITES,
                          ConvexCore, GaussianLattice, ImplicitBody, _design_residual,
-                         apply_constraints, design_sha, extract_mesh, spherical_design)
+                         apply_constraints, extract_mesh, spherical_design)
 
 A = 1.0            # cube half-side
 RES = 128
@@ -26,16 +26,17 @@ def cube_support(normals: np.ndarray, a: float = A) -> np.ndarray:
 # ------------------------------------------------------------------ the fixed normals
 
 def test_design_is_a_ten_design():
+    """The cached design has DESIGN_N unit normals and a small worst-degree residual."""
     x = spherical_design()
     assert x.shape == (DESIGN_N, 3)
     assert np.allclose(np.linalg.norm(x, axis=1), 1.0, atol=1e-9)
-    # an exact design has zero energy at every degree; the Fibonacci spiral it starts from
-    # sits at 1.5e-3, so this is three orders better and far inside anything downstream sees
+    # an exact design has zero residual at every degree
     assert _design_residual(x, DESIGN_T) < 1e-5
 
 
 def test_design_contains_the_axis_directions():
-    """Required for a cube to be exactly representable by the convex core."""
+    """All six axis directions are in the design; the core needs them to represent a cube
+    exactly."""
     x = spherical_design()
     for k in range(3):
         e = np.zeros(3); e[k] = 1.0
@@ -46,7 +47,8 @@ def test_design_contains_the_axis_directions():
 # ------------------------------------------------------------------ the core
 
 def test_core_is_max_not_log_sum_exp():
-    """A soft max would bias the zero set inward by log(J)/beta. Check exactness instead."""
+    """With the cube's support, the core is exactly -A at the centre and exactly zero at the
+    face centres; a log-sum-exp core would put the zero set inside the true surface."""
     n = spherical_design()
     core = ConvexCore(n)
     core.set_support(torch.tensor(cube_support(n), dtype=torch.float32))
@@ -58,6 +60,7 @@ def test_core_is_max_not_log_sum_exp():
 
 
 def test_support_roundtrip():
+    """set_support followed by reading h returns the same support."""
     n = spherical_design()
     h = cube_support(n)
     core = ConvexCore(n)
@@ -66,6 +69,7 @@ def test_support_roundtrip():
 
 
 def test_core_h_is_non_negative():
+    """h stays non-negative whatever the raw parameter holds."""
     core = ConvexCore(spherical_design())
     with torch.no_grad():
         core.raw_h.copy_(torch.full((DESIGN_N,), -50.0))
@@ -75,8 +79,8 @@ def test_core_h_is_non_negative():
 # ------------------------------------------------------------------ the correction
 
 def test_correction_is_signed_and_adds_where_kernels_overlap():
-    """The predecessor's softmax weights summed to one, so co-located tokens AVERAGED: you
-    could not carve deeper by clustering. Amplitudes on a fixed lattice add."""
+    """Amplitudes on the fixed lattice add where their kernels overlap (doubling them doubles
+    the field), and the field takes both signs."""
     gl = GaussianLattice()
     with torch.no_grad():
         gl.g.zero_()
@@ -93,10 +97,8 @@ def test_correction_is_signed_and_adds_where_kernels_overlap():
 
 
 def test_correction_does_not_depend_on_the_query_batch():
-    """Delta must be a function of y alone. The predecessor ended `out - out.mean()`, the mean
-    over the call's own points, so extract_mesh -- which evaluates the grid in chunks of
-    262144 -- subtracted a different constant from each chunk and the extracted surface
-    stepped at the boundaries by 0.84 of a grid cell at res=128."""
+    """The correction is a function of the query point alone: evaluating the points in two
+    chunks gives the same values as one call. extract_mesh evaluates its grid in chunks."""
     torch.manual_seed(0)
     gl = GaussianLattice()
     with torch.no_grad():
@@ -107,8 +109,9 @@ def test_correction_does_not_depend_on_the_query_batch():
 
 
 def test_the_lattice_is_fixed_and_never_travels_with_a_checkpoint():
-    """`g` is the code; the sites and widths are constants of the representation. If they were
-    persistent, a saved state would silently redefine another body's lattice."""
+    """`g` is the only parameter and the only entry of the state dict; the sites and widths
+    are constants of the representation, so a saved state cannot redefine another body's
+    lattice."""
     gl = GaussianLattice()
     assert [n for n, _ in gl.named_parameters()] == ["g"]
     assert list(gl.state_dict().keys()) == ["g"]
@@ -117,17 +120,13 @@ def test_the_lattice_is_fixed_and_never_travels_with_a_checkpoint():
 
 
 def test_dh_is_band_limited_whatever_the_flow_emits():
-    """An out-of-band dh kills facets, and a dead facet has an exactly zero row in the area
-    Jacobian -- no gradient at all, not merely a bad one. The limit is structural.
-
-    Exactly band-limited in the ARGUMENT of the softplus; approximately so in h itself,
-    because d/dx softplus = sigmoid is not constant and h varies across normals. Measured, the
-    induced change in h carries about 5% out-of-band content at any realistic dh scale, which
-    is first-order and does not shrink with the perturbation -- far below the fully-white dh
-    that kills 7% of facets at N=128, but not zero, and worth knowing it is not zero.
+    """The expanded dh is band-limited to degree SH_DEGREE exactly in the argument of the
+    softplus, and approximately in h itself (the softplus slope varies across normals), and
+    the resulting support stays positive. An out-of-band dh would kill facets, and a dead
+    facet has a zero row in the area Jacobian and so no gradient at all.
     """
     n = spherical_design(64)
-    body = ImplicitBody(radius=1.0, normals=n)
+    body = ImplicitBody(normals=n)
     body.set_support(torch.tensor(cube_support(n), dtype=torch.float32))
     from hac26.field import _real_sh
     y5 = torch.tensor(_real_sh(n, 5), dtype=torch.float32)
@@ -144,10 +143,10 @@ def test_dh_is_band_limited_whatever_the_flow_emits():
 
 
 def test_every_parameter_block_receives_gradient():
-    """The bug this replaces: h became unreachable from the loss while the fit still reported
-    a falling number. Assert the loss can move all three blocks."""
+    """Every parameter of ImplicitBody (the support, the lattice amplitudes and dh) receives
+    a non-zero gradient from a loss on the field."""
     n = spherical_design(64)
-    body = ImplicitBody(radius=1.0, normals=n)
+    body = ImplicitBody(normals=n)
     body.set_support(torch.tensor(cube_support(n), dtype=torch.float32))
     (body(torch.randn(512, 3) * 0.5) ** 2).mean().backward()
     for name, prm in body.named_parameters():
@@ -157,6 +156,7 @@ def test_every_parameter_block_receives_gradient():
 # ------------------------------------------------------------------ constraints
 
 def test_constraints_are_applied_to_vertices():
+    """apply_constraints rescales z to [-1, 1] and caps the xy radius at R (1 + tol)."""
     v = np.array([[0.3, 0.0, -4.0], [0.0, 0.4, 6.0], [2.0, 0.0, 1.0]])
     out = apply_constraints(v, radius=1.0, tol=0.03)
     assert out[:, 2].min() == pytest.approx(-1.0, abs=1e-12)
@@ -166,22 +166,22 @@ def test_constraints_are_applied_to_vertices():
 
 
 def test_radius_tolerance_does_not_shrink_a_body_inside_it():
-    """A body at 1.02 R is left alone: two of the three public bodies genuinely exceed R."""
+    """A body whose xy radius is within the tolerance of R is left alone."""
     v = np.array([[1.02, 0, -1.0], [0, 0, 1.0], [-1.02, 0, 0.0]])
     out = apply_constraints(v, radius=1.0, tol=0.03)
     assert np.sqrt(out[:, 0] ** 2 + out[:, 1] ** 2).max() == pytest.approx(1.02, rel=1e-9)
 
 
-# ------------------------------------------------------------------ THE GATE
+# ------------------------------------------------------------------ the gate
 
 @pytest.mark.slow
 def test_cube_extraction_is_planar_and_matches():
-    """Encode a cube with h alone, tokens zero, extract at 128^3."""
+    """A cube encoded with h alone extracts with every vertex on a face to within one grid
+    cell, and Dice above 0.99 against the analytic cube."""
     n = spherical_design()
-    body = ImplicitBody(radius=A * np.sqrt(2.0), normals=n)
+    body = ImplicitBody(normals=n)
     body.set_support(torch.tensor(cube_support(n), dtype=torch.float32))
-    # g and dh at zero, so this is the core alone -- the correction is switched off by being
-    # zero rather than by a flag, because a flag nothing else passes is dead API surface.
+    # g and dh are zero, so this is the core alone
     extent = LATTICE_EXTENT + 0.5
     verts, faces = extract_mesh(lambda y: body(y), extent, res=RES)
     assert len(verts) > 0 and len(faces) > 0
@@ -197,8 +197,10 @@ def test_cube_extraction_is_planar_and_matches():
     g = (np.arange(96) + 0.5) / 96 * 2 * extent - extent
     X, Y, Z = np.meshgrid(g, g, g, indexing="ij")
     truth = (np.abs(X) <= A) & (np.abs(Y) <= A) & (np.abs(Z) <= A)
-    import trimesh
-    got = trimesh.Trimesh(verts, faces, process=False).contains(
-        np.stack([X.ravel(), Y.ravel(), Z.ravel()], 1)).reshape(truth.shape)
+    # mesh_occupancy rather than trimesh.contains: contains() casts a ray per point and is
+    # too expensive on a grid this size without the optional embreex dependency;
+    # mesh_occupancy uses the same cell-centre grid and needs nothing optional.
+    from hac26.recon import mesh_occupancy
+    got = mesh_occupancy(verts, faces, 96, extent)
     dice = 2.0 * (got & truth).sum() / (got.sum() + truth.sum())
     assert dice > 0.99, f"Dice {dice:.4f}"

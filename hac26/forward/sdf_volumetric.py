@@ -57,8 +57,8 @@ __all__ = ["M2_LOGISTIC", "SHELL", "N_NODES", "logistic_cdf", "logistic_pdf",
            "anneal_schedule", "curves"]
 
 M2_LOGISTIC = float(np.pi ** 2 / 3.0)      # variance of the unit-scale logistic density
-SHELL = 10.0        # gate half-width in units of w; 1 - 2/(1 + e^SHELL) = 1 - 9e-5 of the
-                    # weight is inside it, against 1.35% missing at a half-width of 5w
+SHELL = 10.0        # gate half-width in units of w. The weight inside it is
+                    # 1 - 2/(1 + e^SHELL), so a wider gate loses less; see w_bounds.
 N_NODES = 64        # in-shell quadrature nodes per ray, fixed so the count carries no
                     # geometry dependence and the gradient does not jump by a node
 
@@ -161,9 +161,9 @@ def shadow_transmittance(x: torch.Tensor, dirs: torch.Tensor, field, w: float,
         u0 = shell * w / max(n . omega, cos_floor)
 
     at which phi has risen to about shell*w on a locally flat surface. An unoccluded point
-    then returns Phi_s(shell) = 1 - 2/(1 + e^shell), which is 9e-5 short of 1 at shell = 10:
-    the same telescoping residual as the view gate, and the reason the zero-phase deficit is
-    that size rather than identically zero at finite w.
+    then returns Phi_s(shell) = 1 - 2/(1 + e^shell), which is short of 1 by the same
+    telescoping residual as the view gate -- and that is why the zero-phase deficit is small
+    rather than identically zero at finite w.
     """
     P, K = x.shape[0], dirs.shape[0]
     n = field_normal(field, x, create_graph=False) if normal is None else normal
@@ -198,8 +198,8 @@ def march_view(o: torch.Tensor, d: torch.Tensor, field, w: float, shade_fn,
 
     GATE WIDTH. The weight across a crossing telescopes exactly,
     sum_i W_i = Phi_s(phi_start) - Phi_s(phi_end), so gating at |phi| < D w delivers
-    Phi_s(Dw) - Phi_s(-Dw) = 1 - 2/(1 + e^D) rather than 1. At D = 5 that is a 1.35%
-    deficit, above the 0.4-0.9% median noise floor; at D = 10 it is 9e-5. The deficit is a
+    Phi_s(Dw) - Phi_s(-Dw) = 1 - 2/(1 + e^D) rather than 1. That deficit falls off
+    exponentially in D, and at a narrow gate it is well above the measurement noise. It is a
     uniform multiplicative factor and so largely cancels under per-curve mean normalisation,
     but not entirely, because tau_I is a fixed level -- and a grazing ray that never crosses
     picks up opacity 1 - Phi_s(phi_min), so a narrow gate puts a discontinuity at the
@@ -343,7 +343,7 @@ def render_frame(field, view: torch.Tensor, sun_lab_dirs: torch.Tensor, w: float
 def reduce_frame_coarea(img: torch.Tensor, tau_i: float, tau_b: float):
     """The two observables, with exact derivatives through both thresholds by coarea.
 
-    Distinct from forward.common.reduce_frame, which is the plain non-differentiable
+    Distinct from forward.shared.common.reduce_frame, which is the plain non-differentiable
     reduction. The thresholds are not softened to match the geometric softness: they are
     different bandwidths and only the geometric one is physically justified.
     """
@@ -383,7 +383,7 @@ def w_bounds(t_min: float, radius: float, eps: float = 1e-3, psf_px: float = 1.5
     Silhouette: a grazing ray that does not cross accumulates opacity 1 - Phi_s(phi_min), so
     the outline is blurred over a scale w in phi. Keeping that below the optical PSF
     footprint expressed in object units stops the mollification from biasing the thresholded
-    pixel count. At 1.5 px across a body spanning 800 px this is about 0.004 R.
+    pixel count -- which is what the psf_px / body_px ratio below computes.
     """
     neck = 2.0 * t_min / np.log(1.0 / eps)
     silhouette = 2.0 * (psf_px / body_px) * radius
@@ -412,7 +412,7 @@ def curves(field, cam_dir, sun_lab, psi, w: float, sensor=None, psi0: float = 0.
     pipeline; the intensity threshold is the fixed low one.
     """
     from hac26.conventions import source_directions, to_body
-    from .mesh_raster import otsu_threshold
+    from .mesh.raster import otsu_threshold
 
     src = source_directions(delta_rad, n_source)          # (K, 3) in the lab frame
     cam = to_body(np.asarray(cam_dir, dtype=float), np.asarray(psi, dtype=float), psi0)
