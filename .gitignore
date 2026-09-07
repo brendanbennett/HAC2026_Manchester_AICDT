@@ -18,3 +18,4 @@ runs/
 # practice results
 results/genetic/simpfaces/*
 results/genetic/testing/*
+results/genetic/surfaces/*
