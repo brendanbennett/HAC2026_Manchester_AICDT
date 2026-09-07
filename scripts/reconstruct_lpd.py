@@ -326,6 +326,12 @@ def main():
           flush=True)
 
     d = load_model_curves(a.data_dir, a.model, m=a.phases)
+    # A curve file that is absent leaves its block at zero and masked out, which the solver
+    # would accept and reconstruct around. An answer built from half the measurement, or none
+    # of it, is worse than no answer, so say so instead.
+    if set(d["files"]) != {"intensity", "binary"}:
+        raise SystemExit(f"model {a.model} needs both measured curve files under "
+                         f"{a.data_dir}; found {sorted(d['files'])}")
     data = curve_pairs(d["curves"])                              # (N_CAMS, 2, P)
     mask = geometry_mask(d["mask"])
     scale = residual_scale(d["curves"], d["mask"], inst.eta)     # (N_CAMS, 2)

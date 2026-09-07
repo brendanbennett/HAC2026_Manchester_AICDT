@@ -56,7 +56,9 @@ def main():
         dst = out / name
         if not dst.exists():
             try:
-                with urllib.request.urlopen(url, timeout=a.timeout) as r:
+                # the PDS archive refuses requests without a browser-like user agent
+                req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+                with urllib.request.urlopen(req, timeout=a.timeout) as r:
                     dst.write_bytes(r.read())
             except Exception as exc:                          # noqa: BLE001
                 bad.append(f"{name}: {exc}")

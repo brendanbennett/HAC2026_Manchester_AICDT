@@ -30,7 +30,6 @@ cd "$(dirname "$0")/.."
 N_BODIES=${N_BODIES:-16}
 LIB_RES=${LIB_RES:-32}
 LIB_WORKERS=${LIB_WORKERS:-$(nproc 2>/dev/null || echo 2)}
-FIT_STEPS=${FIT_STEPS:-25}
 FIT_WORKERS=${FIT_WORKERS:-$LIB_WORKERS}
 FIT_POINTS=${FIT_POINTS:-1500}
 FLOW_STEPS=${FLOW_STEPS:-25}
@@ -90,21 +89,32 @@ log "=== 3/10 fit_shapes: per-body fit over the smoke library"
 run "fit_shapes" logs/smoke_fit.log \
   "$PY" scripts/fit_shapes.py \
     --bodies "$N_BODIES" --shapes-dir "$LIB_DIR" \
-    --steps "$FIT_STEPS" --batch 2 --workers "$FIT_WORKERS" --points "$FIT_POINTS" \
+    --workers "$FIT_WORKERS" --points "$FIT_POINTS" \
     --out "$OUT/corpus_codes.npz"
 tail -20 logs/smoke_fit.log
 
-# The instrument: the calibrated one when it exists, otherwise the uncalibrated default,
-# which is enough to check the wiring and nothing else.
-if [ -f models/instrument_calibration.pt ]; then
+# The instrument: the calibrated one when it exists and loads, otherwise the uncalibrated
+# default, which is enough to check the wiring and nothing else. A calibration written by an
+# older Instrument does not load, and is treated as absent.
+valid_instrument() {
+  "$PY" -c "import sys; sys.path.insert(0, '.')
+from hac26.forward.mesh.instrument import Instrument
+Instrument.load('models/instrument_calibration.pt')" >/dev/null 2>&1
+}
+if [ -f models/instrument_calibration.pt ] && valid_instrument; then
   CAL=models/instrument_calibration.pt
 else
   CAL=$OUT/instrument_default.pt
   "$PY" -c "import sys; sys.path.insert(0, '.')
 from hac26.forward.mesh.instrument import Instrument
 Instrument().save('$CAL')"
-  log "    NOTE: no models/instrument_calibration.pt; using the UNCALIBRATED default instrument"
-  log "    ($CAL). Fine for a wiring test; the numbers below are meaningless."
+  if [ -f models/instrument_calibration.pt ]; then
+    log "    NOTE: models/instrument_calibration.pt does not load with this Instrument; using the"
+  else
+    log "    NOTE: no models/instrument_calibration.pt; using the"
+  fi
+  log "    UNCALIBRATED default instrument ($CAL). Fine for a wiring test; the numbers below"
+  log "    are meaningless."
 fi
 
 # The convex stage: the real checkpoint when it exists, otherwise an untrained one of the

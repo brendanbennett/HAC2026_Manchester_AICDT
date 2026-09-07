@@ -4,18 +4,20 @@ bodies, rolled-out states and the ablation arm."""
 import sys
 from pathlib import Path
 
+import numpy as np
 import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 
 from hac26.conventions import cameras, psi_grid                                # noqa: E402
-from hac26.field import CODE_DIM, N_DIR, ImplicitBody                          # noqa: E402
+from hac26.field import CODE_DIM, DESIGN_N, N_DIR, ImplicitBody                # noqa: E402
 from hac26.forward.mesh.exact import RenderConfig                              # noqa: E402
 from hac26.forward.mesh.instrument import Instrument                           # noqa: E402
 from hac26.shapes import icosphere, mesh_support                              # noqa: E402
 from hac26.solvers.lpd_flow import LPDFlow, geometry_tags                     # noqa: E402
 from hac26.solvers.operator import CodeOperator                                # noqa: E402
-from train_lpd import FIT_FROM, Corpus, Diag, flow_loss, model_error_scale     # noqa: E402
+from train_lpd import (FIT_FROM, OCC_LOGIT, OCC_WEIGHT, Corpus, Diag,          # noqa: E402
+                       flow_loss, model_error_scale, occ_eps_default, step_loss)
 
 SMALL = RenderConfig(height=24, width=40, supersample=1, sun_res=64, phase_chunk=4,
                      radiosity_faces=48)
@@ -75,3 +77,57 @@ def test_flow_loss_trains_reader_and_expert_with_every_term():
     loss_r = flow_loss(net, op, corpus, eta, idx[:1], x0[:1], t[:1], 2, tag, mask,
                        train_geoms=2, rollout_steps=torch.tensor([1]))
     assert torch.isfinite(loss_r)
+
+
+def _carved_body():
+    """A unit ball and the same ball with a pocket carved into it: the hull support, the true
+    code, and which lattice sites the carve removes."""
+    from hac26.field import GaussianLattice
+    sites = GaussianLattice().p
+    centre = torch.tensor([0.65, 0.0, 0.0])            # a pocket in the side of the ball
+    carved = (sites - centre).norm(dim=1) < 0.30
+    sup = torch.ones(1, DESIGN_N)                      # the support of the unit ball
+    code = torch.zeros(1, CODE_DIM)
+    code[0, N_DIR:][carved] = 1.0                      # amplitudes that push the field outside
+    return sup, code, carved
+
+
+def _occ(net, sup, h_base, code_true, z_est):
+    """The occupancy term alone, for an endpoint estimate z_est in the whitened code."""
+    zero = torch.zeros_like(z_est)
+    x1 = net.codec.encode(code_true)
+    return float(step_loss(net, zero, torch.zeros(1), z_est, x1, sup, code_true, h_base,
+                           OCC_WEIGHT, occ_eps_default())[2])
+
+
+def test_the_occupancy_term_is_mostly_about_the_carve(monkeypatch):
+    """The convex stage already supplies the hull, so the term has to be dominated by the
+    sites the hull gets wrong. Missing the carve entirely costs far more with the weighting
+    than without it, while a convex body's term is untouched."""
+    import train_lpd
+    sup, code_true, carved = _carved_body()
+    net = LPDFlow(n_experts=1)
+    net.codec.fit(torch.cat([code_true, torch.zeros(1, CODE_DIM)]))
+    hull = net.codec.encode(torch.zeros(1, CODE_DIM))          # the body without its carve
+    truth = net.codec.encode(code_true)
+
+    def gap():
+        return _occ(net, sup, sup, code_true, hull) - _occ(net, sup, sup, code_true, truth)
+
+    weighted = gap()
+    monkeypatch.setattr(train_lpd, "CARVE_WEIGHT", 0.0)
+    plain = gap()
+    assert weighted > 5.0 * plain, (weighted, plain)
+    # the carve is a few percent of the sites, and the weighting is what makes it count
+    assert float(carved.float().mean()) < 0.1
+
+
+def test_the_occupancy_term_is_bounded_by_a_wild_field():
+    """A decoded field of many lattice spacings says no more about where the surface is than
+    one of a single spacing, and unbounded it would swamp the step."""
+    sup, code_true, _ = _carved_body()
+    net = LPDFlow(n_experts=1)
+    net.codec.fit(torch.cat([code_true, torch.zeros(1, CODE_DIM)]))
+    wild = torch.full((1, CODE_DIM), 6.0)                      # far outside anything trained
+    val = _occ(net, sup, sup, code_true, wild)
+    assert np.isfinite(val) and val < OCC_LOGIT, val

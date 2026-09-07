@@ -15,7 +15,7 @@ from hac26.shapes import icosphere, mesh_support                              # 
 from hac26.solvers.lpd_flow import LPDFlow                                     # noqa: E402
 from hac26.solvers.operator import CodeOperator                                # noqa: E402
 from reconstruct_lpd import POLISH_TARGET, polish, whitened_misfit             # noqa: E402
-from train_lpd import data_fit, with_gradient                                  # noqa: E402
+from train_lpd import FIT_KNEE, data_fit, with_gradient                        # noqa: E402
 
 SMALL = RenderConfig(height=24, width=40, supersample=1, sun_res=64, phase_chunk=4,
                      radiosity_faces=48)
@@ -84,6 +84,21 @@ def test_data_fit_is_zero_at_the_noise_level_and_its_gradient_points_downhill():
     val3, grad3, _ = data_fit(net, op, z, h[None], torch.tensor([1.2]), data[None], fine,
                               GEOMS, mask)
     assert float(val3) == 0.0 and float(grad3.abs().max()) == 0.0
+    # far above the noise the term grows in proportion to the excess rather than as its
+    # square: it goes on separating a poor body from a hopeless one, and goes on pulling,
+    # where a term that levelled off would report the same value and no gradient for both
+    coarse = torch.full((1, 28, 2), 1e-3)
+    val4, grad4, _ = data_fit(net, op, z, h[None], torch.tensor([1.2]), data[None], coarse,
+                              GEOMS, mask)
+    coarser = torch.full((1, 28, 2), 1e-4)
+    val5, grad5, _ = data_fit(net, op, z, h[None], torch.tensor([1.2]), data[None], coarser,
+                              GEOMS, mask)
+    assert float(val5) > float(val4) > 0
+    assert float(grad4.abs().max()) > 0 and float(grad5.abs().max()) > 0
+    cur = op.curves(h, net.codec.decode(z[0]), 1.2, geoms=GEOMS)
+    excess = whitened_misfit(cur, data, coarse[0], GEOMS) - 1.0
+    assert excess > FIT_KNEE
+    assert abs(float(val4) - FIT_KNEE * (2 * excess - FIT_KNEE)) < 1e-3 * float(val4)
     # with_gradient carries the value and the gradient into autograd
     x = z.clone().requires_grad_(True)
     s = with_gradient(val, x, grad)

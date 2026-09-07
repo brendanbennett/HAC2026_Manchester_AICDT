@@ -1,0 +1,96 @@
+[venv] active: /home/m12567jp/dev/Helsinki/.venv/bin/python (Python 3.12.3)
+[venv] dependencies already satisfied (numpy, scipy, torch, trimesh, skimage, rtree, fast_simplification, embreex)
+[05:57:17] === models: skipped (already done -- rm runs/.done/models or use --force-stage to redo)
+[05:57:17] === objects: skipped (already done)
+[05:57:17] === library: skipped (already done -- rm runs/.done/library or use --force-stage to redo)
+[05:57:17] === design: skipped (already done -- rm runs/.done/design or use --force-stage to redo)
+[05:57:19] === calibrate: skipped (models/instrument_calibration.pt already present)
+[05:57:19] === fit: skipped (already done -- rm runs/.done/fit or use --force-stage to redo)
+[05:57:19] === corpus: skipped (already done -- rm runs/.done/corpus or use --force-stage to redo)
+[05:57:19] === prior: skipped (already done -- rm runs/.done/prior or use --force-stage to redo)
+[05:57:19] === flow: skipped (already done -- rm runs/.done/flow or use --force-stage to redo)
+[05:57:19] === flow-rollout: starting
+  corpus: 169 bodies from runs/corpus.npz, 96 phases, radii 0.33-10.97
+  instrument: rho 0.911, source radius 1.23 deg, eye distance 8.51, tau_i 0.0128, psf sigma 0.80 px, eta median 0.0428
+  exact operator on cuda, extraction res 32, 28 geometries, 96 phases; model error median 0.0428
+  prior: runs/prior_flow.pt, trained 9000 steps on 169 bodies
+  codec: g scale 0.00624, dh sd 0.16153, g sd 1.30893; corpus in whitened space reaches |z| = 4.64
+  EMA decay 0.96000 (window ~25 steps of 250)
+  training samples 28/28 geometries per step; noise level 0.005-0.03 of the curve mean
+  occupancy term: weight 1, soft edge 0.0458 (lattice spacing 0.1833)
+  data-fit term: weight 1 on draws with t >= 0.75
+  quarter turns: on, four training pairs per body
+  154 training bodies, 15 held out; validating every 200 steps, patience 5
+  [06:57:22] resumed runs/lpd_flow.pt.ckpt at step 250 of 250 (0:59:53 trained so far; best val 1.19335 from step 199, 1/5 without improvement)
+  EMA decay 0.96000 (window ~25 steps of 250)
+  branched from 1 to 4 experts at [0.25, 0.5, 0.75]; rollout fraction changed from 0.0 to 0.5: early-stopping record reset
+  training 120 steps beyond the checkpoint, to step 370
+  [06:59:19] step   250  loss 54.63703  (flow 32.62275, occupancy 7.04723, data fit 14.96705)  dropped 0/2 bodies  rolled out 1 batches  116.7s/step  elapsed 1:01:49  eta 3:51:33
+  [budget] 47.2s/step -> 2:34:15 projected for 370 steps; 20:00:00 allowed. Largest --steps that fits: 1699
+  [07:04:53] step   260  loss 137.44446  (flow 40.38678, occupancy 58.07328, data fit 38.98439)  dropped 1/22 bodies  rolled out 4 batches  115.6s/step  elapsed 1:07:24  eta 1:14:28
+  [07:17:07] step   270  loss 35.89980  (flow 23.71454, occupancy 12.18527, data fit 0.00000)  dropped 8/42 bodies  rolled out 12 batches  39.4s/step  elapsed 1:19:38  eta 1:33:08
+  [07:29:46] step   280  loss 2.82965  (flow 2.11076, occupancy 0.71889, data fit 0.00000)  dropped 14/62 bodies  rolled out 19 batches  18.9s/step  elapsed 1:32:17  eta 1:33:02
+  [07:35:26] step   290  loss 228.94034  (flow 97.02842, occupancy 67.08296, data fit 64.82895)  dropped 15/82 bodies  rolled out 24 batches  84.7s/step  elapsed 1:37:57  eta 1:13:21
+  [07:43:22] step   299  checkpointed to runs/lpd_flow.pt.ckpt
+  [07:45:53] step   300  loss 43.08382  (flow 31.91928, occupancy 0.33584, data fit 10.82869)  dropped 25/102 bodies  rolled out 30 batches  151.0s/step  elapsed 1:48:24  eta 1:05:39
+  [07:52:19] step   310  loss 50.32966  (flow 22.78541, occupancy 27.54424, data fit 0.00000)  dropped 28/122 bodies  rolled out 34 batches  24.7s/step  elapsed 1:54:50  eta 0:53:09
+  [07:59:18] step   320  loss 65.14527  (flow 64.12193, occupancy 0.34897, data fit 0.67436)  dropped 28/142 bodies  rolled out 38 batches  166.3s/step  elapsed 2:01:49  eta 0:42:44
+  [08:07:16] step   330  loss 7.55613  (flow 6.29718, occupancy 1.25895, data fit 0.00000)  dropped 35/162 bodies  rolled out 42 batches  12.2s/step  elapsed 2:09:47  eta 0:33:39
+  [08:21:32] step   340  loss 4.76122  (flow 2.99981, occupancy 1.76141, data fit 0.00000)  dropped 48/182 bodies  rolled out 52 batches  67.5s/step  elapsed 2:24:03  eta 0:26:49
+  [08:32:02] step   350  loss 2.67254  (flow 2.40839, occupancy 0.26415, data fit 0.00000)  dropped 49/202 bodies  rolled out 56 batches  12.1s/step  elapsed 2:34:33  eta 0:17:48
+  [08:40:34] step   360  loss 49.40831  (flow 40.03124, occupancy 0.24272, data fit 9.13435)  dropped 53/222 bodies  rolled out 61 batches  94.3s/step  elapsed 2:43:05  eta 0:08:22
+  [08:51:53] step   369  loss 18.79748  (flow 6.05079, occupancy 0.30317, data fit 12.44351)  dropped 53/240 bodies  rolled out 65 batches  15.0s/step  elapsed 2:54:24  eta 0:00:00
+  [08:53:20] step   369  |g|hat 0.03230 vs corpus 0.01424 (227%), across-draw spread 0.03614; val flow 16.24943, occupancy 1.29948, data fit 2.35830, dropped 2/15
+  [08:53:20] step   369  val 19.90721  (best, 87s)
+  [08:53:20] step   369  checkpointed to runs/lpd_flow.pt.ckpt
+  restored step 369 (val 19.90721) after 370 steps
+[08:53:20] wrote runs/lpd_flow.pt after 2:55:51 of training
+[07:53:21] === flow-rollout: done
+[07:53:21] === decision: starting
+  corpus: 169 bodies from runs/corpus.npz, 96 phases, radii 0.33-10.97
+  instrument: rho 0.911, source radius 1.23 deg, eye distance 8.51, tau_i 0.0128, psf sigma 0.80 px, eta median 0.0428
+  15 held-out bodies, carved 0.00-0.95
+Traceback (most recent call last):
+  File "/home/m12567jp/dev/Helsinki/scripts/decision_check.py", line 219, in <module>
+    main()
+  File "/home/m12567jp/dev/Helsinki/scripts/decision_check.py", line 126, in main
+    codes = net.sample(make_resid_fn(net, op, curves, scale, mask, M, cond, support, R),
+            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/m12567jp/dev/Helsinki/.venv/lib/python3.12/site-packages/torch/utils/_contextlib.py", line 124, in decorate_context
+    return func(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^
+  File "/home/m12567jp/dev/Helsinki/hac26/solvers/lpd_flow.py", line 643, in sample
+    x1_hat = x + (1 - t[:, None]) * self.prior_velocity(x, t, rad, sph0.expand(batch, -1, -1),
+                                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/m12567jp/dev/Helsinki/hac26/solvers/lpd_flow.py", line 593, in prior_velocity
+    return self.prior(code, t, radius, sphere_ch, vol_ch)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/m12567jp/dev/Helsinki/.venv/lib/python3.12/site-packages/torch/nn/modules/module.py", line 1778, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/m12567jp/dev/Helsinki/.venv/lib/python3.12/site-packages/torch/nn/modules/module.py", line 1789, in _call_impl
+    return forward_call(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/m12567jp/dev/Helsinki/hac26/solvers/lpd_flow.py", line 496, in forward
+    c = self.cond(torch.cat([te, torch.log(radius)[:, None]], -1))
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/m12567jp/dev/Helsinki/.venv/lib/python3.12/site-packages/torch/nn/modules/module.py", line 1778, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/m12567jp/dev/Helsinki/.venv/lib/python3.12/site-packages/torch/nn/modules/module.py", line 1789, in _call_impl
+    return forward_call(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/m12567jp/dev/Helsinki/.venv/lib/python3.12/site-packages/torch/nn/modules/container.py", line 253, in forward
+    input = module(input)
+            ^^^^^^^^^^^^^
+  File "/home/m12567jp/dev/Helsinki/.venv/lib/python3.12/site-packages/torch/nn/modules/module.py", line 1778, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/m12567jp/dev/Helsinki/.venv/lib/python3.12/site-packages/torch/nn/modules/module.py", line 1789, in _call_impl
+    return forward_call(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/m12567jp/dev/Helsinki/.venv/lib/python3.12/site-packages/torch/nn/modules/linear.py", line 134, in forward
+    return F.linear(input, self.weight, self.bias)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+RuntimeError: Expected all tensors to be on the same device, but got mat1 is on cpu, different from other tensors on cuda:0 (when checking argument in method wrapper_CUDA_addmm)
+[07:53:29] === decision: FAILED -- see logs/decision.log

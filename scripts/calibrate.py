@@ -42,7 +42,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from hac26.conventions import PUBLIC_MODELS, SENSE, cameras, psi_grid   # noqa: E402
 from hac26.data_io import N_CAMS, load_model_curves, public_stl       # noqa: E402
-from hac26.forward.mesh.exact import ExactForward, decimate, normalise, normalise_vjp   # noqa: E402
+from hac26.forward.mesh.exact import (ExactForward, RenderConfig, decimate, normalise,   # noqa: E402
+                                      normalise_vjp)
 from hac26.forward.mesh.instrument import Instrument                  # noqa: E402
 from hac26.noise import sigma_from_replicates                         # noqa: E402
 from hac26.shapes import rescale_touch_z                              # noqa: E402
@@ -150,11 +151,18 @@ def main():
     ap.add_argument("--data-dir", default="dataset/raw")
     ap.add_argument("--out", default=OUT_INSTRUMENT)
     ap.add_argument("--report", default=OUT_REPORT)
+    render = RenderConfig()
+    ap.add_argument("--phase-chunk", type=int, default=render.phase_chunk,
+                    help="phases per rendering batch; with --geom-chunk it sets the GPU "
+                         "memory the rendering takes, not the result")
+    ap.add_argument("--geom-chunk", type=int, default=render.geom_chunk,
+                    help="geometries per rendering batch")
     a = ap.parse_args()
     dev = "cuda" if torch.cuda.is_available() else "cpu"
 
     inst = Instrument().to(dev)
-    fwd = ExactForward(inst, psi_grid(a.phases), device=dev)
+    render = RenderConfig(phase_chunk=a.phase_chunk, geom_chunk=a.geom_chunk)
+    fwd = ExactForward(inst, psi_grid(a.phases), render, device=dev)
     fit_params = [p for n, p in inst.named_parameters() if n != "raw_eta"]
 
     bodies = {}

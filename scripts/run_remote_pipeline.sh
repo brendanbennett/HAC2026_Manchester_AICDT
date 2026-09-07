@@ -71,10 +71,8 @@ N_OBJECTS=${N_OBJECTS:-600}
 DESIGN_N=${DESIGN_N:-4096}
 DESIGN_DEVICE=${DESIGN_DEVICE:-}
 
-FIT_STEPS=${FIT_STEPS:-4000}
-FIT_BATCH=${FIT_BATCH:-4}
 FIT_WORKERS=${FIT_WORKERS:-$LIB_WORKERS}
-FIT_POINTS=${FIT_POINTS:-6000}
+FIT_POINTS=${FIT_POINTS:-60000}
 CODES_FILE=runs/corpus_codes.npz
 
 CONVEX_CKPT=${CONVEX_CKPT:-models/lpd_convex.pt}   # the convex stage, whose starts the flow corrects
@@ -150,9 +148,8 @@ stage_signature() {
       printf 'stage=calibrate\nDATA_DIR=%s\n' "$DATA_DIR"
       ;;
     fit)
-      printf 'stage=fit\nN_BODIES=%s\nLIB_DIR=%s\nLIB_SEED=%s\nLIB_RES=%s\nDESIGN_N=%s\nFIT_STEPS=%s\nFIT_BATCH=%s\nFIT_POINTS=%s\nCODES_FILE=%s\n' \
-        "$N_BODIES" "$LIB_DIR" "$LIB_SEED" "$LIB_RES" "$DESIGN_N" "$FIT_STEPS" \
-        "$FIT_BATCH" "$FIT_POINTS" "$CODES_FILE"
+      printf 'stage=fit\nN_BODIES=%s\nLIB_DIR=%s\nLIB_SEED=%s\nLIB_RES=%s\nDESIGN_N=%s\nFIT_POINTS=%s\nCODES_FILE=%s\n' \
+        "$N_BODIES" "$LIB_DIR" "$LIB_SEED" "$LIB_RES" "$DESIGN_N" "$FIT_POINTS" "$CODES_FILE"
       ;;
     # Each later stage's signature extends the one before it, so a change anywhere upstream
     # reruns everything downstream.
@@ -250,20 +247,34 @@ valid_design() {
 }
 
 # ---------------------------------------------------------------- 0. real shape models
-# Asteroid models are downloaded here; everyday objects (scripts/fetch_objects.py, which
-# needs `pip install thingi10k`) are fetched when FETCH_OBJECTS=1 and otherwise used if
-# already under $SHAPE_MODELS_DIR/objects.
+# Asteroid models are downloaded here. Everyday objects (scripts/fetch_objects.py, which needs
+# the thingi10k package and a long download) are fetched when FETCH_OBJECTS=1; they are an
+# addition to the library, not a requirement, so a failure here is logged and the run goes
+# on with whatever is under $SHAPE_MODELS_DIR/objects.
 if [ "$FETCH_MODELS" = "1" ]; then
   run_stage models "$SHAPE_MODELS_DIR" \
     $PY scripts/fetch_shape_models.py --out "$SHAPE_MODELS_DIR"
 else
   log "=== models: skipped (FETCH_MODELS=0)"
 fi
-if [ "$FETCH_OBJECTS" = "1" ]; then
-  run_stage objects "$SHAPE_MODELS_DIR/objects" \
-    $PY scripts/fetch_objects.py --out "$SHAPE_MODELS_DIR/objects" --n "$N_OBJECTS"
-else
+if [ "$FETCH_OBJECTS" != "1" ]; then
   log "=== objects: skipped (FETCH_OBJECTS=0); using $SHAPE_MODELS_DIR/objects if present"
+elif should_run objects; then
+  log "=== objects: starting"
+  echo "=== objects: starting $(date -u +%FT%TZ) ===" >> logs/objects.log
+  if ! $PY -c "import thingi10k" >/dev/null 2>&1; then
+    # in a subshell: a venv without pip must not stop the run over an optional stage
+    ( _ensure_pip && python -m pip install -q thingi10k ) 2>&1 | tee -a logs/objects.log || true
+  fi
+  if $PY scripts/fetch_objects.py --out "$SHAPE_MODELS_DIR/objects" --n "$N_OBJECTS" \
+      2>&1 | tee -a logs/objects.log; then
+    mark_done objects
+    log "=== objects: done"
+  else
+    log "=== objects: FAILED -- see logs/objects.log; continuing without new objects"
+  fi
+else
+  log "=== objects: skipped (already done)"
 fi
 
 # ---------------------------------------------------------------- 1. shape library
@@ -332,7 +343,7 @@ fi
 run_stage fit "$CODES_FILE" \
   $PY scripts/fit_shapes.py \
     --bodies "$N_BODIES" --shapes-dir "$LIB_DIR" --seed "$LIB_SEED" \
-    --steps "$FIT_STEPS" --batch "$FIT_BATCH" --workers "$FIT_WORKERS" \
+    --workers "$FIT_WORKERS" \
     --points "$FIT_POINTS" \
     --out "$CODES_FILE"
 

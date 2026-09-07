@@ -508,26 +508,36 @@ class Reader(nn.Module):
     """The part of the data network that interprets the curves: the dual, and the pooling of
     its output into one summary vector per body. What a residual means does not depend on t,
     only the response to it does, so the reader is one network shared by all experts, and it
-    trains on every sample at every time."""
+    trains on every sample at every time.
+
+    The summary is what the curves CHANGED, not what the network emits when they are present.
+    The dual carries a mode embedding, a geometry tag and its own biases, so its output on any
+    input already contains a part that no residual influences, and that part is much the
+    larger of the two: the primal would have to read the data as a small perturbation on a
+    constant, and the smaller the residual the worse the ratio, which is exactly the late part
+    of the flow where the fine shape is settled. Subtracting the network's own response to
+    zero features leaves the response to the data. The second pass costs a fraction of one
+    operator call.
+    """
 
     def __init__(self, width: int = 96, n_modes: int = N_MODES, mode_feat: int = 16):
         super().__init__()
         self.dual = DualSetTransformer(width=width)
         # Pool over geometries only, then project each mode with one shared Linear, so the
         # summary keeps which mode carried the signal. Mixing across modes happens later, in
-        # the primal's conditioning.
-        self.mode_proj = nn.Linear(width, mode_feat)
+        # the primal's conditioning. No bias: a bias is a constant the data cannot move.
+        self.mode_proj = nn.Linear(width, mode_feat, bias=False)
         self.register_buffer("modes", torch.arange(1, n_modes + 1), persistent=False)
         self.summary_dim = n_modes * mode_feat
 
     def forward(self, resid, geom_tag, mask):
-        d = self.dual(resid, geom_tag, mask, self.modes)         # (B, C, M, width)
+        d = (self.dual(resid, geom_tag, mask, self.modes)
+             - self.dual(torch.zeros_like(resid), geom_tag, mask, self.modes))
         w = mask[:, :, None, None]
         pooled = (d * w).sum(1) / w.sum(1).clamp_min(1e-6)       # (B, M, width) -- true mean
         # Mode slots the caller zero-filled (orders above what the phase count supports) carry
-        # no data, but the dual still emits a bias and a mode embedding for them. They are
-        # detected from the input rather than from a constructor argument, so a checkpoint
-        # cannot disagree with a run.
+        # no data. They are detected from the input rather than from a constructor argument,
+        # so a checkpoint cannot disagree with a run.
         live = (resid.abs().sum((1, 3)) > 0).float()[..., None]  # (B, M, 1)
         return (self.mode_proj(pooled) * live).reshape(resid.shape[0], -1)
 

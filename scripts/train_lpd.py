@@ -82,10 +82,22 @@ OCC_MARGIN = 0.25      # width of the occupancy target's soft edge, as a fractio
                        # spacing. Sites further from the surface than a few of these saturate
                        # and stop contributing; the field cannot place the surface finer than
                        # the lattice anyway.
+CARVE_WEIGHT = 20.0    # how much a site the body's hull gets wrong counts against one it gets
+                       # right, in the occupancy term. A carve touches a few percent of the
+                       # sites, so this puts about half the term on the carve; see step_loss.
+OCC_LOGIT = 12.0       # where the occupancy term saturates, in units of its soft edge, so
+                       # about three lattice spacings from the surface
 FIT_WEIGHT = 1.0       # weight of the data-fit term (data_fit) against the flow term
 FIT_FROM = 1.0 - 1.0 / N_EXPERTS   # the data-fit term applies at t from here on: the interval
                                    # the last of the N_EXPERTS experts owns, where the endpoint
                                    # estimate is nearly the answer
+FIT_KNEE = 1.0         # excess misfit, in noise standard deviations, beyond which the data-fit
+                       # term stops growing as a square and grows in proportion instead. It
+                       # bounds the pull the term can exert at the pull a body two standard
+                       # deviations from the curves exerts, so a badly placed endpoint cannot
+                       # set the direction of the step on its own, while the term keeps both
+                       # its full strength in that direction and a value that goes on telling
+                       # a poor body from a hopeless one. See data_fit.
 
 
 # ------------------------------------------------------------------------------ the corpus
@@ -458,27 +470,52 @@ def step_loss(net, xt, t, v, x1, sup_true, code_true, h_base, occ_weight, occ_ep
     decoded: the cross-entropy of its inside-or-outside at the lattice sites against the
     corpus body's (true hull support `sup_true`, raw code `code_true`). The endpoint's dh is
     measured from `h_base`, the convex start the operator ran at, exactly as at
-    reconstruction. Returns (total, flow term, occupancy term, decoded endpoint)."""
+    reconstruction.
+
+    The sites are not weighted equally. The convex stage already supplies the hull, so a site
+    the hull places correctly asks nothing of the flow, and a body's hull places all but a few
+    percent of the sites correctly. Weighted equally, almost all of the term would reward
+    reproducing the hull and the carve would be a rounding error in it, which is the one thing
+    the flow exists to produce. So a site where the hull and the body disagree counts
+    CARVE_WEIGHT times one where they agree, and the weights are normalised per body; on a
+    convex body every weight is one and the term is unchanged.
+
+    The cross-entropy saturates at OCC_LOGIT rather than growing with the field. A decoded
+    field of several lattice spacings says nothing more about where the surface is than one of
+    a single spacing, and left unbounded a single site with a large field contributes hundreds
+    to the loss and destabilises the step.
+
+    Returns (total, flow term, occupancy term, decoded endpoint)."""
     err = (v - (x1 - xt) / (1 - t[:, None])) ** 2
     flow = 0.5 * (err[:, :N_DIR].mean() + err[:, N_DIR:].mean())
     x1_hat = xt + (1 - t[:, None]) * v
     with torch.no_grad():
-        occ_true = torch.sigmoid(-site_field(sup_true, code_true[:, N_DIR:]) / occ_eps)
+        g_true = code_true[:, N_DIR:]
+        occ_true = torch.sigmoid(-site_field(sup_true, g_true) / occ_eps)
+        occ_hull = torch.sigmoid(-site_field(sup_true, torch.zeros_like(g_true)) / occ_eps)
+        w = 1.0 + CARVE_WEIGHT * (occ_hull - occ_true).abs()
+        w = w / w.mean(1, keepdim=True).clamp_min(1e-6)
     raw = net.codec.decode(x1_hat)
     f_est = site_field(support_with(h_base, raw[:, :N_DIR]), raw[:, N_DIR:])
-    occ = torch.nn.functional.binary_cross_entropy_with_logits(-f_est / occ_eps, occ_true)
+    logit = OCC_LOGIT * torch.tanh(-f_est / (occ_eps * OCC_LOGIT))
+    occ = (torch.nn.functional.binary_cross_entropy_with_logits(logit, occ_true,
+                                                                reduction="none") * w).mean()
     return flow + occ_weight * occ, flow, occ, raw
 
 
 def data_fit(net, op: CodeOperator, x1_hat, h, radius, data, scale, geoms, step_mask):
     """The data-fit term on endpoint estimates x1_hat (B, CODE_DIM, whitened): each decoded
-    endpoint is rendered, chi is the RMS of its whitened residual against the data over the
-    geometries used, and the term is relu(chi - 1)^2, zero once the endpoint fits the data
-    to within the noise, because fitting below the noise fits noise. Returns (mean term over
-    the bodies with curves, its gradient with respect to x1_hat (B, CODE_DIM), number of
-    bodies without curves). The gradient comes from the adjoint of the same operator call, so
-    the term costs one call per body, and the caller attaches it to the graph with
-    with_gradient."""
+    endpoint is rendered and chi is the RMS of its whitened residual against the data over the
+    geometries used. The term is zero once the endpoint fits the data to within the noise,
+    because fitting below the noise fits noise. Above the noise it grows as the square of the
+    excess up to FIT_KNEE and in proportion to it beyond, which is what keeps a body far from
+    the data from setting the direction of the step: a square makes the pull grow without
+    bound in the region where the endpoint estimate is least trustworthy, whereas the
+    proportional part holds the pull at a fixed size while leaving its direction, the one the
+    curves ask for, untouched. Returns (mean term over the bodies with curves, its gradient
+    with respect to x1_hat (B, CODE_DIM), number of bodies without curves). The gradient comes
+    from the adjoint of the same operator call, so the term costs one call per body, and the
+    caller attaches it to the graph with with_gradient."""
     B, C = step_mask.shape
     dev = x1_hat.device
     gsel = torch.arange(C, device=dev) if geoms is None else torch.tensor(geoms, device=dev)
@@ -498,10 +535,12 @@ def data_fit(net, op: CodeOperator, x1_hat, h, radius, data, scale, geoms, step_
         r = (d_b - cur) / s_b[..., None]
         chi = r.pow(2).mean().sqrt()
         excess = (chi - 1.0).clamp_min(0.0)
-        vals[b] = excess ** 2
+        held = excess.clamp_max(FIT_KNEE)
+        vals[b] = held * (2.0 * excess - held)     # excess^2 below the knee, linear above it
         # g is the gradient of -chi^2 n / 2 with respect to the raw code, n the number of
-        # residual entries; the term's derivative with respect to chi^2 is excess / chi
-        grad[b] = -(2.0 / r.numel()) * float(excess / chi.clamp_min(1e-12)) * g.to(dev)
+        # residual entries. The term's derivative with respect to the excess is twice the
+        # excess below the knee and twice the knee above it, which is `held` either way.
+        grad[b] = -(2.0 / r.numel()) * float(held / chi.clamp_min(1e-12)) * g.to(dev)
     n = live.sum().clamp_min(1.0)
     return vals.sum() / n, net.codec.pullback(x1_hat.detach(), grad) / n, int(B - live.sum())
 

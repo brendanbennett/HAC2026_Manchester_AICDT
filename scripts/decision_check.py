@@ -94,8 +94,10 @@ def main():
     inst = load_instrument(a.calibration, dev)
     eta = model_error_scale(inst)
     op = CodeOperator(inst, psi_grid(phases), res=op_res, config=RENDER, device=dev)
+    # the network runs on the CPU and the operator on the GPU, as reconstruct_lpd.py runs
+    # them: the corpus tensors and the sampler's state stay on one device throughout
     net = LPDFlow.from_state_dict(torch.load(a.ckpt, map_location="cpu", weights_only=True))
-    net = net.to(dev).eval()
+    net.eval()
     C = len(cameras())
     tag, mask = geometry_tags(), torch.ones(1, C)
     geoms = list(range(C))

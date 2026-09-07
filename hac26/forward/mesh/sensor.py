@@ -117,7 +117,7 @@ class SensorModel(nn.Module):
         u = x.clamp(0.0, 1.0) * n
         i = u.floor().clamp(max=n - 1)
         t = u - i
-        i = i.long()
+        i = i.int()                                 # the index is kept for the backward pass
         return torch.lerp(k[i], k[i + 1], t)
 
     def vignette(self, r: torch.Tensor) -> torch.Tensor:
@@ -128,12 +128,14 @@ class SensorModel(nn.Module):
     # -------------------------------------------------------------- the chain
     def forward(self, radiance: torch.Tensor, cos_off: torch.Tensor,
                 radius: torch.Tensor, supersample: int = 4) -> torch.Tensor:
-        """radiance, cos_off and radius are all (B, H, W) at the SUPERSAMPLED resolution.
+        """radiance is (B, H, W) at the SUPERSAMPLED resolution; cos_off and radius are (1, H, W)
+        or (B, H, W) and broadcast against it.
 
         cos_off is the cosine of the off-axis angle of each pixel's ray; radius is the
         normalised distance from the optical axis, in [0, 1] at the frame corner.
         """
-        x = radiance * cos_off.clamp_min(0.0) ** 4 * self.vignette(radius)
+        gain = cos_off.clamp_min(0.0) ** 4 * self.vignette(radius)    # the same for every image
+        x = radiance * gain
         x = _separable_conv(x, gaussian_psf(self.psf_sigma, device=x.device,
                                             dtype=x.dtype))
         x = self.oetf(x / self.saturation.clamp_min(1e-6))

@@ -63,7 +63,10 @@ class RenderConfig:
     sun_res: int = 512         # side of the square sun view, in pixels
     fov_scale: float = 1.6     # the camera's half-height covers this many body extents
     n_source: int = 8          # sample directions on the source disc
-    phase_chunk: int = 8       # phases per rendering batch
+    phase_chunk: int = 8       # phases per rendering batch: the sun view and the
+                               # interreflection are solved once per batch
+    geom_chunk: int = 7        # geometries per rendering batch: the memory of the camera
+                               # renders and the sensor grows with phase_chunk * geom_chunk
     radiosity_faces: int = 600 # patches the interreflection is solved on
     form_factor_samples: int = 4
     bad_rows: str = "raise"    # what RadiositySolver does with a broken form-factor row
@@ -225,7 +228,11 @@ class ExactForward:
         return Prepared(solver, patch, fv, ff, area.clamp_min(1e-12), extent)
 
     def _radiance(self, prep: Prepared, cov: torch.Tensor, k: int) -> torch.Tensor:
-        """Per-face radiance (P, F) from the lit coverage (P K, F) of K source samples."""
+        """Per-face radiance (P, F) from the lit coverage (P K, F) of K source samples: the
+        direct light of the face itself, at the resolution of the mesh, plus the light its
+        patch receives from the other patches, at the resolution of the patches. The
+        interreflection alone is solved on the patches; giving a face its patch's whole
+        radiosity would smear the terminator over the patch."""
         P = cov.shape[0] // k
         e = cov.reshape(P, k, -1).mean(1) / prep.area[None]                        # (P, F)
         n_patch = len(prep.solver.F)
@@ -233,8 +240,11 @@ class ExactForward:
         w = prep.area[None].expand(P, -1)
         E = torch.zeros(P, n_patch, device=cov.device).scatter_add(1, idx, e * w)
         A = torch.zeros(P, n_patch, device=cov.device).scatter_add(1, idx, w)
-        B = prep.solver.solve((E / A.clamp_min(1e-12)).T).T                       # (P, patches)
-        return prep.solver.radiance(B).gather(1, idx)                               # (P, F)
+        E = E / A.clamp_min(1e-12)                                                  # (P, patches)
+        B = prep.solver.solve(E.T).T                                                # (P, patches)
+        rho = prep.solver.rho
+        indirect = (B - rho * E).gather(1, idx)                                     # (P, F)
+        return prep.solver.radiance(rho * e + indirect)
 
     def _images(self, prep: Prepared, L: torch.Tensor, angle: torch.Tensor, geoms):
         """Sensor images (P, G, h, w) of the radiance L (P, F) at the body angles (P,)."""
@@ -253,19 +263,29 @@ class ExactForward:
         attr = L[:, None, :].expand(P, G, -1).reshape(P * G, -1)
         attr = attr.repeat_interleave(3, dim=1)[..., None]                           # (P G, 3F, 1)
         img, _ = self.ras_cam.render(clip, prep.ff, attr)
-        cos_off, radius = self.ras_cam.pixel_geometry(float(fov.detach()))
-        n = img.shape[0]
-        val = inst.sensor(img[..., 0], cos_off.expand(n, -1, -1), radius.expand(n, -1, -1),
-                          supersample=cfg.supersample)
+        cos_off, radius = self.ras_cam.pixel_geometry(float(fov.detach()))     # (1, H, W)
+        val = inst.sensor(img[..., 0], cos_off, radius, supersample=cfg.supersample)
         return val.reshape(P, G, *val.shape[-2:])
 
-    def _images_chunk(self, prep: Prepared, phases: torch.Tensor, psi0, geoms) -> torch.Tensor:
-        """Sensor images (P_chunk, G, h, w) of a block of phases, before the pedestals."""
+    def _radiance_chunk(self, prep: Prepared, phases: torch.Tensor, psi0):
+        """The body angles (P_chunk,) and the radiance of every face (P_chunk, F) for a block
+        of phases: the sun view and the interreflection, which every camera then shares."""
         inst, cfg = self.inst, self.cfg
         angle = -(phases + psi0)                       # lab -> body frame, see conventions.to_body
         sd = rotate_z(source_dirs(inst.delta, cfg.n_source), angle).reshape(-1, 3)   # (P K, 3)
         cov = LitCoverage.apply(prep.fv, prep.ff, sd, prep.extent, prep.extent, self.ras_sun)
-        return self._images(prep, self._radiance(prep, cov, cfg.n_source), angle, geoms)
+        return angle, self._radiance(prep, cov, cfg.n_source)
+
+    def _geom_blocks(self, geoms):
+        """(start, geometries) of each block of at most geom_chunk geometries."""
+        g = self.cfg.geom_chunk
+        return [(i, geoms[i:i + g]) for i in range(0, len(geoms), g)]
+
+    def _images_chunk(self, prep: Prepared, phases: torch.Tensor, psi0, geoms) -> torch.Tensor:
+        """Sensor images (P_chunk, G, h, w) of a block of phases, before the pedestals,
+        rendered one geometry block at a time."""
+        angle, L = self._radiance_chunk(prep, phases, psi0)
+        return torch.cat([self._images(prep, L, angle, gb) for _, gb in self._geom_blocks(geoms)], 1)
 
     def _count(self, val: torch.Tensor, geoms, tau_b: torch.Tensor) -> torch.Tensor:
         """The count curve (G, P_chunk) of the images `val`: pixels above tau_b (G,) after the
@@ -347,8 +367,8 @@ class ExactForward:
         every phase at once, such as the adjoint of the mean normalisation; the curves are
         then computed once without gradient first. Returns (curves, grad_verts,
         [grad_param, ...]); a gradient is None for an input that does not require grad. Runs
-        in phase chunks, so the memory is that of one chunk. Raises RadiosityError when the
-        mesh cannot be used."""
+        in blocks of phases and geometries, so the memory is that of one block. Raises
+        RadiosityError when the mesh cannot be used."""
         geoms = self._geoms(geoms)
         params = list(params or [])
         wrt = ([verts] if verts.requires_grad else []) + params
@@ -363,16 +383,22 @@ class ExactForward:
             grads = [torch.zeros_like(t) for t in wrt]
             out = []
             for i, phases in self._phase_chunks():
-                raw = self._chunk(prep, phases, psi0, geoms, tau_b)
-                if wrt:
-                    # retain_graph: the part of the graph before the chunk (the mesh, the
-                    # form-factor solve) is shared by every chunk
-                    g = torch.autograd.grad(raw, wrt, grad_outputs=cot[..., i:i + raw.shape[-1]],
-                                            allow_unused=True, retain_graph=True)
-                    for acc, gi in zip(grads, g):
-                        if gi is not None:
-                            acc += gi
-                out.append(raw.detach())
+                angle, L = self._radiance_chunk(prep, phases, psi0)
+                parts = []
+                for j, gb in self._geom_blocks(geoms):
+                    # one geometry block at a time, so the memory of the camera renders and the
+                    # sensor is that of one block; retain_graph keeps the part of the graph
+                    # the blocks share (the mesh, the sun view, the interreflection)
+                    raw = self._reduce(self._images(prep, L, angle, gb), gb, tau_b[j:j + len(gb)])
+                    if wrt:
+                        g = torch.autograd.grad(raw, wrt,
+                                                grad_outputs=cot[j:j + len(gb), :, i:i + raw.shape[-1]],
+                                                allow_unused=True, retain_graph=True)
+                        for acc, gi in zip(grads, g):
+                            if gi is not None:
+                                acc += gi
+                    parts.append(raw.detach())
+                out.append(torch.cat(parts, 0))
         curves = torch.cat(out, -1)
         grad_v = grads[0] if verts.requires_grad else None
         grad_p = grads[1:] if verts.requires_grad else grads

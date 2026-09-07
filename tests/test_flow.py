@@ -104,7 +104,7 @@ def test_branching_copies_the_trained_expert_and_shares_the_reader():
     assert net.expert_of(t).tolist() == [0, 1, 2, 3]
     assert len(net.experts) == 4 and len(list(net.reader.parameters())) > 0
     after = net.velocity(code, t, torch.ones(B), tag, inp)
-    assert torch.allclose(before, after, atol=1e-6)
+    assert torch.allclose(before, after, atol=1e-5)      # float32 rounding, summed differently
 
 
 def test_a_fresh_data_part_adds_nothing_to_the_prior():
@@ -172,3 +172,25 @@ def test_from_state_dict_restores_the_expert_count_and_edges():
     again = LPDFlow.from_state_dict(net.state_dict())
     assert len(again.experts) == 3 and torch.allclose(again.edges, torch.tensor([0.5, 0.9]))
     assert again.expert_of(torch.tensor([0.2, 0.6, 0.95])).tolist() == [0, 1, 2]
+
+
+def test_the_summary_is_a_response_to_the_curves():
+    """The dual carries mode embeddings, geometry tags and its own biases, so its raw output
+    contains a large part no residual influences. The summary the primal reads has to be what
+    the curves changed, or the data arrives as a small perturbation on a constant."""
+    from hac26.solvers.lpd_flow import N_FEAT, N_MODES
+    net = _codec().eval()
+    C = len(cameras())
+    K = 32
+    tag = geometry_tags().expand(K, -1, -1)
+    mask = torch.ones(K, C)
+    gen = torch.Generator().manual_seed(3)
+    for scale in (1.0, 0.05):
+        with torch.no_grad():
+            s = net.reader(scale * torch.randn(K, C, N_MODES, N_FEAT, generator=gen), tag, mask)
+        common, varying = float(s.mean(0).norm()), float(s.std(0).norm())
+        assert common < 2.0 * varying, (scale, common, varying)
+    # no curves at all leaves nothing to summarise
+    with torch.no_grad():
+        empty = net.reader(torch.zeros(K, C, N_MODES, N_FEAT), tag, mask)
+    assert float(empty.abs().max()) == 0.0
