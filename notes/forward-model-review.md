@@ -15,14 +15,17 @@ on the released data (`HAC_data_May_8`). Reproduction notes are at the end.
 |---|---|---|
 | 1 | the pair difference is not the noise | **fixed** -- `noise.sigma_from_highfreq` |
 | 2 | the calibration is bounded by its step budget | **fixed** -- early stop, movement report |
-| 3 | no BRDF freedom, and the data asks for one | **open** -- the evidence stands, the mechanism I proposed does not; see the note added below |
+| 3 | no BRDF freedom, and the data asks for one | **retracted** -- the evidence was an artefact of the pre-update Blender curves; see below |
 | 4 | the xy centroid recentring | **fixed** -- `rescale_touch_z(..., centre_xy=False)` |
 | 5 | the field of view is tied to the body | **open, and smaller than first stated** -- see the correction below |
+| 6 | the data snapshot is stale for model 1 | **fixed** -- manifest refreshed, `scripts/check_data.py`, per-azimuth alignment report |
 
-Findings 1, 2 and 4 are commits on this branch, each with tests. Nothing here has been rerun
-through `calibrate.py`: that needs nvdiffrast and a GPU, and 1, 2 and 4 all change what the
-calibration means, so `models/instrument_calibration.pt` is stale and everything downstream
-of it should be regarded as provisional until it is refitted.
+Findings 1, 2, 4 and 6 are commits on this branch, each with tests. Nothing here has been
+rerun through `calibrate.py`: that needs nvdiffrast and a GPU, and every one of those four
+changes what the calibration means, so `models/instrument_calibration.pt` is stale and
+everything downstream of it should be regarded as provisional until it is refitted. Refresh
+model 1's data first (§6) -- refitting against the superseded curves would bake the same
+misalignment in again.
 
 ---
 
@@ -165,92 +168,54 @@ truncated fit. The movement table goes into `instrument_calibration.json` as wel
 Worth watching ρ specifically on the refit: `Instrument.__init__` argues at length for
 starting at 0.20, and the data was pulling hard in the opposite direction when the run ended.
 
-## 3. There is no BRDF freedom, and the data asks for some
+## 3. ~~There is no BRDF freedom, and the data asks for some~~ — retracted
 
-Regressing each real intensity curve on the corresponding Blender curve (both
-mean-normalised, phase-aligned by circular cross-correlation), the amplitude ratio
-`k = amplitude(real)/amplitude(blender)` falls monotonically with solar phase angle.
-Model 3, grouped by α (recall α = arccos(cos ε cos az), so az 135 and az 225 are both
-α = 135°):
-
-```
-α =   0°   (az 0)          k ≈ 1.17
-α =  45°   (az 45, 315)    k ≈ 1.03
-α =  90°   (az 90, 270)    k ≈ 0.88
-α = 135°   (az 135, 225)   k ≈ 0.70
-```
-
-Real curves are 30% flatter than a Lambertian render at the largest phase angle. Two
-mechanisms could do that — a rough-surface BRDF (Oren–Nayar-like), or interreflection
-filling the shadows — and the chain currently has neither available:
-
-- Scattering is pure Lambert. The OETF is a monotone map on *pixel values*, applied
-  identically to every frame, so it cannot produce a phase-angle-dependent amplitude change.
-- Interreflection can, through ρ — but ρ is railed against the optimiser budget (§2).
-
-The calibration report agrees about where the problem is. Model 3 intensity `per_s`
-(residual over `sqrt(σ² + η²)`, so *already* generously scaled per §1):
+**This finding does not survive the data update, and the section below is kept only so the
+retraction is legible.** The evidence was measured against the *pre-update* Blender curves.
+The organisers re-rendered them, and against the re-rendered ones the trend largely
+disappears:
 
 ```
-az    0:  1.22  1.25  0.63  0.66
-az   45:  1.20  1.16  0.46  0.47
-az   90:  0.31  0.39  3.02  1.14
-az  135:  3.15  3.11  3.58  2.59      ← α = 135°
-az  225:  2.63  2.82  3.26  2.13      ← α = 135°
-az  270:  1.49  0.36  0.56  0.42
-az  315:  0.43  0.32  0.29  0.41
+real/Blender intensity amplitude ratio     α=0    α=45   α=90   α=135
+OLD Blender (what I first quoted), model 3   1.174  1.037  0.906  0.690
+NEW Blender (re-rendered),         model 3   1.181  1.031  1.007  0.845
+NEW Blender (re-rendered),         model 1   1.323  1.164  1.125  1.160
 ```
 
-A residual larger than the curve's own spread means those columns currently carry no usable
-information. They are exactly the ones §1 also down-weights by up to 20×, so the two
-findings compound: the geometries the model fits worst are the ones the likelihood has been
-told to care about least.
+Model 1 shows no decline at all now; model 3's runs 1.18 → 0.85 rather than 1.17 → 0.70, and
+the two bodies disagree in direction. "The real curves are flatter than a Lambertian render
+by a factor that falls with the phase angle" was substantially a property of the old render,
+not of the surface. Using a simulation with its own camera and tone mapping as the stand-in
+for a Lambertian reference was the mistake.
 
-Worth noting in passing that `forward/convex_egi.kernel` uses Lommel-Seeliger + Lambert
-while the exact chain uses pure Lambert, so the repository's two forward models disagree
-about the scattering law. That is defensible while the convex stage only supplies a starting
-support, but it means the convex stage cannot be used as a check on the exact one.
+The second forward model, run against both targets on the current data, says the same thing
+from the other side: its amplitude ratio against the *re-rendered Blender* curves is flat at
+0.91–0.97 across phase angle, and against the *real* curves it is 0.96 overall and 1.01 at
+α = 135 on model 3. A plain Lambertian model with a distant camera and a gamma reproduces the
+real amplitudes. There is no amplitude evidence for a BRDF term.
 
-**Open. The evidence above stands; the mechanism I first proposed does not.** The obvious
-candidate is a surface roughness — an Oren–Nayar term on the direct light, zero being exactly
-Lambert. I implemented it (per-face emission directions, the factor applied to the direct
-term only, with the interreflected term left Lambertian) and measured what it does, and it
-does not do this:
+I did implement the Oren–Nayar term before retracting the finding, and it is worth recording
+what it does, since it is the obvious thing for the next person to reach for:
 
 ```
                         amplitude ratio vs a Lambert render, by phase angle
-target from the data      α=0: 1.17   α=45: 1.03   α=90: 0.88   α=135: 0.70
 Oren–Nayar, σ = 10°       α=0: 0.94   α=45: 0.98   α=90: 1.00   α=135: 1.00
 Oren–Nayar, σ = 20°       α=0: 0.86   α=45: 0.96   α=90: 1.00   α=135: 1.00
 Oren–Nayar, σ = 30°       α=0: 0.80   α=45: 0.94   α=90: 1.00   α=135: 1.00
 ```
 
-It bites hardest at α = 0, where the data wants *more* amplitude, and does nothing at all at
-α = 135, where the data wants a third less. Wrong sign at one end and no effect at the other.
-An additive ambient floor — the lab is not a black void, and there is a beam splitter in the
-path at az 0 — moves things the same negligible amount on the same test.
+It bites at α = 0 and does nothing at α = 135. Two implementation notes if anyone tries
+again: the qualitative Oren–Nayar model diverges as both the incidence and emission angles go
+to grazing, reaching a factor of ~3600 on a sphere at 20° of roughness, which saturates the
+sensor and destroys the curve rather than shaping it — it needs a floor on
+`max(n·s, n·v)`, around 0.25. And the α = 135 curve of the *default* instrument sits on
+`tau_i` and collapses to identically zero, so any probe there needs a brighter surface and a
+lower threshold or it measures nothing.
 
-Two caveats on that negative result, which is why this is open rather than closed:
-
-- The test body is a convex ellipsoid, because that is what the pure-torch rasteriser can
-  render here in reasonable time. A convex body's high-phase-angle amplitude comes from the
-  shape of its terminator, and both mechanisms are weak there. The trend was *measured* on
-  model 3, which is strongly non-convex. The probe may simply be insensitive rather than the
-  mechanism wrong.
-- The qualitative Oren–Nayar model diverges as both the incidence and emission angles go to
-  grazing, and unbounded it reaches a factor of ~3600 on a sphere at 20° of roughness, which
-  saturates the sensor and destroys the curve instead of shaping it. Any implementation needs
-  a floor on `max(n·s, n·v)`; 0.25 is a reasonable one.
-
-So the branch does **not** add a BRDF parameter. Adding a fitted physical parameter to the
-calibration on the strength of a hypothesis whose one usable test contradicts it is the same
-mistake as §2 in a different costume — it would give the fit a new direction to absorb misfit
-along, with no evidence it is the right one. The right next step is to repeat the measurement
-above on a non-convex body with nvdiffrast, where the render is cheap, before deciding.
-
-The other thing to try first is simply lifting §2 and seeing how far ρ goes on its own:
-interreflection fills shadows, which is the right kind of effect, and ρ was still climbing
-when the old run ended.
+**What is left.** Both forward models leave a residual of roughly 5–10σ on the high
+phase-angle real columns — this model at RMSE 0.051 against a measured noise near 0.005 on
+asteroid 3, hac26 at `per_sigma` 6–9 on the same columns. That misfit is real and unexplained.
+It is no longer evidence for a scattering term, and §6 accounts for part of it on model 1.
 
 ## 4. Recentring xy on the solid centroid is wrong and unnecessary
 
@@ -319,7 +284,50 @@ by the same number of pixels, whatever its shape — so this is a trade, not a d
 **Open, low priority.** If it is worth doing, make the field of view a fitted instrument
 parameter and let the frame fill follow, rather than deriving it from each body's extent.
 
-## 6. Smaller things
+## 6. The pinned data snapshot is stale for model 1
+
+`dataset/MANIFEST.sha256` pinned a mixed snapshot. Checked entry by entry against a current
+download, 189 of its 198 entries were already right. The exceptions:
+
+```
+model 1  intensity, binary and both _blender     pinned to the PRE-update files
+4 × *.stale29jul                                 renamed local backups, in no download
+Readme.txt                                       matches neither the May nor the current file
+```
+
+The `.stale29jul` names say what happened: models 2 and 3 were refreshed by hand after the
+organisers re-rendered the Blender curves on 29 July 2026, and model 1 was missed — its
+curves changed later, in the 17/25 August update.
+
+That update realigned model 1's real curves by **a different whole-frame shift per azimuth**,
+identical across all four columns of a group, the shifted curves matching the old ones at
+`corr = 1.0000`:
+
+```
+azimuth      0     45     90    135    225    270    315
+shift      -12      0     +3     +3     -4     -2      0     frames of 841
+```
+
+`calibrate.py` fits one ψ₀ per body, so no value of it absorbs a shift that is −12 at az 0,
++3 at az 90/135 and 0 at az 45/315. What is left lands in the residual table as forward-model
+error, and it costs most where the curves move fastest — the high phase angles. Model 1's
+intensity `per_s` is 0.83–1.22 at az 135/225 against 0.15–0.26 at az 45 and 315, which are
+the two azimuths that were never shifted. That is a data-staleness artefact, not a model one,
+and it is part of what §3 was reading as physics.
+
+**Fixed.** The four model-1 entries are refreshed and the four `.stale29jul` entries dropped
+(`Readme.txt` is left alone — there is no copy in the repo to say which version is right).
+`scripts/check_data.py` does the check the README always told people to do and nothing did,
+with `--write` to regenerate after a refresh you meant to make. And `calibrate.py` now reports
+the shift each azimuth still wants at the fitted ψ₀ — reported, not fitted, since seven more
+free parameters per body would explain away real misfit just as readily. Validated against
+this known realignment: at 96 phases it recovers +5.16° where the true shift is 5.14°, and
+exact zeros on the two untouched azimuths.
+
+Groups that all want the same shift mean ψ₀ is off; groups that disagree mean the curves are
+not aligned with each other, and the fix is a fresh download rather than a wider fit.
+
+## 7. Smaller things
 
 - `data_io.resample_curves` decimates 841 → 48 (calibration) and 841 → 96 (reconstruction)
   with plain `np.interp` and no anti-aliasing. Features narrower than ~9 frames alias.
@@ -384,7 +392,12 @@ package.
   centroid shift, compare `max|xy|` against `conventions.CYLINDER_R`.
 - Otsu robustness: synthetic limb-darkened discs through `raster.otsu_threshold` at varying
   fill fraction, background level and background noise.
-- §3: render an ellipsoid hull at geometries 0, 4, 8, 12 (α = 0, 45, 90, 135) with
+- §3: the amplitude ratios come from resampling both curve files to 360 frames,
+  mean-normalising, aligning each column by circular cross-correlation and taking the
+  least-squares slope of one against the other. Use the **current** download: the same
+  measurement on the pre-update Blender curves is what produced the retracted trend.
+  For the Oren–Nayar probe, render an ellipsoid hull at geometries 0, 4, 8, 12
+  (α = 0, 45, 90, 135) with
   `Instrument(rho=0.85, tau_i=1e-4, quantise=False)` and the saturation pushed well clear, so
   no geometry sits on the intensity threshold; take the peak-to-peak of each mean-normalised
   intensity curve and divide by the same at zero roughness. Check the raw minima are non-zero
