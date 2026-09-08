@@ -42,6 +42,9 @@ def _entry(i: int, path: Path, b, skipped: bool, seconds: float | None = None) -
          "convexity": float(b.info["convexity"]),
          "radius": float(b.info["cylinder_radius"]),
          "n_faces": int(len(b.faces)), "skipped": skipped}
+    if "band" in b.info:
+        e["band"] = int(b.info["band"])
+        e["band_hit"] = bool(b.info.get("band_hit", False))
     if seconds is not None:
         e["seconds"] = seconds
     return e
@@ -171,6 +174,20 @@ def write_report(out_dir: str, entries: list, spec: LibrarySpec, sample_n: int =
     ]
     for k, v in sorted(bases.items(), key=lambda kv: -kv[1]):
         lines.append(f"- {k}: {v}")
+    if spec.convexity_shares:
+        edges = (-np.inf,) + tuple(spec.convexity_bins) + (np.inf,)
+        shares = np.asarray(spec.convexity_shares, dtype=float)
+        lines += ["", "Convexity-band targets and realised counts:", "",
+                  "| band | target | dealt | hit | actual in band |",
+                  "|---|---:|---:|---:|---:|"]
+        for i, (lo, hi) in enumerate(zip(edges[:-1], edges[1:])):
+            name = (f"<{hi:g}" if not np.isfinite(lo) else
+                    f">={lo:g}" if not np.isfinite(hi) else f"{lo:g}-{hi:g}")
+            dealt = [e for e in entries if e.get("band") == i]
+            hit = sum(bool(e.get("band_hit", False)) for e in dealt)
+            actual = int(((conv >= lo) & (conv < hi)).sum())
+            lines.append(f"| {name} | {shares[i] / shares.sum():.2f} | "
+                         f"{len(dealt)} | {hit} | {actual} |")
     text = "\n".join(lines) + "\n"
     with open(Path(out_dir) / "report.md", "w") as fh:
         fh.write(text)

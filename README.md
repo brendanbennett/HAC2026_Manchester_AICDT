@@ -182,17 +182,20 @@ PYTHONPATH=. python hac26/scoring/side_view.py --models 1 2 3 --recon-dir result
 ```
 
 The answer to a model is picked among the draws and their consensus bodies by expected
-score against the draws. Whether that rule beats the alternatives (the best-fitting draw,
-the medoid, a fixed consensus level) can only be measured on bodies whose truth is known,
-which the held-out corpus bodies are; the pipeline's `decision` stage does that and writes
-`runs/decision_check.json`:
+score against the draws, after rejecting candidates with non-finite misfit, open surfaces or
+bad volume. Whether that rule beats the alternatives (the best-fitting draw, the medoid, a
+fixed consensus level) can only be measured on bodies whose truth is known, which the
+held-out corpus bodies are; the pipeline's `decision` stage does that and writes
+`runs/decision_check.json`, including the best guidance weight and the gain over the convex
+start in each carving bin:
 
 ```
 python scripts/decision_check.py --bodies 16 --val-bodies 16
 ```
 
-Check that the flow is using the lightcurves rather than memorising the corpus, by
-rerunning its own validation with the prior's velocity alone beside the full one:
+Check that the flow is using the lightcurves rather than memorising the corpus. This reruns
+the flow loss on held-out bodies with real curves, shuffled curves and masked curves, and
+prints the data-branch margin by time and carving bin:
 
 ```
 python scripts/ablate_flow.py

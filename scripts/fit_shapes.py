@@ -72,6 +72,7 @@ POINTS_PER_SITE = 12   # fewest sample points per amplitude the fit will accept.
                        # this floor is set by the bodies that matter. See main.
 DICE_FLOOR = 0.75      # median fitted Dice below which the corpus is refused; see
                        # report_corpus
+FIT_CONVEXITY_BINS = (0.55, 0.7, 0.85, 0.95)
 
 
 def sample_arrays(verts, faces, n_pts=6000, seed=0):
@@ -211,7 +212,16 @@ def fitted_dice(bodies, shape_list, families, n_sample: int, seed: int = 0) -> n
     return out
 
 
-def report_corpus(bodies, data, codes, before, after, fit_dice=None) -> bool:
+def _bin_name(lo: float, hi: float) -> str:
+    if not np.isfinite(lo):
+        return f"<{hi:g}"
+    if not np.isfinite(hi):
+        return f">={lo:g}"
+    return f"{lo:g}-{hi:g}"
+
+
+def report_corpus(bodies, data, codes, before, after, fit_dice=None,
+                  convexity: np.ndarray | None = None) -> bool:
     """Report on the finished corpus. Returns True if it looks usable.
 
     Called after the corpus is written, never before: a fit that took hours must be flagged,
@@ -252,6 +262,30 @@ def report_corpus(bodies, data, codes, before, after, fit_dice=None) -> bool:
                        f"median Dice {float(np.median(d)):.3f} over {len(d)} sampled bodies, "
                        f"against a floor of {DICE_FLOOR}. The usual cause is too few sample "
                        f"points for how deeply carved the library is; raise --points.")
+        if convexity is not None:
+            conv = np.asarray(convexity, dtype=float)
+            raw_dice = np.asarray(fit_dice, dtype=float)
+            edges = (-np.inf,) + tuple(FIT_CONVEXITY_BINS) + (np.inf,)
+            print("  [dice] fitted Dice by source convexity bin:", flush=True)
+            for lo, hi in zip(edges[:-1], edges[1:]):
+                in_bin = (conv >= lo) & (conv < hi)
+                sampled = in_bin & np.isfinite(raw_dice)
+                if not in_bin.any():
+                    continue
+                if sampled.any():
+                    med = float(np.median(raw_dice[sampled]))
+                    mn = float(np.min(raw_dice[sampled]))
+                    print(f"    {_bin_name(lo, hi):<9} bodies {int(in_bin.sum()):>5}  "
+                          f"sampled {int(sampled.sum()):>3}  median {med:.3f}  min {mn:.3f}",
+                          flush=True)
+                    if hi <= 0.85 and int(sampled.sum()) >= 3 and med < DICE_FLOOR:
+                        bad.append(f"nonconvex fitted bodies in convexity bin "
+                                   f"{_bin_name(lo, hi)} have median Dice {med:.3f}, "
+                                   f"below {DICE_FLOOR}; raise --points or simplify the "
+                                   f"library before training the flow.")
+                else:
+                    print(f"    {_bin_name(lo, hi):<9} bodies {int(in_bin.sum()):>5}  "
+                          f"sampled   0  WARNING no fitted-Dice coverage", flush=True)
     for b_ in bad:
         print(f"  ERROR: {b_}", flush=True)
     return not bad
@@ -298,6 +332,7 @@ def main():
     loaded = load_library_dir(a.shapes_dir, n=a.bodies, seed=a.seed, with_entries=True)
     shape_list = [(v, f) for v, f, _ in loaded]
     families = [str(e.get("base", "unknown")) for _, _, e in loaded]
+    convexity = np.array([float(e.get("convexity", np.nan)) for _, _, e in loaded])
     # the width over half-height each body was mounted with; a library written before that
     # was recorded carries none, and build_corpus.py then draws a radius instead
     radii = np.array([float(e.get("radius", np.nan)) for _, _, e in loaded])
@@ -406,10 +441,12 @@ def main():
     fit_d = (fitted_dice(bodies, shape_list, families, a.dice_bodies, seed=a.seed)
              if a.dice_bodies > 0 else np.full(len(bodies), np.nan))
     np.savez(a.out, codes=codes, support=sup, fit_dice=fit_d, family=np.array(families),
-             radius=radii, meta=json.dumps(meta, sort_keys=True))
+             convexity=convexity.astype(np.float32), radius=radii,
+             meta=json.dumps(meta, sort_keys=True))
     print(f"  codes {codes.shape}, amplitude variance {codes[:, N_DIR:].var(0).mean():.5f}")
     print(f"  wrote {a.out}")
-    if not report_corpus(bodies, data, codes, before, after, fit_dice=fit_d):
+    if not report_corpus(bodies, data, codes, before, after, fit_dice=fit_d,
+                         convexity=convexity):
         raise SystemExit("fit_shapes: the corpus above is degenerate. It was written so the "
                          "fit is not lost, but do not train on it.")
 
