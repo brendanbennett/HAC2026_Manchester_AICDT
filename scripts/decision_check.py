@@ -46,10 +46,12 @@ from hac26.solvers.lpd_flow import CHURN, N_MODES, N_STEPS, LPDFlow, geometry_ta
 from hac26.solvers.operator import CodeOperator                            # noqa: E402
 from hac26.solvers.output import metric_medoid                             # noqa: E402
 from reconstruct_lpd import (CONSENSUS_LEVELS, OCC_RES, consensus_bodies, decode,   # noqa: E402
-                             dice_optimal_level, make_resid_fn, mesh_misfit_by_geom, polish)
+                             candidate_diagnostic, dice_optimal_level, make_resid_fn,
+                             mesh_misfit_by_geom, polish)
 from train_lpd import (CALIBRATION, CORPUS, RENDER, _enable_tf32, cond_channels,   # noqa: E402
-                       file_digest, held_out, load_corpus, load_instrument,
-                       model_error_scale, noise_sigma, site_field, smooth_noise_like)
+                       check_flow_metadata, file_digest, held_out, load_corpus,
+                       load_flow_file, load_instrument, model_error_scale, noise_sigma,
+                       site_field, smooth_noise_like)
 
 RULES = (("vote", "best_fit", "medoid", "oracle", "consensus_opt")
          + tuple(f"consensus_{lv:g}" for lv in CONSENSUS_LEVELS))
@@ -71,6 +73,14 @@ def spread_over(values: np.ndarray, k: int) -> np.ndarray:
     if k >= len(order):
         return order
     return order[np.round(np.linspace(0, len(order) - 1, k)).astype(int)]
+
+
+def carve_bin(x: float) -> str:
+    if x < 0.05:
+        return "low"
+    if x < 0.15:
+        return "medium"
+    return "high"
 
 
 def main():
@@ -111,7 +121,14 @@ def main():
     op = CodeOperator(inst, psi_grid(phases), res=op_res, config=RENDER, device=dev)
     # the network runs on the CPU and the operator on the GPU, as reconstruct_lpd.py runs
     # them: the corpus tensors and the sampler's state stay on one device throughout
-    net = LPDFlow.from_state_dict(torch.load(a.ckpt, map_location="cpu", weights_only=True))
+    sd, flow_meta = load_flow_file(a.ckpt, map_location="cpu")
+    if "checkpoint_step" in flow_meta:
+        print(f"  {a.ckpt} is a training checkpoint at step {flow_meta['checkpoint_step']}, "
+              f"using {'best' if flow_meta.get('loaded_best_state') else 'current'} weights "
+              f"from step {flow_meta['loaded_step']}", flush=True)
+    check_flow_metadata(flow_meta, corpus=a.corpus, calibration=a.calibration,
+                        phases=phases, operator_res=op_res, context=a.ckpt)
+    net = LPDFlow.from_state_dict(sd)
     net.eval()
     C = len(cameras())
     tag, mask = geometry_tags(), torch.ones(1, C)
@@ -149,6 +166,9 @@ def main():
             continue
         tv = fit_to_cylinder(apply_constraints(truth[0].cpu().numpy(), 1.0), R)
         tf = truth[1].cpu().numpy()
+        zero_code = torch.zeros_like(data.codes[b])
+        cv, cf, _ = decode(op, zero_code, support, res=a.res)
+        convex_mesh = None if cv is None else (fit_to_cylinder(cv, R), cf)
 
         for w in a.guidance:
             t0 = time.time()
@@ -181,12 +201,37 @@ def main():
             extra = consensus_bodies(occs, ext, R, levels=CONSENSUS_LEVELS + (opt,))
             levels = [lv for lv, _, _ in extra]
             candidates = meshes + [(mv, mf) for _, mv, mf in extra]
+            sources = ([{"kind": "draw", "label": f"draw {i}", "draw": int(i)}
+                        for i in range(n_draws)]
+                       + [{"kind": "consensus", "label": f"consensus at level {lv:g}",
+                           "level": float(lv)} for lv, _, _ in extra])
             occs = occs + [mesh_occupancy(mv, mf, OCC_RES, ext) for _, mv, mf in extra]
-            outlines = [surface_points(v, f, n=a.side_points, seed=a.seed + 1 + i)
-                        for i, (v, f) in enumerate(candidates)]
-            vote = metric_medoid(occs, outlines, n_ref=n_draws)
-            medoid = metric_medoid(occs[:n_draws], n_ref=n_draws)
-            best_fit = int(np.argmin(chis))
+            candidate_fits = list(chis)
+            for _, mv, mf in extra:
+                candidate_fits.append(float(mesh_misfit_by_geom(op, mv / np.array([R, R, 1.0]),
+                                                                mf, R, curves, scale)
+                                            .pow(2).mean().sqrt()))
+            candidate_diagnostics = [
+                candidate_diagnostic(src["kind"], src["label"], candidates[i][0],
+                                     candidates[i][1], candidate_fits[i])
+                for i, src in enumerate(sources)
+            ]
+            eligible = [i for i, row in enumerate(candidate_diagnostics) if row["eligible"]]
+            eligible_draws = [i for i in eligible if i < n_draws]
+            if not eligible_draws:
+                print(f"  body {int(data.index[b])}: no valid draw candidate at guidance {w}, "
+                      f"skipped", flush=True)
+                continue
+            eligible_set = set(eligible)
+            eligible_occs = [occs[i] for i in eligible]
+            eligible_candidates = [candidates[i] for i in eligible]
+            eligible_outlines = [surface_points(v, f, n=a.side_points, seed=a.seed + 1 + i)
+                                 for i, (v, f) in enumerate(eligible_candidates)]
+            vote = eligible[metric_medoid(eligible_occs, eligible_outlines,
+                                          n_ref=len(eligible_draws))]
+            medoid_draw_occs = [occs[i] for i in eligible_draws]
+            medoid = eligible_draws[metric_medoid(medoid_draw_occs, n_ref=len(eligible_draws))]
+            best_fit = eligible_draws[int(np.argmin([candidate_fits[i] for i in eligible_draws]))]
 
             # Every candidate against the truth, with both measures. The grid here is fixed
             # at 128 rather than following OCC_RES on purpose: the candidates are chosen on
@@ -194,24 +239,44 @@ def main():
             # would flatter whichever candidate that grid happens to suit.
             truth_occ = mesh_occupancy(tv, tf, 128, ext)
             truth_pts = surface_points(tv, tf, n=a.side_points, seed=a.seed)
+            score_outlines = {i: surface_points(candidates[i][0], candidates[i][1],
+                                                n=a.side_points, seed=a.seed + 101 + i)
+                              for i in eligible}
+            conv_pts = (surface_points(convex_mesh[0], convex_mesh[1], n=a.side_points,
+                                       seed=a.seed + 999)
+                        if convex_mesh is not None else None)
             # the outlines need their own extent: the occupancy extent above is the half-width of
             # a cube, which is not wide enough for a projection (see side_view.outline_extent)
-            oext = outline_extent(outlines + [truth_pts])
+            oext = outline_extent(list(score_outlines.values()) + [truth_pts]
+                                  + ([] if conv_pts is None else [conv_pts]))
             truth_out = outline_set(truth_pts, oext)
-            scores = []
-            for (v, f), pts in zip(candidates, outlines):
+            scores = [(None, None)] * len(candidates)
+            for i, pts in score_outlines.items():
+                v, f = candidates[i]
                 d = dice(mesh_occupancy(v, f, 128, ext), truth_occ)
                 s = measure_outlines(outline_set(pts, oext), truth_out)["assd_mean"]
-                scores.append((d, s))
+                scores[i] = (d, s)
+            convex_score = None
+            if convex_mesh is not None and conv_pts is not None:
+                conv_d = dice(mesh_occupancy(convex_mesh[0], convex_mesh[1], 128, ext),
+                              truth_occ)
+                conv_s = measure_outlines(outline_set(conv_pts, oext), truth_out)["assd_mean"]
+                convex_score = {"dice": float(conv_d), "side_assd": float(conv_s)}
             picks = {"vote": vote, "best_fit": best_fit, "medoid": medoid,
-                     "oracle": int(np.argmax([d for d, _ in scores]))}
+                     "oracle": max(eligible, key=lambda i: scores[i][0])}
             for lv in CONSENSUS_LEVELS:            # a level with no closed surface has no candidate
-                picks[f"consensus_{lv:g}"] = n_draws + levels.index(lv) if lv in levels else None
-            picks["consensus_opt"] = n_draws + levels.index(opt) if opt in levels else None
+                ci = n_draws + levels.index(lv) if lv in levels else None
+                picks[f"consensus_{lv:g}"] = ci if ci in eligible_set else None
+            ci = n_draws + levels.index(opt) if opt in levels else None
+            picks["consensus_opt"] = ci if ci in eligible_set else None
             row = {"body": int(data.index[b]), "guidance": float(w),
                    "consensus_opt_level": float(opt),
-                   "carved": float(carved[b]), "radius": R,
+                   "carved": float(carved[b]), "carve_bin": carve_bin(float(carved[b])),
+                   "radius": R,
                    "draws": n_draws, "misfit_sigma": chis, "polished_misfit_sigma": fits,
+                   "candidate_diagnostics": candidate_diagnostics,
+                   "eligible_candidates": [int(i) for i in eligible],
+                   "convex_start": convex_score,
                    "dice": {r: (None if k is None else scores[k][0]) for r, k in picks.items()},
                    "side_assd": {r: (None if k is None else scores[k][1]) for r, k in picks.items()},
                    "picked": picks, "seconds": time.time() - t0}
@@ -235,6 +300,18 @@ def main():
                                  "side_assd": mean_of(rows_, "side_assd", r),
                                  "bodies": sum(x["dice"][r] is not None for x in rows_)}
                              for r in RULES}
+        bins = {}
+        for name in ("low", "medium", "high"):
+            br = [x for x in rows_ if x["carve_bin"] == name and x.get("convex_start")]
+            if br:
+                vote_d = [x["dice"]["vote"] for x in br if x["dice"]["vote"] is not None]
+                base_d = [x["convex_start"]["dice"] for x in br]
+                bins[name] = {"bodies": len(br),
+                              "convex_dice": float(np.mean(base_d)),
+                              "vote_dice": float(np.mean(vote_d)) if vote_d else None,
+                              "dice_gain": (float(np.mean(vote_d) - np.mean(base_d))
+                                            if vote_d else None)}
+        summary[f"{w:g}"]["by_carve_bin"] = bins
     print("\n  mean over the bodies, per guidance weight:")
     for w in a.guidance:
         for r in RULES:
@@ -242,6 +319,11 @@ def main():
             if st["dice"] is not None:
                 print(f"    guidance {w:<5g} {r:<15} dice {st['dice']:.4f}   "
                       f"side-view distance {st['side_assd']:.4f}   ({st['bodies']} bodies)")
+        for name, st in summary[f"{w:g}"].get("by_carve_bin", {}).items():
+            if st["vote_dice"] is not None:
+                print(f"    guidance {w:<5g} carved {name:<6} vote dice {st['vote_dice']:.4f} "
+                      f"vs convex {st['convex_dice']:.4f}  gain {st['dice_gain']:+.4f} "
+                      f"({st['bodies']} bodies)")
         print("")
     best = max(((w, summary[f"{w:g}"]["vote"]["dice"]) for w in a.guidance
                 if summary[f"{w:g}"]["vote"]["dice"] is not None),
