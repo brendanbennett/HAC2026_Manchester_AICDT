@@ -283,6 +283,10 @@ def polish(net, op: CodeOperator, z, support, radius, data, scale, geoms, steps:
     return z, chi0, chi, it
 
 
+CONSENSUS_SHRINK_TOL = 0.015   # see consensus_bodies: below this a short radius is a
+                               # contour offset, above it the draws disagreed
+
+
 def dice_optimal_level(occs: list, extent: float, radius: float, iters: int = 3,
                        lo: float = 0.2, hi: float = 0.7) -> float:
     """The level whose body is the best single answer under the voxel measure, derived rather
@@ -315,7 +319,8 @@ def dice_optimal_level(occs: list, extent: float, radius: float, iters: int = 3,
     return t
 
 
-def consensus_bodies(occs: list, extent: float, radius: float, levels=CONSENSUS_LEVELS):
+def consensus_bodies(occs: list, extent: float, radius: float, levels=CONSENSUS_LEVELS,
+                     set_radius: bool = True):
     """Meshes of the level sets of the fraction of draws containing each voxel, for boolean
     grids `occs` on [-extent, extent]^3, posed like the draws. Returns [(level, verts,
     faces)]; a level with no closed surface is left out."""
@@ -329,14 +334,37 @@ def consensus_bodies(occs: list, extent: float, radius: float, levels=CONSENSUS_
             continue
         v, f, _, _ = measure.marching_cubes(prob, level=level, spacing=(spacing,) * 3)
         v = v - extent + spacing / 2.0                  # cell centres, not cell corners
-        # The radius is capped here rather than set, unlike the draws', which are put at the
-        # published radius exactly. A level set is a contour of a probability, not a body: it
-        # sits about half a voxel outside or inside the draws' own surface depending on the
-        # level, and scaling it to the published radius would correct that offset exactly at
-        # the widest point and over-correct everywhere nearer the axis. The offset is a
-        # distance, the correction would be a proportion, and measured on real draws the two
-        # are the same half per cent, so the cap is left as the smaller distortion.
-        out.append((float(level), restore_constraints(v, radius), np.asarray(f, dtype=np.int64)))
+        # The radius is SET here, as it is for the draws, not capped. It used to be capped, on
+        # the argument that a level set is a contour of a probability rather than a body, sits
+        # about half a voxel off the draws' own surface, and that scaling to the published
+        # radius would correct that half-voxel offset at the widest point while over-correcting
+        # nearer the axis -- the offset being a distance and the correction a proportion, both
+        # of them about half a per cent.
+        #
+        # The half-a-per-cent premise is what fails. It holds when the draws agree, and a
+        # consensus body is only ever selected when they do not: averaging eight disagreeing
+        # draws and cutting at 0.5 erodes the body by far more than half a voxel. Model 2's
+        # shipped consensus answer came out at r_xy 1.353 against a published 1.420 -- 4.7%
+        # short, ten times the offset the cap was reasoning about -- and setting the radius
+        # instead of capping it moves its official voxel score 0.8109 -> 0.8516 and its
+        # projection score 0.9711 -> 0.9846. Models 4, 7 and 10 are short by 1.0%, 1.0% and
+        # 0.5% and gain correspondingly less.
+        #
+        # The information is free and exact: the challenge publishes the minimal radius of a
+        # cylinder containing the body, so the true body's widest point touches it by
+        # construction. A reconstruction narrower than R is known to be too narrow.
+        #
+        # Both readings are right in their own regime, so the shortfall decides which applies.
+        # Within CONSENSUS_SHRINK_TOL the contour-offset argument holds and the radius is
+        # capped, as before -- the proportional correction really would do more harm than the
+        # half-voxel it repaired, and test_consensus_levels_keep_or_fill_a_dent measures that
+        # harm on a dent sitting at the widest point. Past it the body has been eroded by
+        # disagreement, not displaced by a contour, and it is set.
+        v = restore_constraints(v, radius)
+        r = float(np.hypot(v[:, 0], v[:, 1]).max())
+        if set_radius and r < radius * (1.0 - CONSENSUS_SHRINK_TOL):
+            v = fit_to_cylinder(v, radius)
+        out.append((float(level), v, np.asarray(f, dtype=np.int64)))
     return out
 
 

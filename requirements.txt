@@ -7,3 +7,6 @@ scikit-image
 rtree
 fast_simplification
 embreex
+meshio
+truststore
+spiceypy

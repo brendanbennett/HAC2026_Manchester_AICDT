@@ -3,12 +3,14 @@ import sys
 from pathlib import Path
 
 import numpy as np
+import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 
 from hac26.recon import mesh_occupancy                     # noqa: E402
 from hac26.solvers.output import metric_medoid            # noqa: E402
-from reconstruct_lpd import candidate_diagnostic, consensus_bodies              # noqa: E402
+from reconstruct_lpd import (CONSENSUS_SHRINK_TOL, candidate_diagnostic,  # noqa: E402
+                             consensus_bodies)              # noqa: E402
 
 
 def _ball(radius, n=32, extent=1.3):
@@ -64,7 +66,7 @@ def test_the_derived_level_is_the_fixed_point_of_half_the_score():
     is right for the body it produces is the fixed point of t -> D(t)/2. Checked by taking the
     level the derivation returns and confirming that the body at that level does score about
     twice it against the draws."""
-    from reconstruct_lpd import consensus_bodies, dice_optimal_level
+    from reconstruct_lpd import CONSENSUS_SHRINK_TOL, consensus_bodies, dice_optimal_level
     from hac26.recon import dice as dice_of
     n, extent = 48, 1.3
     g = (np.arange(n) + 0.5) / n * 2 * extent - extent
@@ -103,3 +105,29 @@ def test_the_consensus_grid_is_fine_enough_not_to_swamp_the_choice():
     _, v, f = made[0]
     round_trip = dice_of(mesh_occupancy(v, f, n, extent), prob >= lv)
     assert round_trip > 0.95, round_trip
+
+
+def test_disagreeing_draws_have_their_eroded_radius_restored():
+    """Draws that disagree erode the consensus body far past the half-voxel a contour offset
+    explains, and then its radius is set to the published one rather than capped.
+
+    This is the model-2 case: its shipped consensus answer came out 4.7% narrower than the
+    published radius, and setting it moved the official voxel score 0.8109 -> 0.8516. The
+    companion test above holds the other regime, where the body is not eroded and the
+    proportional correction would do more harm than good.
+    """
+    extent, n, R = 1.3, 32, 1.0
+    g = (np.arange(n) + 0.5) / n * 2 * extent - extent
+    x, y, z = np.meshgrid(g, g, g, indexing="ij")
+    r2 = x ** 2 + y ** 2 + z ** 2
+    # four draws at visibly different sizes: the 0.5 level lands well inside the largest
+    draws = [r2 < s ** 2 for s in (1.0, 0.90, 0.82, 0.78)]
+    eroded, = consensus_bodies(draws, extent, R, levels=(0.5,), set_radius=False)
+    restored, = consensus_bodies(draws, extent, R, levels=(0.5,), set_radius=True)
+
+    def r_xy(v):
+        return float(np.hypot(v[:, 0], v[:, 1]).max())
+
+    assert r_xy(eroded[1]) < R * (1.0 - CONSENSUS_SHRINK_TOL), \
+        "the draws were meant to disagree enough to erode the level set"
+    assert r_xy(restored[1]) == pytest.approx(R, rel=1e-6)
