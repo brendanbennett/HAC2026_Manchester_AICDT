@@ -24,10 +24,19 @@ from PSI0, PSI0 is wrong.
 The released meshes are decimated to TRUTH_FACES faces before rendering; the interreflection
 runs on the operator's usual patches.
 
+Adam moves a parameter by about lr per step whatever the gradient, so `--steps x --lr` is a
+hard cap on how far any of them can travel in raw (unsquashed) space. A fit that spends most
+of that cap stopped because the run ended, not because it converged, and its parameters are
+wherever the cap left them. The run therefore stops early once the likelihood plateaus, and
+prints how far every parameter travelled against its budget, naming the ones that were still
+moving. Read that table before the residuals: while it names anything, the residuals are
+those of a truncated fit.
+
 Writes the Instrument to models/instrument_calibration.pt, and the fitted psi0 per body with
-the per-geometry residual report to models/instrument_calibration.json. The residual at the
-true shape divided by the noise, per geometry, is the number that says whether the forward
-model reproduces the organisers' processing; everything downstream rests on it.
+the per-geometry residual report and the movement table to
+models/instrument_calibration.json. The residual at the true shape divided by the noise, per
+geometry, is the number that says whether the forward model reproduces the organisers'
+processing; everything downstream rests on it.
 """
 from __future__ import annotations
 
@@ -74,8 +83,8 @@ def load_data(data_dir: str, model: int, phases: int, device: str):
     The noise comes from the high-frequency content of each curve at the files' own frame
     rate, not from the difference of the two columns of a geometry: those two columns are
     separate recordings of the body in its two mountings, so their difference is dominated by
-    the A/B mismatch and runs 3-20x the actual noise (hac26.noise). That difference is
-    reported beside sigma as a diagnostic and is left for eta to absorb.
+    the A/B mismatch and runs 1-277x the actual noise, median 12x (hac26.noise). That
+    difference is reported beside sigma as a diagnostic and is left for eta to absorb.
     """
     d = load_model_curves(data_dir, model, m=phases)
     pairs = np.stack([d["curves"][:N_CAMS], d["curves"][N_CAMS:]], axis=1)
@@ -136,6 +145,41 @@ def residual_report(pred, real, present, sigma, eta) -> dict:
     return out
 
 
+def movement_report(start: dict, now: dict, budget: dict) -> dict:
+    """How far each fitted parameter travelled in its raw (unsquashed) space, against how far
+    the optimiser could have moved it.
+
+    Adam's step is about lr in magnitude whatever the gradient, so `steps * lr` is a hard cap
+    on the travel of any parameter. A parameter that spends most of that cap has not
+    converged -- it stopped because the run ended. Every quantity here is stored through a
+    squashing function, so the raw space is the one the cap applies in.
+    """
+    out = {}
+    for name, x0 in start.items():
+        moved = float((now[name] - x0).abs().max())
+        out[name] = {"moved": moved, "budget": budget[name],
+                     "fraction": moved / max(budget[name], 1e-12)}
+    return out
+
+
+def print_movement(rep: dict, limit: float = 0.5) -> list:
+    """The movement table, and the names that used more than `limit` of their budget."""
+    print("\n[budget] travel of each parameter in raw space, against steps x lr")
+    limited = [n for n, r in rep.items() if r["fraction"] > limit]
+    for name, r in sorted(rep.items(), key=lambda kv: -kv[1]["fraction"]):
+        flag = "  <-- still moving when the run ended" if r["fraction"] > limit else ""
+        print(f"    {name:<24} {r['moved']:8.3f} of {r['budget']:7.3f}  "
+              f"({100 * r['fraction']:5.1f}%){flag}")
+    if limited:
+        print(f"  !!! {len(limited)} parameter(s) used more than {100 * limit:.0f}% of the "
+              f"travel the step budget allows: {', '.join(limited)}.")
+        print("  !!! The fit is bounded by --steps, not by the data. Rerun with more steps "
+              "(or a larger --lr) until this list is empty before trusting the residuals.")
+    else:
+        print("  every parameter settled well inside its budget")
+    return limited
+
+
 def print_report(model: int, rep: dict) -> None:
     """One row per camera kind, one column per azimuth, for each curve type and each
     denominator; nothing is aggregated except the medians on the last line."""
@@ -158,8 +202,16 @@ def print_report(model: int, rep: dict) -> None:
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--phases", type=int, default=48)
-    ap.add_argument("--steps", type=int, default=150)
+    ap.add_argument("--steps", type=int, default=600,
+                    help="cap on the number of steps. Adam moves a parameter by about lr per "
+                         "step, so steps x lr is a hard cap on how far any of them can "
+                         "travel in raw space; the run reports what each one used")
     ap.add_argument("--lr", type=float, default=0.03)
+    ap.add_argument("--tol", type=float, default=1e-4,
+                    help="stop early once the mean -logL has improved by less than this over "
+                         "the last --patience steps")
+    ap.add_argument("--patience", type=int, default=60,
+                    help="window of steps the --tol improvement is measured over")
     ap.add_argument("--data-dir", default="dataset/raw")
     ap.add_argument("--out", default=OUT_INSTRUMENT)
     ap.add_argument("--report", default=OUT_REPORT)
@@ -194,7 +246,16 @@ def main():
     opt = torch.optim.Adam([{"params": fit_params + [inst.raw_eta]},
                             {"params": [b["psi0"] for b in bodies.values()], "lr": a.lr / 10}],
                            lr=a.lr)
-    print(f"[fit] {a.steps} steps over {len(bodies)} bodies at {a.phases} phases", flush=True)
+    # raw-space starting point and travel budget of everything being fitted, for the
+    # convergence report at the end
+    named = {n: p for n, p in inst.named_parameters()}
+    named.update({f"psi0[{M}]": b["psi0"] for M, b in bodies.items()})
+    start = {n: p.detach().clone() for n, p in named.items()}
+    budget = {n: a.steps * (a.lr / 10 if n.startswith("psi0") else a.lr) for n in named}
+
+    print(f"[fit] up to {a.steps} steps over {len(bodies)} bodies at {a.phases} phases "
+          f"(early stop: -logL improving by < {a.tol:g} over {a.patience} steps)", flush=True)
+    history = []
     for step in range(a.steps):
         opt.zero_grad()
         total = 0.0
@@ -212,15 +273,26 @@ def main():
             loss.backward()
             total += float(loss)
         opt.step()
+        mean_loss = total / len(bodies)
+        history.append(mean_loss)
         if step % 10 == 0 or step == a.steps - 1:
-            print(f"  step {step:>4}  -logL {total / len(bodies):.4f}  {inst.summary()}; "
+            print(f"  step {step:>4}  -logL {mean_loss:.4f}  {inst.summary()}; "
                   f"psi0 " + ", ".join(f"{np.degrees(float(b['psi0'])):+.1f}"
                                        for b in bodies.values()) + " deg", flush=True)
+        if len(history) > a.patience and min(history[:-a.patience]) - mean_loss < a.tol:
+            print(f"  stopped at step {step}: -logL improved by less than {a.tol:g} over the "
+                  f"last {a.patience} steps", flush=True)
+            break
+    steps_run = len(history)
+    budget = {n: v * steps_run / a.steps for n, v in budget.items()}
 
     print("\n[report] RMS residual at the true shape, per geometry (azimuth:value)")
     print("    /sigma  against the measurement noise alone")
     print("    /s      against sqrt(sigma^2 + eta^2), eta being the model error the fit admits")
-    report = {"psi0_deg": {}, "residual": {}, "instrument": inst.summary()}
+    moved = movement_report(start, {n: p.detach() for n, p in named.items()}, budget)
+    limited = print_movement(moved)
+    report = {"psi0_deg": {}, "residual": {}, "instrument": inst.summary(),
+              "steps_run": steps_run, "movement": moved, "budget_limited": limited}
     with torch.no_grad():
         eta = inst.eta.reshape(2, N_CAMS).T
         for M, b in bodies.items():
