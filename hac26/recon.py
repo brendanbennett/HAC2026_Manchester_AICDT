@@ -12,7 +12,6 @@ from __future__ import annotations
 
 import numpy as np
 
-from .stl_io import save_stl
 
 
 def body_from_support(normals: np.ndarray, h: np.ndarray, eps: float = 1e-3) -> tuple:
@@ -68,7 +67,10 @@ def save_submission_stl(path: str, verts: np.ndarray, faces: np.ndarray,
     if cylinder_radius is not None:
         info["cylinder_radius_prior"] = cylinder_radius
         info["inside_prior_cylinder"] = bool(info["max_axis_dist"] <= cylinder_radius + 1e-9)
-    save_stl(path, verts, faces)
+    # Through the same repair-and-check gate the flow's answers go through, so a submission
+    # file cannot be written non-watertight or inside out whichever solver produced it.
+    from .solvers.output import export_stl
+    info.update(export_stl(path, verts, faces))
     return info
 
 

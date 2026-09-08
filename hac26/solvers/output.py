@@ -199,18 +199,56 @@ def restore_constraints(verts: np.ndarray, radius: float, tol: float = 0.03) -> 
     return v
 
 
-def export_stl(path: str, verts: np.ndarray, faces: np.ndarray) -> dict:
-    """Write a watertight binary STL with outward normals; returns a report of the repairs."""
+def export_stl(path: str, verts: np.ndarray, faces: np.ndarray,
+               strict: bool = True) -> dict:
+    """Write a watertight binary STL with outward normals; returns a report of the repairs.
+
+    The degenerate faces are dropped BEFORE the vertices are welded, and that order is the
+    whole reason this function exists in its present form. A consensus body -- the level set
+    of several draws averaged together -- comes out of the extractor with a fifth to a quarter
+    of its triangles of exactly zero area, where the averaged field crosses the level along a
+    cell edge. A zero-area triangle has no consistent winding of its own, so `merge_vertices`
+    declines to weld across it and `fix_normals` cannot decide which way it faces. The mesh
+    then stays split into thousands of pieces and its signed volume comes out negative: the
+    surface is geometrically right and topologically inside out. That is exactly what shipped
+    for models 2, 4 and 7, whose answers were consensus bodies, while every single-draw answer
+    (no degenerate faces at all) came out clean through the same code.
+
+    Dropping them first costs nothing -- a zero-area triangle contributes no surface -- and
+    turns all three back into single watertight components with positive volume and the same
+    Dice against truth, the shape having never been wrong in the first place.
+
+    With `strict`, a mesh that is still not a single watertight positive-volume body after all
+    the repairs raises rather than being written. A submission file is not the place to
+    discover this.
+    """
     import trimesh
     m = trimesh.Trimesh(np.asarray(verts), np.asarray(faces), process=True)
+    n_faces_in = int(len(m.faces))
+    m.update_faces(m.nondegenerate_faces())      # before the weld; see above
+    n_degenerate = n_faces_in - int(len(m.faces))
     m.remove_unreferenced_vertices()
     m.merge_vertices()
+    # Stray shards can survive the weld. The body is the largest piece; anything else is
+    # extraction debris, and leaving it in costs volume in the voxel measure and an outline
+    # in the side-view one.
+    pieces = m.split(only_watertight=False)
+    n_dropped = 0
+    if len(pieces) > 1:
+        keep = max(pieces, key=lambda c: len(c.faces))
+        n_dropped = len(pieces) - 1
+        m = keep
     m.fix_normals()                      # consistent winding, outward
-    report = {"watertight": bool(m.is_watertight), "volume": float(m.volume),
-              "faces": int(len(m.faces))}
     if not m.is_watertight:
         m.fill_holes()
-        report["filled_holes"] = True
-        report["watertight"] = bool(m.is_watertight)
+        m.fix_normals()
+    report = {"watertight": bool(m.is_watertight), "volume": float(m.volume),
+              "faces": int(len(m.faces)), "degenerate_faces_dropped": n_degenerate,
+              "components_dropped": n_dropped,
+              "winding_consistent": bool(m.is_winding_consistent)}
+    if strict and not (report["watertight"] and report["volume"] > 0.0):
+        raise ValueError(f"refusing to write {path}: the mesh is not a single watertight body "
+                         f"of positive volume after repair ({report}). Writing it would "
+                         f"submit a surface an evaluator may read inside out.")
     m.export(path, file_type="stl")      # trimesh writes binary STL by default
     return report
