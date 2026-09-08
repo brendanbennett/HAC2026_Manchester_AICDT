@@ -31,6 +31,29 @@ def surface_points(verts, faces, n=1_000_000, seed=0):
     return np.asarray(pts)
 
 
+def outline_extent(clouds, mode: str = "side", margin: float = 1.05) -> float:
+    """Half-width of the image plane wide enough that no projection meets the frame.
+
+    A point's image coordinates are its components along two orthonormal axes perpendicular
+    to the viewing direction. For the equatorial views one axis is z and the other lies in
+    the xy plane, so the coordinates reach the largest |z| and the largest distance from the
+    z axis; over the whole sphere of directions they reach the largest point norm. The
+    largest single Cartesian coordinate understates both, because a body's widest direction
+    need not lie along x or y, and a silhouette that meets the frame is clipped rather than
+    measured: `silhouette_contours` clamps the pixel indices, so the extreme geometry is
+    replaced by a straight edge, and it is the extreme geometry that separates candidates.
+    """
+    out = 0.0
+    for p in clouds:
+        p = np.asarray(p, float)
+        if mode == "sphere":
+            out = max(out, float(np.linalg.norm(p, axis=1).max()))
+        else:
+            out = max(out, float(np.hypot(p[:, 0], p[:, 1]).max()),
+                      float(np.abs(p[:, 2]).max()))
+    return margin * out
+
+
 def silhouette_contours(pts, e1, e2, ext, res):
     """Project the points onto the (e1, e2) image plane, fill the silhouette, and return its
     boundary curves in model units (None if the silhouette is empty)."""
@@ -132,7 +155,7 @@ def measure_outlines(oa, ob):
 
 def side_view_measure(pts_a, pts_b, n_dirs=36, res=512, mode="side"):
     """Aggregate boundary distance between two point clouds over the viewing directions."""
-    ext = 1.05 * max(np.abs(pts_a).max(), np.abs(pts_b).max())
+    ext = outline_extent([pts_a, pts_b], mode)
     return measure_outlines(outline_set(pts_a, ext, n_dirs, res, mode),
                             outline_set(pts_b, ext, n_dirs, res, mode))
 

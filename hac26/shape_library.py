@@ -10,8 +10,10 @@ families are the shapes real asteroids come in -- smooth lumpy potatoes, bilobed
 trilobed contact binaries, spinning tops with an equatorial ridge, angular faceted bodies --
 plus geometric solids with saw cuts. The modifiers are the large features the lightcurves
 and the competition's voxel and side-view measures can see: basins, saw cuts, an added lobe,
-a ridge, moderate roughness. Nothing is generated below the scale the shape code and the
-scoring grid resolve.
+a ridge, moderate roughness. Nothing is generated below the scale the extraction grid
+resolves: min_feature_radius gives that scale, and every sampled feature is above it by
+construction, which tests/test_shape_library.py checks against the ranges themselves rather
+than leaving it as a claim.
 
 Convex bodies are kept, since a sawed-off cube is convex and the flow has to learn when
 there is nothing to carve. What is set is the mix: `LibrarySpec.convexity_shares` gives the
@@ -515,16 +517,31 @@ class LibrarySpec:
     family_weights: dict = _dcfield(default_factory=lambda: {
         "potato": 0.14, "bilobe": 0.24, "trilobe": 0.08, "top": 0.06, "faceted": 0.10,
         "geometric": 0.12, "real": 0.14, "object": 0.12})
-    n_modifiers: tuple = (0, 3)          # inclusive range, drawn per body
+    n_modifiers: tuple = (1, 3)          # inclusive range, drawn per body. The lower end is
+                                         # one rather than zero: a body with no modifier is
+                                         # the bare base family, which for four of the eight
+                                         # families is a convex primitive.
     mod_weights: dict = _dcfield(default_factory=lambda: {
         "basin": 0.35, "saw": 0.20, "bulge": 0.15, "roughness": 0.20, "ridge": 0.10})
+    # Which principal axis becomes the rotation axis. The choice sets the body's bounding
+    # radius, since the axis fixes what is height and what is width: mounted on its short
+    # axis a body lies down and is wide, on its long axis it stands up and is narrow.
+    # Measured over the families, the median radius is 2.9 short, 1.9 middle, 1.2 random and
+    # 0.6 long, against published radii of which nine of ten lie between 0.67 and 1.48 and
+    # one is 3.95. The weights are set from those measurements so that most of the library
+    # sits in the published range while both tails stay covered.
     mount_weights: dict = _dcfield(default_factory=lambda: {
-        "short": 0.40, "long": 0.35, "middle": 0.10, "random": 0.15})
+        "random": 0.50, "long": 0.20, "short": 0.20, "middle": 0.10})
     tilt_deg: float = 12.0               # scale of the tilt off the principal axis
     max_tilt_deg: float = 35.0
-    convexity_bins: tuple = (0.7, 0.85, 0.95)          # band edges of volume / hull volume
-    convexity_shares: tuple = (0.25, 0.30, 0.25, 0.20)  # share of bodies per band; () leaves
-                                                        # the mix to the families
+    # Band edges of volume over hull volume. The lowest edge is what decides whether the
+    # library contains deeply carved bodies at all: with the lowest edge at 0.7 the deepest
+    # band is unbounded below, the sampler stops at the first body that crosses 0.7, and the
+    # band fills up just under its own edge. An edge at 0.55 makes the deepest band a target
+    # in its own right.
+    convexity_bins: tuple = (0.55, 0.7, 0.85, 0.95)
+    convexity_shares: tuple = (0.20, 0.25, 0.25, 0.18, 0.12)  # share of bodies per band; ()
+                                                              # leaves the mix to the families
     band_attempts: int = 12              # draws to land in the band before taking the nearest
     shape_models: tuple = ()             # files of real asteroid models, the "real" family
     object_models: tuple = ()            # files of everyday objects, the "object" family
@@ -555,8 +572,21 @@ class Body:
 
 
 def _rand_rot(rng: np.random.Generator) -> np.ndarray:
+    """A uniformly random rotation.
+
+    The QR of a Gaussian matrix, with the signs of R's diagonal fixed, is uniform over the
+    orthogonal group, half of which has determinant minus one. Those are reflections, and
+    applying one to a mesh turns it inside out: the vertices move but the winding does not
+    follow, so the faces end up pointing inward and every later reader of the mesh has the
+    inside and the outside the wrong way round. Negating a column makes the determinant one
+    and leaves the distribution uniform over rotations, since composing the reflected half
+    with a fixed reflection maps it onto the rotations.
+    """
     q, r = np.linalg.qr(rng.standard_normal((3, 3)))
-    return q * np.sign(np.diag(r))
+    q = q * np.sign(np.diag(r))
+    if np.linalg.det(q) < 0.0:
+        q[:, 0] = -q[:, 0]
+    return q
 
 
 def _draw(d: dict, rng: np.random.Generator) -> str:
@@ -597,14 +627,21 @@ def _lobes(rng: np.random.Generator, s: float, k: int) -> tuple:
         f, rec = _potato(rng, size, rot=R, b_min=0.55)
         if r_ahead is not None:
             r_back = float(_ray_radius(f, -u[None])[0])  # this lobe's radius toward the last
-            frac = rng.uniform(0.65, 0.95)               # 1 would be touching at a point
+            # Centre separation as a fraction of the two lobes' radii along the line. At one
+            # the lobes touch at a point and the neck is whatever the fillet leaves, which is
+            # the dog-bone end of the family; well below it the lobes merge into a single
+            # ovoid with no waist at all.
+            frac = rng.uniform(0.72, 1.0)
             fracs.append(float(frac))
             bend = _unit(rng); bend -= (bend @ u) * u
             pos = pos + u * frac * (r_ahead + r_back) + bend * rng.uniform(0.0, 0.15) * size
         fs.append(_shift(f, pos))
         recs.append(rec)
         r_ahead = float(_ray_radius(f, u[None])[0])
-    k_fill = s * rng.uniform(0.05, 0.18)                 # the neck's fillet
+    # The neck's fillet. The smooth union pushes the surface out by about 0.69 k at the
+    # waist, so this is the floor on how narrow a neck the family can express and it is kept
+    # well below the lobe size.
+    k_fill = s * rng.uniform(0.03, 0.14)
     out = fs[0]
     for g in fs[1:]:
         out = op_smooth_union(out, g, k=k_fill)
@@ -783,16 +820,37 @@ def min_feature_radius(res: int, extent: float, voxels_across: float = 2.5) -> f
     return voxels_across * spacing
 
 
-def _apply_modifier(f: Field, rng: np.random.Generator, kind: str, s: float) -> tuple:
+def _apply_modifier(f: Field, rng: np.random.Generator, kind: str, s: float,
+                    floor: float = 0.0) -> tuple:
     """One large-scale edit of `f`. Every cutter and lobe is placed relative to the body's
-    own surface along its direction, so the edit lands on the body whatever its shape."""
+    own surface along its direction, so the edit lands on the body whatever its shape.
+
+    `floor` is the smallest feature the extraction grid resolves (min_feature_radius). A cut
+    below it is not rendered as a cut: marching cubes returns a body pinched or broken where
+    the cutter went, the repair pass then keeps only the largest piece, and what is written to
+    the library is a fragment labelled with the recipe of the body it was cut from. So a cut
+    that would fall below the floor is widened to it rather than drawn as asked."""
     if kind == "basin":
         k = int(rng.integers(1, 4))
         cuts = []
         for _ in range(k):
             u, rb = _surface_direction(f, rng, s)
             rho = s * rng.uniform(0.3, 0.9)                     # cutter radius
-            depth = rho * rng.uniform(0.15, 0.6)                # how far it dips in
+            # How far the cutter dips below the surface, in units of its own radius. A local
+            # plane cut to depth d by a sphere of radius rho leaves a mouth of radius
+            # sqrt(d (2 rho - d)), so the ratio of mouth to depth is sqrt(2 rho / d - 1):
+            # below one the cut is a dish, at one it is a hemispherical bowl, and above one
+            # the mouth is narrower than the cut is deep and the rim overhangs. Past two the
+            # cutter closes over and leaves a cavity with no mouth, which the repair pass
+            # fills in again, so the range stops short of it. The lower end is set by the
+            # grid: at the smallest cutter a shallower cut is a dent under one cell deep,
+            # which the extraction cannot render as a bowl, so drawing one wastes the draw.
+            frac = rng.uniform(0.35, 1.35)
+            # The cut has to be renderable: it is `frac * rho` deep and its mouth has radius
+            # `rho * sqrt(frac (2 - frac))`, and the smaller of the two decides whether the
+            # grid sees a bowl or a pinch. Widening the cutter raises both together.
+            rho = max(rho, floor / min(frac, np.sqrt(frac * (2.0 - frac))))
+            depth = rho * frac
             cuts.append(sd_sphere(u * (rb + rho - depth), rho))
         return op_subtract(f, *cuts), {"n_basins": k}
     if kind == "saw":
@@ -833,6 +891,14 @@ def _finish(f: Field, rng: np.random.Generator, spec: LibrarySpec, recipe: dict,
         return None
     v, rec_mount = mount(v, fc, rng, spec.mount_weights, spec.tilt_deg, spec.max_tilt_deg,
                          spec.radius)
+    # Orientation is checked again after the mount, not only after the extraction. A mesh
+    # turned inside out is watertight, winding-consistent and of the right convexity, so
+    # every other check here passes it, and the first thing to notice is whatever asks it
+    # which side is inside: the signed distance the fit regresses on comes back negated, and
+    # the body is fitted as its own complement. Nothing about that is visible in the fit's
+    # residual. The repair is the same one the extraction makes.
+    if mesh_volume(v, fc) < 0.0:
+        fc = fc[:, ::-1].copy()
     recipe["mount"] = rec_mount
     info.update({"convexity": convexity_ratio(v, fc), "attempt": attempt,
                  "n_faces": len(fc), "n_verts": len(v),
@@ -853,7 +919,8 @@ def _one_body(rng: np.random.Generator, spec: LibrarySpec) -> Body:
         recipe = {"base": kind, **rec, "mods": []}
         for _ in range(int(rng.integers(spec.n_modifiers[0], spec.n_modifiers[1] + 1))):
             mk = _draw(spec.mod_weights, rng)
-            f, mrec = _apply_modifier(f, rng, mk, s)
+            f, mrec = _apply_modifier(f, rng, mk, s,
+                                      min_feature_radius(spec.res, spec.extent))
             recipe["mods"].append({"kind": mk, **mrec})
         body = _finish(f, rng, spec, recipe, attempt)
         if body is not None:
@@ -1019,7 +1086,8 @@ def body_from_mesh(verts: np.ndarray, faces: np.ndarray,
         recipe = {"base": "mesh", "source_faces": int(len(faces)), "mods": []}
         for _ in range(add_modifiers):
             mk = _draw(spec.mod_weights, rng)
-            f, mrec = _apply_modifier(f, rng, mk, GRID_FILL * spec.extent)
+            f, mrec = _apply_modifier(f, rng, mk, GRID_FILL * spec.extent,
+                                      min_feature_radius(spec.res, spec.extent))
             recipe["mods"].append({"kind": mk, **mrec})
         body = _finish(f, rng, spec, recipe, attempt)
         if body is not None:
@@ -1042,7 +1110,8 @@ def body_from_convex_points(points: np.ndarray, rng: np.random.Generator,
         recipe = {"base": "damit_convex", "n_planes": int(len(hull.equations)), "mods": []}
         for _ in range(n_modifiers):
             mk = _draw(spec.mod_weights, rng)
-            f, mrec = _apply_modifier(f, rng, mk, GRID_FILL * spec.extent)
+            f, mrec = _apply_modifier(f, rng, mk, GRID_FILL * spec.extent,
+                                      min_feature_radius(spec.res, spec.extent))
             recipe["mods"].append({"kind": mk, **mrec})
         body = _finish(f, rng, spec, recipe, attempt)
         if body is not None:

@@ -13,11 +13,13 @@ moves nothing the data cannot see. The misfit of every draw before and after is 
 The curves leave several bodies possible, and the answer has to be one shape scored by voxel
 overlap and by the side-view boundary distance. The draws stand in for the bodies that fit,
 and every candidate is scored by its mean over the draws under both measures. The candidates
-are the draws and the consensus bodies: the level sets, at the levels in CONSENSUS_LEVELS,
-of the fraction of draws that contain each voxel. When the draws are the posterior, a level
-set is the body with the best expected voxel score, and it keeps a dent wherever enough
-draws agree on it; when the draws disagree on where the dents are, a level set blurs them
-and a single draw scores better. Nothing is averaged in code space.
+are the draws and the consensus bodies: the level sets of the fraction of draws that contain
+each voxel. When the draws are the posterior, a level set is the body with the best expected
+voxel score, and it keeps a dent wherever enough draws agree on it; when the draws disagree
+on where the dents are, a level set blurs them and a single draw scores better. Which is the
+case here is not known in advance, so both kinds stand as candidates and the choice between
+them is made by measuring. One of the levels is derived from the draws rather than fixed
+(dice_optimal_level). Nothing is averaged in code space.
 
 --hold-out-geoms K keeps K of the measured geometries away from the inversion and reports
 the answer's misfit on them beside its misfit on the ones it saw. An answer that fits the
@@ -54,12 +56,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from hac26.conventions import CYLINDER_R, PUBLIC_MODELS, psi_grid   # noqa: E402
 from hac26.data_io import N_CAMS, load_model_curves, public_stl        # noqa: E402
-from hac26.field import CODE_DIM, DESIGN_N, N_DIR, N_SITES, apply_constraints   # noqa: E402
+from hac26.field import CODE_DIM, DESIGN_N, N_DIR, N_SITES   # noqa: E402
 from hac26.forward.mesh.exact import normalise                         # noqa: E402
 from hac26.forward.mesh.radiosity import RadiosityError                # noqa: E402
 from hac26.noise import sigma_from_replicates                          # noqa: E402
-from hac26.solvers.lpd_flow import (CHURN, N_MODES, N_STEPS, LPDFlow, flow_inputs,   # noqa: E402
-                                    geometry_tags)
+from hac26.solvers.lpd_flow import (CHURN, GUIDANCE, N_MODES, N_STEPS,   # noqa: E402
+                                    LPDFlow, flow_inputs, geometry_tags)
 from hac26.solvers.operator import CodeOperator                        # noqa: E402
 from hac26.solvers.output import (export_stl, metric_medoid, planar_snap,      # noqa: E402
                                   ransac_planes, restore_constraints)
@@ -72,10 +74,27 @@ SPREAD_MAX = 0.95    # mean Dice of the other draws against the medoid above whi
                      # are reported as one body rather than a spread of answers
 SNAP_MAX_RISE = 0.05 # a snapped plane is kept if the whitened RMS misfit rises by at most
                      # this many standard deviations
-CONSENSUS_LEVELS = (0.35, 0.5, 0.65)   # levels of the draw fraction that make a consensus body
+# Levels of the draw fraction that make a consensus body, beside the one dice_optimal_level
+# derives from the draws themselves. These two bracket the derived level from below and above
+# for any achievable score, so the three together cover the range without a fourth: the
+# derivation puts the optimum at half the achievable score, which no reachable score puts
+# above a half, and a level of 0.65 measured consistently worse than either of them.
+CONSENSUS_LEVELS = (0.35, 0.5)
 POLISH_TARGET = 1.0  # the polish stops once the whitened RMS misfit is at the noise level:
                      # below it, it would be fitting noise
 POLISH_STEP = 0.1    # first step of the polish, in whitened units per coordinate (RMS)
+# Side of the grid the candidates are compared on and the consensus bodies are built from.
+# It matters more than a discretisation usually does, because only the consensus bodies pay
+# for it twice: a draw is a mesh voxelised once, while a consensus body is built out of the
+# voxels and then meshed and voxelised again. Measured on ensembles of eight draws, that
+# round trip costs the consensus body 0.08 of voxel overlap at a side of 64 and 0.03 at 128,
+# against a real difference between candidates of about 0.02, so at 64 the rule was choosing
+# draws over consensus bodies for a reason that had nothing to do with the bodies. Higher is
+# not better without more draws: the fraction of draws occupying a voxel takes only as many
+# values as there are draws, so a finer grid past this makes the level set jagged rather than
+# sharper, and 192 measured worse than 128. It is also no more expensive, since a mesh this
+# fine is no longer decimated on the way in.
+OCC_RES = 128
 
 
 def curve_pairs(curves56: np.ndarray) -> torch.Tensor:
@@ -210,6 +229,38 @@ def polish(net, op: CodeOperator, z, support, radius, data, scale, geoms, steps:
     return z, chi0, chi, it
 
 
+def dice_optimal_level(occs: list, extent: float, radius: float, iters: int = 3,
+                       lo: float = 0.2, hi: float = 0.7) -> float:
+    """The level whose body is the best single answer under the voxel measure, derived rather
+    than chosen.
+
+    Write p_v for the fraction of draws occupying voxel v, A for a candidate body and B for
+    the truth. The measure is 2|A and B| / (|A| + |B|), so adding voxel v to A raises the
+    expected numerator by 2 p_v and the denominator by one. If the body already scores D, the
+    change is (2 p_v - D) / (|A| + |B|) to first order, which is positive exactly when
+    p_v > D / 2. The level that is right for the body it itself produces is therefore the
+    fixed point of t -> D(t) / 2, and D is measured against the draws, which stand in for the
+    truth. A ladder of fixed levels cannot do this: the correct level depends on how much the
+    draws agree, which is not known before the draws exist. Tight draws score near one and
+    want a level near a half; draws that disagree score lower and want a lower level, keeping
+    a dent that only some of them have.
+
+    The iteration is started at a half and clamped to [lo, hi], which brackets every value the
+    fixed point can take for a score between 0.4 and 1.4 -- the second being unreachable, so
+    the upper clamp only guards against a degenerate estimate.
+    """
+    t = 0.5
+    for _ in range(iters):
+        made = consensus_bodies(occs, extent, radius, levels=(t,))
+        if not made:
+            break
+        _, v, f = made[0]
+        occ = mesh_occupancy(v, f, occs[0].shape[0], extent)
+        d = float(np.mean([dice(occ, o) for o in occs]))
+        t = float(np.clip(0.5 * d, lo, hi))
+    return t
+
+
 def consensus_bodies(occs: list, extent: float, radius: float, levels=CONSENSUS_LEVELS):
     """Meshes of the level sets of the fraction of draws containing each voxel, for boolean
     grids `occs` on [-extent, extent]^3, posed like the draws. Returns [(level, verts,
@@ -224,6 +275,13 @@ def consensus_bodies(occs: list, extent: float, radius: float, levels=CONSENSUS_
             continue
         v, f, _, _ = measure.marching_cubes(prob, level=level, spacing=(spacing,) * 3)
         v = v - extent + spacing / 2.0                  # cell centres, not cell corners
+        # The radius is capped here rather than set, unlike the draws', which are put at the
+        # published radius exactly. A level set is a contour of a probability, not a body: it
+        # sits about half a voxel outside or inside the draws' own surface depending on the
+        # level, and scaling it to the published radius would correct that offset exactly at
+        # the widest point and over-correct everywhere nearer the axis. The offset is a
+        # distance, the correction would be a proportion, and measured on real draws the two
+        # are the same half per cent, so the cap is left as the smaller distortion.
         out.append((float(level), restore_constraints(v, radius), np.asarray(f, dtype=np.int64)))
     return out
 
@@ -231,12 +289,20 @@ def consensus_bodies(occs: list, extent: float, radius: float, levels=CONSENSUS_
 def decode(op: CodeOperator, code, support, res=64, misfit_fn=None, snap: bool = False,
            snap_planes: int = 12, snap_tol: float = 0.02, snap_min_frac: float = 0.02):
     """Raw code -> posed mesh in the canonical frame as numpy arrays, with optional planar
-    snapping. Returns (None, None, 0) if the extracted mesh is degenerate."""
+    snapping. Returns (None, None, 0) if the extracted mesh is degenerate.
+
+    The pose is the operator's own, so the mesh that leaves here is the mesh whose curves the
+    misfit is measured on. The operator poses every iterate it renders, putting the solid
+    centroid on the rotation axis, and a mesh posed any other way is a translate of the one
+    that was fitted: the misfit would then describe a body other than the one exported. The
+    pose is idempotent, so applying it again downstream changes nothing.
+    """
     m = op.mesh(support, code, res=res)
     if m is None:
         return None, None, 0
-    v, f = m[0].cpu().numpy(), m[1].cpu().numpy()
-    v = apply_constraints(v, 1.0)          # canonical frame: xy radius 1
+    v, f = m[0], m[1]
+    v = CodeOperator.canonical(v, f).cpu().numpy()
+    f = f.cpu().numpy()
     kept = 0
     planes = ransac_planes(v, f, n_planes=snap_planes, tol=snap_tol,
                            min_frac=snap_min_frac) if snap else []
@@ -245,7 +311,9 @@ def decode(op: CodeOperator, code, support, res=64, misfit_fn=None, snap: bool =
                               misfit_fn=(None if misfit_fn is None
                                          else lambda w: misfit_fn(w, f)),
                               eta=SNAP_MAX_RISE, tol=snap_tol)
-        v = restore_constraints(v, 1.0)
+        import torch as _t
+        v = CodeOperator.canonical(_t.as_tensor(v, dtype=_t.float32),
+                                   _t.as_tensor(f)).numpy()
     return v, f, kept
 
 
@@ -263,6 +331,12 @@ def main():
                          "each")
     ap.add_argument("--churn", type=float, default=CHURN,
                     help="noise added along the way; 0 is the deterministic flow")
+    ap.add_argument("--guidance", type=float, default=GUIDANCE,
+                    help="weight on the data part of the velocity (lpd_flow.LPDFlow.velocity). "
+                         "One is the model as trained; above one the draws follow the curves "
+                         "further from the prior, which is smoother than any single body. "
+                         "scripts/decision_check.py measures which weight scores best on "
+                         "bodies whose truth is known")
     ap.add_argument("--phases", type=int, default=96)
     ap.add_argument("--operator-res", type=int, default=32,
                     help="FlexiCubes resolution of the operator inside the flow; must match "
@@ -351,7 +425,7 @@ def main():
     cond = cond_channels(support)                    # constant per body: h is fixed here
     codes = net.sample(make_resid_fn(net, op, data, scale, mask_seen, M, cond, support, R),
                        tag.expand(a.samples, -1, -1), mask_seen.expand(a.samples, -1),
-                       cond, R, batch=a.samples, n_steps=a.steps, churn=a.churn)
+                       cond, R, batch=a.samples, n_steps=a.steps, churn=a.churn, guidance=a.guidance)
     print(f"  {a.samples} draws x {a.steps} steps (churn {a.churn:g}) in "
           f"{time.time()-t0:.0f}s", flush=True)
 
@@ -411,13 +485,17 @@ def main():
     # one grid for every draw, sized to the widest of them, so the pairwise Dice below
     # compares the same places
     occ_extent = max(float(np.abs(mv).max()) for mv, _ in meshes) * 1.05
-    occs = [mesh_occupancy(mv, mf, 64, occ_extent) for mv, mf in meshes]
+    occs = [mesh_occupancy(mv, mf, OCC_RES, occ_extent) for mv, mf in meshes]
     n_draws = len(meshes)
     # the consensus bodies join the draws as candidates; the draws alone are the reference
-    extra = consensus_bodies(occs, occ_extent, R) if n_draws > 1 else []
+    # the derived level joins the fixed two; see dice_optimal_level
+    levels_used = (CONSENSUS_LEVELS + (dice_optimal_level(occs, occ_extent, R),)
+                   if n_draws > 1 else ())
+    extra = consensus_bodies(occs, occ_extent, R, levels=levels_used) if n_draws > 1 else []
     levels = [lv for lv, _, _ in extra]
     candidates = meshes + [(mv, mf) for _, mv, mf in extra]
-    occs = occs + [mesh_occupancy(mv, mf, 64, occ_extent) for _, mv, mf in extra]
+    occs = occs + [mesh_occupancy(mv, mf, OCC_RES, occ_extent)
+                   for _, mv, mf in extra]
 
     medoid_metric = "volume"
     if a.medoid_volume_only:
@@ -473,7 +551,7 @@ def main():
     Path(a.out).parent.mkdir(parents=True, exist_ok=True)
     info = export_stl(a.out, v, f)
     res = {"model": a.model, "radius": R, "draws": n_draws, "answer": chosen,
-           "candidate": int(k), "consensus_levels": list(CONSENSUS_LEVELS),
+           "candidate": int(k), "consensus_levels": [float(x) for x in levels_used],
            "spread": spread, "spread_off_medoid": spread_off,
            "collapsed": bool(collapsed),
            "medoid_metric": medoid_metric,

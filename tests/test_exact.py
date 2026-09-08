@@ -97,7 +97,7 @@ def test_vjp_returns_the_same_curves_and_finite_gradients():
     raw = op.raw_curves(vt.detach(), ft, geoms=[0, 5])
     cot = torch.zeros_like(raw); cot[:, 0] = 1.0                          # d(sum of I)
     raw2, gv, (g_rho, g_tau, g_ped) = op.vjp(vt, ft, cot, geoms=[0, 5],
-                                            params=[inst.raw_rho, inst.raw_tau_i, inst.pedestal])
+                                            params=[inst.raw_rho, inst.raw_tau_i, inst.raw_pedestal])
     assert torch.allclose(raw, raw2)
     assert gv.shape == vt.shape and torch.isfinite(gv).all()
     assert float(g_rho) > 0.0

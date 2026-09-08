@@ -53,9 +53,11 @@ the stages in order:
 | `reconstruct` | `reconstruct_lpd.py` | all ten models, from those starts, each draw polished on the exact misfit |
 | `score` | `hac26/scoring/` | the three public models |
 
-Each stage writes a marker under `runs/.done/` and is skipped if it is already there, so a
-dropped run is safe to relaunch. Output goes to `logs/<stage>.log`. Every setting is a
-variable at the top of the script and can be overridden from the environment:
+Each stage writes a marker under `runs/.done/` recording the settings and the source it ran
+with, and is skipped only while both still match, so a dropped run is safe to relaunch and a
+change to the code reruns the stages below it on its own. Output goes to `logs/<stage>.log`.
+Every setting is a variable at the top of the script and can be overridden from the
+environment:
 
 ```
 N_BODIES=2000 scripts/run_remote_pipeline.sh

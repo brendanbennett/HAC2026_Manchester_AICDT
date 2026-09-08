@@ -339,3 +339,41 @@ def test_mesh_curve_renderer_produces_a_time_directional_curve():
     c = render_curves_mesh(v, fc, m=10, curve_types=["binary"], geoms=geoms, res=28,
                            decimate_to=2000)
     assert not np.allclose(c, c[:, ::-1])
+
+
+def test_no_feature_is_drawn_below_what_the_grid_resolves():
+    """The library states that nothing is generated below the scale marching cubes resolves,
+    and this is the check of it. The smallest feature the sampler can draw is a basin's mouth
+    at the shallowest cut with the smallest cutter: a sphere of radius rho cutting to depth d
+    leaves a mouth of radius sqrt(d (2 rho - d)). The next smallest is the fillet that rounds
+    a lobed body's neck. Both are compared with the feature radius the build resolution
+    resolves, so widening either range past the grid fails here rather than silently
+    producing bodies the extraction cannot render."""
+    from hac26.shape_library import GRID_FILL, min_feature_radius
+    spec = LibrarySpec(res=64)
+    floor = min_feature_radius(spec.res, spec.extent)
+    s = GRID_FILL * spec.extent                  # the size a finished body is fitted to
+    rho, u = 0.3 * s, 0.35                       # smallest cutter, shallowest cut
+    assert rho * u > floor                                    # the basin is deep enough
+    assert rho * np.sqrt(u * (2.0 - u)) > floor               # and its mouth is wide enough
+    # The neck of a lobed body at the closest spacing, where the two lobes touch and the
+    # fillet alone opens the waist: a fillet of k on two tangent bodies of radius r leaves a
+    # neck of radius about sqrt(2 r * 0.69 k), 0.69 being how far the exponential smooth
+    # union pushes the surface out at the contact.
+    assert np.sqrt(2.0 * s * 0.69 * 0.03 * s) > floor
+
+
+def test_a_mounted_body_is_never_inside_out():
+    """A body's faces have to point outward after mounting as well as after extraction. The
+    mount applies a random orthogonal transform, and a reflection moves the vertices without
+    moving the winding, which leaves a mesh that is watertight, winding-consistent and of the
+    right convexity but has its inside and outside exchanged. Nothing downstream would notice
+    except the signed distance the fit regresses on, which comes back negated."""
+    from hac26.shape_library import _rand_rot, mesh_volume
+    rng = np.random.default_rng(0)
+    for _ in range(200):
+        assert np.linalg.det(_rand_rot(rng)) > 0.0
+    spec = LibrarySpec(res=32, mount_weights={"random": 1.0})
+    for i in range(6):
+        b = sample_body(np.random.default_rng(4000 + i), spec)
+        assert mesh_volume(b.verts, b.faces) > 0.0

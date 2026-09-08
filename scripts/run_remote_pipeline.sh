@@ -15,9 +15,11 @@
 # again.
 #
 # Every stage writes a marker file under runs/.done/ when it finishes, recording the settings
-# it ran with, and is skipped on the next invocation if the marker matches. A pre-empted or
-# disconnected run can therefore be relaunched as is, and one stage can be redone with
-# --force-stage.
+# AND the source it ran with, and is skipped on the next invocation only if both still match.
+# A pre-empted or disconnected run can therefore be relaunched as is, and editing a shape
+# generator, a loss or the forward model reruns the stages downstream of it without anything
+# having to be asked for: the alternative is a run that continues from an artefact the current
+# code would not have produced. --force-stage remains for redoing a stage nothing has changed.
 #
 #   ./scripts/run_remote_pipeline.sh                      # run everything, skip done stages
 #   ./scripts/run_remote_pipeline.sh --force-stage fit     # redo `fit` and everything after
@@ -102,6 +104,12 @@ RECON_SAMPLES=${RECON_SAMPLES:-8}
 RECON_POLISH_STEPS=${RECON_POLISH_STEPS:-30}   # most gradient steps of the polish per draw; 0 skips it
 RECON_RES=${RECON_RES:-96}
 RECON_SNAP=${RECON_SNAP:-0}
+# Weight on the data part of the velocity when sampling (lpd_flow.LPDFlow.velocity).
+# One is the model as trained. The decision stage reconstructs held-out bodies at each
+# of RECON_GUIDANCE_SWEEP and names the weight that scores best; set this to it and
+# rerun the reconstruct stage, which is cheap beside the training.
+RECON_GUIDANCE=${RECON_GUIDANCE:-1.0}
+RECON_GUIDANCE_SWEEP=${RECON_GUIDANCE_SWEEP:-1.0 1.5 2.0 3.0}
 MEDOID_VOLUME_ONLY=${MEDOID_VOLUME_ONLY:-0}
 MEDOID_SIDE_POINTS=${MEDOID_SIDE_POINTS:-200000}
 MEDOID_SIDE_DIRS=${MEDOID_SIDE_DIRS:-36}
@@ -128,6 +136,40 @@ STAGES_AFTER_FORCE=0
 
 log() { echo "[$(date -u +%H:%M:%S)] $*"; }
 
+# A stage is skipped when its marker records the signature this run would produce, so a
+# signature naming only the settings lets a stage be skipped after the code that produces its
+# artefact has been rewritten: the run then continues from an artefact the current code would
+# not have made, and nothing says so. The digests below put the source into the signature, so
+# editing a shape generator, a loss or the forward model invalidates the stages downstream of
+# it and no others.
+src_digest() {
+  $PY - "$@" <<'PYEOF'
+import hashlib, pathlib, sys
+h = hashlib.sha256()
+for name in sorted(sys.argv[1:]):
+    p = pathlib.Path(name)
+    h.update(name.encode())
+    h.update(p.read_bytes() if p.is_file() else b"<missing>")
+print(h.hexdigest()[:16])
+PYEOF
+}
+
+SRC_LIBRARY=$(src_digest hac26/shape_library.py hac26/shapes.py hac26/library_io.py \
+                         hac26/library_metrics.py scripts/build_shape_library.py)
+SRC_FORWARD=$(src_digest hac26/conventions.py hac26/geometry.py hac26/noise.py \
+                         hac26/forward/mesh/exact.py hac26/forward/mesh/instrument.py \
+                         hac26/forward/mesh/radiosity.py hac26/forward/mesh/raster.py \
+                         hac26/forward/mesh/sensor.py hac26/forward/shared/coarea.py \
+                         hac26/forward/shared/common.py \
+                         hac26/forward/shared/software_raster.py scripts/calibrate.py)
+SRC_FIT=$(src_digest hac26/field.py scripts/fit_shapes.py)
+SRC_CORPUS=$(src_digest scripts/build_corpus.py hac26/solvers/operator.py \
+                        hac26/solvers/lpd_convex.py)
+SRC_FLOW=$(src_digest hac26/solvers/lpd_flow.py scripts/train_lpd.py scripts/train_prior.py)
+SRC_OUTPUT=$(src_digest scripts/reconstruct_lpd.py scripts/decision_check.py \
+                        hac26/solvers/output.py hac26/scoring/side_view.py \
+                        hac26/scoring/voxel.py hac26/recon.py)
+
 stage_signature() {
   case "$1" in
     models)
@@ -137,31 +179,32 @@ stage_signature() {
       printf 'stage=objects\nSHAPE_MODELS_DIR=%s\nN_OBJECTS=%s\n' "$SHAPE_MODELS_DIR" "$N_OBJECTS"
       ;;
     library)
-      printf 'stage=library\nN_BODIES=%s\nLIB_SEED=%s\nLIB_RES=%s\nLIB_DIR=%s\nSHAPE_MODELS=%s\n' \
-        "$N_BODIES" "$LIB_SEED" "$LIB_RES" "$LIB_DIR" "$(shape_model_list)"
+      printf 'stage=library\nN_BODIES=%s\nLIB_SEED=%s\nLIB_RES=%s\nLIB_DIR=%s\nSHAPE_MODELS=%s\nSRC=%s\n' \
+        "$N_BODIES" "$LIB_SEED" "$LIB_RES" "$LIB_DIR" "$(shape_model_list)" "$SRC_LIBRARY"
       ;;
     design)
       printf 'stage=design\nDESIGN_N=%s\nDESIGN_DEVICE=%s\n' \
         "$DESIGN_N" "$DESIGN_DEVICE"
       ;;
     calibrate)
-      printf 'stage=calibrate\nDATA_DIR=%s\n' "$DATA_DIR"
+      printf 'stage=calibrate\nDATA_DIR=%s\nSRC=%s\n' "$DATA_DIR" "$SRC_FORWARD"
       ;;
     fit)
-      printf 'stage=fit\nN_BODIES=%s\nLIB_DIR=%s\nLIB_SEED=%s\nLIB_RES=%s\nDESIGN_N=%s\nFIT_POINTS=%s\nCODES_FILE=%s\n' \
-        "$N_BODIES" "$LIB_DIR" "$LIB_SEED" "$LIB_RES" "$DESIGN_N" "$FIT_POINTS" "$CODES_FILE"
+      stage_signature library | sed 's/^stage=library$/stage=fit/'
+      printf 'DESIGN_N=%s\nFIT_POINTS=%s\nCODES_FILE=%s\nSRC=%s\n' \
+        "$DESIGN_N" "$FIT_POINTS" "$CODES_FILE" "$SRC_FIT"
       ;;
     # Each later stage's signature extends the one before it, so a change anywhere upstream
     # reruns everything downstream.
     corpus)
       stage_signature fit | sed 's/^stage=fit$/stage=corpus/'
-      printf 'FLOW_PHASES=%s\nFLOW_OPERATOR_RES=%s\nCONVEX_CKPT=%s\nCORPUS_FILE=%s\n' \
-        "$FLOW_PHASES" "$FLOW_OPERATOR_RES" "$CONVEX_CKPT" "$CORPUS_FILE"
+      printf 'FLOW_PHASES=%s\nFLOW_OPERATOR_RES=%s\nCONVEX_CKPT=%s\nCORPUS_FILE=%s\nSRC=%s\nSRC_FWD=%s\n' \
+        "$FLOW_PHASES" "$FLOW_OPERATOR_RES" "$CONVEX_CKPT" "$CORPUS_FILE" "$SRC_CORPUS" "$SRC_FORWARD"
       ;;
     prior)
       stage_signature corpus | sed 's/^stage=corpus$/stage=prior/'
-      printf 'PRIOR_STEPS=%s\nPRIOR_BATCH=%s\nFLOW_VAL_BODIES=%s\n' \
-        "$PRIOR_STEPS" "$PRIOR_BATCH" "$FLOW_VAL_BODIES"
+      printf 'PRIOR_STEPS=%s\nPRIOR_BATCH=%s\nFLOW_VAL_BODIES=%s\nSRC=%s\n' \
+        "$PRIOR_STEPS" "$PRIOR_BATCH" "$FLOW_VAL_BODIES" "$SRC_FLOW"
       ;;
     flow)
       stage_signature prior | sed 's/^stage=prior$/stage=flow/'
@@ -176,11 +219,12 @@ stage_signature() {
       ;;
     decision)
       stage_signature flow-rollout | sed 's/^stage=flow-rollout$/stage=decision/'
-      printf 'RECON_SAMPLES=%s\nRECON_POLISH_STEPS=%s\nRECON_RES=%s\n' \
-        "$RECON_SAMPLES" "$RECON_POLISH_STEPS" "$RECON_RES"
+      printf 'RECON_SAMPLES=%s\nRECON_POLISH_STEPS=%s\nRECON_RES=%s\nSWEEP=%s\nSRC=%s\n' \
+        "$RECON_SAMPLES" "$RECON_POLISH_STEPS" "$RECON_RES" "$RECON_GUIDANCE_SWEEP" "$SRC_OUTPUT"
       ;;
     convex)
-      printf 'stage=convex\nDATA_DIR=%s\nCONVEX_CKPT=%s\n' "$DATA_DIR" "$CONVEX_CKPT"
+      printf 'stage=convex\nDATA_DIR=%s\nCONVEX_CKPT=%s\nSRC=%s\nSRC_FWD=%s\n' \
+        "$DATA_DIR" "$CONVEX_CKPT" "$SRC_CORPUS" "$SRC_FORWARD"
       ;;
     reconstruct)
       printf 'stage=reconstruct\nDESIGN_N=%s\nFLOW_STEPS=%s\nFLOW_PHASES=%s\nFLOW_BATCH=%s\nFLOW_OPERATOR_RES=%s\nFLOW_TRAIN_GEOMS=%s\nFLOW_ROLLOUT_STEPS=%s\nFLOW_ROLLOUT_FRAC=%s\nCONVEX_CKPT=%s\nRECON_SAMPLES=%s\nRECON_POLISH_STEPS=%s\nRECON_RES=%s\nRECON_SNAP=%s\nMEDOID_VOLUME_ONLY=%s\nMEDOID_SIDE_POINTS=%s\nMEDOID_SIDE_DIRS=%s\nMEDOID_SIDE_RES=%s\nMEDOID_SIDE_MODE=%s\n' \
@@ -189,12 +233,15 @@ stage_signature() {
         "$RECON_SAMPLES" "$RECON_POLISH_STEPS" "$RECON_RES" "$RECON_SNAP" \
         "$MEDOID_VOLUME_ONLY" "$MEDOID_SIDE_POINTS" "$MEDOID_SIDE_DIRS" \
         "$MEDOID_SIDE_RES" "$MEDOID_SIDE_MODE"
+      printf 'RECON_GUIDANCE=%s\nSRC=%s\nSRC_FLOW=%s\nSRC_FWD=%s\n' \
+        "$RECON_GUIDANCE" "$SRC_OUTPUT" "$SRC_FLOW" "$SRC_FORWARD"
       ;;
     score)
       printf 'stage=score\nDATA_DIR=%s\nRECON_DIR=results/lpd\nRECON_SAMPLES=%s\nRECON_RES=%s\nRECON_SNAP=%s\nMEDOID_VOLUME_ONLY=%s\nMEDOID_SIDE_POINTS=%s\nMEDOID_SIDE_DIRS=%s\nMEDOID_SIDE_RES=%s\nMEDOID_SIDE_MODE=%s\n' \
         "$DATA_DIR" "$RECON_SAMPLES" "$RECON_RES" "$RECON_SNAP" \
         "$MEDOID_VOLUME_ONLY" "$MEDOID_SIDE_POINTS" "$MEDOID_SIDE_DIRS" \
         "$MEDOID_SIDE_RES" "$MEDOID_SIDE_MODE"
+      printf 'SRC=%s\n' "$SRC_OUTPUT"
       ;;
     *)
       printf 'stage=%s\n' "$1"
@@ -409,6 +456,7 @@ if [ "$FLOW_VAL_BODIES" -gt 0 ]; then
       --ckpt runs/lpd_flow.pt --corpus "$CORPUS_FILE" --val-bodies "$FLOW_VAL_BODIES" \
       --bodies "$FLOW_VAL_BODIES" --samples "$RECON_SAMPLES" \
       --polish-steps "$RECON_POLISH_STEPS" --res "$RECON_RES" \
+      --guidance $RECON_GUIDANCE_SWEEP \
       --side-points "$MEDOID_SIDE_POINTS" --out runs/decision_check.json
 else
   log "=== decision: skipped (FLOW_VAL_BODIES=0)"
@@ -467,7 +515,7 @@ if should_run reconstruct; then
     log "  --- model $M -> $OUT (started $(date -u +%H:%M:%S))"
     RECON_ARGS=(--model "$M" --samples "$RECON_SAMPLES" --res "$RECON_RES"
       --phases "$FLOW_PHASES" --operator-res "$FLOW_OPERATOR_RES"
-      --polish-steps "$RECON_POLISH_STEPS"
+      --polish-steps "$RECON_POLISH_STEPS" --guidance "$RECON_GUIDANCE"
       --ckpt runs/lpd_flow.pt --data-dir "$DATA_DIR" --out "$OUT"
       --medoid-side-points "$MEDOID_SIDE_POINTS"
       --medoid-side-dirs "$MEDOID_SIDE_DIRS"

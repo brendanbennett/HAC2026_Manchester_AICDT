@@ -27,3 +27,8 @@ scratch/
 bench_raster.py
 surrogate_check.py
 /trimesh
+
+# A run's own console output and process ids, written into the repository root by
+# nohup and by the pipeline. They are records of one machine's run, not source.
+*.out
+*.pid

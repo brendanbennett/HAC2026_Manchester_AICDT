@@ -1,12 +1,25 @@
 """From several reconstructed meshes to one submitted body.
 
-The submitted body is the medoid of the samples, not their mean. A feature whose position is
-uncertain, such as a crater, sits at a different place in each sample; averaging the samples
-smears it into a shallow depression everywhere, which is a body none of the samples is.
-Thresholding a mean occupancy field does the same by another route. The medoid is one of the
-samples, the one most typical under the two measures the challenge scores, so it keeps the
-crater somewhere rather than nowhere. Without side-view outlines the medoid is taken under
-volume overlap alone.
+The submitted body is never the mean of the samples. A feature whose position is uncertain,
+such as a crater, sits at a different place in each sample; averaging the samples in code
+space smears it into a shallow depression everywhere, which is a body none of the samples is.
+
+It is chosen instead from a set of candidates, by which of them scores best on average
+against the samples under the two measures the challenge scores. The candidates are the
+samples themselves and the level sets of the fraction of samples occupying each voxel
+(reconstruct_lpd.consensus_bodies). The two kinds are there because the two measures want
+different bodies. Under voxel overlap the best single answer against an uncertain truth is a
+level set, at the level that is half the overlap achievable; under the side-view boundary
+distance a level set is penalised, because filling a concavity shortens the outline and it is
+the concave stretches that no convex reconstruction can produce. Which wins is therefore
+decided by measurement rather than by argument, and metric_medoid does that.
+
+Ranks are added rather than scores. The challenge sums the two measures after normalising
+each into [0, 1], but the normalisation of the boundary distance is not published, and a rank
+is what survives any monotone choice of it. The cost is that margins are discarded: a
+candidate can lose the voxel measure by a wide margin and win on a narrow lead in the other.
+
+Without side-view outlines the choice is made under volume overlap alone.
 
 Planar snapping is optional. It helps a faceted target and harms a smooth one, so the
 reconstruction script leaves it off unless asked. When it runs, a candidate plane is accepted
@@ -70,11 +83,11 @@ def metric_medoid(occupancies, outlines=None, side_n_dirs: int = 36,
     if outlines is None:
         return int(np.argmax(mean_dice))
 
-    from hac26.scoring.side_view import measure_outlines, outline_set
+    from hac26.scoring.side_view import measure_outlines, outline_extent, outline_set
 
     # Project each cloud once, on one shared extent: the contours come back in model units,
     # and a per-pair extent would put each pair on a different pixel pitch.
-    ext = 1.05 * max(float(np.abs(o).max()) for o in outlines)
+    ext = outline_extent(outlines, side_mode)
     sets = [outline_set(o, ext, n_dirs=side_n_dirs, res=side_res, mode=side_mode)
             for o in outlines]
     cache = {}

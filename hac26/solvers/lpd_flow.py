@@ -31,6 +31,20 @@ start of its training the flow is the prior and everything it learns is a correc
 the data. In the terms of the learned primal-dual method, the prior part is the proximal
 step and the data part is the dual step and the adjoint.
 
+Splitting the velocity this way also makes the sampler adjustable in a way a single network
+would not be. The prior part alone is the flow with no knowledge of these curves and the sum
+is the flow conditioned on them, which is exactly the pair an interpolation between an
+unconditional and a conditional field is built from, and the interpolation reduces here to a
+weight on the data part alone (LPDFlow.velocity). At weight one the sampler integrates the
+model as trained. Above one it follows the curves further from the prior, which is aimed at
+this problem's own failure: the prior is the average of a corpus of bodies and is therefore
+smoother than any of them, and it is the curves, not the prior, that say this body has a hole
+in it. The weight is ramped from one at t = 0 to its full size at t = 1, because what the data
+part reads early in t is the residual at a body the prior made out of noise, which says
+something about the prior's guess and not about this rock. It is a sampling choice, not a
+training one, so it is measured against held-out bodies rather than assumed
+(scripts/decision_check.py).
+
 The data the network reads are the Fourier coefficients along the rotation angle psi of the
 mean-normalised curves, orders m = 1..N_MODES: of the measured curves, and of the residual
 against the operator's prediction divided by each curve's noise and model error, so that a
@@ -82,7 +96,7 @@ from hac26.field import CODE_DIM, LATTICE_SHAPE, N_DIR, N_SITES, dir_design
 __all__ = ["CODE_DIM", "N_DIR", "N_SITES", "N_MODES", "N_STEPS", "N_EXPERTS", "CHURN", "T_DIM",
            "T_FREQ", "N_FEAT", "N_SPHERE_CH", "N_VOL_CH", "FlowInputs", "flow_inputs",
            "DualSetTransformer", "SphereBranch", "VolBranch", "PrimalNet", "PriorNet",
-           "Reader", "CodeCodec", "LPDFlow", "fourier_embed", "time_embed",
+           "Reader", "CodeCodec", "LPDFlow", "fourier_embed", "time_embed", "GUIDANCE",
            "churn_step", "geometry_tags"]
 
 N_MODES = 40
@@ -90,6 +104,11 @@ N_STEPS = 16        # sampling steps by default; the operator runs at each. Trai
                     # depend on it.
 N_EXPERTS = 4       # velocity networks, one per equal interval of t
 CHURN = 0.5         # noise in the sampler, eps(t) = CHURN (1 - t); 0 is the plain flow
+GUIDANCE = 1.0      # weight on the data part of the velocity at t = 1, ramped from one at
+                    # t = 0. One is the model as trained; above one the draws follow the
+                    # curves further from the prior. See LPDFlow.velocity, and
+                    # scripts/decision_check.py, which measures the score against held-out
+                    # bodies over a range of weights.
 T_DIM = 32          # width of the TIME embedding, which is not the mode embedding
 T_FREQ = (0.5, 64.0)  # slowest and fastest time feature, in cycles across [0, 1]
 N_FEAT = 8          # per (geometry, mode) input of the dual: real and imaginary parts of the
@@ -615,16 +634,47 @@ class LPDFlow(nn.Module):
                                        inp.select(sel))
         return out
 
-    def velocity(self, code, t, radius, geom_tag, inp: FlowInputs):
+    def velocity(self, code, t, radius, geom_tag, inp: FlowInputs, guidance: float = 1.0):
         """The velocity at `code` (B, CODE_DIM) and time t (B,), for bodies of published
-        radius (B,), from the geometry tags (B, C, 4) and the inputs: prior part plus data
-        part."""
-        return (self.prior_velocity(code, t, radius, inp.sphere, inp.vol)
-                + self.data_velocity(code, t, radius, geom_tag, inp))
+        radius (B,), from the geometry tags (B, C, 4) and the inputs: prior part plus
+        `guidance` times the data part.
+
+        The two parts are the two halves of a guided velocity. The prior is trained on the
+        corpus alone and frozen, so it is the flow that knows what a body looks like and
+        nothing about these curves; adding the data part gives the flow conditioned on them.
+        Writing v_prior + w (v_prior + v_data - v_prior) for the usual interpolation between
+        an unconditional and a conditional field leaves v_prior + w v_data, so the weight
+        multiplies the data part and nothing else, and w = 1 is the model as trained.
+
+        Above one the sampler follows the curves further from the prior than the model's own
+        conditional does. That is worth having here because the failure this method has to
+        avoid is a draw that falls back on the prior's typical body, which is smooth: the
+        corpus is the average of many bodies and the curves are what say this one has a hole
+        in it. It is not free, since the field being integrated is no longer the one whose
+        marginals the training matched, and far enough above one the draws leave the corpus
+        altogether. scripts/decision_check.py measures the score against held-out bodies over
+        a range of weights, so the value to use is read off that rather than assumed.
+
+        The weight is applied as 1 + (guidance - 1) t rather than as a constant, so it is
+        neutral at t = 0 and full at t = 1. What the data part reads is the residual of the
+        curves at the body the state is heading for, and early in t that body is what the
+        prior made of a draw of noise: the residual there is a statement about the prior's
+        guess rather than about this rock, and amplifying the response to it amplifies
+        nothing useful. Late in t the endpoint estimate is nearly the answer and the residual
+        is about the body being reconstructed. The ramp is also the conservative choice, since
+        it applies less guidance in total than a constant weight of the same size, and at
+        guidance one it is the model as trained at every t.
+        """
+        v = self.prior_velocity(code, t, radius, inp.sphere, inp.vol)
+        d = self.data_velocity(code, t, radius, geom_tag, inp)
+        if guidance == 1.0:
+            return v + d
+        return v + (1.0 + (guidance - 1.0) * t.reshape(-1, 1)) * d
 
     @torch.no_grad()
     def sample(self, resid_fn, geom_tag, mask, cond, radius: float, batch: int = 1,
-               n_steps: int = N_STEPS, churn: float = CHURN, device="cpu"):
+               n_steps: int = N_STEPS, churn: float = CHURN, device="cpu",
+               guidance: float = GUIDANCE):
         """x0 ~ N(0, I), then n_steps steps from t = 0 to 1, in the whitened space
         throughout, for a body of published radius `radius`.
 
@@ -642,7 +692,7 @@ class LPDFlow(nn.Module):
         network forward and no operator call.
 
         With churn > 0 each step is churn_step's step of the stochastic equation; the last
-        step adds no noise.
+        step adds no noise. `guidance` weights the data part of the velocity; see velocity.
         """
         sph0, vol0 = cond
         rad = torch.full((batch,), float(radius), device=device)
@@ -652,6 +702,6 @@ class LPDFlow(nn.Module):
             t = torch.full((batch,), k * dt, device=device)
             x1_hat = x + (1 - t[:, None]) * self.prior_velocity(x, t, rad, sph0.expand(batch, -1, -1),
                                                                 vol0.expand(batch, -1, -1, -1, -1))
-            v = self.velocity(x, t, rad, geom_tag, resid_fn(x1_hat, t))
+            v = self.velocity(x, t, rad, geom_tag, resid_fn(x1_hat, t), guidance)
             x = churn_step(x, v, k * dt, dt, churn)
         return x

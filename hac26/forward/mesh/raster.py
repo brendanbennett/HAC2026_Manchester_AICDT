@@ -112,23 +112,32 @@ class Rasteriser:
     def resolution(self) -> list:
         return [self.h * self.ss, self.w * self.ss]
 
+    def _unit_grid(self):
+        """The pixel grid at unit half-height, and the normalised distance from the optical
+        axis, both (1, H, W). Neither depends on the field of view: the grid scales with
+        tan(fov / 2), and the radius is divided by its own maximum, which scales with it too.
+        So this is cached once per resolution rather than once per field of view."""
+        key = (self.h, self.w, self.ss)
+        if key not in self._px_cache:
+            H, W = self.resolution
+            aspect = self.w / self.h
+            yy = torch.linspace(1.0, -1.0, H, device=self.device)
+            xx = torch.linspace(-aspect, aspect, W, device=self.device)
+            gx, gy = torch.meshgrid(xx, yy, indexing="xy")
+            g2 = gx ** 2 + gy ** 2
+            self._px_cache[key] = (g2[None], (g2.sqrt() / g2.sqrt().max())[None])
+        return self._px_cache[key]
+
     def pixel_geometry(self, fov_y_rad: float):
-        """cos(off-axis angle) and normalised radius for every supersampled pixel, (1, H, W)."""
-        key = (float(fov_y_rad), self.h, self.w, self.ss)
-        if key in self._px_cache:
-            return self._px_cache[key]
-        H, W = self.resolution
-        aspect = self.w / self.h
-        ty = np.tan(fov_y_rad / 2.0)
-        yy = torch.linspace(ty, -ty, H, device=self.device)
-        xx = torch.linspace(-ty * aspect, ty * aspect, W, device=self.device)
-        gx, gy = torch.meshgrid(xx, yy, indexing="xy")
-        cos_off = 1.0 / torch.sqrt(1.0 + gx ** 2 + gy ** 2)
-        r = torch.sqrt(gx ** 2 + gy ** 2)
-        r = r / r.max()
-        out = (cos_off[None], r[None])
-        self._px_cache[key] = out
-        return out
+        """cos(off-axis angle) and normalised radius for every supersampled pixel, (1, H, W).
+
+        The field of view moves with the body, since the camera frames each mesh by its own
+        extent, so it takes a different value on nearly every call. Only the cosine depends
+        on it, and it is one square root over the grid.
+        """
+        g2, r = self._unit_grid()
+        ty = float(np.tan(fov_y_rad / 2.0))
+        return 1.0 / torch.sqrt(1.0 + ty * ty * g2), r
 
     def render(self, pos_clip: torch.Tensor, faces: torch.Tensor, attr: torch.Tensor,
                antialias: bool = True):

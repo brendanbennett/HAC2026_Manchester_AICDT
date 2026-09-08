@@ -64,6 +64,14 @@ SOLVE_CHUNK = 20000    # sample points per block of the solve. Both the core sup
 # sampler never sees is an amplitude the fit cannot determine.
 SAMPLE_EXTENT = LATTICE_EXTENT + 3.0 * LATTICE_ALPHA * (2.0 * LATTICE_EXTENT / LATTICE_SHAPE[0])
 SD_CHUNK = 500         # query points per call to the mesh's signed distance; see sample_arrays
+POINTS_PER_SITE = 12   # fewest sample points per amplitude the fit will accept. Measured
+                       # on the library: at five per amplitude a carved body's fit
+                       # overshoots and decodes to a body unlike itself, at seventeen it
+                       # reproduces one at convexity 0.34 to a Dice of 0.97. A smooth body
+                       # needs far fewer, since most of its amplitudes are near zero, so
+                       # this floor is set by the bodies that matter. See main.
+DICE_FLOOR = 0.75      # median fitted Dice below which the corpus is refused; see
+                       # report_corpus
 
 
 def sample_arrays(verts, faces, n_pts=6000, seed=0):
@@ -83,6 +91,14 @@ def sample_arrays(verts, faces, n_pts=6000, seed=0):
     pts = np.vstack([pts, surf + rng.normal(0, 0.03, surf.shape)])
     sd = -np.concatenate([m.nearest.signed_distance(pts[i:i + SD_CHUNK])
                           for i in range(0, len(pts), SD_CHUNK)])   # trimesh: positive inside
+    # The sign comes from the mesh's winding, so a mesh that is inside out returns the whole
+    # field negated and the body is fitted as its own complement, with no sign of it in the
+    # residual. A point beyond the body's own bounding sphere is outside whatever the mesh
+    # says, so it is the cheapest thing that can tell the two apart.
+    far = np.linalg.norm(pts, axis=1) > float(np.linalg.norm(verts, axis=1).max()) + 1e-6
+    if far.any() and sd[far].min() <= 0.0:
+        raise ValueError("the signed distance calls points outside the body's bounding sphere "
+                         "inside it: the mesh is oriented inward. Check mesh_volume.")
     return pts.astype(np.float32), sd.astype(np.float32)
 
 
@@ -195,7 +211,7 @@ def fitted_dice(bodies, shape_list, families, n_sample: int, seed: int = 0) -> n
     return out
 
 
-def report_corpus(bodies, data, codes, before, after) -> bool:
+def report_corpus(bodies, data, codes, before, after, fit_dice=None) -> bool:
     """Report on the finished corpus. Returns True if it looks usable.
 
     Called after the corpus is written, never before: a fit that took hours must be flagged,
@@ -224,6 +240,18 @@ def report_corpus(bodies, data, codes, before, after) -> bool:
         print(f"  WARNING: the amplitudes barely reduced the residual ({r0:.4f} -> {r1:.4f}). "
               f"The corpus was still written, but these bodies are close to their own hulls.",
               flush=True)
+    # The decisive check, because it compares the decoded body with the body itself rather
+    # than with the sample points it was fitted from. An under-determined solve reproduces
+    # its points and not its body: the residual falls, the amplitudes vary, nothing above
+    # fires, and the decoded bodies are wrong. Only Dice sees that.
+    if fit_dice is not None:
+        d = np.asarray(fit_dice, dtype=float)
+        d = d[np.isfinite(d)]
+        if len(d) and float(np.median(d)) < DICE_FLOOR:
+            bad.append(f"the fitted bodies do not reproduce the bodies they were fitted to: "
+                       f"median Dice {float(np.median(d)):.3f} over {len(d)} sampled bodies, "
+                       f"against a floor of {DICE_FLOOR}. The usual cause is too few sample "
+                       f"points for how deeply carved the library is; raise --points.")
     for b_ in bad:
         print(f"  ERROR: {b_}", flush=True)
     return not bad
@@ -251,6 +279,19 @@ def main():
     ap.add_argument("--dice-bodies", type=int, default=64,
                     help="bodies sampled for the fitted-Dice check by family; 0 skips it")
     a = ap.parse_args()
+    # The amplitudes are the solution of a system with N_SITES unknowns, and the sample points
+    # are its equations. Below a few equations per unknown only the ridge decides the answer,
+    # and the fit returns large amplitudes that reproduce the sample points and not the body:
+    # the corpus is then quietly wrong, and the flow trains on it for as long as the run takes.
+    # A carved body needs the margin more than a smooth one, because more of its amplitudes
+    # are doing work. This is a precondition, so it is checked before any body is loaded.
+    n_samples = a.points + a.points // 2
+    if n_samples < POINTS_PER_SITE * N_SITES:
+        raise SystemExit(
+            f"--points {a.points} gives {n_samples} sample points for {N_SITES} amplitudes, "
+            f"under the {POINTS_PER_SITE} per amplitude the solve needs to be determined by "
+            f"the body rather than by the ridge. Use --points "
+            f"{int(np.ceil(POINTS_PER_SITE * N_SITES / 1.5))} or more.")
 
     from hac26.library_io import load_library_dir
     print(f"[1] loading {a.bodies} bodies from {a.shapes_dir}", flush=True)
@@ -368,7 +409,7 @@ def main():
              radius=radii, meta=json.dumps(meta, sort_keys=True))
     print(f"  codes {codes.shape}, amplitude variance {codes[:, N_DIR:].var(0).mean():.5f}")
     print(f"  wrote {a.out}")
-    if not report_corpus(bodies, data, codes, before, after):
+    if not report_corpus(bodies, data, codes, before, after, fit_dice=fit_d):
         raise SystemExit("fit_shapes: the corpus above is degenerate. It was written so the "
                          "fit is not lost, but do not train on it.")
 

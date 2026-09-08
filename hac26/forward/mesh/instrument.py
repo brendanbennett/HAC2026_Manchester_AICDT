@@ -42,7 +42,15 @@ class Instrument(nn.Module):
     """The fitted scene and sensor parameters. Construct with the starting values; load a
     calibration with `load`."""
 
-    def __init__(self, rho: float = 0.85, delta_deg: float = 1.0, eye_distance: float = 8.0,
+    # rho starts at the middle of the range of asteroid analogue materials rather than near
+    # one. It is fitted, so this is a starting point, but it is the starting point of a
+    # parameter that sets how strongly light bounces between facets, and the interreflection
+    # amplification 1 / (1 - rho * max row sum) is several-fold near one and about a quarter
+    # at a fifth. Bounced light fills concavities, so a high albedo drags a carved body's
+    # curves toward its convex hull's; measured on two library bodies, the separation between
+    # a body and its own hull in the intensity curves is several times larger at 0.2 than at
+    # 0.85, while the binary curves, which are geometry, barely move.
+    def __init__(self, rho: float = 0.20, delta_deg: float = 1.0, eye_distance: float = 8.0,
                  tau_i: float = 0.02, eta: float = 0.02, n_curves: int = N_CURVES,
                  quantise: bool = True):
         super().__init__()
@@ -51,7 +59,8 @@ class Instrument(nn.Module):
         self.raw_delta = nn.Parameter(torch.tensor(_inv_softplus(np.radians(delta_deg))))
         self.raw_eye = nn.Parameter(torch.tensor(_inv_softplus(eye_distance)))
         self.raw_tau_i = nn.Parameter(torch.tensor(_inv_sigmoid(tau_i)))
-        self.pedestal = nn.Parameter(torch.zeros(n_curves))
+        self.n_curves = n_curves
+        self.raw_pedestal = nn.Parameter(torch.full((n_curves // 2,), -6.0))
         self.raw_eta = nn.Parameter(torch.full((n_curves,), _inv_softplus(eta)))
 
     @property
@@ -69,6 +78,26 @@ class Instrument(nn.Module):
     @property
     def tau_i(self) -> torch.Tensor:
         return torch.sigmoid(self.raw_tau_i)
+
+    @property
+    def pedestal(self) -> torch.Tensor:
+        """The per-curve offset added to the image before the curve is formed, laid out as
+        the curves are: the intensity curves first, then the binary ones.
+
+        The intensity offset is held below tau_i. The background of a rendered frame is
+        exactly zero, so an offset above the threshold puts every background pixel into the
+        summed intensity; with a body covering a few per cent of the frame that constant is
+        several times the signal, and after the per-curve mean normalisation it flattens the
+        curve. Since the threshold is what separates the body from the background, the offset
+        belongs below it.
+
+        The binary offset is zero and is not fitted. The binary threshold is Otsu's threshold
+        of the same image, which moves with an added constant, so the count above it is
+        unchanged by the offset: the offset is a direction the curves cannot see, and fitting
+        it only lets the calibration wander along it.
+        """
+        ped_i = self.tau_i * torch.sigmoid(self.raw_pedestal)
+        return torch.cat([ped_i, torch.zeros_like(ped_i)])
 
     @property
     def eta(self) -> torch.Tensor:

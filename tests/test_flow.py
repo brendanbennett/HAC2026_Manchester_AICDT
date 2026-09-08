@@ -194,3 +194,39 @@ def test_the_summary_is_a_response_to_the_curves():
     with torch.no_grad():
         empty = net.reader(torch.zeros(K, C, N_MODES, N_FEAT), tag, mask)
     assert float(empty.abs().max()) == 0.0
+
+
+def test_guidance_weights_the_data_part_and_leaves_the_prior_alone():
+    """The velocity is the prior's plus the data part's, which is the pair an interpolation
+    between an unconditional and a conditional field is built from, so the interpolation is a
+    weight on the data part alone. At weight one the velocity is the model as trained, and the
+    weight never touches the prior."""
+    net = _codec().eval()
+    with torch.no_grad():                 # a prior and a data part that both say something
+        net.prior.gain[-1].bias.fill_(0.3)
+        for e in net.experts:
+            for p in e.parameters():
+                p.data.add_(0.05 * torch.randn_like(p))
+    C, B = len(cameras()), 3
+    t, code, rad = torch.tensor([0.2, 0.5, 0.8]), torch.randn(3, CODE_DIM), torch.ones(3)
+    inp, tag = _inputs(B, C), geometry_tags().expand(B, -1, -1)
+    prior = net.prior_velocity(code, t, rad, inp.sphere, inp.vol)
+    datav = net.data_velocity(code, t, rad, tag, inp)
+    assert datav.abs().sum() > 0          # otherwise the weight has nothing to act on
+    assert torch.allclose(net.velocity(code, t, rad, tag, inp), prior + datav)
+    assert torch.allclose(net.velocity(code, t, rad, tag, inp, guidance=1.0), prior + datav)
+    # the weight ramps with t: neutral where the residual is about the prior's guess rather
+    # than about the body, full where the endpoint estimate is nearly the answer
+    for w in (0.0, 2.0, 3.5):
+        got = net.velocity(code, t, rad, tag, inp, guidance=w)
+        ramp = (1.0 + (w - 1.0) * t).reshape(-1, 1)
+        assert torch.allclose(got, prior + ramp * datav, atol=1e-6)
+    t0 = torch.zeros(B)
+    d0 = net.data_velocity(code, t0, rad, tag, inp)
+    p0 = net.prior_velocity(code, t0, rad, inp.sphere, inp.vol)
+    for w in (1.0, 2.0, 5.0):             # at t = 0 every weight is the model as trained
+        assert torch.allclose(net.velocity(code, t0, rad, tag, inp, guidance=w), p0 + d0,
+                              atol=1e-6)
+    t1 = torch.ones(B)
+    p1 = net.prior_velocity(code, t1, rad, inp.sphere, inp.vol)
+    assert torch.allclose(net.velocity(code, t1, rad, tag, inp, guidance=0.0), p1, atol=1e-6)
