@@ -9,6 +9,21 @@ agreement between them is evidence and disagreement is a place to look.
 Everything below is either a numerical comparison between the two models or a measurement
 on the released data (`HAC_data_May_8`). Reproduction notes are at the end.
 
+## Status
+
+| | finding | status |
+|---|---|---|
+| 1 | the pair difference is not the noise | **fixed** -- `noise.sigma_from_highfreq` |
+| 2 | the calibration is bounded by its step budget | **fixed** -- early stop, movement report |
+| 3 | no BRDF freedom, and the data asks for one | **open** -- the evidence stands, the mechanism I proposed does not; see the note added below |
+| 4 | the xy centroid recentring | **fixed** -- `rescale_touch_z(..., centre_xy=False)` |
+| 5 | the field of view is tied to the body | **open, and smaller than first stated** -- see the correction below |
+
+Findings 1, 2 and 4 are commits on this branch, each with tests. Nothing here has been rerun
+through `calibrate.py`: that needs nvdiffrast and a GPU, and 1, 2 and 4 all change what the
+calibration means, so `models/instrument_calibration.pt` is stale and everything downstream
+of it should be regarded as provisional until it is refitted.
+
 ---
 
 ## What checks out
@@ -60,7 +75,7 @@ binary pedestal is sound. No change needed.
 
 ---
 
-## 1. `sigma_from_replicates` is not measuring measurement noise
+## 1. The replicate-pair difference is not measuring measurement noise
 
 `hac26/noise.py` states: *"At each azimuth two cameras sit at the same place and see the
 same body at the same instant, so their difference is measurement noise with no geometry in
@@ -75,40 +90,45 @@ temporal shift (the challenge text describes exactly this). They are not simulta
 their difference carries the A/B mounting mismatch, the residual alignment error and the
 stem, not just noise.
 
-Measured on the released curves — σ from the pair difference, against a per-curve
-high-frequency estimate from successive differences, plus how much of the difference
-survives a 15-frame box smooth:
+Measured on the released curves — the pair difference against the noise estimated from each
+curve's own high-frequency content, plus how much of the difference survives a 15-frame box
+smooth:
 
 ```
-model 3 intensity   σ(a−b)/√2   HF noise   ratio   low-freq share of (a−b)
-  az  45              0.0048      0.0017     2.9          0.98
-  az  90              0.0088      0.0028     3.2          0.97
-  az 135              0.0318      0.0070     4.6          0.98
-  az 225              0.0328      0.0061     5.4          0.98
+                    pair difference / noise, per azimuth
+model 1 intensity   az0  4x  az45  3x  az90  3x  az135 12x  az225 50x  az270 11x  az315  7x
+model 2 intensity   az0 11x  az45 24x  az90 39x  az135 81x  az225 71x  az270 42x  az315 26x
+model 3 intensity   az0  6x  az45  3x  az90  3x  az135  5x  az225  6x  az270  2x  az315  7x
 
-model 1 intensity
-  az 135              0.0517      0.0040    13.1          0.99
-  az 225              0.0539      0.0027    20.0          0.99
+over all 168 released curves:    min 1x, median 12x, max 277x
+low-frequency share of (a − b): 0.86 to 0.99
 ```
 
-σ is inflated by 3–20×, and 86–99% of the difference is low-frequency — structure, not
-noise. Four consequences, all downstream of the same number:
+σ is inflated by a median factor of 12, and 86–99% of the difference is low-frequency —
+structure, not noise. Four consequences, all downstream of the same number:
 
 - The `per_sigma` column of the residual report is divided by a model-error-inflated scale,
   so the headline "residual against the measurement noise alone" understates the real
   misfit by that factor. The README calls this "the number that says how well the forward
   model matches the organisers' processing".
 - The NLL weights each curve by `1/(σ² + η²)`, so the az 135/225 geometries are
-  down-weighted by up to 20×. Those are the α = 135° geometries — the longest shadows and
+  down-weighted by up to two orders of magnitude. Those are the α = 135° geometries — the longest shadows and
   the most shape information in the whole dataset.
 - `NOISE_PROFILE` is built from these σ, so training injects noise with the wrong overall
   level and the wrong per-azimuth shape, teaching the flow to distrust the same geometries.
 - The polish step, "stopped at the noise level", stops far too early.
 
-**Suggested fix.** Estimate σ per curve from the high-frequency content (successive
-differences, or the tail of the periodogram) rather than from the pair difference, and let
-the A/B mismatch land in `eta`, where the log-determinant term already prices it correctly.
-Keeping the pair difference as a *separate* diagnostic of A/B consistency is still useful.
+**Fixed.** σ now comes from the second difference along each curve,
+`1.4826 · MAD(d) / √6`, taken at the files' native ~841 frames. Second differences rather
+than first: the first difference still carries the signal's own slope, which on these curves
+is of the same order as the noise and larger than it on the faceted bodies. The estimate has
+to be made before the resampling to the operator's phase grid, so `load_model_curves` now
+keeps the native-resolution curves. The pair difference survives as `noise.ab_mismatch`,
+documented as the A/B consistency diagnostic it is and reported beside σ by `calibrate.py`;
+`eta` is where it belongs, and the log-determinant term already prices it. `NOISE_PROFILE`,
+`NOISE_LO` and `NOISE_HI` are re-measured with the new estimator — the profile now rises
+monotonically with phase angle and the intensity and binary curves agree on its shape, which
+the old one did not.
 
 ## 2. The calibration is bounded by the optimiser budget, not converged
 
@@ -135,10 +155,15 @@ That matters, because 8.5 is probably too close. Two independent estimates:
   lands at ~24 model units (broad optimum over 20–32, consistent across asteroids 1, 2 and
   3). Its pre-re-render fit was ~8, which is suspiciously close to this init.
 
-**Suggested fix.** Raise `--steps` / `--lr` until the fit stops moving, and print the
-movement of every parameter in raw space at the end so a truncated fit is visible. It is
-worth re-checking ρ specifically: `Instrument.__init__` argues at length for starting at
-0.20, and the data is pulling hard in the opposite direction.
+**Fixed.** The run now stops early on a plateau of the likelihood (`--tol` over
+`--patience` steps), so the step cap can be raised without paying for it when it is not
+needed, and the default cap goes 150 → 600. Afterwards it prints how far every parameter
+travelled against its own budget and names the ones still moving, and the residual table is
+explicitly downstream of that check: while anything is named, the residuals are those of a
+truncated fit. The movement table goes into `instrument_calibration.json` as well.
+
+Worth watching ρ specifically on the refit: `Instrument.__init__` argues at length for
+starting at 0.20, and the data was pulling hard in the opposite direction when the run ended.
 
 ## 3. There is no BRDF freedom, and the data asks for some
 
@@ -186,10 +211,46 @@ while the exact chain uses pure Lambert, so the repository's two forward models 
 about the scattering law. That is defensible while the convex stage only supplies a starting
 support, but it means the convex stage cannot be used as a check on the exact one.
 
-**Suggested fix.** Give the chain one BRDF parameter (a roughness in an Oren–Nayar term is
-the cheapest thing that produces the observed phase-angle trend) and fit it alongside ρ,
-then re-read the az 135/225 residuals. If ρ alone can do it once §2 is lifted, that is the
-simpler answer.
+**Open. The evidence above stands; the mechanism I first proposed does not.** The obvious
+candidate is a surface roughness — an Oren–Nayar term on the direct light, zero being exactly
+Lambert. I implemented it (per-face emission directions, the factor applied to the direct
+term only, with the interreflected term left Lambertian) and measured what it does, and it
+does not do this:
+
+```
+                        amplitude ratio vs a Lambert render, by phase angle
+target from the data      α=0: 1.17   α=45: 1.03   α=90: 0.88   α=135: 0.70
+Oren–Nayar, σ = 10°       α=0: 0.94   α=45: 0.98   α=90: 1.00   α=135: 1.00
+Oren–Nayar, σ = 20°       α=0: 0.86   α=45: 0.96   α=90: 1.00   α=135: 1.00
+Oren–Nayar, σ = 30°       α=0: 0.80   α=45: 0.94   α=90: 1.00   α=135: 1.00
+```
+
+It bites hardest at α = 0, where the data wants *more* amplitude, and does nothing at all at
+α = 135, where the data wants a third less. Wrong sign at one end and no effect at the other.
+An additive ambient floor — the lab is not a black void, and there is a beam splitter in the
+path at az 0 — moves things the same negligible amount on the same test.
+
+Two caveats on that negative result, which is why this is open rather than closed:
+
+- The test body is a convex ellipsoid, because that is what the pure-torch rasteriser can
+  render here in reasonable time. A convex body's high-phase-angle amplitude comes from the
+  shape of its terminator, and both mechanisms are weak there. The trend was *measured* on
+  model 3, which is strongly non-convex. The probe may simply be insensitive rather than the
+  mechanism wrong.
+- The qualitative Oren–Nayar model diverges as both the incidence and emission angles go to
+  grazing, and unbounded it reaches a factor of ~3600 on a sphere at 20° of roughness, which
+  saturates the sensor and destroys the curve instead of shaping it. Any implementation needs
+  a floor on `max(n·s, n·v)`; 0.25 is a reasonable one.
+
+So the branch does **not** add a BRDF parameter. Adding a fitted physical parameter to the
+calibration on the strength of a hypothesis whose one usable test contradicts it is the same
+mistake as §2 in a different costume — it would give the fit a new direction to absorb misfit
+along, with no evidence it is the right one. The right next step is to repeat the measurement
+above on a non-convex body with nvdiffrast, where the render is cheap, before deciding.
+
+The other thing to try first is simply lifting §2 and seeing how far ρ goes on its own:
+interreflection fills shadows, which is the right kind of effect, and ρ was still climbing
+when the old run ended.
 
 ## 4. Recentring xy on the solid centroid is wrong and unnecessary
 
@@ -218,10 +279,17 @@ This lands in two places that matter:
   the published R, so the recovered body is both shifted and mis-scaled relative to a truth
   posed on the axis. For an asymmetric body the error grows with the asymmetry.
 
-**Suggested fix.** Drop the xy translation; take the radius as max|xy| about the origin.
-The lightcurves are nearly blind to a lateral offset, so this is a prior, not something the
-data will correct — which is a reason to make it the right prior rather than a convenient
-one.
+**Fixed.** `rescale_touch_z` takes a `centre_xy` flag, still true by default because a
+procedural library body has no meaningful origin and has to be mounted somehow — the same
+rule `shape_library.pose` already uses. The call sites handling bodies already in the
+challenge frame pass `False`: the calibration's truth, both scorers, `reconstruct_lpd`'s dice
+check, `measure_public_shapes`. `CodeOperator.canonical` no longer translates at all, so the
+radius is `max|xy|` about the axis; a corpus body, which is centred when it is posed, is
+unaffected. The published-radius test tightens from 3% to 1% and gains a companion showing
+that centring makes the fit worse wherever the centroid really is off the axis.
+
+The lightcurves are nearly blind to a lateral offset, so this is a prior rather than
+something the data will correct — which is the reason to make it the right prior.
 
 ## 5. The field of view is tied to the body, not to the lens
 
@@ -235,20 +303,21 @@ model 10 (R = 3.95) →  fov_y ≈ 75°
 real 100 mm lens on full frame  ≈ 14°
 ```
 
-Two consequences. The cos⁴ falloff and the vignetting polynomial are applied at
-body-relative radii rather than frame-relative ones, so they mean something different for
-each body. And because `tan(fov/2) = fov_scale · extent / eye_distance`, the perspective
-strength is `extent/eye_distance = tan(fov/2)/fov_scale` — fixing `fov_scale` couples the
-frame fill to the camera distance, so the two cannot be identified separately. That coupling
-is a plausible part of why §2 looks the way it does.
+**Correction to my first draft of this section.** I wrote that fixing `fov_scale` couples
+the frame fill to the camera distance so that the two cannot be identified separately, and
+that this was a plausible cause of §2. That is wrong. Perspective strength is
+`extent / eye_distance`, which `eye_distance` sets on its own; `fov_scale` only fixes how
+much of the frame the body fills. The two are separable and §2 stands on its own.
 
-Most of the absolute scale cancels in the per-curve mean normalisation, so this is smaller
-than it first appears — but model 10 is currently rendered through a wide-angle lens it was
-never filmed with.
+What is left is smaller and second-order: the cos⁴ falloff and the vignetting polynomial are
+applied at body-relative radii rather than frame-relative ones, so a single fitted vignette
+polynomial means something different for each body, and model 10 is rendered through a
+75° lens it was never filmed with. Most of the absolute scale cancels in the per-curve mean
+normalisation. Tying the framing to the body also has a real virtue — every body is sampled
+by the same number of pixels, whatever its shape — so this is a trade, not a defect.
 
-**Suggested fix.** Make the field of view a fitted instrument parameter (or fix it from the
-lens and let the frame fill follow from `eye_distance`), rather than deriving it from each
-body's extent.
+**Open, low priority.** If it is worth doing, make the field of view a fitted instrument
+parameter and let the frame fill follow, rather than deriving it from each body's extent.
 
 ## 6. Smaller things
 
@@ -303,8 +372,9 @@ package.
 - Convention comparison: build `conventions.cameras()` vectors and `exact.rotate_z(w,
   −psi_grid())`, compare elementwise against the reference model's camera/light directions.
 - §1: read `Asteroid0{m}_lightcurve_{intensity,binary}.txt`, take columns `4i` and `4i+1`
-  per azimuth; compare `sqrt(mean((a−b)²)/2)` with `sqrt(mean(diff(a)²)/2)`, and the std of
-  a 15-frame box smooth of `a−b` with the std of `a−b`.
+  per azimuth; compare `noise.ab_mismatch` with `noise.sigma_from_highfreq`, and the std of
+  a 15-frame box smooth of `a−b` with the std of `a−b`. Both on the native-resolution
+  curves — resample first and the noise estimate reads the signal's curvature instead.
 - §2: `150 * 0.03 = 4.5`, then invert `softplus`/`sigmoid` at the init and fitted values
   quoted in `models/instrument_calibration.json`.
 - §3: resample real and `_blender` curves to 360, mean-normalise, align each column by
@@ -314,3 +384,9 @@ package.
   centroid shift, compare `max|xy|` against `conventions.CYLINDER_R`.
 - Otsu robustness: synthetic limb-darkened discs through `raster.otsu_threshold` at varying
   fill fraction, background level and background noise.
+- §3: render an ellipsoid hull at geometries 0, 4, 8, 12 (α = 0, 45, 90, 135) with
+  `Instrument(rho=0.85, tau_i=1e-4, quantise=False)` and the saturation pushed well clear, so
+  no geometry sits on the intensity threshold; take the peak-to-peak of each mean-normalised
+  intensity curve and divide by the same at zero roughness. Check the raw minima are non-zero
+  first: with the default instrument the α = 135 curve sits on `tau_i` and collapses, which
+  makes the ratio meaningless rather than small.
