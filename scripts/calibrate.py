@@ -70,7 +70,9 @@ OUT_REPORT = "models/instrument_calibration.json"
 def load_truth(data_dir: str, model: int, device: str):
     """The released mesh of a public model, posed and decimated, as torch tensors."""
     v, f = load_stl(public_stl(data_dir, model))
-    v = rescale_touch_z(v, f)
+    # centre_xy=False: the released STL is already posed on the rotation axis, and moving it
+    # onto its own centroid would move it off (hac26.shapes.rescale_touch_z)
+    v = rescale_touch_z(v, f, centre_xy=False)
     v, f = decimate(np.asarray(v, dtype=np.float64), np.asarray(f, dtype=np.int64), TRUTH_FACES)
     return (torch.tensor(v, dtype=torch.float32, device=device),
             torch.tensor(f, dtype=torch.long, device=device))

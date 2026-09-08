@@ -138,19 +138,36 @@ def solid_centroid(verts: np.ndarray, faces: np.ndarray) -> np.ndarray:
     return (tet * w[:, None]).sum(0) / tot if abs(tot) > 1e-12 else v.mean(0)
 
 
-def rescale_touch_z(verts: np.ndarray, faces: np.ndarray | None = None) -> np.ndarray:
-    """The challenge pose: uniform scale and translation so that min z = -1, max z = +1 and
-    the centroid sits on the rotation axis. A uniform scale does not change the
-    mean-normalised curves.
+def rescale_touch_z(verts: np.ndarray, faces: np.ndarray | None = None,
+                    centre_xy: bool = True) -> np.ndarray:
+    """The challenge pose: uniform scale and translation so that min z = -1 and max z = +1.
+    A uniform scale does not change the mean-normalised curves.
 
-    Pass `faces` whenever two meshes will be compared. With them the centre is the solid
-    centroid; without them it is the vertex mean, which depends on the triangulation, so two
-    meshes of the same body would be posed at different centres.
+    `centre_xy` decides what happens to x and y, and the answer depends on where the mesh
+    came from:
+
+    - A mesh that is **already in the challenge frame** -- a released public STL, a
+      reconstruction this package produced, anything whose origin is the rotation axis --
+      must be left alone: `centre_xy=False`. Its origin is the axis, and moving the body to
+      put its centroid there moves it off. The released STLs say so. Posed to z in [-1, 1],
+      their largest xy radius about the STL origin matches the published bounding-cylinder
+      radius to within 0.6% (1.1198 vs 1.12, 1.4142 vs 1.42, 0.8782 vs 0.88), and centring
+      them on the solid centroid makes model 2 read 1.4451 -- larger than the published
+      *minimal* enclosing radius, which the true body cannot be -- and displaces it by 0.031.
+    - A mesh with **no meaningful origin** -- a procedural library body, a random training
+      shape -- has to be mounted on the axis somehow, and its centroid is as good a choice as
+      any: `centre_xy=True`, the default, which is also the rule
+      `hac26.shape_library.pose` uses so that a body posed either way lands in the same place.
+
+    Pass `faces` whenever two meshes will be compared and `centre_xy` is on. With them the
+    centre is the solid centroid; without them it is the vertex mean, which depends on the
+    triangulation, so two meshes of the same body would be posed at different centres.
     """
     v = verts.copy()
-    c = v.mean(0) if faces is None else solid_centroid(v, faces)
-    v[:, 0] -= c[0]
-    v[:, 1] -= c[1]
+    if centre_xy:
+        c = v.mean(0) if faces is None else solid_centroid(v, faces)
+        v[:, 0] -= c[0]
+        v[:, 1] -= c[1]
     zmin, zmax = v[:, 2].min(), v[:, 2].max()
     v[:, 2] -= 0.5 * (zmin + zmax)
     return v * (2.0 / (zmax - zmin))

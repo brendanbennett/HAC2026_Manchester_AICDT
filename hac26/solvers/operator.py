@@ -74,19 +74,21 @@ class CodeOperator:
         return verts, faces
 
     @staticmethod
-    def canonical(verts: torch.Tensor, faces: torch.Tensor) -> torch.Tensor:
+    def canonical(verts: torch.Tensor, faces: torch.Tensor | None = None) -> torch.Tensor:
         """The challenge pose, applied to any closed mesh and differentiable in its vertices:
-        the centroid of the solid on the rotation axis, z touching -1 and +1, the largest
-        distance from the axis one. These hold for every body the corpus was fitted from and
-        for every real model, so they are imposed on every iterate the operator sees, not
-        only on the final answer."""
-        v0, v1, v2 = verts[faces[:, 0]], verts[faces[:, 1]], verts[faces[:, 2]]
-        cr = torch.cross(v1 - v0, v2 - v0, dim=-1)
-        w = ((v0 + v1 + v2) * cr).sum(-1) / 18.0                 # signed volume per tetrahedron
-        tot = w.sum()
-        c = (((v0 + v1 + v2) / 4.0) * w[:, None]).sum(0) / tot if tot.abs() > 1e-12 \
-            else verts.mean(0)
-        xy = verts[:, :2] - c[:2]
+        z touching -1 and +1, and the largest distance from the rotation axis one. These hold
+        for every body the corpus was fitted from and for every real model, so they are
+        imposed on every iterate the operator sees, not only on the final answer.
+
+        The rotation axis is the z axis of the frame the iterate is already in -- the grid the
+        field is extracted on, which is centred on the origin, itself inherited from the
+        convex start. It is not recentred here. The challenge fixes the axis, not the body's
+        centre of mass, and the published radius is the largest distance from *the axis*; the
+        released STLs are posed that way and moving them onto their own centroid moves them
+        off it (hac26.shapes.rescale_touch_z). A body that is already centred, which every
+        corpus body is, is unaffected.
+        """
+        xy = verts[:, :2]
         z = verts[:, 2]
         z = 2.0 * (z - z.min()) / (z.max() - z.min()).clamp_min(1e-9) - 1.0
         xy = xy / xy.norm(dim=1).max().clamp_min(1e-9)

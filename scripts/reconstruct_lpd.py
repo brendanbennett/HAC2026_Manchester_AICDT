@@ -578,8 +578,8 @@ def main():
     if a.model in PUBLIC_MODELS:
         import trimesh
         t = trimesh.load(public_stl(a.data_dir, a.model), process=False)
-        tv = rescale_touch_z(np.asarray(t.vertices), np.asarray(t.faces))
-        rv = rescale_touch_z(v, f)
+        tv = rescale_touch_z(np.asarray(t.vertices), np.asarray(t.faces), centre_xy=False)
+        rv = rescale_touch_z(v, f, centre_xy=False)
         e = max(float(np.abs(tv).max()), float(np.abs(rv).max())) * 1.05
         res["dice"] = float(dice(mesh_occupancy(tv, np.asarray(t.faces), 128, e),
                                  mesh_occupancy(rv, f, 128, e)))

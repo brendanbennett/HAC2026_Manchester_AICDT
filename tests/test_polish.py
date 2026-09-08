@@ -17,7 +17,14 @@ from hac26.solvers.operator import CodeOperator                                #
 from reconstruct_lpd import POLISH_TARGET, polish, whitened_misfit             # noqa: E402
 from train_lpd import FIT_KNEE, data_fit, with_gradient                        # noqa: E402
 
-SMALL = RenderConfig(height=24, width=40, supersample=1, sun_res=64, phase_chunk=4,
+# The polish is a line search on the rendered misfit, so the render has to be fine enough
+# that the misfit falls smoothly along the descent direction. At 24x40 with no supersampling
+# it does not: the body covers ~15 pixels across, the binary count moves in whole pixels, and
+# the misfit wobbles by more between neighbouring step sizes than the step buys. The line
+# search then stops on whichever of its five step sizes happens to land on a decrease, which
+# is luck rather than a property of the polish. At this resolution the misfit is monotone
+# below the first step size and the descent is a descent.
+SMALL = RenderConfig(height=48, width=80, supersample=2, sun_res=128, phase_chunk=4,
                      radiosity_faces=48)
 GEOMS = [0, 7]
 
