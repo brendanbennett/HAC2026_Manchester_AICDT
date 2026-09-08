@@ -24,6 +24,16 @@ import sys
 import urllib.request
 from pathlib import Path
 
+import truststore
+
+# The stdlib ssl module verifies against a static CA bundle that can lag behind the OS's own
+# trust store; JPL's host chains through a Sectigo root recent enough to be missing from it,
+# which urlopen reports as "self-signed certificate in certificate chain" even though the
+# system (and curl) trusts the chain fine. truststore delegates verification to the OS trust
+# store instead, so this stays real certificate verification, just against the same roots
+# curl already uses.
+truststore.inject_into_ssl()
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from hac26.shape_library import read_shape_model                     # noqa: E402
