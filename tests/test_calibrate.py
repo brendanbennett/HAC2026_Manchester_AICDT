@@ -44,3 +44,57 @@ def test_a_settled_fit_is_not_flagged():
 def test_a_vector_parameter_reports_its_largest_component():
     rep = _report({"raw_oetf": [0.0, 0.0, 0.0]}, {"raw_oetf": [0.1, -3.0, 0.4]})
     assert rep["raw_oetf"]["moved"] == pytest.approx(3.0)
+
+
+# ---------------------------------------------------------------- alignment diagnostic
+
+def _curves(P, shifts_deg):
+    """(28, 2, P) curves, each azimuth group shifted by its own amount."""
+    import numpy as np
+    t = 2 * np.pi * np.arange(P) / P
+    base = 1.0 + 0.3 * np.cos(2 * t + 0.4) + 0.15 * np.cos(5 * t)
+    out = torch.zeros(28, 2, P)
+    for i, az in enumerate((0, 45, 90, 135, 225, 270, 315)):
+        f = shifts_deg[az] * P / 360.0
+        idx = (np.arange(P) - f) % P
+        y = np.interp(idx, np.arange(P + 1), np.r_[base, base[0]])
+        for j in range(4):
+            out[4 * i + j, 0] = torch.tensor(y, dtype=torch.float32)
+            out[4 * i + j, 1] = torch.tensor(y, dtype=torch.float32)
+    return out
+
+
+def test_an_aligned_set_reports_no_offset():
+    P = 96
+    zero = dict.fromkeys((0, 45, 90, 135, 225, 270, 315), 0.0)
+    c = _curves(P, zero)
+    off = calibrate.phase_offset_report(c, c.clone(), torch.ones(28, dtype=torch.bool),
+                                        torch.full((28, 2), 0.01))
+    assert all(v == 0.0 for v in off.values()), off
+
+
+def test_a_per_azimuth_misalignment_is_recovered():
+    """What the organisers' 17/25 Aug realignment of model 1 looked like: a different
+    whole-frame shift per azimuth, which no single psi0 can absorb."""
+    P = 96
+    truth = {0: -5.14, 45: 0.0, 90: 1.28, 135: 1.28, 225: -1.71, 270: -0.86, 315: 0.0}
+    pred = _curves(P, dict.fromkeys(truth, 0.0))
+    real = _curves(P, truth)
+    off = calibrate.phase_offset_report(pred, real, torch.ones(28, dtype=torch.bool),
+                                        torch.full((28, 2), 0.01))
+    res = 360.0 * 0.125 / P                       # the search's own resolution
+    for az, want in truth.items():
+        got = off[str(float(az))]
+        assert abs(got - want) <= res + 1e-9, f"az {az}: reported {got:+.2f}, want {want:+.2f}"
+
+
+def test_a_common_offset_is_reported_on_every_azimuth():
+    """A psi0 that is simply wrong shifts every group by the same amount, which is what
+    distinguishes it from curves that disagree with each other."""
+    P = 96
+    common = dict.fromkeys((0, 45, 90, 135, 225, 270, 315), 3.75)
+    off = calibrate.phase_offset_report(_curves(P, dict.fromkeys(common, 0.0)),
+                                        _curves(P, common),
+                                        torch.ones(28, dtype=torch.bool),
+                                        torch.full((28, 2), 0.01))
+    assert len(set(off.values())) == 1 and abs(list(off.values())[0] - 3.75) < 0.5, off

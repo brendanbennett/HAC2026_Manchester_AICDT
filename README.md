@@ -21,8 +21,19 @@ same code on a slow pure-torch rasteriser, so they need neither.
 
 ## Data
 
-Put the challenge data in `dataset/raw/` under the organisers' original directory names and
-check it against `dataset/MANIFEST.sha256`. It is not stored in the repo.
+Put the challenge data in `dataset/raw/` under the organisers' original directory names. It
+is not stored in the repo. Check it with
+
+```
+python scripts/check_data.py
+```
+
+which verifies it against `dataset/MANIFEST.sha256` and names anything missing or changed.
+Do that after every download: the organisers have re-released these files more than once, and
+a partial refresh is silent. `--write` regenerates the manifest, for a refresh you meant to
+make. `calibrate.py` reports a per-azimuth phase offset for the same reason -- the realignment
+that came with the Aug 2026 update is a different shift per azimuth, which no single start
+phase absorbs.
 
 ## Running the pipeline
 

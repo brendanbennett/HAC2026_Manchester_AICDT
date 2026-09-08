@@ -147,6 +147,63 @@ def residual_report(pred, real, present, sigma, eta) -> dict:
     return out
 
 
+def _shift(curves: torch.Tensor, frac: float) -> torch.Tensor:
+    """Circularly shift along the phase axis by `frac` frames, linearly interpolated. The
+    curves are periodic, so this is exact wraparound; fractional because the shifts worth
+    seeing are smaller than one frame of the calibration's grid -- the organisers' realignment
+    of model 1 was up to 12 frames of 841, which is 0.7 of a frame at 48 phases."""
+    P = curves.shape[-1]
+    idx = torch.arange(P, dtype=torch.float32, device=curves.device) - frac
+    i0 = torch.floor(idx)
+    w = (idx - i0).to(curves.dtype)
+    i0 = i0.long() % P
+    return curves[..., i0] * (1 - w) + curves[..., (i0 + 1) % P] * w
+
+
+def phase_offset_report(pred, real, present, sigma, search: float = PSI0_SEARCH,
+                        step: float = 0.125) -> dict:
+    """The shift each azimuth group would still like, in degrees of rotation, at the fitted
+    psi0.
+
+    The calibration fits one start phase per body, which is right if the body's frames are
+    aligned with each other. The organisers align them per azimuth: the 17/25 Aug 2026 update
+    to model 1's real curves shifted each azimuth's four columns by its own whole-frame offset
+    (0 deg by -12 frames of 841, 90 and 135 by +3, 225 by -4, 270 by -2, 45 and 315 not at
+    all), leaving the shifted curves matching the old ones at corr = 1.0000. No single psi0
+    absorbs that, so a residual per-azimuth misalignment lands in the residual table looking
+    like forward-model error -- and it costs most where the curves move fastest, which is the
+    high phase angles that carry the most shape.
+
+    Reported, not fitted: seven more free parameters per body would explain away real misfit
+    just as readily. Groups that all want the same shift mean psi0 is off; groups that
+    disagree mean the curves are not aligned with each other, and the fix is a fresh download
+    rather than a wider fit (scripts/check_data.py).
+    """
+    P = real.shape[-1]
+    w = present[:, None, None] / sigma[..., None]
+    span = P * search
+    grid = [k * step for k in range(-int(span / step), int(span / step) + 1)]
+    out = {}
+    for az in sorted({c.azimuth_deg for c in cameras()}):
+        idx = [i for i, c in enumerate(cameras()) if c.azimuth_deg == az]
+        pr, rl, ww = pred[idx], real[idx], w[idx]
+        best, best_f = float("inf"), 0.0
+        for f in grid:
+            m = float(((_shift(pr, f) - rl) * ww).pow(2).mean())
+            if m < best:
+                best, best_f = m, f
+        out[str(az)] = 360.0 * best_f / P
+    return out
+
+
+def print_phase_offsets(model: int, off: dict, frames: int) -> None:
+    """One row per body, in degrees of rotation. All zero is a correctly aligned set."""
+    az = sorted(off, key=float)
+    res = 360.0 * 0.125 / frames
+    print(f"    model {model}: " + "  ".join(f"{float(a):>3.0f}deg {off[a]:+6.2f}" for a in az)
+          + f"   (deg, resolution {res:.2f})")
+
+
 def movement_report(start: dict, now: dict, budget: dict) -> dict:
     """How far each fitted parameter travelled in its raw (unsquashed) space, against how far
     the optimiser could have moved it.
@@ -293,7 +350,8 @@ def main():
     print("    /s      against sqrt(sigma^2 + eta^2), eta being the model error the fit admits")
     moved = movement_report(start, {n: p.detach() for n, p in named.items()}, budget)
     limited = print_movement(moved)
-    report = {"psi0_deg": {}, "residual": {}, "instrument": inst.summary(),
+    report = {"psi0_deg": {}, "residual": {}, "phase_offset_deg": {},
+              "instrument": inst.summary(),
               "steps_run": steps_run, "movement": moved, "budget_limited": limited}
     with torch.no_grad():
         eta = inst.eta.reshape(2, N_CAMS).T
@@ -303,6 +361,20 @@ def main():
             print_report(M, rep)
             report["residual"][M] = rep
             report["psi0_deg"][M] = float(np.degrees(float(b["psi0"])))
+            report["phase_offset_deg"][M] = phase_offset_report(
+                pred, b["real"], b["present"], b["sigma"])
+    print("\n[alignment] whole-frame shift each azimuth still wants at the fitted psi0")
+    print("    all zero = the body's frames agree with each other; a nonzero row means that")
+    print("    azimuth is misaligned with the others, which no single psi0 can absorb and")
+    print("    which the residual table above will show as forward-model error")
+    for M, off in report["phase_offset_deg"].items():
+        print_phase_offsets(M, off, a.phases)
+    worst = max((abs(v) for off in report["phase_offset_deg"].values()
+                 for v in off.values()), default=0.0)
+    if worst > 360.0 * 0.25 / a.phases:
+        print("  !!! Some azimuths are misaligned. Check the download against the manifest")
+        print("  !!! (scripts/check_data.py) before reading the residuals: the organisers have")
+        print("  !!! realigned these curves once already.")
     print(f"  fitted: {inst.summary()}")
     print("  start phases: " + ", ".join(f"model {M} {v:+.2f} deg"
                                           for M, v in report["psi0_deg"].items()))
