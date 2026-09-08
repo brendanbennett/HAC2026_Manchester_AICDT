@@ -11,8 +11,10 @@ curves given the rendered ones,
     sum over present curves and phases of  (pred - real)^2 / s^2 + log s^2,
     s_c^2 = sigma_c^2 + eta_c^2,
 
-with sigma_c the measurement noise of each curve from the co-located camera pairs. The log
-term is what stops the fit from explaining every residual by a larger eta.
+with sigma_c the measurement noise of each curve, estimated from its own high-frequency
+content at the files' native frame rate (hac26.noise). The log term is what stops the fit
+from explaining every residual by a larger eta, and eta is where the A/B mounting mismatch
+between the two columns of a geometry belongs.
 
 psi0 is first found by a search over whole-frame shifts of the rendered curves against the
 data, within an eighth of a turn either way, then refined with everything else. Its fitted
@@ -41,11 +43,12 @@ import torch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from hac26.conventions import PUBLIC_MODELS, SENSE, cameras, psi_grid   # noqa: E402
-from hac26.data_io import N_CAMS, load_model_curves, public_stl       # noqa: E402
+from hac26.data_io import (N_CAMS, load_model_curves, native_sigma,    # noqa: E402
+                           public_stl)
 from hac26.forward.mesh.exact import (ExactForward, RenderConfig, decimate, normalise,   # noqa: E402
                                       normalise_vjp)
 from hac26.forward.mesh.instrument import Instrument                  # noqa: E402
-from hac26.noise import sigma_from_replicates                         # noqa: E402
+from hac26.noise import ab_mismatch                                   # noqa: E402
 from hac26.shapes import rescale_touch_z                              # noqa: E402
 from hac26.stl_io import load_stl                                     # noqa: E402
 
@@ -66,14 +69,23 @@ def load_truth(data_dir: str, model: int, device: str):
 
 def load_data(data_dir: str, model: int, phases: int, device: str):
     """The real mean-normalised curves (N_CAMS, 2, P), which geometries are present (N_CAMS,)
-    and the measured noise per curve (N_CAMS, 2)."""
+    and the measured noise per curve (N_CAMS, 2).
+
+    The noise comes from the high-frequency content of each curve at the files' own frame
+    rate, not from the difference of the two columns of a geometry: those two columns are
+    separate recordings of the body in its two mountings, so their difference is dominated by
+    the A/B mismatch and runs 3-20x the actual noise (hac26.noise). That difference is
+    reported beside sigma as a diagnostic and is left for eta to absorb.
+    """
     d = load_model_curves(data_dir, model, m=phases)
     pairs = np.stack([d["curves"][:N_CAMS], d["curves"][N_CAMS:]], axis=1)
     present = (d["mask"][:N_CAMS] > 0) & (d["mask"][N_CAMS:] > 0)
-    sigma = sigma_from_replicates(d["curves"], d["mask"]).reshape(2, N_CAMS).T
+    sigma = native_sigma(d).reshape(2, N_CAMS).T
+    mismatch = ab_mismatch(d["curves"], d["mask"]).reshape(2, N_CAMS).T
     return (torch.tensor(pairs, dtype=torch.float32, device=device),
             torch.tensor(present, device=device),
-            torch.tensor(sigma, dtype=torch.float32, device=device))
+            torch.tensor(sigma, dtype=torch.float32, device=device),
+            torch.tensor(mismatch, dtype=torch.float32, device=device))
 
 
 def initial_psi0(fwd: ExactForward, verts, faces, real, present, sigma) -> float:
@@ -169,14 +181,15 @@ def main():
     for M in PUBLIC_MODELS:
         t0 = time.time()
         verts, faces = load_truth(a.data_dir, M, dev)
-        real, present, sigma = load_data(a.data_dir, M, a.phases, dev)
+        real, present, sigma, mismatch = load_data(a.data_dir, M, a.phases, dev)
         with torch.no_grad():
             psi0 = initial_psi0(fwd, verts, faces, real, present, sigma)
         bodies[M] = dict(verts=verts, faces=faces, real=real, present=present, sigma=sigma,
                          psi0=torch.tensor(psi0, device=dev, requires_grad=True))
         print(f"  model {M}: {len(faces)} faces, {int(present.sum())}/{N_CAMS} geometries, "
-              f"noise median {float(sigma.median()):.4f}, start phase "
-              f"{np.degrees(psi0):+.1f} deg ({time.time()-t0:.0f}s)", flush=True)
+              f"noise median {float(sigma.median()):.4f} (A/B mismatch "
+              f"{float(mismatch.median()):.4f}, {float(mismatch.median()/sigma.median()):.0f}x), "
+              f"start phase {np.degrees(psi0):+.1f} deg ({time.time()-t0:.0f}s)", flush=True)
 
     opt = torch.optim.Adam([{"params": fit_params + [inst.raw_eta]},
                             {"params": [b["psi0"] for b in bodies.values()], "lr": a.lr / 10}],
