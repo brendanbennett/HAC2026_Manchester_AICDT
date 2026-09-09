@@ -65,9 +65,15 @@ def load_model_curves(data_dir: str, model_idx: int, m: int = 360,
                       use_blender: bool = False, renormalize: bool = True) -> dict:
     """Assemble one model's [intensity, binary] curve stack, resampled to m frames.
 
-    Returns {'curves': (2 * N_CAMS, m), 'mask': (2 * N_CAMS,), 'files': {type: path}}. A
-    missing file leaves its block at zero with mask 0. `renormalize` divides each curve by
-    its mean, which leaves an already mean-normalised file unchanged.
+    Returns {'curves': (2 * N_CAMS, m), 'mask': (2 * N_CAMS,), 'files': {type: path},
+    'native': {type: (N_CAMS, m0)}}. A missing file leaves its block at zero with mask 0.
+    `renormalize` divides each curve by its mean, which leaves an already mean-normalised
+    file unchanged.
+
+    'native' holds the curves at the frame rate of the files, before the resampling. The
+    noise has to be estimated there: `hac26.noise.sigma_from_highfreq` reads successive
+    differences, and resampling ~841 frames down to the operator's phase grid turns those
+    into the curvature of the signal. `native_sigma` does that for a whole model.
     """
     import glob as _glob
 
@@ -75,6 +81,7 @@ def load_model_curves(data_dir: str, model_idx: int, m: int = 360,
     stack = np.zeros((2 * N_CAMS, m))
     mask = np.zeros(2 * N_CAMS, dtype=np.float32)
     found = {}
+    native = {}
     for j, ctype in enumerate(("intensity", "binary")):
         # The released archive spells the model number both zero-padded (Asteroid10) and
         # zero-prefixed (Asteroid010), and files sit in nested per-model folders, so both
@@ -87,14 +94,32 @@ def load_model_curves(data_dir: str, model_idx: int, m: int = 360,
             hits += _glob.glob(str(Path(data_dir) / nm))
         p = Path(sorted(hits)[0]) if hits else None
         if p is not None and p.exists():
-            cur = resample_curves(read_curves29(str(p))["curves"], m)
+            raw = read_curves29(str(p))["curves"]
+            cur = resample_curves(raw, m)
             if renormalize:
+                raw = normalize_np(raw)
                 cur = normalize_np(cur)
             sl = slice(j * N_CAMS, (j + 1) * N_CAMS)
             stack[sl] = cur
             mask[sl] = 1.0
             found[ctype] = str(p)
-    return {"curves": stack, "mask": mask, "files": found}
+            native[ctype] = raw
+    return {"curves": stack, "mask": mask, "files": found, "native": native}
+
+
+def native_sigma(d: dict) -> np.ndarray:
+    """(2 * N_CAMS,) noise sigma per curve of a `load_model_curves` result, estimated at the
+    files' own frame rate. Blocks whose file is missing get the median of the present ones;
+    a result with no files at all raises."""
+    from .noise import sigma_from_highfreq
+
+    out = np.full(2 * N_CAMS, np.nan)
+    for j, ctype in enumerate(("intensity", "binary")):
+        if ctype in d["native"]:
+            out[j * N_CAMS:(j + 1) * N_CAMS] = sigma_from_highfreq(d["native"][ctype])
+    if np.isnan(out).all():
+        raise ValueError("no curve file was found; cannot estimate the noise")
+    return np.where(np.isnan(out), np.nanmedian(out), out)
 
 
 def fit_conventions(verts: np.ndarray, faces: np.ndarray, curves56: np.ndarray,

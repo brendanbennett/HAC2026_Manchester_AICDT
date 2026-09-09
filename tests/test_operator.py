@@ -69,17 +69,30 @@ def test_the_radius_changes_the_curves():
 
 
 def test_canonical_pose_is_imposed_and_differentiable():
-    """A mesh shifted, stretched and scaled comes back centred on the axis, touching z = -1
-    and +1, with its largest xy radius one, and the pose has a gradient in the vertices."""
+    """A mesh stretched and scaled comes back touching z = -1 and +1, with its largest xy
+    radius one, and the pose has a gradient in the vertices."""
     v, f = icosphere(2)
-    v = torch.tensor(v * np.array([0.6, 1.4, 0.3]) + np.array([2.0, -1.0, 0.5]),
+    v = torch.tensor(v * np.array([0.6, 1.4, 0.3]) + np.array([0.0, 0.0, 0.5]),
                      dtype=torch.float32).requires_grad_(True)
     ft = torch.tensor(f)
     c = CodeOperator.canonical(v, ft)
     assert float(c[:, 2].min()) == -1.0 and float(c[:, 2].max()) == 1.0
     assert abs(float(c[:, :2].norm(dim=1).max()) - 1.0) < 1e-6
-    assert float(c[:, :2].mean(0).abs().max()) < 0.05
     p = CodeOperator.physical(v, ft, 1.7)
     assert abs(float(p[:, :2].norm(dim=1).max()) - 1.7) < 1e-5
     p.sum().backward()
     assert v.grad is not None and torch.isfinite(v.grad).all()
+
+
+def test_canonical_pose_does_not_move_the_body_off_the_rotation_axis():
+    """The pose rescales; it must not translate in xy. The rotation axis is the z axis of the
+    frame the body is already in, not the line through its centre of mass, so a body sitting
+    off the axis has to stay there -- that offset is geometry, and the released public STLs
+    carry one."""
+    v, f = icosphere(2)
+    off = torch.tensor(v + np.array([0.35, -0.2, 0.0]), dtype=torch.float32)
+    ft = torch.tensor(f)
+    c = CodeOperator.canonical(off, ft)
+    scale = float(c[:, :2].norm(dim=1).max()) / float(off[:, :2].norm(dim=1).max())
+    assert torch.allclose(c[:, :2], off[:, :2] * scale, atol=1e-6)   # a pure scaling
+    assert float(c[:, :2].mean(0).norm()) > 0.1                      # still off the axis
