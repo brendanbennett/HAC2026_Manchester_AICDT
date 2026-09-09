@@ -130,9 +130,11 @@ def test_source_disc():
 # ---------------------------------------------------------------- against the data
 
 @pytest.mark.parametrize("model", [1, 2, 3])
-def test_published_radius_is_approximate_not_a_bound(model):
-    """Posed so that z spans exactly [-1, 1], a public body's largest xy radius is within 3%
-    of its published R, not necessarily below it. Skipped when the public shapes are absent."""
+def test_the_stl_origin_is_the_rotation_axis(model):
+    """Posed so that z spans exactly [-1, 1] and left where it is in xy, a public body's
+    largest xy radius about the STL origin reproduces its published bounding-cylinder radius
+    to within 1%. That is the check that the STL origin IS the rotation axis, and so that
+    nothing downstream may translate the body in xy. Skipped when the shapes are absent."""
     import os
 
     from hac26.conventions import CYLINDER_R
@@ -143,9 +145,48 @@ def test_published_radius_is_approximate_not_a_bound(model):
     f = public_stl(DATA, model)
     if not os.path.exists(f):
         pytest.skip("public STLs not present")
-    v = rescale_touch_z(load_stl(f)[0])
+    v, fc = load_stl(f)
+    v = rescale_touch_z(v, fc, centre_xy=False)
     r = float(np.sqrt(v[:, 0] ** 2 + v[:, 1] ** 2).max())
-    assert r == pytest.approx(CYLINDER_R[model], rel=0.03), (
+    assert r == pytest.approx(CYLINDER_R[model], rel=0.01), (
         f"model {model}: r_max={r:.4f} vs published R={CYLINDER_R[model]}")
     assert abs(v[:, 2].min() + 1.0) < 1e-6 and abs(v[:, 2].max() - 1.0) < 1e-6
+
+
+@pytest.mark.parametrize("model", [1, 2, 3])
+def test_centring_a_public_body_moves_it_off_the_axis(model):
+    """The other half of the same statement: putting a released body's solid centroid on the
+    axis moves it off, and makes the published radius fit worse -- for model 2 it pushes the
+    body outside the published *minimal* enclosing radius, which the true body cannot be.
+    This is why the released shapes and the reconstructions are posed with centre_xy=False."""
+    import os
+
+    from hac26.conventions import CYLINDER_R
+    from hac26.data_io import public_stl
+    from hac26.shapes import rescale_touch_z
+    from hac26.stl_io import load_stl
+
+    f = public_stl(DATA, model)
+    if not os.path.exists(f):
+        pytest.skip("public STLs not present")
+    from hac26.shapes import solid_centroid
+
+    v, fc = load_stl(f)
+    def r_of(**kw):
+        w = rescale_touch_z(v, fc, **kw)
+        return float(np.sqrt(w[:, 0] ** 2 + w[:, 1] ** 2).max())
+    err_axis = abs(r_of(centre_xy=False) - CYLINDER_R[model])
+    err_centred = abs(r_of(centre_xy=True) - CYLINDER_R[model])
+    posed = rescale_touch_z(v, fc, centre_xy=False)
+    offset = float(np.linalg.norm(solid_centroid(posed, fc)[:2]))
+    why = (f"model {model}: centroid {offset:.4f} off the axis, |r - R| about the origin "
+           f"{err_axis:.4f}, centred {err_centred:.4f}")
+
+    # R is published to three decimals, so differences below that are not differences.
+    assert err_axis <= err_centred + 1e-3, why
+    if offset > 0.01:
+        # a body whose centroid really is off the axis: centring it is strictly worse, and
+        # for model 2 it pushes r_max past the published minimal enclosing radius
+        assert err_centred > err_axis, why
+        assert r_of(centre_xy=True) > CYLINDER_R[model], why
 

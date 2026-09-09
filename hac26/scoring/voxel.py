@@ -32,10 +32,11 @@ def score(stl: str, model: int, data_dir: str = "dataset/raw", n: int = 128) -> 
     import trimesh
     r = trimesh.load(stl, process=False)
     t = trimesh.load(public_stl(data_dir, model), process=False)
-    # The faces are passed so the pose centres the body by its solid centroid; a vertex-mean
-    # centre would depend on the triangulation.
-    rv = rescale_touch_z(np.asarray(r.vertices), np.asarray(r.faces))
-    tv = rescale_touch_z(np.asarray(t.vertices), np.asarray(t.faces))
+    # Both meshes are already in the challenge frame -- the truth as released, the
+    # reconstruction as this package builds it -- so the pose only rescales z and leaves the
+    # rotation axis where it is. Centring either on its own centroid would slide them apart.
+    rv = rescale_touch_z(np.asarray(r.vertices), np.asarray(r.faces), centre_xy=False)
+    tv = rescale_touch_z(np.asarray(t.vertices), np.asarray(t.faces), centre_xy=False)
     e = max(float(np.abs(rv).max()), float(np.abs(tv).max())) * 1.05
     return float(dice(mesh_occupancy(rv, np.asarray(r.faces), n, e),
                       mesh_occupancy(tv, np.asarray(t.faces), n, e)))

@@ -15,6 +15,8 @@ dependencies = [
     "rtree",
     "fast_simplification",
     "embreex",
+    "truststore",
+    "spiceypy",
 ]
 
 [project.optional-dependencies]
