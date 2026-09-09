@@ -84,11 +84,17 @@ def sample_arrays(verts, faces, n_pts=6000, seed=0):
     the point count, which is the one thing the point count must not cost; the blocks also
     stay in cache, so they are quicker than the single call they replace."""
     import trimesh
-    m = trimesh.Trimesh(verts, faces, process=False)
+    m = trimesh.Trimesh(verts, faces, process=True)
+    m.remove_unreferenced_vertices()
+    m.merge_vertices()
+    m.fix_normals()
+    if m.volume < 0.0:
+        m.invert()
     rng = np.random.default_rng(seed)
+    verts = np.asarray(m.vertices, dtype=np.float64)
     ext = max(float(np.abs(verts).max()) * 1.3, SAMPLE_EXTENT)
     pts = rng.uniform(-ext, ext, (n_pts, 3))
-    surf, _ = trimesh.sample.sample_surface(m, n_pts // 2)
+    surf, _ = trimesh.sample.sample_surface(m, n_pts // 2, seed=seed)
     pts = np.vstack([pts, surf + rng.normal(0, 0.03, surf.shape)])
     sd = -np.concatenate([m.nearest.signed_distance(pts[i:i + SD_CHUNK])
                           for i in range(0, len(pts), SD_CHUNK)])   # trimesh: positive inside
@@ -98,6 +104,10 @@ def sample_arrays(verts, faces, n_pts=6000, seed=0):
     # says, so it is the cheapest thing that can tell the two apart.
     far = np.linalg.norm(pts, axis=1) > float(np.linalg.norm(verts, axis=1).max()) + 1e-6
     if far.any() and sd[far].min() <= 0.0:
+        m.invert()
+        sd = -np.concatenate([m.nearest.signed_distance(pts[i:i + SD_CHUNK])
+                              for i in range(0, len(pts), SD_CHUNK)])
+    if far.any() and sd[far].min() <= 0.0:
         raise ValueError("the signed distance calls points outside the body's bounding sphere "
                          "inside it: the mesh is oriented inward. Check mesh_volume.")
     return pts.astype(np.float32), sd.astype(np.float32)
@@ -106,7 +116,10 @@ def sample_arrays(verts, faces, n_pts=6000, seed=0):
 def _prepare_shape(args):
     """One body's sample points, signed distances and hull support, for a worker pool."""
     i, verts, faces, normals, n_pts = args
-    pts, sd = sample_arrays(verts, faces, n_pts=n_pts, seed=i)
+    try:
+        pts, sd = sample_arrays(verts, faces, n_pts=n_pts, seed=i)
+    except Exception as exc:
+        raise RuntimeError(f"failed to prepare library body {i}") from exc
     h0 = np.maximum((verts @ normals.T).max(axis=0), 1e-3).astype(np.float32)
     return i, pts, sd, h0
 
