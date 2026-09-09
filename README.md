@@ -10,14 +10,42 @@ boundary curves of 2D projections. `docs/challenge_info.md` has the rules.
 
 ## Install
 
+`make` does the whole setup; `pyproject.toml` is the only dependency list.
+
 ```
-pip install -e ".[torch]"
+make venv               # a .venv with the right Python and dependencies
+make venv CUDA=12       # torch built against CUDA 12.x  (cu129 wheels)
+make venv CUDA=13       # torch built against CUDA 13.x  (cu130 wheels)
+make check              # what the venv has: python, torch, CUDA, nvdiffrast
 ```
 
+Without `CUDA=`, the torch build is chosen from the driver `nvidia-smi` reports (CUDA 13
+wheels need a 580-series driver or newer), and a machine with no GPU gets the CPU build --
+on macOS that is the MPS build. Switching between 12 and 13 later is `make venv CUDA=13`;
+it notices the installed torch is the wrong build and replaces it.
+
+The Python is chosen by version, not by whichever `python3` comes first on PATH: the project
+needs 3.10 or newer and cluster images often ship an older one as `python3`, which otherwise
+produces a venv that fails much later. `uv`, if it is installed, is used and fetches a
+matching interpreter itself; otherwise the newest suitable `python3.X` on PATH is used.
+`make venv PY_VERSION=3.11` asks for a particular one, `make venv VENV=/scratch/env` puts it
+elsewhere, and `make deps` reinstalls everything.
+
 The exact forward model renders with nvdiffrast on a GPU; nvdiffrast is not on PyPI and
-compiles CUDA at install time, and `scripts/setup_toolchain.sh` builds it without root. The
-calibration, the flow training and the reconstruction all render with it. The tests run the
-same code on a slow pure-torch rasteriser, so they need neither.
+compiles CUDA at install time, so it is built from source against a toolkit assembled
+without root:
+
+```
+make toolchain
+```
+
+That leaves it importable from the venv, with no `PYTHONPATH` to set. The calibration, the
+flow training and the reconstruction all render with it. The tests run the same code on a
+slow pure-torch rasteriser, so they need neither it nor a GPU.
+
+`scripts/run_smoke_test.sh` and `scripts/run_remote_pipeline.sh` build the same venv through
+the same Makefile if it is not there yet, so `make smoke` and `make pipeline`, or the scripts
+by hand, are equivalent.
 
 ## Data
 
@@ -53,8 +81,8 @@ scripts/run_smoke_test.sh        # wiring check: minutes, no dataset needed
 scripts/run_remote_pipeline.sh   # the real run
 ```
 
-`run_remote_pipeline.sh` creates and activates a `.venv`, installs anything missing, and runs
-the stages in order:
+`run_remote_pipeline.sh` builds and activates the venv through the Makefile if it is not
+already there, then runs the stages in order:
 
 | stage | script | notes |
 | --- | --- | --- |
