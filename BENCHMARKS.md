@@ -90,4 +90,21 @@ had been superseded by the 25 August re-release and the local copies were the Ma
 fresh download agrees hash-for-hash with the manifest on `origin/brendan/fixes`. The
 `Evaluation_measures/` folder (released 27 August) had never been fetched at all.
 `scripts/check_data.py` verifies the snapshot; `scripts/fetch_data.py` re-fetches it.
-**The calibration in `models/` was fitted against the superseded model-1 curves.**
+
+What the model-1 re-release actually changed, measured against the superseded copies kept
+alongside them: for the **real** curves it is a **pure per-curve circular shift** — realign
+each curve by its own offset and the difference is exactly 0.0000, so not one sample value
+moved. The shifts run from -5.1 deg to +1.3 deg with five distinct values across the 28
+curves. That is the organisers' curve-matching step being redone, and it matters more than a
+5-degree number suggests: the shifts differ *per curve*, and the calibration has one start
+phase per body, so no value of psi0 could have absorbed them. The old snapshot therefore fed
+the calibration a misalignment it could only account for as forward-model error, which is
+part of what the fitted eta was absorbing.
+
+The **Blender** curves for model 1 changed in value, not just in phase: 0.0213 RMS before
+realignment and 0.0196 after, so realigning explains almost none of it. Those were re-rendered.
+
+**The calibration in `models/` was fitted against the superseded curves, and does not load
+anyway** — its keys predate a refactor of `Instrument`, so `Instrument.load` raises. Nothing
+that touches the exact forward model runs from a clean checkout until `scripts/calibrate.py`
+is rerun.
