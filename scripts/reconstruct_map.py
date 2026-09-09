@@ -51,7 +51,10 @@ from reconstruct_lpd import (curve_pairs, geometry_mask, residual_scale,  # noqa
 from train_lpd import CALIBRATION, RENDER, _enable_tf32, load_instrument  # noqa: E402
 
 OCC_RES = 128
-EXPORT_RES = 96      # extraction resolution for the written mesh; the fit runs coarser
+EXPORT_RES = 96       # extraction resolution for the written mesh; the fit runs coarser
+TARGET_SIGMA = 1.0    # stop once the answer explains the data to the noise level
+MAX_HALVINGS = 8      # trial steps per iteration before declaring convergence
+STEP_GROW = 1.6       # a step that works makes the next trial bolder
 
 
 def truth_dice(verts, faces, model: int, data_dir: str) -> float:
@@ -86,7 +89,9 @@ def main() -> None:
     ap.add_argument("--convex-dir", default="results/convex")
     ap.add_argument("--calibration", default=CALIBRATION)
     ap.add_argument("--steps", type=int, default=300)
-    ap.add_argument("--lr", type=float, default=0.01, help="Adam step on the raw amplitudes")
+    ap.add_argument("--lr", type=float, default=0.05,
+                    help="first trial step, in RMS code units per coordinate. Backtracking "
+                         "adapts it, so this is a starting scale and not a schedule")
     ap.add_argument("--l2", type=float, default=3e-3,
                     help="ridge on g. The only prior here: 1728 amplitudes against 56 curves "
                          "is not obviously determined, and the ridge is what stops the fit "
@@ -98,6 +103,19 @@ def main() -> None:
     ap.add_argument("--every", type=int, default=25, help="steps between diagnostics")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--device", default="cuda")
+    ap.add_argument("--blender", action="store_true",
+                    help="fit the Blender curves instead of the real ones. They exist for all "
+                         "ten models and nothing in this repository has ever read them; they "
+                         "are a render of the true shape by a known camera, so the "
+                         "forward-model error against them is a different and much smaller "
+                         "quantity than the eta fitted to the lab curves")
+    ap.add_argument("--eta", type=float, default=-1.0,
+                    help="override the calibration's per-curve model error. The fitted eta "
+                         "(~0.07 of the curve mean) is the mismatch against the LAB curves; "
+                         "against Blender it is far smaller, and leaving it high makes the "
+                         "noise floor swallow the concavity signal")
+    ap.add_argument("--dh-weight", type=float, default=1.0,
+                    help="relative step for the convex-core block against the carving block")
     ap.add_argument("--uncalibrated", action="store_true",
                     help="run against a default Instrument instead of a fitted one. For "
                          "shaking out the plumbing only: the misfit is then measured against "
@@ -113,23 +131,28 @@ def main() -> None:
     if a.uncalibrated:
         from hac26.forward.mesh.instrument import Instrument
         inst = Instrument().to(dev).requires_grad_(False)
-        eta56 = inst.eta.detach().cpu()
         print("  WARNING: running --uncalibrated; the misfit is not measured against a "
               "fitted instrument", flush=True)
     else:
-        inst, eta56 = load_instrument(a.calibration, device=dev)
+        inst = load_instrument(a.calibration, device=dev)
+    eta56 = inst.eta
     psi = psi_grid(a.phases)
     op = CodeOperator(inst, psi, res=a.operator_res, config=RENDER, device=dev)
 
     sup_stl = str(Path(a.convex_dir) / f"Asteroid{a.model:02d}.stl")
     support = support_from_convex(sup_stl)
 
-    d = load_model_curves(a.data_dir, a.model, m=a.phases)
+    d = load_model_curves(a.data_dir, a.model, m=a.phases, use_blender=a.blender)
     if d["mask"].sum() < 2 * N_CAMS:
         raise SystemExit(f"model {a.model}: only {int(d['mask'].sum())} of {2 * N_CAMS} "
                          f"curves present; refusing to fit around missing data")
     data = curve_pairs(d["curves"])
+    if a.eta >= 0:
+        eta56 = torch.full_like(eta56, a.eta)
     scale = residual_scale(d, eta56)
+    print(f"  curves: {'blender' if a.blender else 'real'}   "
+          f"eta {float(eta56.median()):.4f}   median scale {float(scale.median()):.4f}",
+          flush=True)
     gmask = geometry_mask(d["mask"])[0] > 0
     present = [i for i in range(N_CAMS) if bool(gmask[i])]
 
@@ -149,19 +172,31 @@ def main() -> None:
         return 2.0 * (cur - d_fit) / (s_fit[..., None] ** 2) / n_obs
 
     code = torch.zeros(CODE_DIM, device=dev)
-    opt = torch.optim.Adam([code.requires_grad_(True)], lr=a.lr)
     hist, best = [], None
     t0 = time.time()
 
-    for step in range(a.steps + 1):
-        cur, grad = op.adjoint(support, code.detach(), R, cot_fn, geoms=fit_geoms)
+    # Backtracking rather than a fixed step. Adam on these amplitudes overshoots badly -- at
+    # lr 0.01 the misfit went 1.85 -> 5.74 in one step -- because the objective's curvature
+    # varies over orders of magnitude across the 1728 coordinates and nothing here normalises
+    # it. polish() in reconstruct_lpd.py already solved this the robust way: step along the
+    # gradient, halve until the objective actually falls, grow the step when it does. That
+    # also makes the run insensitive to the binary channel's gradient being about half scale
+    # (tests/test_vertex_gradient.py), since a line search only needs the direction.
+    def objective(z):
+        cur = op.curves(support, z, R, geoms=fit_geoms)
         if cur is None:
-            print(f"  step {step}: the body has no curves; stopping", flush=True)
-            break
-        chi_fit = whitened_misfit(cur.cpu(), data, scale, fit_geoms)
-        if step % a.every == 0 or step == a.steps:
-            m = op.mesh(support, code.detach(), res=EXPORT_RES)
-            row = {"step": step, "chi_fit": chi_fit, "seconds": round(time.time() - t0, 1)}
+            return float("inf"), None
+        chi = whitened_misfit(cur.cpu(), data, scale, fit_geoms)
+        ridge = a.l2 * float((z[N_DIR:] ** 2).sum())
+        return chi ** 2 + ridge, chi
+
+    step = a.lr
+    J, chi = objective(code)
+    for it in range(a.steps + 1):
+        if it % a.every == 0 or it == a.steps:
+            m = op.mesh(support, code, res=EXPORT_RES)
+            row = {"step": it, "chi_fit": chi, "objective": J, "step_size": step,
+                   "seconds": round(time.time() - t0, 1)}
             if m is not None:
                 v = fit_to_cylinder(restore_constraints(
                     CodeOperator.canonical(m[0], m[1]).cpu().numpy(), R), R)
@@ -169,27 +204,54 @@ def main() -> None:
                 row["dice"] = truth_dice(v, f, a.model, a.data_dir)
                 row["convexity"] = convexity(v, f)
                 if held:
-                    ch, _ = op.adjoint(support, code.detach(), R,
-                                       lambda c: torch.zeros_like(c), geoms=held)
+                    ch = op.curves(support, code, R, geoms=held)
                     row["chi_held"] = (whitened_misfit(ch.cpu(), data, scale, held)
                                        if ch is not None else float("inf"))
-                if best is None or chi_fit < best["chi_fit"]:
-                    best = {**row, "code": code.detach().clone()}
+            if best is None or chi < best["chi_fit"]:
+                best = {**row, "code": code.detach().clone()}
             hist.append(row)
-            print(f"  step {row['step']:>4}  chi_fit {chi_fit:7.3f}"
+            print(f"  step {it:>4}  chi_fit {chi:7.3f}"
                   + (f"  chi_held {row['chi_held']:7.3f}" if held else "")
                   + f"  dice {row.get('dice', float('nan')):.4f}"
                     f"  convexity {row.get('convexity', float('nan')):.3f}"
-                    f"  [{row['seconds']:.0f}s]", flush=True)
-        if step == a.steps:
+                    f"  step {step:.4f}  [{row['seconds']:.0f}s]", flush=True)
+        if it == a.steps or chi <= TARGET_SIGMA:
             break
-        # the ridge is applied to the amplitudes only; dh is 36 effective degrees of freedom
-        # correcting the convex stage's bias and needs no shrinking
-        g = code[N_DIR:]
-        opt.zero_grad(set_to_none=True)
-        code.grad = grad.detach()
-        code.grad[N_DIR:] += 2.0 * a.l2 * g.detach()
-        opt.step()
+
+        _, grad = op.adjoint(support, code, R, cot_fn, geoms=fit_geoms)
+        if grad is None:
+            print("  the body has no curves; stopping", flush=True)
+            break
+        grad = grad.detach()
+        grad[N_DIR:] += 2.0 * a.l2 * code[N_DIR:]
+        # Per-block normalisation. dh is 128 coordinates band-limited to 36 effective
+        # degrees of freedom that shift the convex core; g is 1728 amplitudes that carve.
+        # They are in different units, and one global RMS lets whichever block has the larger
+        # gradient set the step for both -- which is how a run ends up at convexity 0.999
+        # having "converged": the core absorbed the misfit and the amplitudes never moved.
+        direction = torch.zeros_like(grad)
+        for sl, w in ((slice(0, N_DIR), a.dh_weight), (slice(N_DIR, None), 1.0)):
+            r = float(grad[sl].pow(2).mean().sqrt())
+            if np.isfinite(r) and r > 0:
+                direction[sl] = -w * grad[sl] / r
+        if float(direction.abs().max()) == 0.0:
+            print("  the gradient vanished; stopping", flush=True)
+            break
+
+        moved = False
+        for _ in range(MAX_HALVINGS):
+            trial = code + step * direction
+            J_t, chi_t = objective(trial)
+            if J_t < J:
+                code, J, chi = trial, J_t, chi_t
+                step *= STEP_GROW
+                moved = True
+                break
+            step *= 0.5
+        if not moved:
+            print(f"  no step of size >= {step:.2e} lowers the objective; converged at "
+                  f"step {it}", flush=True)
+            break
 
     if a.out:
         z = best["code"] if best is not None else code.detach()
