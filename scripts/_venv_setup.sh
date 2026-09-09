@@ -123,23 +123,26 @@ _ensure_pip() {
 # fit_shapes.py), fast_simplification backs simplify_quadric_decimation (the radiosity
 # patches and the released meshes in hac26/forward/mesh/exact.py) and embreex backs the ray
 # tests of the form factors; trimesh imports all three lazily, so their absence only shows
-# when that code runs. Importability is checked instead of running pip every time, which
-# keeps a repeat run fast.
+# when that code runs. truststore is needed by scripts/fetch_shape_models.py (stage 0) and
+# spiceypy by scripts/fetch_dsk_shapes.py, both to reach hosts whose certificate chains the
+# stdlib ssl module's static CA bundle does not cover. Importability is checked instead of
+# running pip every time, which keeps a repeat run fast.
 NEED_INSTALL=0
-python -c "import numpy, scipy, torch, trimesh, skimage, rtree, fast_simplification, embreex" \
-  >/dev/null 2>&1 || NEED_INSTALL=1
+python -c "import numpy, scipy, torch, trimesh, skimage, rtree, fast_simplification, embreex, \
+  truststore, spiceypy" >/dev/null 2>&1 || NEED_INSTALL=1
 if [ "$NEED_INSTALL" = "1" ] || [ "${FORCE_DEPS:-0}" = "1" ]; then
   echo "[venv] installing dependencies (this can take a while, especially torch)"
   _ensure_pip
   python -m pip install --upgrade pip -q
   python -m pip install "numpy>=1.24" "scipy>=1.10" "torch>=2.1" \
-    trimesh scikit-image rtree fast_simplification embreex -q
-  python -c "import numpy, scipy, torch, trimesh, skimage, rtree, fast_simplification, embreex" || {
+    trimesh scikit-image rtree fast_simplification embreex truststore spiceypy -q
+  python -c "import numpy, scipy, torch, trimesh, skimage, rtree, fast_simplification, embreex, \
+    truststore, spiceypy" || {
     echo "ERROR: dependency install ran but imports still fail; see the pip output above." >&2
     exit 1
   }
   echo "[venv] dependencies installed"
 else
   echo "[venv] dependencies already satisfied (numpy, scipy, torch, trimesh, skimage," \
-       "rtree, fast_simplification, embreex)"
+       "rtree, fast_simplification, embreex, truststore, spiceypy)"
 fi
