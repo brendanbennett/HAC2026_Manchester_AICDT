@@ -182,7 +182,7 @@ def main():
             print(f"model {M}: no truth STL", flush=True)
             continue
         tv, tfc = load_stl(tf)
-        tv = rescale_touch_z(tv, tfc)
+        tv = rescale_touch_z(tv, tfc, centre_xy=False)
         tp = surface_points(tv, tfc)
 
         rows = {}
@@ -197,7 +197,7 @@ def main():
         rf = Path(args.recon_dir) / f"Asteroid{M:02d}.stl"
         if rf.exists():
             rv, rfc = load_stl(str(rf))
-            rv = rescale_touch_z(rv, rfc)
+            rv = rescale_touch_z(rv, rfc, centre_xy=False)
             rows["shipped_vs_truth"] = side_view_measure(
                 surface_points(rv, rfc), tp, args.n_dirs, args.res)
 

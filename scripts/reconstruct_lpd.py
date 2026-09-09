@@ -59,7 +59,7 @@ from hac26.data_io import N_CAMS, load_model_curves, public_stl        # noqa: E
 from hac26.field import CODE_DIM, DESIGN_N, N_DIR, N_SITES   # noqa: E402
 from hac26.forward.mesh.exact import normalise                         # noqa: E402
 from hac26.forward.mesh.radiosity import RadiosityError                # noqa: E402
-from hac26.noise import sigma_from_replicates                          # noqa: E402
+from hac26.data_io import native_sigma                                 # noqa: E402
 from hac26.solvers.lpd_flow import (CHURN, GUIDANCE, N_MODES, N_STEPS,   # noqa: E402
                                     LPDFlow, flow_inputs, geometry_tags)
 from hac26.solvers.operator import CodeOperator                        # noqa: E402
@@ -110,10 +110,13 @@ def geometry_mask(mask56: np.ndarray) -> torch.Tensor:
                         dtype=torch.float32)[None]
 
 
-def residual_scale(curves56: np.ndarray, mask56: np.ndarray, eta56: torch.Tensor) -> torch.Tensor:
-    """sqrt(sigma_c^2 + eta_c^2) per curve as (N_CAMS, 2): the measured noise of this model's
-    co-located pairs and the calibration's per-curve model error."""
-    sigma = torch.tensor(sigma_from_replicates(curves56, mask56), dtype=torch.float32)
+def residual_scale(d: dict, eta56: torch.Tensor) -> torch.Tensor:
+    """sqrt(sigma_c^2 + eta_c^2) per curve as (N_CAMS, 2): the measured noise of this model,
+    estimated from the high-frequency content of its curves at their native frame rate
+    (hac26.noise), and the calibration's per-curve model error. `d` is a
+    `data_io.load_model_curves` result, which carries the native-resolution curves the noise
+    estimate needs."""
+    sigma = torch.tensor(native_sigma(d), dtype=torch.float32)
     return torch.sqrt(sigma ** 2 + eta56.detach().cpu().float() ** 2).reshape(2, N_CAMS).T
 
 
@@ -408,7 +411,7 @@ def main():
                          f"{a.data_dir}; found {sorted(d['files'])}")
     data = curve_pairs(d["curves"])                              # (N_CAMS, 2, P)
     mask = geometry_mask(d["mask"])
-    scale = residual_scale(d["curves"], d["mask"], inst.eta)     # (N_CAMS, 2)
+    scale = residual_scale(d, inst.eta)                          # (N_CAMS, 2)
     tag = geometry_tags()
     present = torch.nonzero(mask[0] > 0).flatten()
     # the geometries the inversion sees, and the ones kept back to test its answer on
@@ -575,8 +578,8 @@ def main():
     if a.model in PUBLIC_MODELS:
         import trimesh
         t = trimesh.load(public_stl(a.data_dir, a.model), process=False)
-        tv = rescale_touch_z(np.asarray(t.vertices), np.asarray(t.faces))
-        rv = rescale_touch_z(v, f)
+        tv = rescale_touch_z(np.asarray(t.vertices), np.asarray(t.faces), centre_xy=False)
+        rv = rescale_touch_z(v, f, centre_xy=False)
         e = max(float(np.abs(tv).max()), float(np.abs(rv).max())) * 1.05
         res["dice"] = float(dice(mesh_occupancy(tv, np.asarray(t.faces), 128, e),
                                  mesh_occupancy(rv, f, 128, e)))

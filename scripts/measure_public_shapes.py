@@ -87,7 +87,7 @@ def main():
             print(f"{M:<8} ({stl} not found)")
             continue
         v, f = load_stl(stl)
-        v = rescale_touch_z(np.asarray(v, dtype=np.float64), np.asarray(f))
+        v = rescale_touch_z(np.asarray(v, dtype=np.float64), np.asarray(f), centre_xy=False)
         m = measures(v, f)
         pub.append(m)
         print(f"{M:<8} " + " ".join(f"{m[k]:>10.3f}" for k in keys)
