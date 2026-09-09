@@ -20,6 +20,9 @@ results/genetic/simpfaces/*
 results/genetic/testing/*
 results/genetic/toy_spherical_harmonics/*
 results/genetic/surfaces/*
+scripts/visualize_real_shapes.py
+scripts/visualize_shapes.py
+scripts/visualize_shape_models.py
 
 # Written into the repo root by a run, not source.
 calibration.json

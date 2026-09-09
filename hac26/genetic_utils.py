@@ -16,6 +16,7 @@ from hac26.shapes import (
     icosphere,
     sh_mesh_from_coefficients,
     mesh_curves_convex,
+    solid_centroid,
 )
 
 
@@ -119,6 +120,100 @@ def shape_fitness(
     return -error
 
 
+class ExactForwardModel:
+    """The flow-matching (LPD) stage's own forward model
+    (hac26.forward.mesh.exact.ExactForward), wrapped to the same (verts, faces, cameras, m,
+    curve_types) -> (n_curves, m) contract mesh_curves_convex already has, so it drops into
+    render_curves/sh_fitness/surface_fitness/target-curve generation unchanged.
+
+    Why this exists: mesh_curves_convex (hac26.forward.convex_egi.kernel) gives every facet's
+    brightness from its own normal alone -- mu > 0 and mu0 > 0 -- with no visibility test
+    against any other facet on the body, so it cannot represent cast shadows or
+    interreflected light. That is exactly right for a convex candidate (a convex body has no
+    self-occlusion to model) but increasingly wrong as a candidate becomes concave, which is
+    the entire point of the surface-deformation GA. ExactForward instead rasterises real cast
+    shadows and solves a radiosity system for interreflection between faces -- what the flow
+    stage is actually trained against.
+
+    That fidelity costs real compute: expect at least an order of magnitude slower per
+    candidate than mesh_curves_convex, more on a machine with no CUDA/nvdiffrast, which falls
+    back to the pure-torch software rasteriser (hac26.forward.mesh.raster._backend) -- this
+    repo documents that backend as a stand-in for tests, not for real runs. Construction loads
+    the calibrated Instrument and builds its Rasterisers, both expensive; build one instance
+    and reuse it across every candidate and generation, never per call.
+
+    Camera correspondence: `cameras` passed to .curves() are matched to
+    hac26.conventions.cameras() purely by list position, not by re-deriving azimuth/elevation.
+    hac26.geometry.build_cameras() (what the GA otherwise uses) and hac26.conventions.cameras()
+    independently hardcode the same released azimuths/elevations in the same per-azimuth
+    (hor_a, hor_b, top, bottom) order -- the two lists agree index for index, which is the
+    invariant hac26.conventions's own Camera docstring already relies on. Passing any other
+    camera list here is not supported.
+    """
+
+    def __init__(self, calibration: str, m: int, device: str = "cpu", backend: str | None = None,
+                radiosity_faces: int = 200, form_factor_samples: int = 4,
+                height: int = 108, width: int = 192):
+        import torch
+        from hac26.conventions import cameras as conv_cameras
+        from hac26.conventions import psi_grid as conv_psi_grid
+        from hac26.forward.mesh.exact import ExactForward, RenderConfig
+        from hac26.forward.mesh.instrument import Instrument
+
+        self._torch = torch
+        self.device = device
+        inst = Instrument.load(calibration, device=device)
+        cfg = RenderConfig(height=height, width=width, radiosity_faces=radiosity_faces,
+                           form_factor_samples=form_factor_samples)
+        psi = conv_psi_grid(frames=m)
+        self._forward = ExactForward(inst, psi, config=cfg, device=device, backend=backend)
+        self._n_cams = len(conv_cameras())
+        # hac26.geometry.build_cameras() returns fresh Camera objects on every call (a
+        # dataclass, but a new instance each time), so matching by object identity would
+        # never work; Camera is frozen (value-equal and hashable), so a dict built once from
+        # one reference call is a correct and cheap way to turn a caller's Camera back into
+        # its position in that list -- built here rather than per .curves() call.
+        from hac26.geometry import build_cameras
+        self._cam_index = {cam: i for i, cam in enumerate(build_cameras())}
+
+    def curves(self, verts: np.ndarray, faces: np.ndarray, cameras: list,
+              curve_types: list) -> np.ndarray:
+        """(n_curves, m): one row per (cameras[i], curve_types[i]) pair, matching
+        mesh_curves_convex's contract. `cameras` must be hac26.geometry.build_cameras()'s own
+        list (or a subset of it, by position) -- see the class docstring."""
+        torch = self._torch
+        v = torch.as_tensor(np.ascontiguousarray(verts, dtype=np.float32), device=self.device)
+        f = torch.as_tensor(np.ascontiguousarray(faces, dtype=np.int64), device=self.device)
+        geoms = list(range(self._n_cams))
+        with torch.no_grad():
+            raw = self._forward.raw_curves(v, f, geoms=geoms)          # (G, 2, m), no grad
+        raw = raw.cpu().numpy()
+        kind = {"intensity": 0, "binary": 1}
+        try:
+            rows = [raw[self._cam_index[cam], kind[ctype]] for cam, ctype in
+                   zip(cameras, curve_types)]
+        except KeyError as exc:
+            raise ValueError("camera not in hac26.geometry.build_cameras() -- ExactForwardModel "
+                             "only supports the GA's own fixed camera list, see the class "
+                             "docstring") from exc
+        return np.stack(rows, axis=0)
+
+
+def render_curves(verts: np.ndarray, faces: np.ndarray, cameras: list, m: int,
+                  curve_types: list, forward: "ExactForwardModel | None" = None,
+                  **convex_kwargs) -> np.ndarray:
+    """Curves of a candidate mesh: mesh_curves_convex by default, or `forward.curves(...)`
+    (an ExactForwardModel, the flow stage's own forward model) when one is given. Both return
+    the same (n_curves, m) shape, so this is what sh_fitness/surface_fitness and the
+    target-curve generation in scripts/reconstruct_genetic.py and
+    scripts/tune_genetic_hyperparams.py call, and which model they use only depends on
+    whether a `forward` was built and threaded through -- nothing else about the GA changes."""
+    if forward is None:
+        return mesh_curves_convex(verts, faces, cameras=cameras, m=m, curve_types=curve_types,
+                                  **convex_kwargs)
+    return forward.curves(verts, faces, cameras, curve_types)
+
+
 def sh_fitness(
     coefficients,
     target_curves,
@@ -132,11 +227,13 @@ def sh_fitness(
     delta=1.0,
     psi0=0.0,
     ls_weight=1.0,
+    forward=None,
     ):
     """Calculate fitness by comparing model and target lightcurves.
 
     Higher fitness is better, so this returns the negative mean squared
-    lightcurve residual.
+    lightcurve residual. `forward` selects the forward model (render_curves); c_lambert,
+    sigma, delta, psi0, ls_weight only apply to the default convex one.
     """
 
     # ------------------------------------------------------------
@@ -153,17 +250,16 @@ def sh_fitness(
     # Candidate lightcurves
     # ------------------------------------------------------------
 
-    curves = mesh_curves_convex(
+    convex_kwargs = {} if forward is not None else dict(
+        c_lambert=c_lambert, sigma=sigma, delta=delta, psi0=psi0, ls_weight=ls_weight)
+    curves = render_curves(
         vertices,
         faces,
         cameras=cameras,
         m=m,
         curve_types=curve_types,
-        c_lambert=c_lambert,
-        sigma=sigma,
-        delta=delta,
-        psi0=psi0,
-        ls_weight=ls_weight,
+        forward=forward,
+        **convex_kwargs,
     )
 
     # ------------------------------------------------------------
@@ -185,7 +281,8 @@ def surface_fitness(
         target_curves,
         cameras,
         m,
-        curve_types
+        curve_types,
+        forward=None,
         ):
 
         mesh = deform_surface(
@@ -194,12 +291,13 @@ def surface_fitness(
             influence,
         )
 
-        curves = mesh_curves_convex(
+        curves = render_curves(
             mesh.vertices,
             mesh.faces,
             cameras=cameras,
             m=m,
             curve_types=curve_types,
+            forward=forward,
         )
 
         residual = curves - target_curves
@@ -217,22 +315,34 @@ def deform_surface(
 
     Positive amplitude = outward bulge.
     Negative amplitude = inward indentation.
+
+    Vertices move along the radial direction from the mesh's solid centroid, not along
+    per-vertex surface normals. A surface normal is a function of the local triangle
+    geometry, so at a high-curvature region (an elongated body's tips) neighbouring
+    vertices can have sharply diverging normals; pushing them along those diverging
+    directions is what produced the spiky/jagged artefacts seen at those tips. The radial
+    direction is a smooth function of vertex position alone, so it has no such divergence.
     """
 
     vertices = np.asarray(mesh.vertices)
+    faces = np.asarray(mesh.faces)
+
+    centre = solid_centroid(vertices, faces)
+    radial = vertices - centre
+    radial_unit = radial / np.linalg.norm(radial, axis=1, keepdims=True)
 
     # Total displacement at each vertex
     displacement = influence @ amplitudes
 
-    # Move along the original surface normals
+    # Move along the radial direction from the body's centre
     new_vertices = (
         vertices
-        + displacement[:, None] * mesh.vertex_normals
+        + displacement[:, None] * radial_unit
     )
 
     return trimesh.Trimesh(
         vertices=new_vertices,
-        faces=mesh.faces.copy(),
+        faces=faces.copy(),
         process=False,
     )
 

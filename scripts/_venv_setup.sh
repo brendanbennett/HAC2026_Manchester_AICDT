@@ -126,20 +126,21 @@ _ensure_pip() {
 # when that code runs. truststore is needed by scripts/fetch_shape_models.py (stage 0) and
 # spiceypy by scripts/fetch_dsk_shapes.py, both to reach hosts whose certificate chains the
 # stdlib ssl module's static CA bundle does not cover. cloudpickle, matplotlib and psutil are
-# the genetic-algorithm branch's own (hac26/genetic_utils.py, scripts/reconstruct_genetic.py).
+# the genetic-algorithm branch's own (hac26/genetic_utils.py, scripts/reconstruct_genetic.py),
+# and optuna is scripts/tune_genetic_hyperparams.py's search library.
 # Importability is checked instead of running pip every time, which keeps a repeat run fast.
 NEED_INSTALL=0
 python -c "import numpy, scipy, torch, trimesh, skimage, rtree, fast_simplification, embreex, \
-  truststore, spiceypy, cloudpickle, matplotlib, psutil" >/dev/null 2>&1 || NEED_INSTALL=1
+  truststore, spiceypy, cloudpickle, matplotlib, psutil, optuna" >/dev/null 2>&1 || NEED_INSTALL=1
 if [ "$NEED_INSTALL" = "1" ] || [ "${FORCE_DEPS:-0}" = "1" ]; then
   echo "[venv] installing dependencies (this can take a while, especially torch)"
   _ensure_pip
   python -m pip install --upgrade pip -q
   python -m pip install "numpy>=1.24" "scipy>=1.10" "torch>=2.1" \
     trimesh scikit-image rtree fast_simplification embreex truststore spiceypy \
-    "cloudpickle>=3.1.2" "matplotlib>=3.10.9" "psutil>=7.2.2" -q
+    "cloudpickle>=3.1.2" "matplotlib>=3.10.9" "psutil>=7.2.2" "optuna>=4.0" -q
   python -c "import numpy, scipy, torch, trimesh, skimage, rtree, fast_simplification, embreex, \
-    truststore, spiceypy, cloudpickle, matplotlib, psutil" || {
+    truststore, spiceypy, cloudpickle, matplotlib, psutil, optuna" || {
     echo "ERROR: dependency install ran but imports still fail; see the pip output above." >&2
     exit 1
   }
@@ -147,5 +148,5 @@ if [ "$NEED_INSTALL" = "1" ] || [ "${FORCE_DEPS:-0}" = "1" ]; then
 else
   echo "[venv] dependencies already satisfied (numpy, scipy, torch, trimesh, skimage," \
        "rtree, fast_simplification, embreex, truststore, spiceypy, cloudpickle, matplotlib," \
-       "psutil)"
+       "psutil, optuna)"
 fi

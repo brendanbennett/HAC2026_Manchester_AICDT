@@ -12,7 +12,6 @@ import cloudpickle
 from hac26.shapes import (
     icosphere,
     sh_mesh_from_coefficients,
-    mesh_curves_convex,
 )
 from hac26.solvers.genetic import GeneticSolver
 from hac26.geometry import build_cameras
@@ -24,7 +23,7 @@ from hac26.genetic_utils import make_target_coefficients, sh_fitness, surface_fi
                                 plot_lightcurve_comparison, plot_genetic_convergence, \
                                 save_checkpoint_results, load_initialisation_mesh, \
                                 sample_surface_control_points, build_surface_influence_matrix, \
-                                deform_surface
+                                deform_surface, render_curves, ExactForwardModel
                                 
 
 
@@ -165,6 +164,58 @@ def main():
         help="Decay rate of mutation noise",
     )
 
+    parser.add_argument(
+        "--forward-model",
+        choices=["convex", "exact"],
+        default="convex",
+        help=(
+            "convex (default): the cheap per-facet Lommel-Seeliger+Lambert kernel "
+            "(hac26.forward.convex_egi.kernel) -- exact for a convex body, but blind to cast "
+            "shadows and interreflection, so increasingly approximate as a candidate becomes "
+            "concave. exact: the flow-matching (LPD) stage's own forward model "
+            "(hac26.forward.mesh.exact.ExactForward) -- real shadows and a radiosity "
+            "interreflection solve, at real cost: at least an order of magnitude slower per "
+            "candidate, much more on a machine with no CUDA/nvdiffrast (see --exact-backend)."
+        ),
+    )
+    parser.add_argument(
+        "--calibration",
+        type=str,
+        default="models/instrument_calibration.pt",
+        help="Instrument written by scripts/calibrate.py; only used with --forward-model exact",
+    )
+    parser.add_argument(
+        "--exact-device",
+        type=str,
+        default="cpu",
+        help="torch device for --forward-model exact (cpu/cuda/mps)",
+    )
+    parser.add_argument(
+        "--exact-backend",
+        type=str,
+        default=None,
+        help="rasteriser backend for --forward-model exact: 'nvdiffrast' (needs a CUDA "
+             "build) or 'software' (the pure-torch stand-in this repo documents as being for "
+             "tests, not real runs -- but the only option without nvdiffrast). Defaults to "
+             "nvdiffrast, or software if the HAC26_SOFTWARE_RASTER env var is set.",
+    )
+    parser.add_argument(
+        "--exact-radiosity-faces",
+        type=int,
+        default=200,
+        help="patches the interreflection solve uses, for --forward-model exact; "
+             "hac26.forward.mesh.exact.RenderConfig's own default is 600, expensive per call "
+             "in a GA's inner loop, so this defaults lower",
+    )
+    parser.add_argument(
+        "--exact-res",
+        type=int,
+        nargs=2,
+        default=[108, 192],
+        metavar=("HEIGHT", "WIDTH"),
+        help="sensor resolution for --forward-model exact, before supersampling",
+    )
+
     # load args
     args = parser.parse_args()
 
@@ -210,12 +261,29 @@ def main():
     # Load source of truth (if exists)
     # --------------------------------------------------------
     
-    # camera angles 
+    # camera angles
     cameras = build_cameras()
 
     # lightcurve types
-    curve_types = ["intensity"] * len(cameras) #+ ["binary"] * len(cameras) 
+    curve_types = ["intensity"] * len(cameras) #+ ["binary"] * len(cameras)
 
+    # --------------------------------------------------------
+    # Forward model: the cheap convex kernel (default), or the flow-matching stage's own
+    # exact one (--forward-model exact). Built once and reused for every render this run
+    # makes -- construction loads the calibrated Instrument and builds Rasterisers, both
+    # too expensive to redo per candidate.
+    # --------------------------------------------------------
+
+    forward = None
+    if args.forward_model == "exact":
+        print(f"[forward model] exact (hac26.forward.mesh.exact.ExactForward), "
+              f"device={args.exact_device}, backend={args.exact_backend or 'nvdiffrast (default)'}",
+              flush=True)
+        forward = ExactForwardModel(
+            args.calibration, m=args.m, device=args.exact_device, backend=args.exact_backend,
+            radiosity_faces=args.exact_radiosity_faces,
+            height=args.exact_res[0], width=args.exact_res[1],
+        )
 
     if args.model is None:
         
@@ -233,12 +301,13 @@ def main():
             subdiv=args.subdiv,
         )
 
-        target_curves = mesh_curves_convex(
+        target_curves = render_curves(
             target_vertices,
             target_faces,
             cameras=cameras,
             m=args.m,
             curve_types=curve_types,
+            forward=forward,
         )
 
         # TODO: use this ?
@@ -329,6 +398,7 @@ def main():
                 cameras=cameras,
                 m=args.m,
                 curve_types=curve_types,
+                forward=forward,
             )
 
 
@@ -397,16 +467,18 @@ def main():
                 target_curves=target_curves,
                 cameras=cameras,
                 m=args.m,
-                curve_types=curve_types
+                curve_types=curve_types,
+                forward=forward,
                 )
 
 
-        initial_curves = mesh_curves_convex(
+        initial_curves = render_curves(
             initial_mesh.vertices,
             initial_mesh.faces,
             cameras=cameras,
             m=args.m,
             curve_types=curve_types,
+            forward=forward,
         )
 
         initial_dice = score_mesh(
@@ -479,12 +551,13 @@ def main():
         # Generate and save lightcurves
         # --------------------------------------------------------
 
-        curves = mesh_curves_convex(
+        curves = render_curves(
             mesh.vertices,
             mesh.faces,
             cameras=cameras,
             m=args.m,
             curve_types=curve_types,
+            forward=forward,
         )
 
         np.save(

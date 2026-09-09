@@ -1,6 +1,74 @@
-"""
-Class to perform genetic algorithm search for asteroid concavities. 
+"""Genetic-algorithm search over a shape parametrization, fit to lightcurves.
 
+An alternative reconstruction path to the LPD/flow pipeline elsewhere in this repo: instead
+of a trained network, a candidate shape's own simulated lightcurves are compared directly
+against the target's, and the shape parameters are searched by simple evolution rather than
+gradient descent. Slower and with no learned prior, but needs no training and can be pointed
+at any shape parametrization with a differentiable-free fitness.
+
+The algorithm (GeneticSolver, this module)
+--------------------------------------------
+A minimal elitist (mu, lambda) evolution strategy over a flat parameter vector: mutate the
+initial parameters with Gaussian noise to build a population, evaluate every individual's
+fitness, keep the best `n_parents` as parents, and refill the population by mutating them
+(the single best individual survives unchanged each generation). No crossover. The mutation
+scale decays geometrically each generation (`mutation_decay`), narrowing the search as it
+converges. `bounds`, if given, clips every parameter after mutation.
+
+The shape parametrizations (hac26/genetic_utils.py)
+-----------------------------------------------------
+GeneticSolver only ever sees a parameter vector and a fitness function; what the vector
+means is decided by which fitness function scripts/reconstruct_genetic.py builds:
+
+  --mode sh       parameters are spherical-harmonic coefficients (hac26.shapes.
+                  sh_mesh_from_coefficients): r(u) = exp(sum a_lm Y_lm(u)) on an icosphere.
+                  Globally smooth by construction -- cannot express arbitrarily sharp detail.
+
+  --mode surface  parameters are signed amplitudes at a sparse set of control points on a
+                  loaded --initial-stl mesh (genetic_utils.sample_surface_control_points),
+                  blended across the mesh by a geodesic Gaussian falloff
+                  (build_surface_influence_matrix) and applied along the radial direction
+                  from the mesh's solid centroid (deform_surface). Radial, not the mesh's own
+                  per-vertex normals: normals fan out fastest at high-curvature points (an
+                  elongated body's tips), so pushing along them amplified any local
+                  difference in nearby vertices' displacement into visible spiking there; the
+                  radial direction is a smooth function of vertex position alone and has no
+                  such divergence.
+
+Fitness is either raw coefficient-recovery (make_target_coefficients + shape_fitness, a toy
+sanity check) or the actual reconstruction objective: simulate the candidate's lightcurves and
+score the negative mean squared residual against the target curves (sh_fitness /
+surface_fitness, via genetic_utils.render_curves). By default that simulation is the cheap
+per-facet convex kernel (hac26.forward.convex_egi.kernel, through hac26.shapes.
+mesh_curves_convex) -- blind to cast shadows and interreflection, exact only for a genuinely
+convex candidate. Passing a genetic_utils.ExactForwardModel as `forward` swaps in the
+flow-matching stage's own forward model instead (hac26.forward.mesh.exact.ExactForward: real
+shadows, a radiosity interreflection solve) at real per-candidate cost -- see
+ExactForwardModel's own docstring for the tradeoff and scripts/reconstruct_genetic.py's
+--forward-model flag to select it from the command line.
+
+Running it
+----------
+scripts/reconstruct_genetic.py is the CLI entry point; it builds the fitness closure, runs
+GeneticSolver, and checkpoints STL + lightcurves + Dice score at fixed generation fractions
+(hac26.genetic_utils.save_checkpoint_results), plus a convergence plot at the end.
+
+    # Synthetic SH target, sh-mode search (no external data needed):
+    python scripts/reconstruct_genetic.py --mode sh --L 3 --generations 50
+
+    # Synthetic SH target, surface-mode search (needs a starting mesh):
+    python scripts/reconstruct_genetic.py --mode surface \\
+        --initial-stl path/to/some_start_shape.stl --generations 50
+
+    # A real challenge asteroid (1-3 have a released truth shape, for Dice scoring):
+    python scripts/reconstruct_genetic.py --mode surface --model 3 \\
+        --initial-stl path/to/some_start_shape.stl --data-dir dataset/raw
+
+Key flags: --population-size/--parents/--mutation-scale/--mutation-decay/--generations
+control the search itself; --deform-width/--max-amp/--n-cpts control the surface-mode
+control-point footprint and amplitude bounds (both in units of the initial mesh's
+characteristic length); --dice-resolution/--simplify-faces control the voxel grid used to
+score reconstructions against the truth mesh, not the search itself.
 """
 
 # import modules
