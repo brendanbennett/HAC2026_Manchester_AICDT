@@ -75,6 +75,31 @@ DICE_FLOOR = 0.75      # median fitted Dice below which the corpus is refused; s
 FIT_CONVEXITY_BINS = (0.55, 0.7, 0.85, 0.95)
 
 
+def _trimesh_signed_distance(m, pts):
+    """Signed distances with this file's convention: positive outside."""
+    return -np.concatenate([m.nearest.signed_distance(pts[i:i + SD_CHUNK])
+                            for i in range(0, len(pts), SD_CHUNK)])
+
+
+def _contains_signed_distance(m, pts):
+    """Robust fallback: unsigned nearest-surface distance, sign from ray parity."""
+    out = []
+    for i in range(0, len(pts), SD_CHUNK):
+        block = pts[i:i + SD_CHUNK]
+        _, distance, _ = m.nearest.on_surface(block)
+        signed = np.asarray(distance, dtype=np.float64)
+        inside = np.asarray(m.contains(block), dtype=bool)
+        signed[inside] *= -1.0
+        out.append(signed)
+    return np.concatenate(out)
+
+
+def _bad_signed_distances(sd, far):
+    if not np.isfinite(sd).all():
+        return True
+    return bool(far.any() and sd[far].min() <= 0.0)
+
+
 def sample_arrays(verts, faces, n_pts=6000, seed=0):
     """Sample points for the fit and the body's signed distance at them (positive outside):
     n_pts uniform in a box covering the lattice, plus half as many jittered surface points.
@@ -96,18 +121,21 @@ def sample_arrays(verts, faces, n_pts=6000, seed=0):
     pts = rng.uniform(-ext, ext, (n_pts, 3))
     surf, _ = trimesh.sample.sample_surface(m, n_pts // 2, seed=seed)
     pts = np.vstack([pts, surf + rng.normal(0, 0.03, surf.shape)])
-    sd = -np.concatenate([m.nearest.signed_distance(pts[i:i + SD_CHUNK])
-                          for i in range(0, len(pts), SD_CHUNK)])   # trimesh: positive inside
+    sd = _trimesh_signed_distance(m, pts)
     # The sign comes from the mesh's winding, so a mesh that is inside out returns the whole
     # field negated and the body is fitted as its own complement, with no sign of it in the
     # residual. A point beyond the body's own bounding sphere is outside whatever the mesh
     # says, so it is the cheapest thing that can tell the two apart.
     far = np.linalg.norm(pts, axis=1) > float(np.linalg.norm(verts, axis=1).max()) + 1e-6
-    if far.any() and sd[far].min() <= 0.0:
+    if _bad_signed_distances(sd, far):
         m.invert()
-        sd = -np.concatenate([m.nearest.signed_distance(pts[i:i + SD_CHUNK])
-                              for i in range(0, len(pts), SD_CHUNK)])
-    if far.any() and sd[far].min() <= 0.0:
+        sd = _trimesh_signed_distance(m, pts)
+    if _bad_signed_distances(sd, far):
+        sd = _contains_signed_distance(m, pts)
+        # A point beyond every vertex radius is outside by construction, even when a
+        # degeneracy makes the ray-parity fallback undecidable on that exact ray.
+        sd[far] = np.maximum(sd[far], 1e-6)
+    if _bad_signed_distances(sd, far):
         raise ValueError("the signed distance calls points outside the body's bounding sphere "
                          "inside it: the mesh is oriented inward. Check mesh_volume.")
     return pts.astype(np.float32), sd.astype(np.float32)
