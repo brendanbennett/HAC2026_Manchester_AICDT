@@ -49,6 +49,51 @@ reproduces Mithra to Dice **0.991**, a torus to **0.995** and a limbed lego-like
 **0.860** (parity-scan Dice at res 96; the official voxeliser reads ~0.02 higher on model 3).
 Whatever is losing 0.28 of score, it is not the shape parametrisation.
 
+## What has been tried against the convex answer, and has failed
+
+Everything below beats the convex answer on *misfit* and loses to it on *Dice*, which is the
+single most useful fact in this file. The convex stage's answer is at χ 2.1473 and Dice 0.6902
+on model 3, against an oracle -- the lattice fitted to the true body on that same convex
+support -- at **χ 1.883, Dice 0.9909**. The representation reaches the truth. The objective
+prefers the truth to the convex start. And nothing that searches the objective finds it.
+
+| attempt | best χ | Dice there | verdict |
+|---|---|---|---|
+| convex answer (`results/convex`) | 2.1473 | 0.6902 | the floor |
+| *oracle*: lattice least-squares fit to truth, same support | **1.883** | **0.9909** | reachable, not findable |
+| Track A: descent on the exact misfit, 1728 amplitudes | 1.109 | 0.665 | fits model error |
+| carve search, mixed families, 250 candidates | 2.092 | 0.696 | +2.6%, below the accept margin |
+| carve search, 4-parameter waist family, 400 candidates | 2.358 | 0.695 | not one candidate beat convex |
+| convex-stage support smoothing, `--smooth 1/2/3` | — | — | 5.527 / 5.484 / 5.153 against 5.543 |
+
+**Why they fail is one fact, measured three ways.** Walk the straight line from the convex
+answer to the oracle: χ goes 2.147 → 2.336 at t = 0.4 → 1.898 at t = 1, while Dice climbs
+0.690 → 0.991 the whole way (`results/figures/basin_barrier.png`). The truth is a real minimum
+and a better one, but it sits behind a barrier about 9% high, and a body must be roughly 85%
+of the way there before its misfit beats the convex answer's at all. So descent walks away
+from it, and a search has to land inside the last 15% of the path to be rewarded — which a
+random draw in 1728 dimensions does not, and which even a dense four-parameter waist search
+did not.
+
+The searches make the point sharper than the descent does. In the mixed search, candidate 2
+scored **Dice 0.752 at χ 2.349** while the winner scored **Dice 0.696 at χ 2.092**; in the
+waist search, candidate 148 scored **Dice 0.747 at χ 2.475**. Better shapes are easy to find.
+They have worse misfits. Selecting on misfit therefore selects *against* shape quality, and
+that is not a tuning problem.
+
+**What would change it.** The residual at the *true* shape is 0.0375 RMS on model 1 and 0.1058
+on model 3 (phase-optimised, so not misalignment). The concavity signal -- the difference
+between Mithra's curves and its own hull's -- is 0.1580. Signal exceeds error by 1.5x on the
+lab curves and 2.3x on the Blender ones, so the information is there; the barrier is what
+hides it, and the barrier's height is set by how much model error a wrong body can absorb.
+Halve the forward-model error and the barrier shrinks against the signal. That is the one
+lever with real upside left, and it is why the Blender curves are worth calibrating against:
+they are a render of the true shape by a known camera with no photographic sensor in front of
+it, and they exist for all ten models.
+
+**What this means for a submission.** Ship the convex answers. Any misfit-driven refinement of
+them, convex or carved, has been measured to make the shape worse.
+
 ## Two quirks of the released evaluation code
 
 **`twoDmetric.m`'s `theta` is a no-op.** It rotates both meshes about z and then projects onto

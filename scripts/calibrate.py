@@ -78,7 +78,8 @@ def load_truth(data_dir: str, model: int, device: str):
             torch.tensor(f, dtype=torch.long, device=device))
 
 
-def load_data(data_dir: str, model: int, phases: int, device: str):
+def load_data(data_dir: str, model: int, phases: int, device: str,
+              use_blender: bool = False):
     """The real mean-normalised curves (N_CAMS, 2, P), which geometries are present (N_CAMS,)
     and the measured noise per curve (N_CAMS, 2).
 
@@ -88,7 +89,7 @@ def load_data(data_dir: str, model: int, phases: int, device: str):
     the A/B mismatch and runs 1-277x the actual noise, median 12x (hac26.noise). That
     difference is reported beside sigma as a diagnostic and is left for eta to absorb.
     """
-    d = load_model_curves(data_dir, model, m=phases)
+    d = load_model_curves(data_dir, model, m=phases, use_blender=use_blender)
     pairs = np.stack([d["curves"][:N_CAMS], d["curves"][N_CAMS:]], axis=1)
     present = (d["mask"][:N_CAMS] > 0) & (d["mask"][N_CAMS:] > 0)
     sigma = native_sigma(d).reshape(2, N_CAMS).T
@@ -272,6 +273,12 @@ def main():
     ap.add_argument("--patience", type=int, default=60,
                     help="window of steps the --tol improvement is measured over")
     ap.add_argument("--data-dir", default="dataset/raw")
+    ap.add_argument("--blender", action="store_true",
+                    help="fit the instrument to the BLENDER curves rather than the lab ones. "
+                         "They are a render of the true shape by a known camera with no "
+                         "photographic sensor in front of it, so the chain has a different "
+                         "and much smaller mismatch to explain -- and they exist for all ten "
+                         "models, so an instrument fitted here applies to every secret body.")
     ap.add_argument("--models", nargs="+", type=int, default=list(PUBLIC_MODELS),
                     help="public bodies to fit the instrument on. One eta is shared across "
                          "all of them, so a body the model cannot reproduce raises the noise "
@@ -301,7 +308,8 @@ def main():
     for M in a.models:
         t0 = time.time()
         verts, faces = load_truth(a.data_dir, M, dev)
-        real, present, sigma, mismatch = load_data(a.data_dir, M, a.phases, dev)
+        real, present, sigma, mismatch = load_data(a.data_dir, M, a.phases, dev,
+                                                   use_blender=a.blender)
         with torch.no_grad():
             psi0 = initial_psi0(fwd, verts, faces, real, present, sigma)
         bodies[M] = dict(verts=verts, faces=faces, real=real, present=present, sigma=sigma,
