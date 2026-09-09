@@ -1,26 +1,21 @@
-"""The sensor chain, applied in the order the hardware applies it.
+"""The sensor chain, from a radiance image to the pixel values the curves are computed from.
 
-    radiance L
-      -> natural off-axis falloff cos^4(theta_off) x fitted radial vignetting
-      -> convolution with the measured PSF
-      -> OETF (a monotone spline, not a power law)
-      -> clip at saturation
-      -> quantise to 8 bits, straight-through in the backward pass
-      -> box-downsample from 4x supersampling
+    radiance L at the supersampled resolution
+      -> off-axis falloff cos^4(theta_off) times a fitted radial vignetting polynomial
+      -> Gaussian PSF with a fitted width
+      -> divide by the fitted saturation level
+      -> OETF: a monotone piecewise-linear spline on [0, 1] with fitted knots
+      -> clamp to [0, 1]
+      -> quantise to `levels` grey levels, identity in the backward pass
+      -> box-average down to the sensor resolution
 
-What is absent: any 1/d^2 factor. Radiance is conserved along a ray, so the
-image irradiance produced by an extended surface does not depend on how far away it is. The
-perspective effect is entirely in how many PIXELS a surface element covers, which the
-rasteriser already handles. Putting a 1/d^2 on pixel VALUES would double-count it; the
-roughly 2x difference between near and far limb is a projected-area effect, not a
-brightness one. The only radiometric falloff here is off-axis cos^4 and fitted vignetting.
+There is no 1/d^2 factor. Radiance is conserved along a ray, so the pixel value from a surface
+does not depend on how far away it is; distance changes only how many pixels the surface
+covers, which the rasteriser handles.
 
-The OETF is a spline. A power law has one parameter and forces the same curvature
-everywhere. Real camera transfer curves have a toe and a shoulder, and it is the shoulder
-that decides which pixels survive the Otsu threshold -- exactly the pixels that carry the
-grazing-incidence geometry. Monotonicity is enforced by construction (softplus increments)
-rather than hoped for, because a non-monotone OETF would make the value threshold
-multi-valued and the coarea derivative meaningless.
+The OETF is a spline rather than a power law because real transfer curves have a toe and a
+shoulder, and the shoulder decides which faint pixels survive the binary threshold. The knots
+are cumulative positive increments, so the curve is monotone by construction.
 """
 from __future__ import annotations
 
@@ -32,13 +27,15 @@ import torch.nn.functional as F
 __all__ = ["SensorModel", "gaussian_psf", "box_downsample", "quantise_ste"]
 
 
-def gaussian_psf(sigma_px: float, radius: int | None = None,
+def gaussian_psf(sigma_px, radius: int | None = None,
                  device=None, dtype=torch.float32) -> torch.Tensor:
-    """Separable Gaussian PSF kernel. Stands in for the measured PSF until it is fitted."""
+    """One-dimensional Gaussian kernel, differentiable in sigma when a tensor is passed. The
+    support `radius` is an integer chosen from the current sigma and is not differentiated."""
+    sig = torch.as_tensor(sigma_px, device=device, dtype=dtype)
     if radius is None:
-        radius = max(1, int(np.ceil(3.0 * sigma_px)))
+        radius = max(1, int(np.ceil(3.0 * float(sig.detach()))))
     x = torch.arange(-radius, radius + 1, device=device, dtype=dtype)
-    k = torch.exp(-0.5 * (x / max(sigma_px, 1e-6)) ** 2)
+    k = torch.exp(-0.5 * (x / sig.clamp_min(1e-6)) ** 2)
     return k / k.sum()
 
 
@@ -55,7 +52,7 @@ def _separable_conv(img: torch.Tensor, k: torch.Tensor) -> torch.Tensor:
 
 
 def box_downsample(img: torch.Tensor, factor: int) -> torch.Tensor:
-    """Box average over factor x factor blocks. Supersample, then average, then threshold."""
+    """Box average over factor x factor blocks."""
     if factor == 1:
         return img
     b, h, w = img.shape
@@ -65,7 +62,7 @@ def box_downsample(img: torch.Tensor, factor: int) -> torch.Tensor:
 
 
 class _QuantiseSTE(torch.autograd.Function):
-    """8-bit quantisation, identity on the backward pass."""
+    """Quantisation to `levels` grey levels, identity on the backward pass."""
 
     @staticmethod
     def forward(ctx, x, levels: int):
@@ -81,12 +78,11 @@ def quantise_ste(x: torch.Tensor, levels: int = 256) -> torch.Tensor:
 
 
 class SensorModel(nn.Module):
-    """The sensor chain. Every fitted quantity is a parameter here, pinned by the calibration.
+    """The sensor chain. Every fitted quantity is a parameter here, set by the calibration.
 
-    `vignette` is the radial polynomial in normalised image radius r in [0, 1]:
+    `vignette` is the radial polynomial in the normalised image radius r in [0, 1]:
         V(r) = 1 + a1 r^2 + a2 r^4 + a3 r^6
-    even powers only, because a lens is radially symmetric and an odd term would put a cusp
-    on the optical axis.
+    even powers only, because a lens is radially symmetric.
     """
 
     def __init__(self, n_oetf_knots: int = 8, psf_sigma_px: float = 1.0,
@@ -121,7 +117,7 @@ class SensorModel(nn.Module):
         u = x.clamp(0.0, 1.0) * n
         i = u.floor().clamp(max=n - 1)
         t = u - i
-        i = i.long()
+        i = i.int()                                 # the index is kept for the backward pass
         return torch.lerp(k[i], k[i + 1], t)
 
     def vignette(self, r: torch.Tensor) -> torch.Tensor:
@@ -132,13 +128,15 @@ class SensorModel(nn.Module):
     # -------------------------------------------------------------- the chain
     def forward(self, radiance: torch.Tensor, cos_off: torch.Tensor,
                 radius: torch.Tensor, supersample: int = 4) -> torch.Tensor:
-        """radiance, cos_off and radius are all (B, H, W) at the SUPERSAMPLED resolution.
+        """radiance is (B, H, W) at the SUPERSAMPLED resolution; cos_off and radius are (1, H, W)
+        or (B, H, W) and broadcast against it.
 
         cos_off is the cosine of the off-axis angle of each pixel's ray; radius is the
         normalised distance from the optical axis, in [0, 1] at the frame corner.
         """
-        x = radiance * cos_off.clamp_min(0.0) ** 4 * self.vignette(radius)
-        x = _separable_conv(x, gaussian_psf(float(self.psf_sigma), device=x.device,
+        gain = cos_off.clamp_min(0.0) ** 4 * self.vignette(radius)    # the same for every image
+        x = radiance * gain
+        x = _separable_conv(x, gaussian_psf(self.psf_sigma, device=x.device,
                                             dtype=x.dtype))
         x = self.oetf(x / self.saturation.clamp_min(1e-6))
         x = x.clamp(0.0, 1.0)                       # saturation

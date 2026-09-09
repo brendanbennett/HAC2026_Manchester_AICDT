@@ -1,6 +1,5 @@
-"""Sanity tests tying the code to the exact mathematical statements of
-the convex forward model. Torch-dependent tests are skipped if torch
-is not installed; everything else is numpy/scipy only."""
+"""Tests of the convex forward model, its derivatives and adjoints, the Minkowski solver and
+the curve-file parser. Tests that need torch are skipped when it is not installed."""
 import numpy as np
 import pytest
 
@@ -23,18 +22,20 @@ def small_setup(nt=6, nphi=12, m=24):
 
 
 def test_camera_table():
+    """hac26.geometry.build_cameras gives the released column order and phase angles."""
     cams = build_cameras()
     assert len(cams) == 28
     a0 = [c for c in cams if c.azimuth_deg == 0.0]
     assert [c.kind for c in a0] == ["hor_a", "hor_b", "top", "bottom"]
-    # beam-splitter view: phase angle 0 at azimuth 0, horizontal
+    # the horizontal camera at azimuth 0 looks along the light: phase angle 0
     assert abs(a0[0].phase_angle_deg) < 1e-12
-    # top camera at azimuth 0 has alpha = 21 deg
+    # at azimuth 0 the top camera's phase angle equals its elevation
     assert abs(a0[2].phase_angle_deg - 21.0) < 1e-9
 
 
 def test_pole_columns_zero():
-    """Lemma: normals +-e3 are never illuminated -> exactly zero A-columns."""
+    """The pole normals are never lit by a light in the equatorial plane, so their columns
+    of A are exactly zero."""
     cams = build_cameras()
     normals = np.array([[0, 0, 1.0], [0, 0, -1.0], [1.0, 0, 0]])
     A = build_A(normals, cams + cams, 16,
@@ -45,6 +46,7 @@ def test_pole_columns_zero():
 
 
 def test_dn_derivative_and_adjoint():
+    """dn_np matches a finite difference of normalize_np, and dn_adjoint_np is its adjoint."""
     y = RNG.uniform(1.0, 2.0, size=(5, 30))
     v = RNG.standard_normal((5, 30))
     w = RNG.standard_normal((5, 30))
@@ -59,12 +61,14 @@ def test_dn_derivative_and_adjoint():
 
 
 def test_scale_invariance():
+    """The normalised forward model does not change when the EGI is scaled."""
     grid, cams, A, types = small_setup()
     g = RNG.uniform(0, 1, grid.n)
     assert np.allclose(forward_np(A, g), forward_np(A, 7.3 * g))
 
 
 def test_deriv_adjoint_vs_fd():
+    """<h, dF(g) v> from a finite difference equals <v, deriv_adjoint_np(A, g, h)>."""
     grid, cams, A, types = small_setup()
     g = RNG.uniform(0.1, 1.0, grid.n)
     h = RNG.standard_normal(A.shape[:2])
@@ -76,12 +80,12 @@ def test_deriv_adjoint_vs_fd():
 
 
 def test_azimuthal_equivariance():
-    """Rotating the EGI by one phi-cell == cyclic shift of every raw curve by
-    m/n_phi frames (exact on the grid)."""
+    """Rotating the EGI by one phi cell shifts every raw curve cyclically by m / n_phi frames,
+    exactly on the grid."""
     nt, nphi, m = 6, 12, 24
     grid = make_grid(nt, nphi)
-    # psi0 offset keeps samples off the measure-zero set {mu0 = 0}, where the
-    # *discontinuous* binary kernel turns float sign-noise into O(1) flips
+    # The psi0 offset keeps the samples away from mu0 = 0, where the discontinuous binary
+    # kernel turns floating-point sign noise into whole-pixel flips.
     A, types = stack_A(grid, build_cameras(), m, psi0=0.1234)
     g = RNG.uniform(0, 1, grid.n)
     gimg = g.reshape(nt, nphi)
@@ -94,6 +98,7 @@ def test_azimuthal_equivariance():
 
 
 def test_closure_projection():
+    """project_closure keeps the EGI non-negative and makes its area vector vanish."""
     grid = make_grid(8, 16)
     g = RNG.uniform(0, 1, grid.n)
     gp = project_closure(g, grid.normals)
@@ -102,6 +107,7 @@ def test_closure_projection():
 
 
 def test_minkowski_cube():
+    """Six axis normals with equal areas solve to a unit cube."""
     U = np.array([[1., 0, 0], [-1, 0, 0], [0, 1, 0], [0, -1, 0], [0, 0, 1], [0, 0, -1]])
     sol = solve_minkowski(U, np.ones(6))
     assert sol["egi_l1"] < 0.02, sol["message"]
@@ -111,8 +117,9 @@ def test_minkowski_cube():
 
 
 def test_minkowski_roundtrip_and_bruteforce():
-    """g -> Minkowski polytope -> (a) EGI back ~ g, (b) brute-force mesh curves ==
-    A @ g_mesh exactly (facet normals are grid nodes by construction)."""
+    """An EGI g is solved to a Minkowski polytope; (a) the polytope's EGI is close to g in
+    proportion, and (b) the mesh curves of the polytope match A @ g_back, since its facet
+    normals are grid nodes by construction."""
     nt, nphi, m = 8, 16, 32
     grid = make_grid(nt, nphi)
     cams = build_cameras()
@@ -126,9 +133,9 @@ def test_minkowski_roundtrip_and_bruteforce():
     g_back = mesh_to_egi(sol["verts"], sol["faces"], grid, close=False)
     p, pb = g / g.sum(), g_back / g_back.sum()
     assert np.abs(p - pb).sum() < 0.05
-    # (b) matrix route == brute-force facet-sum on the same polytope
-    # (psi0 offset: stay off {mu0 = 0}, where the discontinuous binary kernel
-    #  amplifies float-level sign differences between the two normal computations)
+    # (b) the matrix route against the facet sum on the same polytope; the psi0 offset keeps
+    # the samples away from mu0 = 0, where the discontinuous binary kernel amplifies
+    # floating-point differences between the two normal computations
     A, types = stack_A(grid, cams, m, psi0=0.789)
     y_mat = np.einsum("cmn,n->cm", A, g_back)
     y_brt = mesh_curves_convex(sol["verts"], sol["faces"], cams + cams, m, types,
@@ -138,6 +145,7 @@ def test_minkowski_roundtrip_and_bruteforce():
 
 
 def test_sample_shape_and_egi():
+    """A sampled training shape has a non-negative closed EGI and spans z in [-1, 1]."""
     grid = make_grid(12, 24)
     s = sample_training_shape(np.random.default_rng(3), grid)
     assert s["g"].min() >= 0 and s["g"].sum() > 0
@@ -146,6 +154,7 @@ def test_sample_shape_and_egi():
 
 
 def test_parser_roundtrip(tmp_path):
+    """write_curves29 followed by read_curves29 returns the time and curves unchanged."""
     m = 17
     time = np.arange(m, dtype=float)
     curves = RNG.uniform(0.5, 1.5, size=(28, m))
@@ -158,6 +167,7 @@ def test_parser_roundtrip(tmp_path):
 
 # ---------------- torch-dependent tests ----------------------------------------------
 def test_torch_operator_matches_numpy():
+    """ConvexPhotometricOperator agrees with forward_np."""
     torch = pytest.importorskip("torch")
     from hac26.forward.convex_egi import ConvexPhotometricOperator
     grid, cams, A, types = small_setup()
@@ -169,6 +179,7 @@ def test_torch_operator_matches_numpy():
 
 
 def test_torch_deriv_adjoint_matches_autograd():
+    """The operator's closed-form deriv_adjoint equals the autograd gradient."""
     torch = pytest.importorskip("torch")
     from hac26.forward.convex_egi import ConvexPhotometricOperator
     grid, cams, A, types = small_setup()
@@ -182,6 +193,8 @@ def test_torch_deriv_adjoint_matches_autograd():
 
 
 def test_lpd_forward_backward():
+    """LPDNet returns an EGI that sums to one per sample, and every trainable parameter
+    receives a gradient."""
     torch = pytest.importorskip("torch")
     from hac26.forward.convex_egi import ConvexPhotometricOperator
     from hac26.solvers.lpd_convex import LPDNet

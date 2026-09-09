@@ -1,22 +1,19 @@
 #!/usr/bin/env bash
-# Build the CUDA toolchain and nvdiffrast that M2/M3 need, without root.
+# Build, without root, the CUDA toolchain and nvdiffrast that the mesh forward model
+# (hac26/forward/mesh) and scripts/train_surrogate.py need.
 #
-# The machine has a CUDA *runtime* (torch cu130) but no CUDA *compiler*, no GL/EGL headers,
-# and no sudo. nvdiffrast is not on PyPI and compiles CUDA at install time, so it has to be
-# built from source against a toolkit we assemble ourselves.
+# The machine has a CUDA runtime (torch's cu13 wheels) but no CUDA compiler, no GL/EGL
+# headers and no sudo. nvdiffrast is not on PyPI and compiles CUDA at install time, so it is
+# built from source against a toolkit assembled here.
 #
-# Why CUDA 12.9 and not 13.0, which would match torch: the 13.0 redistributable does not
-# ship `cicc`, the NVVM frontend, so nvcc 13.0 cannot compile a .cu file at all. Grafting
-# 12.9's cicc into a 13.0 tree fails differently -- it emits CUDA-12 launch stubs against
-# CUDA-13 headers ("__cudaLaunch requires 2 arguments"). 12.9 is the earliest consistent
-# line that both ships cicc and supports the sm_120 device here.
+# CUDA 12.9 rather than 13.0, which would match torch: the 13.0 redistributable does not
+# ship cicc, the NVVM frontend, so its nvcc cannot compile a .cu file, and grafting 12.9's
+# cicc into a 13.0 tree fails on mismatched launch stubs. 12.9 is the earliest line that
+# ships cicc and supports the sm_120 device here.
 #
-# That leaves torch's build-time guard refusing 12.9 against a cu130 build. The guard is
-# about ABI drift in the CUDA runtime; nvdiffrast uses launch, memcpy and texture APIs,
-# which are stable across this pair. It is bypassed deliberately, and the result is then
-# exercised end to end -- rasterize, interpolate, antialias and backward -- before anything
-# is built on top. Measured after the build: coverage 0.1809 against an analytic 0.1809,
-# and a non-zero finite silhouette gradient (|grad| = 5708.68).
+# torch's build-time version guard refuses 12.9 against a cu13 build. The guard is about ABI
+# drift in the CUDA runtime; nvdiffrast uses launch, memcpy and texture APIs, which are stable
+# across this pair, so the guard is bypassed in the build script below.
 set -euo pipefail
 PREFIX=${PREFIX:-$HOME/.local}
 REDIST=https://developer.download.nvidia.com/compute/cuda/redist
@@ -31,7 +28,7 @@ for c in cuda_nvcc cuda_cudart cuda_cccl; do
 done
 for d in cuda_*-archive; do cp -rn "$d"/* "$CUDA"/; done
 
-# math-library headers come from the venv's cu13 bundle; the CUDA CORE headers must stay
+# The math-library headers come from torch's cu13 bundle; the CUDA core headers must stay
 # consistent with nvcc 12.9, so only the math ones are copied.
 mkdir -p /tmp/mathinc
 for pat in 'cublas*' 'cusparse*' 'cusolver*' 'cufft*' 'curand*' 'nvrtc*' 'library_types.h' 'cuComplex.h'; do
@@ -41,7 +38,7 @@ done
 [ -d /tmp/nvdiffrast ] || git clone --depth 1 -q https://github.com/NVlabs/nvdiffrast.git /tmp/nvdiffrast
 cat > /tmp/build_nvdr.py <<'PY'
 import sys, torch.utils.cpp_extension as ce
-ce._check_cuda_version = lambda *a, **k: None      # see the header comment
+ce._check_cuda_version = lambda *a, **k: None      # the version guard; see the header comment
 sys.argv = ["setup.py", "build_ext", "--inplace"]
 exec(open("setup.py").read())
 PY

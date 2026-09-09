@@ -1,15 +1,11 @@
 #!/usr/bin/env python3
-"""Check the ten written STLs really are what the submission requires.
+"""Check the ten written STLs against what the submission requires.
 
-This exists because twice in this project the pipeline wrote meshes built with a
-different configuration than the one that was evaluated, and both times the only thing
-that caught it was checking the geometry of the files on disk rather than trusting the
-logs. Checks, per model:
-
-  * loads, non-empty, watertight-hull-able
-  * challenge pose: z in [-1,1] to tolerance, xy-centroid on the axis
-  * max axis distance matches the published bounding-cylinder radius when the shipped
-    configuration used --fit-cylinder (this is the check that caught the flag bug)
+Per model: the file exists, loads and has a usable number of vertices and faces; the
+challenge pose holds (z in [-1, 1] to a small tolerance, xy-centroid near the axis); and
+the largest axis distance does not exceed the published bounding-cylinder radius
+(hac26.conventions.CYLINDER_R) by more than a small tolerance. The radius check is
+one-sided because the radius is a bound, not a target. Exits non-zero on any problem.
 """
 import argparse
 import sys
@@ -17,17 +13,15 @@ from pathlib import Path
 
 import numpy as np
 
-from hac26.shapes import hull_mesh  # noqa: E402
-from hac26.stl_io import load_stl  # noqa: E402
-
-CYLINDER_R = {1: 1.12, 2: 1.42, 3: 0.88, 4: 1.475, 5: 1.22,
-              6: 0.925, 7: 1.205, 8: 1.24, 9: 0.67, 10: 3.95}
+from hac26.conventions import CYLINDER_R
+from hac26.shapes import hull_mesh
+from hac26.stl_io import load_stl
 
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--dir", required=True)
-    ap.add_argument("--expect-cylinder", action="store_true", default=True)
+    ap.add_argument("--dir", required=True,
+                    help="directory holding Asteroid01.stl to Asteroid10.stl")
     args = ap.parse_args()
 
     ok = True
@@ -40,7 +34,7 @@ def main() -> None:
             ok = False
             continue
         v, f = load_stl(str(p))
-        hv, hf = hull_mesh(v)
+        hull_mesh(v)                 # raises if the vertices do not span a solid
         zmin, zmax = float(v[:, 2].min()), float(v[:, 2].max())
         r = float(np.sqrt((v[:, :2] ** 2).sum(1)).max())
         R = CYLINDER_R[M]

@@ -1,20 +1,12 @@
-"""Challenge data IO: the 29-column lightcurve format, file discovery, and the
-convention-fitting routine to run on the public models once data is present.
+"""Reading the challenge curve files.
 
-Column layout (challenge page, 1-indexed): column 1 = time stamp / frame index;
-then 7 groups of 4 columns for azimuths 0, 45, 90, 135, 225, 270, 315 deg;
-within each group: (horizontal, horizontal, top, virtual bottom) — same order as
-geometry.build_cameras().
+A curve file has one row per frame and N_CAMS + 1 columns: the frame time, then one curve
+per camera in the released column order (per azimuth: two horizontal cameras, top, virtual
+bottom), the same order as hac26.geometry.build_cameras(). Files are named
+Asteroid<NN>_lightcurve_<intensity|binary>[_blender].txt.
 
-File names observed in the page's News section:
-    Asteroid01_lightcurve_intensity.txt
-    Asteroid01_lightcurve_binary.txt
-    Asteroid01_lightcurve_intensity_blender.txt
-    Asteroid01_lightcurve_binary_blender.txt
-
-UNVERIFIED-UNTIL-DATA (kept configurable, fitted by fit_conventions):
-    sigma (rotation sense), delta (azimuth handedness), semantics of the two
-    horizontal columns, c_lambert of the LS+L scattering law.
+fit_conventions estimates the rotation sense, azimuth handedness and Lambert weight of the
+convex operator on a public model whose shape is known.
 """
 from __future__ import annotations
 
@@ -23,15 +15,24 @@ from pathlib import Path
 import numpy as np
 
 from hac26.forward.convex_egi import normalize_np
+from .conventions import PUBLIC_MODELS
 from .geometry import build_cameras
 from .shapes import hull_mesh, mesh_curves_convex
 
 N_CAMS = 28
 
 
+def public_stl(data_dir: str, model: int) -> str:
+    """Path of a public model's released shape inside the dataset directory."""
+    if model not in PUBLIC_MODELS:
+        raise ValueError(f"model {model} has no released shape; public models are "
+                         f"{PUBLIC_MODELS}")
+    return str(Path(data_dir) / f"AsteroidModel0{model}_shape_public" / f"asteroid{model}.stl")
+
+
 def read_curves29(path: str) -> dict:
-    """Read one lightcurve file -> {'time': (m,), 'curves': (28, m)}.
-    Real challenge files are comma-separated; delimiter is auto-detected."""
+    """Read one curve file into {'time': (m,), 'curves': (N_CAMS, m)}. The delimiter, comma
+    or whitespace, is detected from the first line."""
     with open(path) as fh:
         first = fh.readline()
     delim = "," if "," in first else None
@@ -44,11 +45,12 @@ def read_curves29(path: str) -> dict:
 
 
 def write_curves29(path: str, time: np.ndarray, curves: np.ndarray) -> None:
+    """Write curves in the layout read_curves29 reads, whitespace-separated."""
     assert curves.shape[0] == N_CAMS
     np.savetxt(path, np.column_stack([time, curves.T]))
 
 
-def _resample(curves: np.ndarray, m: int) -> np.ndarray:
+def resample_curves(curves: np.ndarray, m: int) -> np.ndarray:
     """Periodic linear resampling of each curve onto m uniform frames."""
     m0 = curves.shape[-1]
     if m0 == m:
@@ -61,11 +63,11 @@ def _resample(curves: np.ndarray, m: int) -> np.ndarray:
 
 def load_model_curves(data_dir: str, model_idx: int, m: int = 360,
                       use_blender: bool = False, renormalize: bool = True) -> dict:
-    """Assemble the 56-curve stack [28 intensity, 28 binary] + availability mask.
+    """Assemble one model's [intensity, binary] curve stack, resampled to m frames.
 
-    Missing files yield zero curves with mask 0 (the LPD input convention).
-    Data files are already mean-normalized per the page; renormalize is an
-    idempotent safeguard.
+    Returns {'curves': (2 * N_CAMS, m), 'mask': (2 * N_CAMS,), 'files': {type: path}}. A
+    missing file leaves its block at zero with mask 0. `renormalize` divides each curve by
+    its mean, which leaves an already mean-normalised file unchanged.
     """
     import glob as _glob
 
@@ -74,8 +76,9 @@ def load_model_curves(data_dir: str, model_idx: int, m: int = 360,
     mask = np.zeros(2 * N_CAMS, dtype=np.float32)
     found = {}
     for j, ctype in enumerate(("intensity", "binary")):
-        # names in the released archive: Asteroid01..Asteroid09, but Asteroid010;
-        # files live in nested per-model subfolders -> recursive search
+        # The released archive spells the model number both zero-padded (Asteroid10) and
+        # zero-prefixed (Asteroid010), and files sit in nested per-model folders, so both
+        # spellings are searched recursively.
         names = {f"Asteroid{model_idx:02d}_lightcurve_{ctype}{suffix}.txt",
                  f"Asteroid0{model_idx}_lightcurve_{ctype}{suffix}.txt"}
         hits: list = []
@@ -84,7 +87,7 @@ def load_model_curves(data_dir: str, model_idx: int, m: int = 360,
             hits += _glob.glob(str(Path(data_dir) / nm))
         p = Path(sorted(hits)[0]) if hits else None
         if p is not None and p.exists():
-            cur = _resample(read_curves29(str(p))["curves"], m)
+            cur = resample_curves(read_curves29(str(p))["curves"], m)
             if renormalize:
                 cur = normalize_np(cur)
             sl = slice(j * N_CAMS, (j + 1) * N_CAMS)
@@ -97,12 +100,12 @@ def load_model_curves(data_dir: str, model_idx: int, m: int = 360,
 def fit_conventions(verts: np.ndarray, faces: np.ndarray, curves56: np.ndarray,
                     mask: np.ndarray, m: int,
                     c_grid=(0.0, 0.05, 0.1, 0.2, 0.4, 0.8)) -> dict:
-    """Estimate (sigma, delta, c_lambert) on a public model with known mesh.
+    """Estimate (sigma, delta, c_lambert) for a public model with a known mesh.
 
-    Defined estimator: minimize the summed squared misfit between the measured
-    normalized curves and the normalized brute-force convex-hull curves over the
-    finite candidate set {+-1} x {+-1} x c_grid. (The true models may be nonconvex;
-    the hull curves are the convex-model surrogate — sufficient to identify signs.)
+    Minimises the summed squared misfit between the measured normalised curves and the
+    normalised convex-operator curves of the mesh's convex hull, over the finite candidate
+    set {+-1} x {+-1} x c_grid. The true body may be non-convex; the hull is enough to
+    identify the signs. Returns the best candidate with its misfit under 'err'.
     """
     cams = build_cameras()
     types = ["intensity"] * N_CAMS + ["binary"] * N_CAMS

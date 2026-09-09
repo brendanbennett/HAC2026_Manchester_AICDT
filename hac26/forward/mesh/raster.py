@@ -1,64 +1,109 @@
-"""Perspective rasterisation and the reduction to the two curves.
+"""Rasterisation with nvdiffrast: the projections, a thin wrapper around the three
+operations, and Otsu's threshold, which the organisers use to turn a frame into the pixel
+count.
 
-    I_c(psi) = sum_p val_p * 1[val_p > tau_I]          summed pixel value
-    N_c(psi) = sum_p       1[val_p > tau_B,c]          pixel count
-    then each curve is divided by its own mean over psi
-
-tau_B,c is Otsu, computed on the FULL frame at a single reference phase -- not on a crop
-around the body. A crop changes the class weights that Otsu balances, which moves the
-threshold, and it moves it in the direction that matters: toward or away from the dim
-grazing-incidence pixels that carry the terminator geometry. It is recomputed once per
-outer iteration and stop-gradiented within the iteration, so the threshold is a constant of
-the current linearisation rather than something the optimiser can chase.
+Every mesh rendered here has its vertices duplicated per face (`flat_faces`), so a per-face
+attribute such as the radiance can be given as a per-vertex attribute. nvdiffrast then treats
+every edge as a silhouette edge and antialiases all of them, which is correct for a
+flat-shaded mesh: adjacent faces share the same geometric edge, so the blend at that edge is
+the same whichever face is taken to own it.
 """
 from __future__ import annotations
+
+import os
 
 import numpy as np
 import torch
 
-__all__ = ["perspective", "look_at", "Rasteriser", "otsu_threshold", "reduce_curves",
-           "normalise_curves"]
+__all__ = ["perspective", "look_at", "orthographic", "flat_faces", "Rasteriser",
+           "otsu_threshold"]
 
 
-def perspective(fov_y_rad: float, aspect: float, near: float = 0.1,
-                far: float = 100.0, device=None) -> torch.Tensor:
-    """Standard OpenGL-style projection matrix, which is what nvdiffrast expects."""
-    f = 1.0 / np.tan(fov_y_rad / 2.0)
-    m = torch.zeros(4, 4, device=device, dtype=torch.float32)
-    m[0, 0] = f / aspect
-    m[1, 1] = f
-    m[2, 2] = (far + near) / (near - far)
-    m[2, 3] = (2 * far * near) / (near - far)
-    m[3, 2] = -1.0
-    return m
+def perspective(fov_y_rad, aspect: float, near, far, device=None) -> torch.Tensor:
+    """Standard OpenGL-style projection matrix, which is what nvdiffrast expects, clipping
+    at the distances `near` and `far` from the eye. Differentiable in the field of view and
+    in the two distances when they are tensors."""
+    fov = torch.as_tensor(fov_y_rad, dtype=torch.float32, device=device)
+    near = torch.as_tensor(near, dtype=torch.float32, device=device)
+    far = torch.as_tensor(far, dtype=torch.float32, device=device)
+    f = 1.0 / torch.tan(fov / 2.0)
+    zero = torch.zeros((), device=device)
+    return torch.stack([
+        torch.stack([f / aspect, zero, zero, zero]),
+        torch.stack([zero, f, zero, zero]),
+        torch.stack([zero, zero, (far + near) / (near - far), (2 * far * near) / (near - far)]),
+        torch.stack([zero, zero, -torch.ones((), device=device), zero])])
 
 
-def look_at(eye: np.ndarray, target=(0.0, 0.0, 0.0), up=(0.0, 0.0, 1.0),
-            device=None) -> torch.Tensor:
-    eye = np.asarray(eye, dtype=np.float64)
-    t = np.asarray(target, dtype=np.float64)
-    u = np.asarray(up, dtype=np.float64)
-    f = t - eye
-    f = f / np.linalg.norm(f)
-    if abs(float(f @ (u / np.linalg.norm(u)))) > 0.999:      # camera on the up axis
-        u = np.array([0.0, 1.0, 0.0])
-    s = np.cross(f, u); s /= np.linalg.norm(s)
-    v = np.cross(s, f)
-    m = np.eye(4)
-    m[0, :3], m[1, :3], m[2, :3] = s, v, -f
-    m[:3, 3] = -m[:3, :3] @ eye
-    return torch.tensor(m, device=device, dtype=torch.float32)
+def look_at(eyes, up=(0.0, 0.0, 1.0), device=None) -> torch.Tensor:
+    """View matrices (B, 4, 4) for cameras at `eyes` (B, 3) looking at the origin, with `up`
+    as the vertical unless a camera sits on it. Differentiable in `eyes`."""
+    eyes = torch.as_tensor(eyes, dtype=torch.float32, device=device)
+    squeeze = eyes.dim() == 1
+    e = eyes.reshape(-1, 3)
+    u = torch.as_tensor(up, dtype=torch.float32, device=device)
+    u = u / u.norm()
+    f = -e / e.norm(dim=1, keepdim=True)
+    on_axis = (f.detach() @ u).abs() > 0.999
+    alt = torch.tensor([0.0, 1.0, 0.0], dtype=torch.float32, device=device)
+    ub = torch.where(on_axis[:, None], alt[None], u[None].expand_as(f))
+    s = torch.linalg.cross(f, ub); s = s / s.norm(dim=1, keepdim=True)
+    v = torch.linalg.cross(s, f)
+    rot = torch.stack([s, v, -f], 1)                                     # (B, 3, 3)
+    trans = -(rot @ e[..., None])                                        # (B, 3, 1)
+    last = torch.tensor([0.0, 0.0, 0.0, 1.0], dtype=torch.float32, device=device)
+    m = torch.cat([torch.cat([rot, trans], 2), last.expand(len(e), 1, 4)], 1)
+    return m[0] if squeeze else m
+
+
+def orthographic(direction, half_width: float, depth: float, device=None) -> torch.Tensor:
+    """Matrix taking body-frame points to clip space for a camera looking along -`direction`
+    from far away: clip x = (p . u) / half_width, y = (p . v) / half_width and
+    z = -(p . direction) / depth, with (u, v, direction) a right-handed frame. A point closer
+    to the source along `direction` gets a smaller z, which nvdiffrast treats as nearer.
+    Differentiable in `direction` when it is a tensor."""
+    d = torch.as_tensor(direction, dtype=torch.float32, device=device)
+    d = d / d.norm()
+    a = torch.tensor([0.0, 0.0, 1.0], dtype=torch.float32, device=device)
+    if abs(float(d[2].detach())) > 0.9:
+        a = torch.tensor([0.0, 1.0, 0.0], dtype=torch.float32, device=device)
+    u = torch.linalg.cross(a, d); u = u / u.norm()
+    v = torch.linalg.cross(d, u)
+    rows = torch.stack([u / half_width, v / half_width, -d / depth,
+                        torch.zeros(3, dtype=torch.float32, device=device)])
+    last_col = torch.tensor([[0.0], [0.0], [0.0], [1.0]], dtype=torch.float32, device=device)
+    return torch.cat([rows, last_col], 1)
+
+
+def flat_faces(verts: torch.Tensor, faces: torch.Tensor):
+    """Duplicate the vertices per face: (3F, 3) positions and (F, 3) faces indexing them, so
+    a per-face attribute can be given per vertex. Differentiable in `verts`."""
+    fv = verts[faces.long()].reshape(-1, 3)
+    ff = torch.arange(fv.shape[0], device=verts.device, dtype=torch.int32).reshape(-1, 3)
+    return fv, ff
+
+
+def _backend(name: str | None):
+    """nvdiffrast, or the pure-torch stand-in when asked for by name or by the
+    HAC26_SOFTWARE_RASTER environment variable."""
+    name = name or ("software" if os.environ.get("HAC26_SOFTWARE_RASTER") else "nvdiffrast")
+    if name == "software":
+        from hac26.forward.shared import software_raster
+        return software_raster
+    if name != "nvdiffrast":
+        raise ValueError(f"unknown raster backend {name!r}")
+    from ..shared._nvdr import load
+    return load()
 
 
 class Rasteriser:
-    """Perspective first-hit rasterisation with nvdiffrast, plus the per-pixel geometry
-    the sensor chain needs (off-axis cosine and normalised radius)."""
+    """Point-sampled rasterisation with antialiased coverage, plus the per-pixel geometry the
+    sensor chain needs. Positions must be float32 on the rasteriser's device."""
 
-    def __init__(self, height: int = 1080, width: int = 1920, supersample: int = 4,
-                 device: str = "cuda"):
-        from ..shared._nvdr import load
-        self.dr = load()
-        self.h, self.w, self.ss = height, width, supersample
+    def __init__(self, height: int, width: int, supersample: int = 1, device: str = "cuda",
+                 backend: str | None = None):
+        self.dr = _backend(backend)
+        self.h, self.w, self.ss = int(height), int(width), int(supersample)
         self.device = device
         self.ctx = self.dr.RasterizeCudaContext(device=device)
         self._px_cache: dict = {}
@@ -67,70 +112,66 @@ class Rasteriser:
     def resolution(self) -> list:
         return [self.h * self.ss, self.w * self.ss]
 
+    def _unit_grid(self):
+        """The pixel grid at unit half-height, and the normalised distance from the optical
+        axis, both (1, H, W). Neither depends on the field of view: the grid scales with
+        tan(fov / 2), and the radius is divided by its own maximum, which scales with it too.
+        So this is cached once per resolution rather than once per field of view."""
+        key = (self.h, self.w, self.ss)
+        if key not in self._px_cache:
+            H, W = self.resolution
+            aspect = self.w / self.h
+            yy = torch.linspace(1.0, -1.0, H, device=self.device)
+            xx = torch.linspace(-aspect, aspect, W, device=self.device)
+            gx, gy = torch.meshgrid(xx, yy, indexing="xy")
+            g2 = gx ** 2 + gy ** 2
+            self._px_cache[key] = (g2[None], (g2.sqrt() / g2.sqrt().max())[None])
+        return self._px_cache[key]
+
     def pixel_geometry(self, fov_y_rad: float):
-        """cos(off-axis angle) and normalised radius for every supersampled pixel."""
-        key = (fov_y_rad, self.h, self.w, self.ss)
-        if key in self._px_cache:
-            return self._px_cache[key]
-        H, W = self.resolution
-        aspect = self.w / self.h
-        ty = np.tan(fov_y_rad / 2.0)
-        yy = torch.linspace(ty, -ty, H, device=self.device)
-        xx = torch.linspace(-ty * aspect, ty * aspect, W, device=self.device)
-        gx, gy = torch.meshgrid(xx, yy, indexing="xy")
-        cos_off = 1.0 / torch.sqrt(1.0 + gx ** 2 + gy ** 2)
-        r = torch.sqrt(gx ** 2 + gy ** 2)
-        r = r / r.max()
-        out = (cos_off[None], r[None])
-        self._px_cache[key] = out
-        return out
+        """cos(off-axis angle) and normalised radius for every supersampled pixel, (1, H, W).
 
-    def render(self, verts: torch.Tensor, faces: torch.Tensor,
-               vert_radiance: torch.Tensor, eye: np.ndarray,
-               fov_y_rad: float, antialias: bool = True):
-        """Returns (radiance image (1,H,W), coverage mask (1,H,W)) at supersampled size."""
-        dev = self.device
-        mv = look_at(eye, device=dev)
-        proj = perspective(fov_y_rad, self.w / self.h, device=dev)
-        mvp = proj @ mv
-        v_h = torch.cat([verts, torch.ones(len(verts), 1, device=dev, dtype=verts.dtype)], 1)
-        clip = (v_h @ mvp.T)[None]
+        The field of view moves with the body, since the camera frames each mesh by its own
+        extent, so it takes a different value on nearly every call. Only the cosine depends
+        on it, and it is one square root over the grid.
+        """
+        g2, r = self._unit_grid()
+        ty = float(np.tan(fov_y_rad / 2.0))
+        return 1.0 / torch.sqrt(1.0 + ty * ty * g2), r
+
+    def render(self, pos_clip: torch.Tensor, faces: torch.Tensor, attr: torch.Tensor,
+               antialias: bool = True):
+        """Rasterise clip-space positions (B, V, 4) with triangles (F, 3) and interpolate the
+        per-vertex attribute (V, C). Returns (image (B, H, W, C), rast). Differentiable in
+        `attr` and, through the antialiasing, in `pos_clip`."""
         tri = faces.to(torch.int32).contiguous()
-        rast, _ = self.dr.rasterize(self.ctx, clip.contiguous(), tri, resolution=self.resolution)
-        attr = vert_radiance.reshape(1, -1, 1)
-        img, _ = self.dr.interpolate(attr, rast, tri)
+        rast, _ = self.dr.rasterize(self.ctx, pos_clip.contiguous(), tri,
+                                    resolution=self.resolution)
+        img, _ = self.dr.interpolate(attr.contiguous(), rast, tri)
         if antialias:
-            img = self.dr.antialias(img, rast, clip.contiguous(), tri)
-        return img[..., 0], (rast[..., 3] > 0).to(img.dtype)
+            img = self.dr.antialias(img, rast, pos_clip.contiguous(), tri)
+        return img, rast
 
 
-def otsu_threshold(frame: torch.Tensor, bins: int = 256) -> float:
-    """Otsu's threshold on the FULL frame. Returns a plain float: it is stop-gradiented.
-
-    Standard between-class variance maximisation, computed on the histogram of the whole
-    image rather than a crop -- see the module docstring for why the crop matters.
-    """
-    x = frame.detach().reshape(-1).clamp(0.0, 1.0)
-    hist = torch.histc(x, bins=bins, min=0.0, max=1.0)
-    p = hist / hist.sum().clamp_min(1.0)
-    centres = (torch.arange(bins, device=x.device, dtype=x.dtype) + 0.5) / bins
-    w0 = torch.cumsum(p, 0)
-    w1 = 1.0 - w0
-    m0 = torch.cumsum(p * centres, 0) / w0.clamp_min(1e-12)
-    mt = (p * centres).sum()
-    m1 = (mt - torch.cumsum(p * centres, 0)) / w1.clamp_min(1e-12)
-    between = w0 * w1 * (m0 - m1) ** 2
-    return float(centres[int(torch.argmax(between))])
-
-
-def reduce_curves(value_image: torch.Tensor, tau_i: float, tau_b: float):
-    """(I, N) for one frame: summed value above tau_I, and pixel count above tau_B."""
-    v = value_image
-    i = (v * (v > tau_i)).sum(dim=(-2, -1))
-    n = (v > tau_b).to(v.dtype).sum(dim=(-2, -1))
-    return i, n
-
-
-def normalise_curves(curves: torch.Tensor, eps: float = 1e-9) -> torch.Tensor:
-    """Divide each curve by its own mean over phase, as the organisers do."""
-    return curves / curves.mean(dim=-1, keepdim=True).clamp_min(eps)
+def otsu_threshold(images: torch.Tensor, bins: int = 256) -> torch.Tensor:
+    """Otsu's threshold of each image in `images` (B, H, W): the grey level that maximises the
+    variance between the two classes it separates. Values are binned over [0, 1]. Returns
+    (B,), not differentiable."""
+    B = images.shape[0]
+    x = images.detach().reshape(B, -1).clamp(0.0, 1.0)
+    idx = (x * (bins - 1)).round().long()
+    flat = idx + bins * torch.arange(B, device=x.device)[:, None]
+    hist = torch.bincount(flat.reshape(-1), minlength=B * bins).reshape(B, bins).to(x.dtype)
+    levels = torch.arange(bins, device=x.device, dtype=x.dtype) / (bins - 1)
+    w0 = hist.cumsum(1)                                   # pixels at or below each level
+    total = w0[:, -1:]
+    w1 = total - w0
+    m0 = (hist * levels).cumsum(1)
+    mean_total = m0[:, -1:]
+    mu0 = m0 / w0.clamp_min(1)
+    mu1 = (mean_total - m0) / w1.clamp_min(1)
+    between = w0 * w1 * (mu0 - mu1) ** 2
+    between[:, -1] = -1.0                                 # a split with an empty class is not one
+    k = between.argmax(1)
+    # the threshold sits between bin k and bin k + 1: a value is bright if above it
+    return (k.to(x.dtype) + 0.5) / (bins - 1)

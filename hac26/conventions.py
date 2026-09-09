@@ -5,22 +5,25 @@ directions are carried into it, which makes the transport phase-independent sinc
 and turntable are mutually rigid.
 
 Tabulated camera azimuths are measured from the light direction, so the lab azimuth is
-180 + az. psi0 is one fitted scalar per body.
+180 + az. psi0 is the phase of the body at the first frame. The convex stage and the flow
+both assume PSI0, so their frames agree; scripts/calibrate.py fits psi0 per public body
+against the released shapes and reports it, which is the check that PSI0 is right.
 
 SENSE is fixed by correlating forward-modelled curves for the public bodies against the real
 ones, not by the published wording, which is ambiguous about the direction of rotation.
 
 The published bounding-cylinder radius is treated as an approximation rather than a hard
-bound: posed to z in [-1, 1], two of the three public bodies exceed their own published R, so
-clamping to it would shrink true geometry.
+bound: posed to z in [-1, 1] a public body can sit right at or slightly past its published R,
+so clamping to it would shrink true geometry.
 """
 from __future__ import annotations
 
 import numpy as np
 
 __all__ = ["S_LAB", "AZIMUTHS_DEG", "TOP_ELEVATION_DEG", "CAM_KINDS", "FRAMES",
-           "Camera", "cameras", "camera_vector", "lab_azimuth_deg", "phase_angle_deg",
-           "R_z", "to_body", "source_directions", "psi_grid", "SENSE"]
+           "CYLINDER_R", "PUBLIC_MODELS", "Camera", "cameras", "camera_vector",
+           "lab_azimuth_deg", "phase_angle_deg", "R_z", "to_body", "source_directions",
+           "psi_grid", "SENSE", "PSI0"]
 
 S_LAB = np.array([-1.0, 0.0, 0.0])
 
@@ -35,8 +38,19 @@ CAM_KINDS = ("hor_a", "hor_b", "top", "bottom")
 
 FRAMES = 360
 
+# Published bounding-cylinder radius of each model, from the challenge page. The published
+# value is approximate; see the module docstring.
+CYLINDER_R = {1: 1.12, 2: 1.42, 3: 0.88, 4: 1.475, 5: 1.22,
+              6: 0.925, 7: 1.205, 8: 1.24, 9: 0.67, 10: 3.95}
+
+# The models whose true shape was released.
+PUBLIC_MODELS = (1, 2, 3)
+
 # Turntable sense, measured against the real curves -- see the module docstring.
 SENSE = -1.0
+
+# Phase of the body at the first frame, in radians, for every body; see the module docstring.
+PSI0 = 0.0
 
 
 def lab_azimuth_deg(azimuth_deg: float) -> float:
@@ -58,6 +72,9 @@ def phase_angle_deg(azimuth_deg: float, elevation_deg: float) -> float:
 
 
 class Camera:
+    """One viewing geometry: azimuth from the light, elevation, and which of the four cameras
+    at that azimuth it is. hac26.geometry has an older Camera class with the same angles that
+    the convex operator uses; the two agree."""
     __slots__ = ("azimuth_deg", "elevation_deg", "kind")
 
     def __init__(self, azimuth_deg: float, elevation_deg: float, kind: str):
@@ -79,7 +96,7 @@ class Camera:
 
 
 def cameras() -> list:
-    """The 28 geometries in released column order: per azimuth (hor_a, hor_b, top, bottom)."""
+    """Every geometry, in the released column order: per azimuth (hor_a, hor_b, top, bottom)."""
     out = []
     for az in AZIMUTHS_DEG:
         e = TOP_ELEVATION_DEG[az]
@@ -91,16 +108,14 @@ def cameras() -> list:
 
 
 def R_z(angle_rad: float | np.ndarray) -> np.ndarray:
+    """Rotation about z by `angle_rad`."""
     c, s = np.cos(angle_rad), np.sin(angle_rad)
     return np.array([[c, -s, 0.0], [s, c, 0.0], [0.0, 0.0, 1.0]])
 
 
 def to_body(w: np.ndarray, psi: np.ndarray, psi0: float = 0.0) -> np.ndarray:
-    """Carry a lab direction into the body frame at each phase: R_z(-psi - psi0) w.
-
-    Vectorised over psi, returning (len(psi), 3). Written out rather than looping R_z so
-    that the whole phase axis is one array operation.
-    """
+    """Carry a lab direction into the body frame at each phase: R_z(-psi - psi0) w, returning
+    (len(psi), 3)."""
     psi = np.atleast_1d(np.asarray(psi, dtype=float))
     a = -psi - psi0
     c, s = np.cos(a), np.sin(a)
@@ -109,13 +124,10 @@ def to_body(w: np.ndarray, psi: np.ndarray, psi0: float = 0.0) -> np.ndarray:
 
 
 def source_directions(delta_rad: float, k: int = 8) -> np.ndarray:
-    """K directions on a disc of angular radius delta about s_lab, each carrying E0/K.
-
-    Points are placed on a single ring at the radius that makes the ring's mean solid-angle
-    weight match the disc's, i.e. at delta/sqrt(2): for a uniform disc the mean squared
-    offset is delta^2/2. One ring is enough because the penumbra term only needs the
-    second moment of the source right, not its fine structure.
-    """
+    """k directions standing in for a source disc of angular radius delta about S_LAB, each
+    carrying an equal share of the light. They sit on one ring at radius delta/sqrt(2), which
+    gives the ring the same mean squared offset as a uniform disc, so the penumbra has the
+    right width."""
     if delta_rad <= 0:
         return S_LAB[None, :].copy()
     r = delta_rad / np.sqrt(2.0)

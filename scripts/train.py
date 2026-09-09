@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""Train the LPD model. Examples:
-    python scripts/train_lpd.py --preset smoke
-    python scripts/train_lpd.py --preset gpu --out checkpoints
-    python scripts/train_lpd.py --preset gpu --steps 20000 --resume checkpoints/lpd_gpu_step2000.pt
+"""Train the convex LPD (hac26.train). Command-line options override preset fields.
+
+    python scripts/train.py --preset smoke
+    python scripts/train.py --preset gpu --out checkpoints
+    python scripts/train.py --preset gpu --steps 20000 --resume checkpoints/lpd_gpu_step2000.pt
 """
 import argparse
 import sys
@@ -15,60 +16,53 @@ from hac26.train import PRESETS, Preset, auto_device, train  # noqa: E402
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--preset", default="gpu", choices=sorted(PRESETS))
-    ap.add_argument("--steps", type=int, default=None)
-    ap.add_argument("--batch", type=int, default=None)
-    ap.add_argument("--out", default="checkpoints")
-    ap.add_argument("--device", default=None)
-    ap.add_argument("--seed", type=int, default=None)
+    ap.add_argument("--preset", default="gpu", choices=sorted(PRESETS),
+                    help="named preset from hac26.train.PRESETS")
+    ap.add_argument("--steps", type=int, default=None, help="number of training steps")
+    ap.add_argument("--batch", type=int, default=None, help="batch size")
+    ap.add_argument("--out", default="checkpoints", help="checkpoint directory")
+    ap.add_argument("--device", default=None, help="torch device; default: auto-detect")
+    ap.add_argument("--seed", type=int, default=None, help="random seed")
     ap.add_argument("--noise-profile-mode", choices=["measured", "flat"],
-                    default=None, help="measured = the replicate-derived "
-                    "heteroscedastic profile; flat = homoscedastic")
-    ap.add_argument("--resume", default=None)
+                    default=None, help="measured = the per-curve profile from hac26.noise; "
+                    "flat = the same noise level on every curve")
+    ap.add_argument("--resume", default=None,
+                    help="checkpoint to continue from, with its optimiser state")
     ap.add_argument("--warm-start", default=None,
-                    help="initialise from an existing (possibly ungated) checkpoint; the "
-                         "gate starts closed (a = sigmoid(-9) ~ 1e-4), so the run begins "
-                         "at a known-good solution instead of from scratch")
+                    help="copy the weights of an existing, possibly ungated, checkpoint "
+                         "before training (see hac26.train.warm_start)")
     ap.add_argument("--lr", type=float, default=None,
-                    help="peak learning rate. The preset's 1e-3 is a FROM-SCRATCH rate; "
-                         "warm-starting at it walks the pretrained weights straight off "
-                         "the solution it was handed. Use ~2e-4 to fine-tune.")
+                    help="peak learning rate; use a smaller one than the preset's when "
+                         "warm-starting")
     ap.add_argument("--data", default=None,
-                    help="root of the team dataset (meshes [+ *_curves.npz]); "
-                         "omit to train on the built-in synthetic sampler")
+                    help="root of a mesh dataset with optional stored curves "
+                         "(hac26.adapter); omit to train on synthetic shapes only")
     ap.add_argument("--mix", type=float, default=0.25,
-                    help="fraction of built-in synthetic shapes mixed in (breadth reserve)")
+                    help="fraction of synthetic shapes mixed into a --data run")
     ap.add_argument("--support", action="store_true",
-                    help="add the support-function head and train h(u); the body is "
-                         "then a half-space intersection instead of a Minkowski solve")
+                    help="add the support-function head and train h(u)")
     ap.add_argument("--canonical-r", action="store_true",
-                    help="train on the r_max=1 canonical shape; pair with "
-                         "reconstruct.py --fit-cylinder, its exact inverse")
+                    help="train on the shape scaled to xy radius 1; pair with "
+                         "reconstruct.py --fit-cylinder")
     ap.add_argument("--r-cond", action="store_true",
-                    help="feed the a-priori bounding radius R to the network as an "
-                         "input channel (test-time R is the published cylinder radius)")
+                    help="give the a-priori bounding radius to the network as an input "
+                         "(the published cylinder radius at test time)")
     ap.add_argument("--egi-weight", type=float, default=None,
-                    help="weight on the auxiliary EGI objective when --support is set")
+                    help="weight on the EGI loss")
     ap.add_argument("--dice-weight", type=float, default=None,
-                    help="weight on the EXACT Dice metric (hac26.radial). This is the "
-                         "scoring function itself, computed in closed form from the "
-                         "support function, so it is a loss and not a surrogate")
+                    help="weight on the Dice loss of hac26.radial; needs --support")
     ap.add_argument("--h-mse-weight", type=float, default=None,
-                    help="weight on the support MSE; keep non-zero with --dice-weight "
-                         "because Dice is scale-invariant and cannot pin the size")
+                    help="weight on the support MSE; keep it non-zero with --dice-weight, "
+                         "since Dice cannot fix the scale")
     ap.add_argument("--gate-rank", type=int, default=None,
-                    help="rank of the occlusion gate; 0 disables it. R=1 with the "
-                         "zero-initialised scale reproduces the ungated solver exactly")
+                    help="rank of the occlusion gate; 0 disables it")
     ap.add_argument("--p-flat", type=float, default=None,
-                    help="fraction of flat-faced / few-face training bodies (prisms, "
-                         "platonic solids, plane-cut ellipsoids). Challenge model 2 is "
-                         "a cube and the original family contained no such shapes")
+                    help="fraction of flat-faced training bodies (platonic solids, prisms, "
+                         "faceted and bilobed shapes)")
     ap.add_argument("--n-rays", type=int, default=None,
-                    help="sphere quadrature size for the Dice loss")
+                    help="number of sphere directions for the Dice loss")
     ap.add_argument("--workers", type=int, default=None,
-                    help="DataLoader workers; the input pipeline (shape sampling + "
-                         "einsum) is the bottleneck on a fast GPU, so raise this to "
-                         "keep the device fed")
+                    help="number of DataLoader workers")
     args = ap.parse_args()
     pr: Preset = PRESETS[args.preset]
     if args.workers is not None:

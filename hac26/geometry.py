@@ -1,19 +1,20 @@
-"""Measurement geometry of HAC 2026 (all constants from the challenge page).
+"""Measurement geometry as the convex operator uses it. hac26.conventions is the newer module
+with the same angles, used by the mesh chain; the two agree on every camera direction.
 
-World frame: e3 = rotation axis (challenge z-axis). Light source at (-inf, 0, 0)
-=> illumination direction (object -> source) OMEGA0 = -e1, constant (parallel beam).
+World frame: e3 is the rotation axis (the challenge z-axis). The light comes from -e1, so the
+direction from the body to the source is OMEGA0 = -e1, constant (parallel beam).
 
-Camera view direction (object -> camera), for azimuth theta, elevation eps,
-handedness delta in {+1,-1} (to be fixed on public models; see data_io.fit_conventions):
+Camera direction (body -> camera) for azimuth theta, elevation eps, and azimuth handedness
+delta in {+1, -1}:
 
     omega_c = R3(delta*theta) @ (-cos(eps) e1 + sin(eps) e3)
             = (-cos(eps)cos(theta), -delta cos(eps)sin(theta), sin(eps))
 
-Check: theta=0, eps=0 gives omega_c = -e1 = OMEGA0 (beam-splitter view, phase angle 0).
+theta = 0, eps = 0 gives omega_c = OMEGA0: the camera looks along the beam, phase angle 0.
 
-Rotation state: psi(t) = sigma * 2*pi * k/m for frame k of an m-frame full revolution,
-sense sigma in {+1,-1} (fixed on public models). Body frame == world frame at frame 0
-(challenge convention: marked point faces the light source at the initial time).
+Rotation: psi = sigma * 2 pi k / m for frame k of an m-frame revolution, with the sense
+sigma in {+1, -1}. The values fitted on the public models are in hac26.train.Preset (sigma,
+delta) and hac26.conventions.SENSE. The body frame equals the world frame at frame 0.
 """
 from __future__ import annotations
 
@@ -25,13 +26,12 @@ AZIMUTHS_DEG: tuple = (0.0, 45.0, 90.0, 135.0, 225.0, 270.0, 315.0)
 TOP_ALPHA_DEG: dict = {0.0: 21.0, 45.0: 26.0, 90.0: 26.0, 135.0: 26.0,
                        225.0: 24.0, 270.0: 24.0, 315.0: 24.0}
 CAM_KINDS: tuple = ("hor_a", "hor_b", "top", "bottom")  # column order within each azimuth group
-CURVE_TYPES: tuple = ("intensity", "binary")
 OMEGA0 = np.array([-1.0, 0.0, 0.0])
-BLENDER_FRAMES = 360  # frames per revolution in the Blender-simulated curves
 
 
 @dataclass(frozen=True)
 class Camera:
+    """One viewing geometry, with the camera direction for a given azimuth handedness."""
     azimuth_deg: float
     elevation_deg: float
     kind: str  # one of CAM_KINDS
@@ -52,8 +52,7 @@ class Camera:
 
 
 def build_cameras() -> list:
-    """The 28 curves of one file, in the documented column order:
-    for each azimuth in AZIMUTHS_DEG: (hor_a, hor_b, top, bottom)."""
+    """Every geometry in the released column order: per azimuth (hor_a, hor_b, top, bottom)."""
     cams = []
     for az in AZIMUTHS_DEG:
         a = TOP_ALPHA_DEG[az]
@@ -64,22 +63,13 @@ def build_cameras() -> list:
     return cams
 
 
-def r3(psi: float) -> np.ndarray:
-    c, s = np.cos(psi), np.sin(psi)
-    return np.array([[c, -s, 0.0], [s, c, 0.0], [0.0, 0.0, 1.0]])
-
-
 def psi_grid(m: int, sigma: float = 1.0, psi0: float = 0.0) -> np.ndarray:
-    """Rotation angles of the m frames of one full revolution.
+    """Rotation angles of the m frames of one revolution, sigma * 2 pi k / m + psi0.
 
-    Not the same as hac26.conventions.psi_grid, which carries the measured turntable sense
-    and takes no phase offset. This one serves the convex operator; that one serves the
-    mesh-based models. Importing the wrong one silently reverses the rotation.
-
-    psi0 is a constant phase offset (frame 0 = aligned pose has psi0 = 0; nonzero
-    values model residual start-phase misalignment, and are also used in tests to
-    stay off the measure-zero set {mu0 = 0} where the discontinuous binary kernel
-    makes float-level sign noise visible)."""
+    Not the same as hac26.conventions.psi_grid, which has the measured sense built in and no
+    phase offset. This one serves the convex operator, which receives sigma explicitly.
+    Importing the wrong one silently reverses the rotation.
+    """
     return sigma * 2.0 * np.pi * np.arange(m) / m + psi0
 
 
@@ -110,7 +100,7 @@ class NormalGrid:
 
 
 def make_grid(n_theta: int = 24, n_phi: int = 48) -> NormalGrid:
-    """Equirectangular grid of unit normals; cell centers avoid the exact poles."""
+    """Equirectangular grid of unit normals; cell centres avoid the exact poles."""
     theta = (np.arange(n_theta) + 0.5) * np.pi / n_theta
     phi = np.arange(n_phi) * 2.0 * np.pi / n_phi
     tt, pp = np.meshgrid(theta, phi, indexing="ij")
@@ -132,12 +122,9 @@ def cell_index(grid: NormalGrid, u: np.ndarray) -> np.ndarray:
 
 def project_closure(g: np.ndarray, normals: np.ndarray, iters: int = 200,
                     tol: float = 1e-12) -> np.ndarray:
-    """Alternating projections onto {sum_i g_i u_i = 0} (affine) and {g >= 0}.
-
-    Both sets are convex and their intersection C (the Minkowski-feasible cone)
-    is nonempty; POCS converges to a point of C. Projection onto the affine set:
-    g - U^T (U U^T)^{-1} U g with U = normals^T (3 x N).
-    """
+    """Alternating projections onto {sum_i g_i u_i = 0} and {g >= 0}: the closest facet-area
+    vector that can close into a polytope. Both sets are convex, so the alternating
+    projections converge to a point in their intersection."""
     U = normals.T                      # (3, N)
     M = U @ U.T                        # (3, 3)
     Minv = np.linalg.inv(M)

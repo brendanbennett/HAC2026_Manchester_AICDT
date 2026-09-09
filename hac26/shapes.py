@@ -1,8 +1,7 @@
-"""Synthetic shape generation, EGI extraction, and a brute-force convex curve renderer.
-
-The brute-force renderer evaluates the facet-sum model directly on a mesh (valid for
-convex bodies, where visible-and-lit <=> mu>0 and mu0>0)
-and is used to cross-validate the matrix route A @ g in tests.
+"""Mesh utilities shared by the convex stage and the pose conventions: simple synthetic
+shapes, facet areas and normals binned into the EGI, the challenge pose (rescale_touch_z,
+canonicalize_r), the support function of a point set, and a brute-force convex curve
+renderer used to cross-check the convex operator in tests.
 """
 from __future__ import annotations
 
@@ -189,6 +188,7 @@ def hull_mesh(points: np.ndarray) -> tuple:
 
 
 def face_normals_areas(verts: np.ndarray, faces: np.ndarray) -> tuple:
+    """Unit normals and areas of every face; a degenerate face gets a zero normal."""
     v0, v1, v2 = verts[faces[:, 0]], verts[faces[:, 1]], verts[faces[:, 2]]
     cr = np.cross(v1 - v0, v2 - v0)
     a2 = np.linalg.norm(cr, axis=1)
@@ -209,34 +209,49 @@ def mesh_to_egi(verts: np.ndarray, faces: np.ndarray, grid: NormalGrid,
     return project_closure(g, grid.normals) if close else g
 
 
-def rescale_touch_z(verts: np.ndarray) -> np.ndarray:
-    """Uniform scale + translation so that min z = -1, max z = +1 (challenge pose),
-    xy-centroid at the rotation axis. Photometrically this only changes overall scale,
-    which the normalization cancels (scale-invariance lemma)."""
+def solid_centroid(verts: np.ndarray, faces: np.ndarray) -> np.ndarray:
+    """Centroid of the solid a closed mesh bounds, by the divergence theorem. Does not depend
+    on the triangulation, unlike the vertex mean. hac26.shape_library.pose uses the same
+    expression, so a body posed by either lands in the same place."""
+    v = np.asarray(verts, float)
+    v0, v1, v2 = v[faces[:, 0]], v[faces[:, 1]], v[faces[:, 2]]
+    cr = np.cross(v1 - v0, v2 - v0)
+    tet = (v0 + v1 + v2) / 4.0
+    w = np.einsum("ij,ij->i", v0 + v1 + v2, cr) / 18.0
+    tot = w.sum()
+    return (tet * w[:, None]).sum(0) / tot if abs(tot) > 1e-12 else v.mean(0)
+
+
+def rescale_touch_z(verts: np.ndarray, faces: np.ndarray | None = None) -> np.ndarray:
+    """The challenge pose: uniform scale and translation so that min z = -1, max z = +1 and
+    the centroid sits on the rotation axis. A uniform scale does not change the
+    mean-normalised curves.
+
+    Pass `faces` whenever two meshes will be compared. With them the centre is the solid
+    centroid; without them it is the vertex mean, which depends on the triangulation, so two
+    meshes of the same body would be posed at different centres.
+    """
     v = verts.copy()
-    v[:, 0] -= v[:, 0].mean()
-    v[:, 1] -= v[:, 1].mean()
+    c = v.mean(0) if faces is None else solid_centroid(v, faces)
+    v[:, 0] -= c[0]
+    v[:, 1] -= c[1]
     zmin, zmax = v[:, 2].min(), v[:, 2].max()
     v[:, 2] -= 0.5 * (zmin + zmax)
     return v * (2.0 / (zmax - zmin))
 
 
 def canonicalize_r(verts: np.ndarray) -> np.ndarray:
-    """Scale xy so the max axis distance is 1, leaving z (already in [-1,1]) alone.
+    """Scale xy so the largest axis distance is 1, leaving z (already in [-1, 1]) alone.
 
-    The challenge publishes a bounding radius R per model, and per-curve mean
-    normalization provably destroys the cross-camera amplitudes that encode the
-    body's latitude profile -- i.e. its aspect ratio. Rather than ask the network to
-    predict a coordinate the data cannot determine and then anisotropically rescale
-    its answer at test time (a train/test mismatch), train on the CANONICAL shape
-    with r_max = 1 and restore the width from R at reconstruction:
+    The challenge publishes a bounding radius R per model, and the per-curve mean
+    normalisation removes most of the information about the body's width relative to its
+    height. So every model is trained on the canonical shape with xy radius 1 and the width is
+    restored from R at reconstruction:
 
         train target : canonicalize_r(hull)              (r_max = 1)
         test  output : fit_to_cylinder(prediction, R)    (r_max = R)
 
-    The two are exact inverses, so the network never spends capacity on the
-    unidentifiable degree of freedom and nothing is applied at test time that was
-    absent at train time."""
+    The two are exact inverses."""
     v = verts.copy()
     r = float(np.sqrt((v[:, :2] ** 2).sum(1)).max())
     if r > 1e-12:
@@ -245,26 +260,9 @@ def canonicalize_r(verts: np.ndarray) -> np.ndarray:
 
 
 def mesh_support(verts: np.ndarray, normals: np.ndarray) -> np.ndarray:
-    """Support function h(u) = max_{x in conv(verts)} <x, u>, sampled on `normals`.
-
-    Exact for the convex hull of `verts` (the max of a linear functional over a
-    polytope is attained at a vertex). Unlike the EGI this needs no closure
-    condition and no positivity repair: h determines the body directly as
-    {x : <x,u> <= h(u) for all u}."""
+    """Support function h(u) = max over the vertices of <x, u>, sampled on `normals`. Exact
+    for the convex hull of `verts`."""
     return (verts @ normals.T).max(axis=0)
-
-
-def star_inside(points: np.ndarray, a_L: tuple) -> np.ndarray:
-    """Exact inside test for the SH star-shaped body: |x| <= r(x/|x|)."""
-    a, L = a_L
-    r = np.linalg.norm(points, axis=-1)
-    safe = np.where(r > 1e-12, r, 1.0)
-    u = points / safe[..., None]
-    theta = np.arccos(np.clip(u[..., 2], -1, 1))
-    phi = np.mod(np.arctan2(u[..., 1], u[..., 0]), 2 * np.pi)
-    B = real_sh_basis(L, theta.ravel(), phi.ravel())
-    rad = np.exp(a @ B).reshape(r.shape)
-    return r <= rad
 
 
 # ---------- brute-force convex renderer ----------------------------------------------
@@ -288,12 +286,8 @@ def mesh_curves_convex(verts: np.ndarray, faces: np.ndarray, cameras: list, m: i
 # ---------- training-shape sampler ----------------------------------------------------
 def sample_training_shape(rng: np.random.Generator, grid: NormalGrid,
                           p_flat: float = 0.0) -> dict:
-    """Random body, challenge-posed; returns EGI of its convex hull + metadata.
-
-    `p_flat` mixes in flat-faced / few-face bodies (see sample_flat_shape). The default
-    of 0 reproduces the base distribution exactly, so existing checkpoints stay
-    comparable; the trained presets set it explicitly.
-    """
+    """A random posed body for the convex stage's training: its hull mesh, the EGI of the hull
+    and metadata. `p_flat` is the fraction of flat-faced bodies mixed in."""
     meta = None
     if p_flat and rng.random() < p_flat:
         v, kind = sample_flat_shape(rng)
@@ -318,16 +312,15 @@ def sample_training_shape(rng: np.random.Generator, grid: NormalGrid,
 
 
 def _random_rotation(rng: np.random.Generator) -> np.ndarray:
-    """Uniform random rotation matrix (QR of a Gaussian, sign-fixed)."""
+    """Uniform random orthogonal matrix, reflections included. Fine for orienting a random
+    body; not a proper rotation."""
     q, r = np.linalg.qr(rng.standard_normal((3, 3)))
     return q * np.sign(np.diag(r))
 
 
 # ---------- flat-faced and few-face bodies -------------------------------------------
-# The original training family (sh / random-hull / ellipsoid) contains essentially no
-# bodies with large flat facets: a hull of 12-60 Gaussian points is round, and the SH and
-# ellipsoid families are smooth by construction, while challenge model 2 is a cube, whose
-# EGI mass concentrates in 6 cells. These generators add flat-faced and few-faced bodies.
+# The smooth families above contain no bodies with large flat facets, while the public models
+# include one that is a cube. These generators add flat-faced and few-faced bodies.
 
 _PLATONIC = {}
 
@@ -374,7 +367,7 @@ def prism_mesh(rng: np.random.Generator) -> np.ndarray:
 
 
 def faceted_mesh(rng: np.random.Generator) -> np.ndarray:
-    """A smooth body sliced by a few random half-spaces -> genuinely flat facets.
+    """A smooth body sliced by a few random half-spaces, giving flat facets.
 
     This is the physically motivated one: real small bodies acquire flat faces from
     large impacts and from fracture along planes, so a cut ellipsoid is a much better
@@ -394,7 +387,8 @@ def faceted_mesh(rng: np.random.Generator) -> np.ndarray:
 
 
 def bilobe_mesh(rng: np.random.Generator) -> np.ndarray:
-    """Hull of two overlapping ellipsoids -- a contact-binary silhouette."""
+    """Hull of two offset ellipsoids -- a contact-binary silhouette. They need not overlap;
+    the hull bridges them either way."""
     u, _ = icosphere(2)
     out = []
     sep = rng.uniform(0.4, 1.1)
