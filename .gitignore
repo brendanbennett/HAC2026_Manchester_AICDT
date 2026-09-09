@@ -32,3 +32,5 @@ surrogate_check.py
 # nohup and by the pipeline. They are records of one machine's run, not source.
 *.out
 *.pid
+
+uv.lock
