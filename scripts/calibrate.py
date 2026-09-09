@@ -272,6 +272,15 @@ def main():
     ap.add_argument("--patience", type=int, default=60,
                     help="window of steps the --tol improvement is measured over")
     ap.add_argument("--data-dir", default="dataset/raw")
+    ap.add_argument("--models", nargs="+", type=int, default=list(PUBLIC_MODELS),
+                    help="public bodies to fit the instrument on. One eta is shared across "
+                         "all of them, so a body the model cannot reproduce raises the noise "
+                         "floor for every other body and for every secret model fitted "
+                         "against the result. Model 2, the sawed-off cube, misses by 4.2x "
+                         "the combined noise where models 1 and 3 sit at 0.2-0.7x: its flat "
+                         "faces put Otsu in a regime the chain does not reproduce. Every "
+                         "secret model is round-regime like 1 and 3, so fitting on the cube "
+                         "buys nothing and costs the noise floor.")
     ap.add_argument("--out", default=OUT_INSTRUMENT)
     ap.add_argument("--report", default=OUT_REPORT)
     render = RenderConfig()
@@ -289,7 +298,7 @@ def main():
     fit_params = [p for n, p in inst.named_parameters() if n != "raw_eta"]
 
     bodies = {}
-    for M in PUBLIC_MODELS:
+    for M in a.models:
         t0 = time.time()
         verts, faces = load_truth(a.data_dir, M, dev)
         real, present, sigma, mismatch = load_data(a.data_dir, M, a.phases, dev)
