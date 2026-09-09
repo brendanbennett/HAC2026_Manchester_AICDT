@@ -91,8 +91,27 @@ lever with real upside left, and it is why the Blender curves are worth calibrat
 they are a render of the true shape by a known camera with no photographic sensor in front of
 it, and they exist for all ten models.
 
+**That lever was tried and it is closed.** `scripts/calibrate.py --blender` fits the instrument
+to the Blender curves instead of the lab ones -- a render of the true shape by a known camera,
+with no photographic sensor in front of it and no A/B mounting mismatch (their pair difference
+is exactly zero). It converges far faster than the lab fit (-logL 383 → -10.7, against
+1587 → 1.2) and lands at **eta 0.0372, against the lab fit's 0.0378**. The residual at the
+true shape moves from 0.0681 to **0.0667** on model 3 and 0.0255 to 0.0256 on model 1: about
+two per cent relative, which is nothing. The mismatch is a property of the forward model, not
+of which curves it is calibrated against or of anything the calibration can absorb.
+
+| instrument | eta | model 1 @ truth | model 3 @ truth |
+|---|---|---|---|
+| all three public bodies, lab curves | 0.0710 | 0.0386 | 0.1078 |
+| models 1 and 3 only, lab curves | 0.0378 | 0.0375 | 0.1058 |
+| models 1 and 3 only, **Blender** curves | 0.0372 | 0.0256 (blender) | 0.0667 (blender) |
+
 **What this means for a submission.** Ship the convex answers. Any misfit-driven refinement of
-them, convex or carved, has been measured to make the shape worse.
+them has been measured to make the shape worse -- and note that this includes *convex*
+refinement: the Track A run that ended at chi 1.109 stayed at convexity 1.000 throughout, so
+it was a convex body fitted to the data, and its Dice still fell 0.690 → 0.665. The convex
+stage's answer is good because it is a learned prior over plausible convex bodies, not because
+it fits the curves; fitting the curves is what breaks it.
 
 ## Two quirks of the released evaluation code
 
