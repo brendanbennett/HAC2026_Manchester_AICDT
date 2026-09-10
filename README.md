@@ -127,13 +127,13 @@ differentiates the renderer. Run the non-convex public model first, because its 
 released and the gate below is calibrated on it, then the scored models.
 
 ```
-python scripts/reconstruct_gn.py --model 3 --channel blender --out results/gn/Asteroid03.stl
-for M in 4 5 6 7 8 9 10; do
-  python scripts/reconstruct_gn.py --model $M --channel blender \
-      --out "results/gn/Asteroid$(printf %02d $M).stl"
-done
-python scripts/select_answers.py --refined results/gn --calibrate results/gn/Asteroid03.json
+scripts/run_nonconvex.sh
 ```
+
+which calibrates the channel if it has not been calibrated, reconstructs the public model
+with a concavity, then the scored models, and decides. Every setting is a variable at the top
+of it and can be overridden from the environment; `scripts/reconstruct_gn.py --help` runs one
+model on its own.
 
 Cameras are held out of every fit, and the body's misfit on them is written beside the convex
 answer's on the same cameras. That pair is the only test of whether a shape was recovered
@@ -151,6 +151,16 @@ fits the curves worse than no carve at all, because a shadow is cast by an edge,
 representation has to be able to hold the body before any solver can find it.
 `notes/representation.md` measures what each lattice can hold and why the one in
 `hac26/field.py` was chosen.
+
+Read the calibration's residual at the released shapes before reading any reconstruction.
+Written in the fit's own coordinates, the non-convex public body has a lower misfit than the
+body the fit reaches from its convex answer, and the fit released from the body stays there,
+so the curves do prefer the body; but the two are separated by less than the forward model's
+own error at the released shapes. A search that selects on the misfit is only selecting
+between them once that residual is well below the separation, which is why the calibration's
+number is the first one to read and why `select_answers.py` requires a public body to have
+vouched for a correction before any scored body is corrected. `notes/identifiability.md`
+carries the measurement.
 
 The flow pipeline, `scripts/run_remote_pipeline.sh`, builds a shape library, fits shape codes
 to it, renders a corpus with the exact operator and the convex stage's starts, trains the

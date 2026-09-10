@@ -72,3 +72,10 @@ tighter value, because what a scored body needs is the shape.
 96 grid points the pitch is 0.033 against a kernel width of 0.069, so the grid carries
 about two samples per kernel. `field.kernel_pitch_ratio` reports it, and an extraction
 below one samples a body coarser than its own amplitudes describe.
+
+**A lattice that cannot hold the body lets a wrong body outrank it.** Fitted to the
+curves rather than to the body, the coarse lattice reaches a misfit of 0.042 at an
+overlap of 0.709: below the 0.051 it can manage at the body itself. On such a lattice
+the misfit prefers a body that is not the body, and no solver of it can be asked for
+the right answer. The fine lattice does not do this. `identifiability.md` takes that
+comparison further.
