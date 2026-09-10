@@ -26,10 +26,9 @@ def test_movement_is_measured_in_raw_space_against_steps_times_lr():
     assert rep["raw_eye"]["fraction"] == pytest.approx(1.5 / 4.5)
 
 
-def test_the_shipped_calibration_is_flagged_as_budget_limited():
-    """The values in models/instrument_calibration.json came from 150 steps at lr 0.03, a
-    travel budget of 4.5. rho moved 3.7 of that, so it was still moving when the run ended;
-    eye_distance could not have passed softplus(8 + 4.5) = 12.5 whatever the data said."""
+def test_a_parameter_that_spends_most_of_its_budget_is_flagged():
+    """With a travel budget of steps times lr, a parameter that has moved most of it was
+    still moving when the run ended and is named; one that moved little is not."""
     rep = _report({"raw_rho": -1.386, "raw_eye": 8.0, "raw_tau_i": -3.892},
                   {"raw_rho": 2.330, "raw_eye": 8.510, "raw_tau_i": -4.345})
     assert calibrate.print_movement(rep) == ["raw_rho"]

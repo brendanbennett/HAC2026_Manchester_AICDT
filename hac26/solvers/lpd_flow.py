@@ -221,9 +221,8 @@ def churn_step(x: torch.Tensor, v: torch.Tensor, t: float, dt: float, churn: flo
     x + v dt. Otherwise it is a step of the stochastic equation of the module docstring,
     dx = (v + eps s) dt + sqrt(2 eps) dW, with s = -(x - t v) / (1 - t) the score of the
     flow's marginal at t and eps = churn (1 - t - dt), the noise level at the end of the step:
-    the last step, which nothing follows, is then the plain flow step. LPDFlow.sample and
-    train_lpd.rollout both step through here, so the states training sees are the states
-    reconstruction makes."""
+    the last step, which nothing follows, is then the plain flow step x + v dt, which lands
+    exactly on the endpoint the velocity implies."""
     if churn <= 0:
         return x + v * dt
     eps = churn * max(0.0, 1.0 - t - dt)

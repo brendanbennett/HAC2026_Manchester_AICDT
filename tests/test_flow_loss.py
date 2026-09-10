@@ -1,6 +1,6 @@
 """The training loss end to end on the software rasteriser: the operator at the prior's
 endpoint estimate, the reader and expert in the loop, the data-fit term for late t, turned
-bodies, rolled-out states and the ablation arm."""
+bodies and the ablation arm."""
 import sys
 from pathlib import Path
 
@@ -73,10 +73,6 @@ def test_flow_loss_trains_reader_and_expert_with_every_term():
     full, prior_only, dropped = flow_loss(net, op, corpus, eta, idx, x0, t, 2, tag, mask,
                                           train_geoms=2, turns=turns, ablate=True)
     assert torch.isfinite(full) and torch.isfinite(prior_only) and dropped == 0
-    # the rolled-out states: the sampler's whole trajectory, every state scored at its own time
-    loss_r = flow_loss(net, op, corpus, eta, idx[:1], x0[:1], t[:1], 2, tag, mask,
-                       train_geoms=2, rollout=2)
-    assert torch.isfinite(loss_r)
 
 
 def _carved_body():

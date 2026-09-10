@@ -4,9 +4,52 @@ Shape reconstruction from lightcurves for the
 [Helsinki Asteroid Challenge 2026](https://fips.fi/data-challenges/helsinki-asteroid-challenge-2026/).
 
 Ten 3D-printed asteroids were filmed on a turntable from 28 camera geometries. Each frame is
-reduced to two numbers, summed intensity and lit-pixel count, giving 56 curves per body.
-Reconstructions are scored on voxel overlap with the true shape plus the distance between the
-boundary curves of 2D projections. `docs/challenge_info.md` has the rules.
+reduced to two numbers, summed intensity and lit-pixel count, giving 56 curves per body, and
+the organisers release both the laboratory curves and a Blender rendering of the true shape
+under the same geometries. Reconstructions are scored on voxel overlap with the true shape
+plus the distance between the boundary curves of 2D projections. `docs/challenge_info.md` has
+the rules.
+
+## The submission
+
+The submitted bodies are the convex stage's answers, `results/submission/Asteroid04.stl` to
+`Asteroid10.stl`, produced by
+
+```
+python scripts/make_submission.py
+```
+
+which reconstructs every model with the trained convex network `models/lpd_convex.pt`, poses
+it as the challenge asks (rotation axis z, the body touching z = 1 and z = -1, the light at
+minus infinity on x, frame 0 of the curves), sets its width from the published bounding
+radius, writes the public models to `results/public/`, checks every file
+(`scripts/check_submission.py`: one watertight component of positive volume, consistent
+winding, the pose, the cylinder) and scores the public ones against the released shapes
+with the organisers' two measures (`hac26/scoring/official.py`) into
+`results/public_scores.json`. It takes seconds per model on a CPU and needs neither a GPU
+nor nvdiffrast. The recipe is fixed in the script, and `results/public_scores.json` records
+the checkpoint's digest and the channel each model was inverted from.
+
+The convex network reads the Blender curves when the organisers release them and the
+laboratory curves otherwise (`hac26.data_io.load_inversion_curves`). The render is the
+cleaner observation of the shape. It has no lens, sensor, mounting or beam in front of it
+and no per-column realignment behind it, its scattering is of the kind the convex operator
+assumes, and the laboratory columns of several bodies are out of phase with their own
+geometry by tens of degrees. `scripts/reconstruct.py --channel` forces either channel for one
+model.
+
+Why the convex answer and not a carved one is measured rather than assumed. On the three
+public bodies, one of which is a contact binary, every refinement of the convex answer that
+this repository or its history has produced, the trained flow, gradient descent on the exact
+misfit, searches over carved bodies, scored below the convex answer or equal to it under the
+organisers' measures, because a body that fits the curves better than the convex answer is
+not, on the evidence of the public bodies, a body closer to the truth. `scripts/benchmark.py`
+scores any directory of reconstructions the same way, so a refinement earns its place by
+that number:
+
+```
+python scripts/benchmark.py results/public results/lpd
+```
 
 ## Install
 
@@ -16,8 +59,8 @@ pip install -e ".[torch]"
 
 The exact forward model renders with nvdiffrast on a GPU; nvdiffrast is not on PyPI and
 compiles CUDA at install time, and `scripts/setup_toolchain.sh` builds it without root. The
-calibration, the flow training and the reconstruction all render with it. The tests run the
-same code on a slow pure-torch rasteriser, so they need neither.
+calibration, the flow training and the non-convex reconstructions render with it. The
+submission and the tests do not: the tests run the same code on a slow pure-torch rasteriser.
 
 ## Data
 
@@ -40,163 +83,56 @@ python scripts/check_data.py
 which verifies it against `dataset/MANIFEST.sha256` and names anything missing or changed.
 Do that after every download: the organisers have re-released these files more than once, and
 a partial refresh is silent. `--write` regenerates the manifest, for a refresh you meant to
-make. `calibrate.py` reports a per-azimuth phase offset for the same reason -- the realignment
-that came with the Aug 2026 update is a different shift per azimuth, which no single start
-phase absorbs.
+make.
 
-## Running the pipeline
+## The non-convex path
 
-Two wrappers do the whole thing:
-
-```
-scripts/run_smoke_test.sh        # wiring check: minutes, no dataset needed
-scripts/run_remote_pipeline.sh   # the real run
-```
-
-`run_remote_pipeline.sh` creates and activates a `.venv`, installs anything missing, and runs
-the stages in order:
-
-| stage | script | notes |
-| --- | --- | --- |
-| `models` | `fetch_shape_models.py` | downloads public asteroid shape models; `FETCH_MODELS=0` skips it |
-| `objects` | `fetch_objects.py` | everyday printable objects from Thingi10K; only with `FETCH_OBJECTS=1` (`pip install thingi10k`) |
-| `library` | `build_shape_library.py` | CPU only; draws on the shape models and objects when there are any |
-| `design` | `make_design.py` | GPU if there is one |
-| `calibrate` | `calibrate.py` | needs `dataset/raw`; skipped if `models/instrument_calibration.pt` is present |
-| `fit` | `fit_shapes.py` | fits shape codes to the library |
-| `corpus` | `build_corpus.py` | renders every body and runs the convex stage on it; needs `models/lpd_convex.pt` |
-| `prior` | `train_prior.py` | the prior part of the flow; no operator, minutes |
-| `flow` | `train_lpd.py` | the data part, one expert on the straight line; needs the calibrated instrument |
-| `flow-rollout` | `train_lpd.py` | the same run continued: branched into its experts, trained on the sampler's own states; the main phase |
-| `decision` | `decision_check.py` | reconstructs the held-out corpus bodies and scores every rule for picking the answer against their truth |
-| `convex` | `reconstruct.py` | the convex starts of all ten models; needs `dataset/raw` |
-| `reconstruct` | `reconstruct_lpd.py` | all ten models, from those starts, each draw polished on the exact misfit |
-| `score` | `hac26/scoring/` | the three public models |
-
-Each stage writes a marker under `runs/.done/` recording the settings and the source it ran
-with, and is skipped only while both still match, so a dropped run is safe to relaunch and a
-change to the code reruns the stages below it on its own. Output goes to `logs/<stage>.log`.
-Every setting is a variable at the top of the script and can be overridden from the
-environment:
+Everything beyond the convex stage is research code. It runs, it is tested, and none of its
+answers are submitted, for the reason above. It needs an instrument fitted to the channel it
+inverts, which `scripts/calibrate.py` writes from the public models' released shapes:
 
 ```
-N_BODIES=2000 scripts/run_remote_pipeline.sh
-scripts/run_remote_pipeline.sh --force-stage fit    # redo fit and everything after it
+python scripts/calibrate.py                                # the laboratory channel
+python scripts/calibrate.py --channel blender --models 1 3 # the Blender render
 ```
 
-## Running stages by hand
+The two channels are different instruments (`hac26/forward/mesh/instrument.py`). The
+laboratory curves come through a lens, a sensor and bounce light off a matte white print;
+the render has none of those and a far camera, so it starts from `Instrument.blender_start`,
+a far camera with the interreflection switched off and an sRGB-like transfer curve, and is
+written to its own file. The calibration prints the residual of the exact forward model at
+the true shape divided by the noise, per geometry, which is the number that says how well
+the chain matches the channel, and a travel table that names any parameter still moving
+when the step budget ran out.
 
-Build the set of surface normals the shape representation is defined on. Once per size:
-
-```
-python scripts/make_design.py --n 4096
-```
-
-Fit the instrument to the real curves of the three public models, using their released
-shapes. This writes `models/instrument_calibration.pt`, which training and reconstruction
-require, and prints the residual of the exact forward model at the true shape divided by the
-measured noise, per geometry -- the number that says how well the forward model matches the
-organisers' processing, and which everything downstream rests on:
+Descent from the convex answer, with cameras held out as the check on whether a shape was
+recovered rather than curves fitted:
 
 ```
-python scripts/calibrate.py
+python scripts/reconstruct_map.py --model 3 --channel blender --hold-out-geoms 6 \
+    --out results/map/Asteroid03.stl
+python scripts/select_answers.py --refined results/map --ratio <measured on model 3>
 ```
 
-Build a shape library, fit codes to it, build the corpus, train the prior part of the flow
-and then the data part:
+`reconstruct_map.py` records, for the body as written, its misfit on the fitted and on the
+held-out geometries beside the convex answer's, and on a public model the Dice against the
+released shape at every checkpoint. `select_answers.py` replaces a convex answer only where
+the refined body beats it on the held-out geometries by a ratio measured on the public
+model whose refinement raised the score, and writes `results/submission/selection.json`
+saying what it did.
 
-```
-python scripts/fetch_shape_models.py
-pip install thingi10k && python scripts/fetch_objects.py --n 600
-python scripts/build_shape_library.py --n 5000 --shape-models dataset/shape_models
-python scripts/fit_shapes.py --shapes-dir dataset/generated/shapes --bodies 2000
-python scripts/build_corpus.py
-python scripts/train_prior.py
-python scripts/train_lpd.py --steps 1000 --experts 1
-python scripts/train_lpd.py --steps 1000 --extra-steps 1000 --rollout-frac 0.5
-```
-
-The library is what the secret bodies are likely to be: real asteroid shape models (the
-radar and spacecraft models `fetch_shape_models.py` downloads, plus any OBJ, PLY or STL
-dropped into the same directory), everyday printable objects from Thingi10K
-(`fetch_objects.py`, into `dataset/shape_models/objects`), both stretched and mirrored at
-random, and procedural bodies of the kinds real asteroids and test solids come in: smooth
-lumpy potatoes, contact binaries with two or three lobes, spinning tops, faceted bodies,
-boxes and prisms and cylinders with saw cuts; with basins, cuts, added lobes, ridges and
-moderate roughness on top. Convex bodies are kept, so the flow also learns when there is
-nothing to carve, and the mix of how deeply carved the bodies are is set directly
-(`LibrarySpec.convexity_shares`: a quarter below 0.7 of their hull volume, a fifth at or
-above 0.95), so the deeply carved tail is covered whatever the families would give on their
-own. Each body is then mounted on one of its principal axes with a random
-tilt, or at random, as the organisers mounted theirs, and the width over half-height that
-gives is the radius it is rendered at (the number the challenge publishes per model); both
-parts of the flow read that radius, and the operator poses every iterate the way the
-challenge poses its models before rendering it. `dataset/generated/shapes/report.md`
-summarises the library; `measure_public_shapes.py` compares it with the public bodies, and
-`fit_shapes.py` reports per family how faithfully the shape code can hold its bodies, which
-is the check that thin parts of an object are within the solver's reach.
-
-The corpus is each body's curves from the exact forward model and the start the convex stage
-(`models/lpd_convex.pt`, the same checkpoint `reconstruct.py` uses) reconstructs from a noisy
-realisation of them; the flow is trained to make the correction from that start to the true
-body, so it learns the errors the convex stage actually makes. The velocity of the flow is a
-prior part, an unconditional flow over the corpus codes that reads no data and trains without
-the operator, plus a data part that reads the residual and the adjoint of the exact forward
-model and trains with the operator in the loop: every training step renders the body the
-prior says the state is heading for and runs the adjoint back onto its code. The data part
-is one reader, which interprets the curves and is shared by all times, and one expert per
-interval of t, because the job changes along t: early the velocity has to come from the
-curves, late it is a clean-up. Late in t the endpoint the velocity implies is rendered once
-more and must fit the data to within the noise. The training data carry noise at the measured
-level and a model-error term of the size the calibration fitted, and the residual is divided
-by the two combined, as at reconstruction; every body is also turned by random quarter
-turns about its spin axis, an exact symmetry the corpus carries the count curves for.
-`build_corpus.py --phases` and `--operator-res` have to agree with `reconstruct_lpd.py`;
-they share defaults, and the training scripts take them from the corpus.
-
-`fit_shapes.py` and `train_lpd.py` both checkpoint and resume, so `--steps` is a cap and not
-a schedule. `train_lpd.py` also early-stops on a held-out split (`--val-bodies`,
-`--val-every`, `--patience`). Training is two runs of it: the first trains one expert on
-states of the straight line between noise and body; the second continues its checkpoint,
-copies the expert into one per interval of t (branching, `--experts`, four by default) and
-trains half its draws on states the sampler itself reaches (`--rollout-frac 0.5`). The
-second run is the main one; the pipeline runs both.
-
-Reconstruct one model: the convex stage first, since its output is the start the flow
-corrects, then the flow. Each draw is polished afterwards: gradient steps on the exact
-misfit, stopped at the noise level, so the answer explains the data whatever the learned
-steps left. `--hold-out-geoms 4` keeps four cameras away from the inversion and reports the
-answer's misfit on them: the test of whether a shape was recovered rather than curves fitted.
-
-```
-python scripts/reconstruct.py --ckpt models/lpd_convex.pt --model 4 --out results/convex/Asteroid04.stl
-python scripts/reconstruct_lpd.py --model 4 --out results/lpd/Asteroid04.stl
-python scripts/reconstruct_lpd.py --model 1 --hold-out-geoms 4 --out results/check/Asteroid01.stl
-```
-
-Score against a public model:
-
-```
-PYTHONPATH=. python hac26/scoring/voxel.py --stl results/lpd/Asteroid01.stl --models 1
-PYTHONPATH=. python hac26/scoring/side_view.py --models 1 2 3 --recon-dir results/lpd
-```
-
-The answer to a model is picked among the draws and their consensus bodies by expected
-score against the draws. Whether that rule beats the alternatives (the best-fitting draw,
-the medoid, a fixed consensus level) can only be measured on bodies whose truth is known,
-which the held-out corpus bodies are; the pipeline's `decision` stage does that and writes
-`runs/decision_check.json`:
-
-```
-python scripts/decision_check.py --bodies 16 --val-bodies 16
-```
-
-Check that the flow is using the lightcurves rather than memorising the corpus, by
-rerunning its own validation with the prior's velocity alone beside the full one:
-
-```
-python scripts/ablate_flow.py
-```
+The flow pipeline, `scripts/run_remote_pipeline.sh`, builds a shape library, fits shape codes
+to it, renders a corpus with the exact operator and the convex stage's starts, trains the
+prior and the data part of a conditional flow (`hac26/solvers/lpd_flow.py`,
+`scripts/train_lpd.py`) and reconstructs every model from several draws with a polish on the
+exact misfit (`scripts/reconstruct_lpd.py`). Each stage writes a marker under `runs/.done/`
+recording its settings and the source it ran with, and is skipped only while both still
+match, so a dropped run is safe to relaunch and a change to the code reruns the stages below
+it. `scripts/run_smoke_test.sh` runs the same stages small, as a wiring check. Every setting
+is a variable at the top of the pipeline script and can be overridden from the environment.
+Training states lie on the straight line between noise and body only; `train_lpd.py` says
+why states from the sampler's own trajectory are not scored. The flow's answers are scored
+beside the convex ones by the pipeline's last stage and are not part of the submission.
 
 ## Tests
 
@@ -209,13 +145,13 @@ pytest -m "not slow"     # skip the extraction-scale ones
 
 ```
 hac26/forward/    forward models; see forward/__init__.py
-hac26/solvers/    lpd_convex, lpd_flow, minkowski, output
-hac26/scoring/    voxel, side_view
+hac26/solvers/    lpd_convex, lpd_flow, minkowski, operator, output
+hac26/scoring/    official (the organisers' measures), voxel, side_view
 hac26/            conventions, geometry, field, shapes, noise, shape_library, curves_mesh,
-                  library_io, library_metrics
-scripts/          entry points
-models/           trained convex solver and calibrated instrument; models/load.py loads them
-results/          reconstructions: convex/ the convex stage's starts, lpd/ the flow's
+                  data_io, recon, library_io, library_metrics
+scripts/          entry points; make_submission.py is the submission
+models/           the trained convex solver; the calibrations calibrate.py writes go here
+results/          submission/ the scored models, public/ the public ones, public_scores.json
 dataset/          challenge data, not tracked
 runs/             training output, not tracked
 tests/
@@ -226,7 +162,8 @@ chain (shadows from a rasterised sun view, radiosity, rasterisation from every c
 sensor model), which is differentiable in the mesh. `hac26/forward/__init__.py` describes
 both.
 
-`lpd_convex` is an unrolled primal-dual network on the convex operator; its output is the
-starting support of the main solver. `lpd_flow` is the main solver: a conditional flow that
-generates a non-convex correction on top of that convex start, reading at every step the
-residual of the exact model and its adjoint (`hac26/solvers/operator.py`).
+`lpd_convex` is an unrolled primal-dual network on the convex operator, trained on synthetic
+convex bodies; its output is the submitted body and the starting support of the non-convex
+path. `lpd_flow` is a conditional flow that generates a non-convex correction on top of that
+convex start, reading at every step the residual of the exact model and its adjoint
+(`hac26/solvers/operator.py`).

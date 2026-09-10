@@ -104,6 +104,17 @@ class SensorModel(nn.Module):
     def saturation(self) -> torch.Tensor:
         return F.softplus(self.raw_sat)
 
+    def set_oetf_power(self, exponent: float) -> None:
+        """Set the knots so the spline interpolates the power law x ** exponent, for a start
+        that matches a renderer's standard view transform; the knots stay free to move."""
+        n = len(self.raw_oetf)
+        x = torch.arange(1, n + 1, dtype=torch.float32) / n
+        inc = torch.diff(torch.cat([torch.zeros(1), x ** float(exponent)]))
+        with torch.no_grad():
+            # cumsum(softplus(raw) + 1e-4) / total is the curve; the total scale is free, so
+            # the increments are matched up to the small floor
+            self.raw_oetf.copy_(torch.log(torch.expm1((inc - 1e-4).clamp_min(1e-6))))
+
     def oetf_knots(self) -> torch.Tensor:
         """Monotone knot values on [0, 1], starting at 0 and ending at 1."""
         inc = F.softplus(self.raw_oetf) + 1e-4

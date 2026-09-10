@@ -14,7 +14,9 @@ The chain, in the body frame, per rotation phase psi:
      and B = rho (I - rho F)^-1 E is solved with F the form factors between the patches, held
      constant. The radiance leaving a face is that of its patch, L = B / pi. Direct light
      therefore has the resolution of the mesh, interreflected light that of the patches, and
-     the form-factor matrix stays small whatever the mesh.
+     the form-factor matrix stays small whatever the mesh. An instrument without
+     interreflection skips the patches and the solve, and the radiance is the direct term
+     rho E / pi alone.
   3. Cameras. The mesh is rasterised from every camera with L as a per-face attribute,
      antialiased, and passed through the sensor chain and the per-curve pedestal.
   4. Reduction. The intensity curve sums the pixel values above tau_i; the binary curve counts
@@ -73,9 +75,10 @@ class RenderConfig:
 
 
 class Prepared(NamedTuple):
-    """Everything about one mesh that does not depend on the phase."""
-    solver: RadiositySolver
-    patch: torch.Tensor        # (F,) patch index of every face
+    """Everything about one mesh that does not depend on the phase. `solver` and `patch` are
+    None for an instrument without interreflection."""
+    solver: RadiositySolver | None
+    patch: torch.Tensor | None  # (F,) patch index of every face
     fv: torch.Tensor           # (3F, 3) per-face vertices, differentiable
     ff: torch.Tensor           # (F, 3) faces indexing fv
     area: torch.Tensor         # (F,) face areas, differentiable
@@ -208,19 +211,23 @@ class ExactForward:
         the face-to-patch map, and the per-face vertices and areas, which stay
         differentiable. Raises RadiosityError when the patches cannot be built or their form
         factors are unusable."""
-        v_np = verts.detach().cpu().double().numpy()
-        f_np = faces.detach().cpu().numpy()
-        try:
-            pv, pf = decimate(v_np, f_np, self.cfg.radiosity_faces)
-        except Exception as exc:                        # noqa: BLE001  decimation failed
-            raise RadiosityError(f"could not build the radiosity patches: {exc}") from exc
-        if len(pf) < 4:
-            raise RadiosityError("the mesh decimates to fewer than four patches")
-        F, _, _, pc = form_factors(pv, pf, n_samples=self.cfg.form_factor_samples,
-                                   device=self.device)
-        solver = RadiositySolver(F.to(torch.float32), self.inst.rho, bad_rows=self.cfg.bad_rows)
-        from scipy.spatial import cKDTree
-        patch = torch.as_tensor(cKDTree(pc).query(v_np[f_np].mean(1))[1], device=self.device)
+        solver, patch = None, None
+        if bool(self.inst.interreflection):
+            v_np = verts.detach().cpu().double().numpy()
+            f_np = faces.detach().cpu().numpy()
+            try:
+                pv, pf = decimate(v_np, f_np, self.cfg.radiosity_faces)
+            except Exception as exc:                    # noqa: BLE001  decimation failed
+                raise RadiosityError(f"could not build the radiosity patches: {exc}") from exc
+            if len(pf) < 4:
+                raise RadiosityError("the mesh decimates to fewer than four patches")
+            F, _, _, pc = form_factors(pv, pf, n_samples=self.cfg.form_factor_samples,
+                                       device=self.device)
+            solver = RadiositySolver(F.to(torch.float32), self.inst.rho,
+                                     bad_rows=self.cfg.bad_rows)
+            from scipy.spatial import cKDTree
+            patch = torch.as_tensor(cKDTree(pc).query(v_np[f_np].mean(1))[1],
+                                    device=self.device)
         fv, ff = flat_faces(verts, faces)
         tv = verts[faces.long()]
         area = 0.5 * torch.linalg.cross(tv[:, 1] - tv[:, 0], tv[:, 2] - tv[:, 0]).norm(dim=1)
@@ -235,6 +242,8 @@ class ExactForward:
         radiosity would smear the terminator over the patch."""
         P = cov.shape[0] // k
         e = cov.reshape(P, k, -1).mean(1) / prep.area[None]                        # (P, F)
+        if prep.solver is None:
+            return RadiositySolver.radiance(self.inst.rho * e)
         n_patch = len(prep.solver.F)
         idx = prep.patch[None].expand(P, -1)
         w = prep.area[None].expand(P, -1)

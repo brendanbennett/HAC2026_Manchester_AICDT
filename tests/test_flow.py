@@ -238,3 +238,69 @@ def test_guidance_weights_the_data_part_and_leaves_the_prior_alone():
     t1 = torch.ones(B)
     p1 = net.prior_velocity(code, t1, rad, inp.sphere, inp.vol)
     assert torch.allclose(net.velocity(code, t1, rad, tag, inp, guidance=0.0), p1, atol=1e-6)
+
+
+def test_supervising_the_samplers_own_states_collapses_the_draws():
+    """Why training states are taken from the straight line only. A state the sampler
+    reaches is a function of the start, the churn noise and the data, all independent of the
+    body given the data, so a velocity scored against (x1 - x) / (1 - t) at such states has
+    the posterior mean as its optimum and carries every draw there. On a two-point body with
+    noisy data the line objective keeps both points and the rollout objective keeps neither.
+    The sampler is churn_step itself."""
+    import torch.nn as nn
+    from hac26.solvers.lpd_flow import churn_step, time_embed
+
+    torch.manual_seed(0)
+    n_steps, batch = 8, 128
+
+    class V(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.net = nn.Sequential(nn.Linear(2 + time_embed(torch.zeros(1)).shape[1], 48),
+                                     nn.SiLU(), nn.Linear(48, 48), nn.SiLU(), nn.Linear(48, 1))
+
+        def forward(self, x, t, d):
+            return self.net(torch.cat([x, d, time_embed(t)], 1))
+
+    def draw_data():
+        x1 = torch.where(torch.rand(batch, 1) < 0.5, 1.0, -1.0)
+        return x1, x1 + torch.randn(batch, 1)
+
+    def train(rollout: bool):
+        v = V()
+        opt = torch.optim.Adam(v.parameters(), lr=3e-3)
+        for _ in range(1200):
+            x1, d = draw_data()
+            x0 = torch.randn(batch, 1)
+            if not rollout:
+                t = torch.rand(batch, 1)
+                xt = (1 - t) * x0 + t * x1
+                states = [(xt, t)]
+            else:
+                states, x = [], x0
+                with torch.no_grad():
+                    for s in range(n_steps):
+                        t = torch.full((batch, 1), s / n_steps)
+                        states.append((x.clone(), t))
+                        x = churn_step(x, v(x, t[:, 0], d), s / n_steps, 1 / n_steps, 0.5)
+            loss = sum(((v(x, t[:, 0], d) - (x1 - x) / (1 - t)) ** 2).mean()
+                       for x, t in states) / len(states)
+            opt.zero_grad(); loss.backward(); opt.step()
+        return v
+
+    def sample(v, d_value: float, n: int = 2000):
+        d = torch.full((n, 1), d_value)
+        x = torch.randn(n, 1)
+        with torch.no_grad():
+            for s in range(n_steps):
+                t = torch.full((n,), s / n_steps)
+                x = churn_step(x, v(x, t, d), s / n_steps, 1 / n_steps, 0.5)
+        return x[:, 0]
+
+    line = sample(train(rollout=False), 0.0)
+    rolled = sample(train(rollout=True), 0.0)
+    # at d = 0 the posterior is the two points with equal weight: spread one, mean zero
+    assert float(line.std()) > 0.7
+    assert float(((line.abs() - 1.0).abs() < 0.35).float().mean()) > 0.7
+    assert float(rolled.std()) < 0.25
+    assert float(((rolled.abs() - 1.0).abs() < 0.35).float().mean()) < 0.3

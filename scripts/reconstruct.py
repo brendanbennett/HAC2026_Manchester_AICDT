@@ -19,10 +19,20 @@ import torch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from eval_exact import decode, ensemble_body, predict_h  # noqa: E402
-from hac26.conventions import CYLINDER_R  # noqa: E402
+from hac26.conventions import CYLINDER_R, PUBLIC_MODELS  # noqa: E402
 from hac26.data_io import CHANNELS, load_inversion_curves  # noqa: E402
 from hac26.recon import save_submission_stl  # noqa: E402
 from hac26.train import load_net  # noqa: E402
+
+SUBMISSION_DIR = "results/submission"   # the convex answers of the scored models
+PUBLIC_DIR = "results/public"           # the same recipe on the public models
+
+
+def answer_path(model: int) -> Path:
+    """Where the convex stage's answer for a model is written by scripts/make_submission.py
+    and read by every stage that starts from it."""
+    d = PUBLIC_DIR if model in PUBLIC_MODELS else SUBMISSION_DIR
+    return Path(d) / f"Asteroid{model:02d}.stl"
 
 
 def load_checkpoints(paths) -> list:

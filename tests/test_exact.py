@@ -133,3 +133,52 @@ def test_a_distant_camera_still_sees_the_body():
                       device="cpu", backend="software")
     raw = op.raw_curves(vt, ft, geoms=[0, 9])
     assert torch.isfinite(raw).all() and (raw > 0).all()
+
+
+def test_without_interreflection_the_radiance_is_the_direct_term_alone():
+    """With the bounce light switched off the radiance of every face is rho E / pi from its
+    own lit coverage, and no patches are built. With it on, the faces of two overlapping
+    spheres that face each other across the waist receive more when the light comes in
+    along the waist, so the direct term is a lower bound that is strict inside the
+    concavity."""
+    v, f = _two_spheres()
+    vt, ft = torch.tensor(v, dtype=torch.float32), torch.tensor(f)
+    on = Instrument(rho=0.9, quantise=False)
+    off = Instrument(rho=0.9, quantise=False, interreflection=False)
+    op_on = ExactForward(on, psi_grid(4), SMALL, device="cpu", backend="software")
+    op_off = ExactForward(off, psi_grid(4), SMALL, device="cpu", backend="software")
+    quarter = op_off.psi[1:2]                  # the light along the waist of the two spheres
+    with torch.no_grad():
+        prep_off = op_off._prepare(vt, ft)
+        assert prep_off.solver is None and prep_off.patch is None
+        _, L_off = op_off._radiance_chunk(prep_off, quarter, 0.0)
+        prep_on = op_on._prepare(vt, ft)
+        _, L_on = op_on._radiance_chunk(prep_on, quarter, 0.0)
+        from hac26.forward.mesh.exact import source_dirs, rotate_z
+        dirs = rotate_z(source_dirs(off.delta, SMALL.n_source), -quarter).reshape(-1, 3)
+        cov = LitCoverage.apply(prep_off.fv, prep_off.ff, dirs, prep_off.extent,
+                                prep_off.extent, op_off.ras_sun)
+        e = cov.reshape(1, SMALL.n_source, -1).mean(1) / prep_off.area[None]
+    assert torch.allclose(L_off, 0.9 * e / np.pi, rtol=1e-4, atol=1e-6)
+    assert (L_on >= L_off - 1e-6).all()
+    assert float((L_on - L_off).max()) > 0.1 * float(L_off.max())
+
+
+def test_the_blender_start_is_a_far_camera_without_bounce_light_and_survives_saving(tmp_path):
+    """The start of a calibration against the render has the far camera, the bounce light off
+    and the sRGB-like transfer curve, fits neither the albedo, the distance nor the
+    vignetting, and comes back from a saved file with the switch as it was."""
+    inst = Instrument.blender_start()
+    assert not bool(inst.interreflection)
+    assert float(inst.eye_distance) >= 300.0
+    x = torch.linspace(0, 1, 9)
+    assert torch.allclose(inst.sensor.oetf_knots(), x ** (1.0 / 2.2), atol=2e-3)
+    names = {n for n, _ in inst.fitted_parameters()}
+    assert {"raw_rho", "raw_eye", "sensor.raw_vignette", "raw_eta"}.isdisjoint(names)
+    assert {"raw_delta", "raw_tau_i", "sensor.raw_oetf", "sensor.raw_sat"} <= names
+    lab = {n for n, _ in Instrument().fitted_parameters()}
+    assert {"raw_rho", "raw_eye", "sensor.raw_vignette"} <= lab
+    inst.save(tmp_path / "blender.pt")
+    back = Instrument.load(tmp_path / "blender.pt")
+    assert not bool(back.interreflection)
+    assert float(back.eye_distance) == pytest.approx(float(inst.eye_distance))

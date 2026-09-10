@@ -19,7 +19,7 @@
 # What this proves: the shape library builds valid, non-convex, single-component bodies;
 # fit_shapes.py fits codes to them; build_corpus.py renders them with the exact operator and
 # runs the convex stage on them; train_prior.py and train_lpd.py train on that corpus, in
-# both runs (one expert, then branched and rolled out); decision_check.py reconstructs a
+# both runs (one expert, then branched into several); decision_check.py reconstructs a
 # held-out body; the resulting flow checkpoint loads and runs in reconstruct_lpd.py.
 #
 # What this does not prove: that the results are any good. A few bodies and a few steps
@@ -164,17 +164,17 @@ run "train_lpd" logs/smoke_flow.log \
     --out "$OUT/lpd_flow.pt"
 tail -20 logs/smoke_flow.log
 
-log "=== 7/10 train_lpd: the same run continued, branched into its experts and rolled out"
-run "train_lpd (rollout)" logs/smoke_flow_rollout.log \
+log "=== 7/10 train_lpd: the same run continued, branched into its experts"
+run "train_lpd (experts)" logs/smoke_flow_experts.log \
   "$PY" scripts/train_lpd.py \
     --steps "$FLOW_STEPS" --extra-steps 4 --batch 1 \
     --val-bodies 2 --val-every 2 --patience 2 \
-    --ckpt-every 2 --log-every 1 --rollout-frac 0.5 \
+    --ckpt-every 2 --log-every 1 \
     --corpus "$OUT/corpus.npz" \
     --calibration "$CAL" --prior "$OUT/prior_flow.pt" \
     --out "$OUT/lpd_flow.pt"
-tail -12 logs/smoke_flow_rollout.log
-grep -q "branched from 1 to" logs/smoke_flow_rollout.log || { log "FAILED: the second run did not branch"; exit 1; }
+tail -12 logs/smoke_flow_experts.log
+grep -q "branched from 1 to" logs/smoke_flow_experts.log || { log "FAILED: the second run did not branch"; exit 1; }
 
 log "=== 8/10 decision_check: a held-out smoke body, two draws"
 run "decision_check" logs/smoke_decision.log \
@@ -188,7 +188,7 @@ if [ -d dataset/raw ]; then
   log "=== 9/10 convex: dataset/raw is present, the convex start of model 1"
   mkdir -p results/smoke
   run "reconstruct (convex)" logs/smoke_convex.log \
-    "$PY" scripts/reconstruct.py --ckpt "$CONVEX" --model 1 \
+    "$PY" scripts/reconstruct.py --ckpt "$CONVEX" --model 1 --fit-cylinder \
       --out results/smoke/convex_Asteroid01.stl
   log "=== 10/10 reconstruct: model 1 from that start"
   run "reconstruct_lpd" logs/smoke_reconstruct.log \

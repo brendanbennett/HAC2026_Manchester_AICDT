@@ -55,7 +55,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from hac26.conventions import CYLINDER_R, PUBLIC_MODELS, psi_grid   # noqa: E402
-from hac26.data_io import N_CAMS, load_model_curves, public_stl        # noqa: E402
+from hac26.data_io import N_CAMS, load_inversion_curves, public_stl    # noqa: E402
 from hac26.field import CODE_DIM, DESIGN_N, N_DIR, N_SITES   # noqa: E402
 from hac26.forward.mesh.exact import normalise                         # noqa: E402
 from hac26.forward.mesh.radiosity import RadiosityError                # noqa: E402
@@ -67,7 +67,8 @@ from hac26.solvers.output import (export_stl, metric_medoid, planar_snap,      #
                                   ransac_planes, restore_constraints)
 from hac26.recon import dice, fit_to_cylinder, mesh_occupancy          # noqa: E402
 from hac26.shapes import rescale_touch_z                              # noqa: E402
-from train_lpd import (CALIBRATION, RENDER, _enable_tf32, cond_channels,   # noqa: E402
+from reconstruct import answer_path                                    # noqa: E402
+from train_lpd import (INSTRUMENT, RENDER, _enable_tf32, cond_channels,   # noqa: E402
                        load_instrument, residual_features, support_from_mesh)
 
 SPREAD_MAX = 0.95    # mean Dice of the other draws against the medoid above which the draws
@@ -324,9 +325,12 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", type=int, required=True)
     ap.add_argument("--ckpt", default="runs/lpd_flow.pt")
-    ap.add_argument("--calibration", default=CALIBRATION,
-                    help="the Instrument written by scripts/calibrate.py; must be the one "
-                         "the flow was trained with")
+    ap.add_argument("--channel", choices=("real", "blender"), default="real",
+                    help="the released curves to invert, and with them the instrument "
+                         "fitted to that channel")
+    ap.add_argument("--calibration", default=None,
+                    help="the Instrument written by scripts/calibrate.py for the channel; "
+                         "must be the one the flow was trained with")
     ap.add_argument("--data-dir", default="dataset/raw")
     ap.add_argument("--samples", type=int, default=8)
     ap.add_argument("--steps", type=int, default=N_STEPS,
@@ -382,7 +386,7 @@ def main():
     M = min(N_MODES, a.phases // 2)
     dev = "cuda" if torch.cuda.is_available() else "cpu"
 
-    inst = load_instrument(a.calibration, dev)
+    inst = load_instrument(a.calibration or INSTRUMENT[a.channel], dev)
     op = CodeOperator(inst, psi, res=a.operator_res, config=RENDER, device=dev)
 
     sd = torch.load(a.ckpt, map_location="cpu", weights_only=False)
@@ -397,17 +401,17 @@ def main():
     net = LPDFlow.from_state_dict(sd)
     net.eval()
 
-    sup_stl = a.support_from or f"results/convex/Asteroid{a.model:02d}.stl"
+    sup_stl = a.support_from or str(answer_path(a.model))
     support = support_from_convex(sup_stl)
     print(f"  h from {sup_stl}: {float(support.min()):.3f}-{float(support.max()):.3f}",
           flush=True)
 
-    d = load_model_curves(a.data_dir, a.model, m=a.phases)
+    d = load_inversion_curves(a.data_dir, a.model, m=a.phases, channel=a.channel)
     # A curve file that is absent leaves its block at zero and masked out, which the solver
     # would accept and reconstruct around. An answer built from half the measurement, or none
     # of it, is worse than no answer, so say so instead.
     if set(d["files"]) != {"intensity", "binary"}:
-        raise SystemExit(f"model {a.model} needs both measured curve files under "
+        raise SystemExit(f"model {a.model} needs both {a.channel} curve files under "
                          f"{a.data_dir}; found {sorted(d['files'])}")
     data = curve_pairs(d["curves"])                              # (N_CAMS, 2, P)
     mask = geometry_mask(d["mask"])

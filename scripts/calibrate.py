@@ -1,5 +1,13 @@
 #!/usr/bin/env python3
-"""Fit the instrument against the real curves of the public models, whose shapes are released.
+"""Fit the instrument against the curves of the public models, whose shapes are released.
+
+    python scripts/calibrate.py                                # the laboratory channel
+    python scripts/calibrate.py --channel blender --models 1 3 # the organisers' render
+
+The two released channels are different instruments. The laboratory curves come through a
+lens, a sensor and bounce light off a matte white print; the Blender render has none of
+those and a far camera, so it is fitted from its own start (Instrument.blender_start) and
+written to its own file, and a reconstruction against the render reads that file.
 
 What is fitted, all at once and all by gradient: the albedo rho, the source radius delta, the
 camera distance, the intensity threshold tau_i, the per-curve pedestal, the per-curve model
@@ -63,24 +71,26 @@ from hac26.stl_io import load_stl                                     # noqa: E4
 
 TRUTH_FACES = 20000       # faces the released meshes are decimated to before rendering
 PSI0_SEARCH = 1.0 / 8.0   # the start phase is searched within this fraction of a turn each way
-OUT_INSTRUMENT = "models/instrument_calibration.pt"
-OUT_REPORT = "models/instrument_calibration.json"
+OUT_INSTRUMENT = {"real": "models/instrument_calibration.pt",
+                  "blender": "models/instrument_blender.pt"}
+OUT_REPORT = {"real": "models/instrument_calibration.json",
+              "blender": "models/instrument_blender.json"}
 
 
-def load_truth(data_dir: str, model: int, device: str):
+def load_truth(data_dir: str, model: int, device: str, faces: int = TRUTH_FACES):
     """The released mesh of a public model, posed and decimated, as torch tensors."""
     v, f = load_stl(public_stl(data_dir, model))
     # centre_xy=False: the released STL is already posed on the rotation axis, and moving it
     # onto its own centroid would move it off (hac26.shapes.rescale_touch_z)
     v = rescale_touch_z(v, f, centre_xy=False)
-    v, f = decimate(np.asarray(v, dtype=np.float64), np.asarray(f, dtype=np.int64), TRUTH_FACES)
+    v, f = decimate(np.asarray(v, dtype=np.float64), np.asarray(f, dtype=np.int64), faces)
     return (torch.tensor(v, dtype=torch.float32, device=device),
             torch.tensor(f, dtype=torch.long, device=device))
 
 
-def load_data(data_dir: str, model: int, phases: int, device: str):
-    """The real mean-normalised curves (N_CAMS, 2, P), which geometries are present (N_CAMS,)
-    and the measured noise per curve (N_CAMS, 2).
+def load_data(data_dir: str, model: int, phases: int, device: str, channel: str = "real"):
+    """The mean-normalised curves (N_CAMS, 2, P) of one channel, which geometries are present
+    (N_CAMS,) and the measured noise per curve (N_CAMS, 2).
 
     The noise comes from the high-frequency content of each curve at the files' own frame
     rate, not from the difference of the two columns of a geometry: those two columns are
@@ -88,7 +98,9 @@ def load_data(data_dir: str, model: int, phases: int, device: str):
     the A/B mismatch and runs 1-277x the actual noise, median 12x (hac26.noise). That
     difference is reported beside sigma as a diagnostic and is left for eta to absorb.
     """
-    d = load_model_curves(data_dir, model, m=phases)
+    d = load_model_curves(data_dir, model, m=phases, use_blender=(channel == "blender"))
+    if not d["files"]:
+        raise FileNotFoundError(f"model {model}: no {channel} curve files under {data_dir}")
     pairs = np.stack([d["curves"][:N_CAMS], d["curves"][N_CAMS:]], axis=1)
     present = (d["mask"][:N_CAMS] > 0) & (d["mask"][N_CAMS:] > 0)
     sigma = native_sigma(d).reshape(2, N_CAMS).T
@@ -272,27 +284,53 @@ def main():
     ap.add_argument("--patience", type=int, default=60,
                     help="window of steps the --tol improvement is measured over")
     ap.add_argument("--data-dir", default="dataset/raw")
-    ap.add_argument("--out", default=OUT_INSTRUMENT)
-    ap.add_argument("--report", default=OUT_REPORT)
+    ap.add_argument("--channel", choices=("real", "blender"), default="real",
+                    help="which released curves to fit: the laboratory recordings or the "
+                         "organisers' Blender render, each from its own starting instrument")
+    ap.add_argument("--models", nargs="+", type=int, default=list(PUBLIC_MODELS),
+                    help="public bodies to fit on. One eta is shared across them, so a body "
+                         "the chain cannot reproduce raises the model error admitted for "
+                         "every other body")
+    ap.add_argument("--out", default=None,
+                    help=f"instrument file; by channel, {OUT_INSTRUMENT}")
+    ap.add_argument("--report", default=None,
+                    help=f"report file; by channel, {OUT_REPORT}")
     render = RenderConfig()
     ap.add_argument("--phase-chunk", type=int, default=render.phase_chunk,
                     help="phases per rendering batch; with --geom-chunk it sets the GPU "
                          "memory the rendering takes, not the result")
     ap.add_argument("--geom-chunk", type=int, default=render.geom_chunk,
                     help="geometries per rendering batch")
+    ap.add_argument("--truth-faces", type=int, default=TRUTH_FACES,
+                    help="faces the released meshes are decimated to before rendering")
+    ap.add_argument("--height", type=int, default=render.height,
+                    help="sensor image height; with --width and --sun-res, a lower value "
+                         "checks the wiring on a CPU and is not a calibration")
+    ap.add_argument("--width", type=int, default=render.width)
+    ap.add_argument("--sun-res", type=int, default=render.sun_res)
     a = ap.parse_args()
     dev = "cuda" if torch.cuda.is_available() else "cpu"
+    a.out = a.out or OUT_INSTRUMENT[a.channel]
+    a.report = a.report or OUT_REPORT[a.channel]
+    if any(M not in PUBLIC_MODELS for M in a.models):
+        raise SystemExit(f"only the public models {PUBLIC_MODELS} have a released shape")
 
-    inst = Instrument().to(dev)
-    render = RenderConfig(phase_chunk=a.phase_chunk, geom_chunk=a.geom_chunk)
+    inst = (Instrument() if a.channel == "real" else Instrument.blender_start()).to(dev)
+    render = RenderConfig(height=a.height, width=a.width, sun_res=a.sun_res,
+                          phase_chunk=a.phase_chunk, geom_chunk=a.geom_chunk)
+    if render != RenderConfig(phase_chunk=a.phase_chunk, geom_chunk=a.geom_chunk):
+        print(f"  NOTE: rendering at {render.height}x{render.width}, sun view {render.sun_res}; "
+              f"a fit at a reduced resolution checks the wiring and is not a calibration",
+              flush=True)
     fwd = ExactForward(inst, psi_grid(a.phases), render, device=dev)
-    fit_params = [p for n, p in inst.named_parameters() if n != "raw_eta"]
+    fit_params = [p for _, p in inst.fitted_parameters()]
+    print(f"[start] {a.channel} channel, models {a.models}: {inst.summary()}", flush=True)
 
     bodies = {}
-    for M in PUBLIC_MODELS:
+    for M in a.models:
         t0 = time.time()
-        verts, faces = load_truth(a.data_dir, M, dev)
-        real, present, sigma, mismatch = load_data(a.data_dir, M, a.phases, dev)
+        verts, faces = load_truth(a.data_dir, M, dev, a.truth_faces)
+        real, present, sigma, mismatch = load_data(a.data_dir, M, a.phases, dev, a.channel)
         with torch.no_grad():
             psi0 = initial_psi0(fwd, verts, faces, real, present, sigma)
         bodies[M] = dict(verts=verts, faces=faces, real=real, present=present, sigma=sigma,
@@ -307,7 +345,8 @@ def main():
                            lr=a.lr)
     # raw-space starting point and travel budget of everything being fitted, for the
     # convergence report at the end
-    named = {n: p for n, p in inst.named_parameters()}
+    named = {n: p for n, p in inst.fitted_parameters()}
+    named["raw_eta"] = inst.raw_eta
     named.update({f"psi0[{M}]": b["psi0"] for M, b in bodies.items()})
     start = {n: p.detach().clone() for n, p in named.items()}
     budget = {n: a.steps * (a.lr / 10 if n.startswith("psi0") else a.lr) for n in named}
@@ -350,7 +389,8 @@ def main():
     print("    /s      against sqrt(sigma^2 + eta^2), eta being the model error the fit admits")
     moved = movement_report(start, {n: p.detach() for n, p in named.items()}, budget)
     limited = print_movement(moved)
-    report = {"psi0_deg": {}, "residual": {}, "phase_offset_deg": {},
+    report = {"channel": a.channel, "models": a.models,
+              "psi0_deg": {}, "residual": {}, "phase_offset_deg": {},
               "instrument": inst.summary(),
               "steps_run": steps_run, "movement": moved, "budget_limited": limited}
     with torch.no_grad():

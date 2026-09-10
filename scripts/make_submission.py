@@ -10,9 +10,10 @@ results/submission are the output of one stated procedure. The convex LPD reads 
 of the released channel hac26.data_io.load_inversion_curves picks, the Blender render when
 it is present and the laboratory curves otherwise, and the body's width is set from the
 published bounding-cylinder radius, the one number the mean-normalised curves do not carry.
-The scored models go to results/submission, the public ones to results/public, every file
-passes scripts/check_submission.py's inspection before the script exits zero, and the public
-files are scored against the released shapes into results/public_scores.json.
+The scored models go to results/submission, the public ones to results/public
+(reconstruct.answer_path), every file passes scripts/check_submission.py's inspection before
+the script exits zero, and the public files are scored against the released shapes into
+results/public_scores.json.
 """
 from __future__ import annotations
 
@@ -32,14 +33,12 @@ from check_submission import inspect                                # noqa: E402
 from hac26.conventions import CYLINDER_R, PUBLIC_MODELS             # noqa: E402
 from hac26.data_io import public_stl                                # noqa: E402
 from hac26.recon import save_submission_stl                         # noqa: E402
-from reconstruct import load_checkpoints, reconstruct_convex        # noqa: E402
+from reconstruct import answer_path, load_checkpoints, reconstruct_convex   # noqa: E402
 
 CKPT = "models/lpd_convex.pt"     # the trained convex LPD
 CHANNEL = "auto"                  # the Blender render when released, else the lab curves
 FIT_CYLINDER = True               # xy scaled to the published radius
 SMOOTH = 0                        # no support smoothing
-SUBMISSION_DIR = "results/submission"
-PUBLIC_DIR = "results/public"
 SCORES_FILE = "results/public_scores.json"
 VOXEL_PITCH = 0.05                # the pitch of the organisers' released example
 PROJECTION_DIRS = 4               # angles averaged in the projection measure
@@ -62,9 +61,8 @@ def main() -> None:
               "fit_cylinder": FIT_CYLINDER, "smooth": SMOOTH, "models": {}}
     failed = 0
     for M in a.models:
-        out_dir = Path(PUBLIC_DIR if M in PUBLIC_MODELS else SUBMISSION_DIR)
-        out_dir.mkdir(parents=True, exist_ok=True)
-        out = out_dir / f"Asteroid{M:02d}.stl"
+        out = answer_path(M)
+        out.parent.mkdir(parents=True, exist_ok=True)
         v, f, info = reconstruct_convex(M, a.data_dir, loaded, CHANNEL, smooth=SMOOTH,
                                         fit_cylinder=FIT_CYLINDER)
         info.update(save_submission_stl(str(out), v, f, cylinder_radius=CYLINDER_R[M]))
@@ -84,8 +82,8 @@ def main() -> None:
         print(f"\n{'model':>5} {'voxel':>7} {'proj':>7} {'SCORE':>7}")
         with tempfile.TemporaryDirectory() as td:
             for M in public:
-                r = score_one(public_stl(a.data_dir, M), Path(PUBLIC_DIR) / f"Asteroid{M:02d}.stl",
-                              Path(td), VOXEL_PITCH, False, PROJECTION_DIRS)
+                r = score_one(public_stl(a.data_dir, M), answer_path(M), Path(td),
+                              VOXEL_PITCH, False, PROJECTION_DIRS)
                 report["models"][M]["score"] = r
                 print(f"{M:>5} {r['voxel']:>7.4f} {r['proj_released']:>7.4f} {r['score']:>7.4f}",
                       flush=True)
