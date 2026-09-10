@@ -44,6 +44,10 @@ nvidia-smi || echo "WARNING: no GPU visible; corpus, flow and reconstruct will f
 SCRATCH=${SCRATCH_DIR:-$HOME/scratch/hac26}
 mkdir -p "$SCRATCH"/{cache,raw,generated,shape_models,runs}
 export XDG_CACHE_HOME="$SCRATCH/cache"    # pip, and thingi10k via platformdirs
+export UV_CACHE_DIR="$SCRATCH/cache/uv"   # named outright: uv's cache reached 39G
+                                          # in home on the first run, and it is the
+                                          # Makefile's installer whenever uv is on PATH
+export HF_HOME="$SCRATCH/cache/huggingface"
 mkdir -p dataset
 for pair in dataset/raw:raw dataset/generated:generated             dataset/shape_models:shape_models runs:runs; do
   link=${pair%%:*}
