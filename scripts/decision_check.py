@@ -84,12 +84,16 @@ def main():
                     help="held-out bodies to check, spread over how carved they are")
     ap.add_argument("--samples", type=int, default=8)
     ap.add_argument("--steps", type=int, default=N_STEPS)
-    ap.add_argument("--churn", type=float, default=CHURN)
-    ap.add_argument("--guidance", type=float, nargs="+", default=[1.0, 1.5, 2.0, 3.0],
+    ap.add_argument("--churn", type=float, nargs="+", default=[0.0, 0.25, CHURN],
+                    help="noise levels of the sampler to compare (lpd_flow.churn_step). Churn "
+                         "corrects a velocity the network gets wrong and costs variance where "
+                         "it gets it right, so which level is best is a property of the "
+                         "trained network and is measured here rather than assumed")
+    ap.add_argument("--guidance", type=float, nargs="+", default=[1.0, 1.5, 2.0],
                     help="weights on the data part of the velocity to compare "
-                         "(lpd_flow.LPDFlow.velocity). Each body is reconstructed once per "
-                         "weight from the same starts, so the comparison is between the "
-                         "weights and not between the draws")
+                         "(lpd_flow.LPDFlow.velocity). Every body is reconstructed once per "
+                         "(churn, weight) pair from the same starts, so the comparison is "
+                         "between the settings and not between the draws")
     ap.add_argument("--polish-steps", type=int, default=30)
     ap.add_argument("--res", type=int, default=64, help="extraction resolution of the meshes")
     ap.add_argument("--side-points", type=int, default=200000,
@@ -150,12 +154,12 @@ def main():
         tv = fit_to_cylinder(apply_constraints(truth[0].cpu().numpy(), 1.0), R)
         tf = truth[1].cpu().numpy()
 
-        for w in a.guidance:
+        for ch, w in [(c, g) for c in a.churn for g in a.guidance]:
             t0 = time.time()
-            torch.manual_seed(a.seed * 7919 + int(data.index[b]))   # same starts at every weight
+            torch.manual_seed(a.seed * 7919 + int(data.index[b]))   # same starts at every setting
             codes = net.sample(make_resid_fn(net, op, curves, scale, mask, M, cond, support, R),
                                tag.expand(a.samples, -1, -1), mask.expand(a.samples, -1), cond, R,
-                               batch=a.samples, n_steps=a.steps, churn=a.churn, guidance=w)
+                               batch=a.samples, n_steps=a.steps, churn=ch, guidance=w)
             fits = []
             for i in range(a.samples):
                 if a.polish_steps > 0:
@@ -208,7 +212,7 @@ def main():
             for lv in CONSENSUS_LEVELS:            # a level with no closed surface has no candidate
                 picks[f"consensus_{lv:g}"] = n_draws + levels.index(lv) if lv in levels else None
             picks["consensus_opt"] = n_draws + levels.index(opt) if opt in levels else None
-            row = {"body": int(data.index[b]), "guidance": float(w),
+            row = {"body": int(data.index[b]), "guidance": float(w), "churn": float(ch),
                    "consensus_opt_level": float(opt),
                    "carved": float(carved[b]), "radius": R,
                    "draws": n_draws, "misfit_sigma": chis, "polished_misfit_sigma": fits,
@@ -216,7 +220,8 @@ def main():
                    "side_assd": {r: (None if k is None else scores[k][1]) for r, k in picks.items()},
                    "picked": picks, "seconds": time.time() - t0}
             results.append(row)
-            print(f"  body {row['body']:>5} carved {row['carved']:.2f} guidance {w:.2f}: dice "
+            print(f"  body {row['body']:>5} carved {row['carved']:.2f} churn {ch:.2f} "
+                  f"guidance {w:.2f}: dice "
                   + ", ".join(f"{r} {row['dice'][r]:.3f}" for r in RULES
                               if row['dice'][r] is not None)
                   + f"  ({row['seconds']:.0f}s)", flush=True)
@@ -228,32 +233,37 @@ def main():
         vals = [x[key][r] for x in rows_ if x[key][r] is not None]
         return float(np.mean(vals)) if vals else None
 
+    settings = [(c, g) for c in a.churn for g in a.guidance]
     summary = {}
-    for w in a.guidance:
-        rows_ = [x for x in results if x["guidance"] == float(w)]
-        summary[f"{w:g}"] = {r: {"dice": mean_of(rows_, "dice", r),
-                                 "side_assd": mean_of(rows_, "side_assd", r),
-                                 "bodies": sum(x["dice"][r] is not None for x in rows_)}
-                             for r in RULES}
-    print("\n  mean over the bodies, per guidance weight:")
-    for w in a.guidance:
+    for ch, w in settings:
+        rows_ = [x for x in results
+                 if x["churn"] == float(ch) and x["guidance"] == float(w)]
+        summary[f"{ch:g}/{w:g}"] = {r: {"dice": mean_of(rows_, "dice", r),
+                                        "side_assd": mean_of(rows_, "side_assd", r),
+                                        "bodies": sum(x["dice"][r] is not None for x in rows_)}
+                                    for r in RULES}
+    print("\n  mean over the bodies, per churn and guidance weight:")
+    for ch, w in settings:
         for r in RULES:
-            st = summary[f"{w:g}"][r]
+            st = summary[f"{ch:g}/{w:g}"][r]
             if st["dice"] is not None:
-                print(f"    guidance {w:<5g} {r:<15} dice {st['dice']:.4f}   "
+                print(f"    churn {ch:<5g} guidance {w:<5g} {r:<15} dice {st['dice']:.4f}   "
                       f"side-view distance {st['side_assd']:.4f}   ({st['bodies']} bodies)")
         print("")
-    best = max(((w, summary[f"{w:g}"]["vote"]["dice"]) for w in a.guidance
-                if summary[f"{w:g}"]["vote"]["dice"] is not None),
+    best = max((((ch, w), summary[f"{ch:g}/{w:g}"]["vote"]["dice"]) for ch, w in settings
+                if summary[f"{ch:g}/{w:g}"]["vote"]["dice"] is not None),
                key=lambda kv: kv[1], default=(None, None))
     if best[0] is not None:
-        print(f"  the rule the reconstruction uses ('vote') scores best at guidance "
-              f"{best[0]:g} (dice {best[1]:.4f}). Set RECON_GUIDANCE to it.")
+        print(f"  the rule the reconstruction uses ('vote') scores best at churn "
+              f"{best[0][0]:g} and guidance {best[0][1]:g} (dice {best[1]:.4f}). Set "
+              f"RECON_CHURN and RECON_GUIDANCE to them.")
     print("\n  'oracle' is the best candidate in hindsight, the ceiling of any rule.")
     out = {"ckpt": a.ckpt, "corpus": a.corpus, "samples": a.samples, "steps": a.steps,
            "polish_steps": a.polish_steps, "rules": list(RULES),
            "guidance": [float(w) for w in a.guidance],
-           "best_guidance": (None if best[0] is None else float(best[0])),
+           "churn": [float(c) for c in a.churn],
+           "best_churn": (None if best[0] is None else float(best[0][0])),
+           "best_guidance": (None if best[0] is None else float(best[0][1])),
            "summary": summary, "bodies": results}
     Path(a.out).parent.mkdir(parents=True, exist_ok=True)
     Path(a.out).write_text(json.dumps(out, indent=2))

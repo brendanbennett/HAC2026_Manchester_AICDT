@@ -93,17 +93,26 @@ import torch.nn as nn
 from hac26.conventions import cameras
 from hac26.field import CODE_DIM, LATTICE_SHAPE, N_DIR, N_SITES, dir_design
 
-__all__ = ["CODE_DIM", "N_DIR", "N_SITES", "N_MODES", "N_STEPS", "N_EXPERTS", "CHURN", "T_DIM",
+__all__ = ["CODE_DIM", "N_DIR", "N_SITES", "N_MODES", "N_STEPS", "N_EXPERTS", "CHURN",
+           "OP_GAIN", "DESCENT_CAP", "T_DIM",
            "T_FREQ", "N_FEAT", "N_SPHERE_CH", "N_VOL_CH", "FlowInputs", "flow_inputs",
            "DualSetTransformer", "SphereBranch", "VolBranch", "PrimalNet", "PriorNet",
            "Reader", "CodeCodec", "LPDFlow", "fourier_embed", "time_embed", "GUIDANCE",
-           "churn_step", "geometry_tags"]
+           "churn_step", "descent_scale", "geometry_tags"]
 
 N_MODES = 40
 N_STEPS = 16        # sampling steps by default; the operator runs at each. Training does not
                     # depend on it.
 N_EXPERTS = 4       # velocity networks, one per equal interval of t
 CHURN = 0.5         # noise in the sampler, eps(t) = CHURN (1 - t); 0 is the plain flow
+DESCENT_CAP = 0.5   # largest descent step per block, as a share of that block of the state
+OP_GAIN = 300.0     # tr(A' Sigma^-1 A) / CODE_DIM for the operator at the run's geometries and
+                    # phases, in whitened code units: how much whitened misfit a unit whitened
+                    # change of the code makes. It sets descent_scale and nothing else, and
+                    # that profile is flat enough in it that the order of magnitude is what
+                    # matters. Measure it by rendering pairs of corpus bodies and taking the
+                    # ratio of the whitened squared curve difference to the whitened squared
+                    # code difference.
 GUIDANCE = 1.0      # weight on the data part of the velocity at t = 1, ramped from one at
                     # t = 0. One is the model as trained; above one the draws follow the
                     # curves further from the prior. See LPDFlow.velocity, and
@@ -185,6 +194,26 @@ def time_embed(t: torch.Tensor, dim: int = T_DIM) -> torch.Tensor:
     f = T_FREQ[0] * (T_FREQ[1] / T_FREQ[0]) ** k
     a = t[..., None].float() * (2.0 * np.pi) * f
     return torch.cat([torch.sin(a), torch.cos(a)], -1)
+
+
+def descent_scale(t: torch.Tensor, gain: float = OP_GAIN) -> torch.Tensor:
+    """The multiple of the operator's adjoint that the conditional velocity asks for at time t.
+
+    With the interpolant x_t = (1-t) x0 + t x1 and a whitened prior, the exact conditional
+    velocity is v_prior + ((1-t)/D) A' (Sigma + v_t A A')^-1 r, where D = (1-t)^2 + t^2,
+    v_t = (1-t)^2 / D is the prior's conditional variance of the endpoint, and r is the
+    residual at the endpoint estimate. The operator returns A' Sigma^-1 r, so the two differ by
+    the whitening of the residual by the endpoint's own spread as well as by the noise. Taking
+    A A' for a multiple of the identity, that difference collapses to
+
+        (1 - t) / [ (1 - t)^2 + t^2 + gain (1 - t)^2 ],
+
+    which is what this returns. It rises from 1/(1+gain) at t = 0 to 1/(2(sqrt(2+gain) - 1)) at
+    t = 1 - 1/sqrt(2+gain) and falls to zero at t = 1. The data part is a correction on top of
+    it (PrimalNet), so an error in `gain` costs the correction some of its range and nothing
+    else."""
+    u = 1.0 - t
+    return u / (u * u * (1.0 + gain) + t * t)
 
 
 def churn_step(x: torch.Tensor, v: torch.Tensor, t: float, dt: float, churn: float) -> torch.Tensor:
@@ -461,11 +490,17 @@ class PrimalNet(nn.Module):
     and g have different scales, and zero-initialised, so training starts from the branches
     alone.
 
-    The adjoint step adds, per block, a learned multiple of the unit adjoint direction: a
-    step of gradient descent on the whitened data misfit, with a step size that depends on t
-    and on the size of the gradient. The branches still read the direction as an input and
-    can shape it; this path makes the plain descent step available with two numbers. It is
-    zero-initialised too.
+    The adjoint step adds, per block, a multiple of the adjoint of the whitened data misfit: a
+    step of gradient descent on it. The multiple is the one the conditional velocity asks for
+    (descent_scale) times one plus a learned correction that depends on t and on the size of
+    the gradient. The correction is zero-initialised, so an untrained data part is the descent
+    step at the size the closed form prescribes rather than nothing at all, and training
+    spends itself on the part of the correction that no scale can supply; a correction of
+    minus one cancels the term where it is wrong. The branches still read the direction as an
+    input and can shape it.
+
+    The contribution is capped per block at DESCENT_CAP times the size of the state, so that a
+    mis-set OP_GAIN cannot drive the first steps to a body the operator cannot render.
     """
 
     def __init__(self, summary_dim: int, cond_width: int = 256):
@@ -479,16 +514,32 @@ class PrimalNet(nn.Module):
         self.step = nn.Sequential(nn.Linear(T_DIM + 2, 64), nn.SiLU(), nn.Linear(64, 2))
         nn.init.zeros_(self.step[-1].weight); nn.init.zeros_(self.step[-1].bias)
 
-    def forward(self, code, summary, t_embed, log_radius, inp: FlowInputs):
+    def forward(self, code, t, summary, t_embed, log_radius, inp: FlowInputs):
         c = self.cond(torch.cat([summary, t_embed, log_radius[:, None]], -1))
         v_dh = self.sphere(torch.cat([code[:, None, :N_DIR].transpose(1, 2), inp.sphere], -1), c)
         g = code[:, N_DIR:].reshape(-1, 1, *LATTICE_SHAPE)
         v_g = self.vol(torch.cat([g, inp.vol], 1), c)
         gain = self.gain(t_embed)
-        step = self.step(torch.cat([t_embed, inp.adj_log], -1))
+        # inp.adj is the unit direction per block and inp.adj_log the log of the size taken
+        # out of it, so the two together are the adjoint itself
+        step = descent_scale(t)[:, None] * torch.exp(inp.adj_log) \
+            * (1.0 + self.step(torch.cat([t_embed, inp.adj_log], -1)))
         skip = torch.cat([gain[:, :1] * code[:, :N_DIR], gain[:, 1:] * code[:, N_DIR:]], -1)
         descent = torch.cat([step[:, :1] * inp.adj[:, :N_DIR], step[:, 1:] * inp.adj[:, N_DIR:]], -1)
+        descent = self._capped(descent, code)
         return skip + descent + torch.cat([v_dh, v_g], -1)
+
+    @staticmethod
+    def _capped(descent, code):
+        """Each block of the descent step held to DESCENT_CAP times the size of that block of
+        the state."""
+        out = []
+        for sl in (slice(None, N_DIR), slice(N_DIR, None)):
+            d, z = descent[:, sl], code[:, sl]
+            lim = DESCENT_CAP * z.norm(dim=1, keepdim=True).clamp_min(1e-6)
+            n = d.norm(dim=1, keepdim=True).clamp_min(1e-12)
+            out.append(d * torch.clamp(lim / n, max=1.0))
+        return torch.cat(out, -1)
 
 
 class PriorNet(nn.Module):
@@ -630,8 +681,8 @@ class LPDFlow(nn.Module):
         out = torch.zeros_like(code)
         for e in which.unique().tolist():
             sel = which == e
-            out[sel] = self.experts[e](code[sel], summary[sel], te[sel], torch.log(radius[sel]),
-                                       inp.select(sel))
+            out[sel] = self.experts[e](code[sel], t[sel], summary[sel], te[sel],
+                                       torch.log(radius[sel]), inp.select(sel))
         return out
 
     def velocity(self, code, t, radius, geom_tag, inp: FlowInputs, guidance: float = 1.0):

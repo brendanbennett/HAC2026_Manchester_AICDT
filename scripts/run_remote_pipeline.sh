@@ -97,8 +97,16 @@ FLOW_LOG_EVERY=${FLOW_LOG_EVERY:-10}
 FLOW_OPERATOR_RES=${FLOW_OPERATOR_RES:-32}
 FLOW_TRAIN_GEOMS=${FLOW_TRAIN_GEOMS:-28}   # geometries the operator renders per step; all of them
 FLOW_ROLLOUT_STEPS=${FLOW_ROLLOUT_STEPS:-1000}  # cap on the second run's extra steps: branched into
-                                                # experts, rolled out, the main phase; 0 skips it
-FLOW_ROLLOUT_FRAC=${FLOW_ROLLOUT_FRAC:-0.5}     # share of its draws that come from the sampler
+                                                # experts, rolled out, the main phase; 0 skips it.
+                                                # A rolled step runs a whole trajectory and
+                                                # scores every state on it, so it is worth
+                                                # N_STEPS of the first run's draws and costs
+                                                # about twice one of its steps
+FLOW_ROLLOUT_FRAC=${FLOW_ROLLOUT_FRAC:-1.0}     # share of its draws that come from the sampler.
+                                                # The sampler only ever visits the times of its
+                                                # own grid, and the first run already covers the
+                                                # times between them, so the second run spends
+                                                # itself on the states that will be met
 
 RECON_SAMPLES=${RECON_SAMPLES:-8}
 RECON_POLISH_STEPS=${RECON_POLISH_STEPS:-30}   # most gradient steps of the polish per draw; 0 skips it
@@ -109,7 +117,14 @@ RECON_SNAP=${RECON_SNAP:-0}
 # of RECON_GUIDANCE_SWEEP and names the weight that scores best; set this to it and
 # rerun the reconstruct stage, which is cheap beside the training.
 RECON_GUIDANCE=${RECON_GUIDANCE:-1.0}
-RECON_GUIDANCE_SWEEP=${RECON_GUIDANCE_SWEEP:-1.0 1.5 2.0 3.0}
+RECON_GUIDANCE_SWEEP=${RECON_GUIDANCE_SWEEP:-1.0 1.5 2.0}
+# Noise in the sampler (lpd_flow.churn_step). It corrects a velocity the network gets wrong
+# and costs variance where it gets it right, so the level that scores best depends on the
+# trained network. The decision stage reconstructs held-out bodies at each of
+# RECON_CHURN_SWEEP and names the level that scores best; set this to it and rerun the
+# reconstruct stage.
+RECON_CHURN=${RECON_CHURN:-0.5}
+RECON_CHURN_SWEEP=${RECON_CHURN_SWEEP:-0.0 0.25 0.5}
 MEDOID_VOLUME_ONLY=${MEDOID_VOLUME_ONLY:-0}
 MEDOID_SIDE_POINTS=${MEDOID_SIDE_POINTS:-200000}
 MEDOID_SIDE_DIRS=${MEDOID_SIDE_DIRS:-36}
@@ -220,7 +235,8 @@ stage_signature() {
     decision)
       stage_signature flow-rollout | sed 's/^stage=flow-rollout$/stage=decision/'
       printf 'RECON_SAMPLES=%s\nRECON_POLISH_STEPS=%s\nRECON_RES=%s\nSWEEP=%s\nSRC=%s\n' \
-        "$RECON_SAMPLES" "$RECON_POLISH_STEPS" "$RECON_RES" "$RECON_GUIDANCE_SWEEP" "$SRC_OUTPUT"
+        "$RECON_SAMPLES" "$RECON_POLISH_STEPS" "$RECON_RES" \
+        "$RECON_GUIDANCE_SWEEP $RECON_CHURN_SWEEP" "$SRC_OUTPUT"
       ;;
     convex)
       printf 'stage=convex\nDATA_DIR=%s\nCONVEX_CKPT=%s\nSRC=%s\nSRC_FWD=%s\n' \
@@ -233,8 +249,8 @@ stage_signature() {
         "$RECON_SAMPLES" "$RECON_POLISH_STEPS" "$RECON_RES" "$RECON_SNAP" \
         "$MEDOID_VOLUME_ONLY" "$MEDOID_SIDE_POINTS" "$MEDOID_SIDE_DIRS" \
         "$MEDOID_SIDE_RES" "$MEDOID_SIDE_MODE"
-      printf 'RECON_GUIDANCE=%s\nSRC=%s\nSRC_FLOW=%s\nSRC_FWD=%s\n' \
-        "$RECON_GUIDANCE" "$SRC_OUTPUT" "$SRC_FLOW" "$SRC_FORWARD"
+      printf 'RECON_GUIDANCE=%s\nRECON_CHURN=%s\nSRC=%s\nSRC_FLOW=%s\nSRC_FWD=%s\n' \
+        "$RECON_GUIDANCE" "$RECON_CHURN" "$SRC_OUTPUT" "$SRC_FLOW" "$SRC_FORWARD"
       ;;
     score)
       printf 'stage=score\nDATA_DIR=%s\nRECON_DIR=results/lpd\nRECON_SAMPLES=%s\nRECON_RES=%s\nRECON_SNAP=%s\nMEDOID_VOLUME_ONLY=%s\nMEDOID_SIDE_POINTS=%s\nMEDOID_SIDE_DIRS=%s\nMEDOID_SIDE_RES=%s\nMEDOID_SIDE_MODE=%s\n' \
@@ -456,7 +472,7 @@ if [ "$FLOW_VAL_BODIES" -gt 0 ]; then
       --ckpt runs/lpd_flow.pt --corpus "$CORPUS_FILE" --val-bodies "$FLOW_VAL_BODIES" \
       --bodies "$FLOW_VAL_BODIES" --samples "$RECON_SAMPLES" \
       --polish-steps "$RECON_POLISH_STEPS" --res "$RECON_RES" \
-      --guidance $RECON_GUIDANCE_SWEEP \
+      --guidance $RECON_GUIDANCE_SWEEP --churn $RECON_CHURN_SWEEP \
       --side-points "$MEDOID_SIDE_POINTS" --out runs/decision_check.json
 else
   log "=== decision: skipped (FLOW_VAL_BODIES=0)"
@@ -515,7 +531,8 @@ if should_run reconstruct; then
     log "  --- model $M -> $OUT (started $(date -u +%H:%M:%S))"
     RECON_ARGS=(--model "$M" --samples "$RECON_SAMPLES" --res "$RECON_RES"
       --phases "$FLOW_PHASES" --operator-res "$FLOW_OPERATOR_RES"
-      --polish-steps "$RECON_POLISH_STEPS" --guidance "$RECON_GUIDANCE"
+      --polish-steps "$RECON_POLISH_STEPS" --guidance "$RECON_GUIDANCE" \
+      --churn "$RECON_CHURN"
       --ckpt runs/lpd_flow.pt --data-dir "$DATA_DIR" --out "$OUT"
       --medoid-side-points "$MEDOID_SIDE_POINTS"
       --medoid-side-dirs "$MEDOID_SIDE_DIRS"

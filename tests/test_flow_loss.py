@@ -73,9 +73,9 @@ def test_flow_loss_trains_reader_and_expert_with_every_term():
     full, prior_only, dropped = flow_loss(net, op, corpus, eta, idx, x0, t, 2, tag, mask,
                                           train_geoms=2, turns=turns, ablate=True)
     assert torch.isfinite(full) and torch.isfinite(prior_only) and dropped == 0
-    # a rolled-out state: one step of the sampler, then the loss at that step's time
+    # the rolled-out states: the sampler's whole trajectory, every state scored at its own time
     loss_r = flow_loss(net, op, corpus, eta, idx[:1], x0[:1], t[:1], 2, tag, mask,
-                       train_geoms=2, rollout_steps=torch.tensor([1]))
+                       train_geoms=2, rollout=2)
     assert torch.isfinite(loss_r)
 
 

@@ -67,8 +67,8 @@ from hac26.forward.mesh.instrument import Instrument                            
 from hac26.noise import NOISE_HI, NOISE_LO, NOISE_PROFILE                       # noqa: E402
 from hac26.shapes import canonicalize_r, mesh_support, rescale_touch_z          # noqa: E402
 from hac26.solvers.lpd_flow import (CHURN, N_EXPERTS, N_FEAT, N_MODES, N_SPHERE_CH,   # noqa: E402
-                                    N_STEPS, N_VOL_CH, LPDFlow, churn_step, flow_inputs,
-                                    geometry_tags)
+                                    N_STEPS, N_VOL_CH, FlowInputs, LPDFlow, churn_step,
+                                    flow_inputs, geometry_tags)
 from hac26.solvers.operator import CodeOperator                                 # noqa: E402
 
 CALIBRATION = "models/instrument_calibration.pt"   # written by scripts/calibrate.py
@@ -436,23 +436,54 @@ def operator_inputs(net, op: CodeOperator, x1_hat, h, radius, data, sigma, geoms
 
 
 @torch.no_grad()
-def rollout(net, op, x0, k, h, radius, data, sigma, geoms, step_mask, sph, vol, tag, M):
-    """The sampler's state after k of N_STEPS steps from x0, run exactly as LPDFlow.sample
-    runs it (operator at the prior's endpoint estimate, churn_step), for one batch. Training
-    on these states, instead of on points of the straight line between x0 and x1, teaches the
-    network on the states it will actually meet."""
+def rollout_states(net, op, x0, h, radius, data, sigma, geoms, step_mask, sph, vol, tag, M,
+            n_steps=N_STEPS):
+    """Every state the sampler visits from x0, run exactly as LPDFlow.sample runs it (operator
+    at the prior's endpoint estimate, churn_step), for one batch. Training on these states,
+    instead of on points of the straight line between x0 and x1, teaches the network on the
+    states it will actually meet.
+
+    Returns (states, times, inputs, dropped): the state before each step, its time, and the
+    operator's inputs there. The step had to make that operator call to continue the
+    trajectory, so scoring the loss at every state costs the network forwards and nothing
+    else, and the states cover the sampler's time grid once each."""
     x = x0.clone()
-    dt = 1.0 / N_STEPS
+    dt = 1.0 / n_steps
     dropped = 0
-    for s in range(int(k)):
+    xs, ts, inps = [], [], []
+    for s in range(int(n_steps)):
         t = torch.full((len(x),), s * dt, device=x.device)
         x1_hat = x + (1 - t[:, None]) * net.prior_velocity(x, t, radius, sph, vol)
         inp, n_bad = operator_inputs(net, op, x1_hat, h, radius, data, sigma, geoms,
                                      step_mask, sph, vol, M)
         dropped += n_bad
+        xs.append(x.clone()); ts.append(t); inps.append(inp)
         v = net.velocity(x, t, radius, tag, inp)
         x = churn_step(x, v, s * dt, dt, CHURN)
-    return x, dropped
+    return xs, ts, inps, dropped
+
+
+def _stack_states(xs, ts, inps):
+    """The states of a rollout as one batch: (x, t, FlowInputs), each stacked along the batch
+    axis in step order, so that a per-body quantity repeated `len(xs)` times lines up with
+    them."""
+    return (torch.cat(xs), torch.cat(ts),
+            FlowInputs(*(torch.cat([getattr(i, f) for i in inps])
+                         for f in FlowInputs._fields)))
+
+
+def _one_per_body(sel, n_bodies):
+    """One true entry per body, drawn among that body's true entries, from a mask over states
+    stacked in step order. The data-fit term costs an operator call per entry it keeps, and
+    over a trajectory every body offers several; keeping one holds the term's cost at what it
+    was per body while leaving it an unbiased estimate of the same average."""
+    keep = torch.zeros_like(sel)
+    idx = torch.nonzero(sel).flatten()
+    for b in range(n_bodies):
+        cand = idx[idx % n_bodies == b]
+        if len(cand):
+            keep[cand[int(torch.randint(len(cand), ()))]] = True
+    return keep
 
 
 # ------------------------------------------------------------------------------- the loss
@@ -564,7 +595,7 @@ class Diag(NamedTuple):
 
 
 def flow_loss(net, op: CodeOperator, corpus: Corpus, eta, idx, x0, t, M, tag, mask,
-              train_geoms=None, sigma=None, xi=None, zeta=None, turns=None, rollout_steps=None,
+              train_geoms=None, sigma=None, xi=None, zeta=None, turns=None, rollout=False,
               return_diag=False, ablate=False, occ_weight=OCC_WEIGHT, occ_eps=None,
               fit_weight=FIT_WEIGHT):
     """The training loss for one batch, given the draws (idx, x0, t, sigma, xi, zeta, turns):
@@ -588,12 +619,14 @@ def flow_loss(net, op: CodeOperator, corpus: Corpus, eta, idx, x0, t, M, tag, ma
     the correction it has to make at reconstruction.
 
     The state. By default x_t is the point of the straight line x_t = (1-t) x0 + t x1 at the
-    drawn t. With `rollout_steps` (B,) given, body b's state is instead what the sampler
-    itself reaches after that many of its N_STEPS steps from x0, with the operator at every
-    step, and t is that step's time; the target is still the straight line from there to x1.
-    The sampler's states drift away from the straight line, and a network trained only on
-    the line meets states it has never seen; training on rolled-out states closes that gap.
-    It costs one operator call per rolled step.
+    drawn t. With `rollout` set, the sampler is run from x0 for all of its N_STEPS steps and
+    every state it passes through is scored, at the time of the step that produced it; the
+    target is still the straight line from there to x1. The sampler's states drift away from
+    the straight line, and a network trained only on the line meets states it has never seen;
+    training on rolled-out states closes that gap. The trajectory calls the operator once per
+    step whether or not the state it reaches is scored, so scoring all of them costs the same
+    operator calls as scoring one and covers the sampler's time grid once each. An integer
+    shortens the trajectory, which only the tests need.
 
     The operator's inputs are taken at the endpoint the prior's velocity implies,
     x1_hat = x_t + (1-t) v_prior(x_t), not at x_t: at small t, x_t is mostly the Gaussian
@@ -655,36 +688,43 @@ def flow_loss(net, op: CodeOperator, corpus: Corpus, eta, idx, x0, t, M, tag, ma
     sph, vol = cond_channels(h_base, device=dev)
     tag_b = tag.expand(B, C, 4)
 
-    # The state: on the straight line, or where the sampler gets to.
+    # The state: on the straight line, or every state the sampler passes through.
     n_dropped = 0
-    if rollout_steps is None:
+    n_rep = 1
+    if not rollout:
         xt = (1 - t[:, None]) * x0 + t[:, None] * x1
+        with torch.no_grad():
+            v0 = net.prior_velocity(xt, t, radius, sph, vol)
+            inp, n_bad = operator_inputs(net, op, xt + (1 - t[:, None]) * v0, h_base, radius,
+                                         data, scale, geoms, step_mask, sph, vol, M)
+        n_dropped += n_bad
     else:
-        t = rollout_steps.to(dev).float() / N_STEPS
-        xt = torch.empty_like(x0)
-        for b in range(B):
-            sl = slice(b, b + 1)
-            xt[sl], n_bad = rollout(net, op, x0[sl], int(rollout_steps[b]), h_base[sl],
-                                    radius[sl], data[sl], scale[sl], geoms, step_mask[sl],
-                                    sph[sl], vol[sl], tag_b[sl], M)
-            n_dropped += n_bad
-
-    with torch.no_grad():
-        v0 = net.prior_velocity(xt, t, radius, sph, vol)
-        inp, n_bad = operator_inputs(net, op, xt + (1 - t[:, None]) * v0, h_base, radius,
-                                     data, scale, geoms, step_mask, sph, vol, M)
-    n_dropped += n_bad
+        xs, ts, inps, n_dropped = rollout_states(
+            net, op, x0, h_base, radius, data, scale, geoms, step_mask, sph, vol, tag_b, M,
+            n_steps=N_STEPS if rollout is True else int(rollout))
+        n_rep = len(xs)
+        xt, t, inp = _stack_states(xs, ts, inps)
+        rep = lambda z: z.repeat(n_rep, *([1] * (z.dim() - 1)))
+        x1, codes, sup_true = rep(x1), rep(codes), rep(sup_true)
+        h_base, radius, tag_b = rep(h_base), rep(radius), rep(tag_b)
+        data, scale, sph, vol = rep(data), rep(scale), rep(sph), rep(vol)
+        v0 = None
     step_mask = inp.mask
     u = net.velocity(xt, t, radius, tag_b, inp)
     loss, flow, occ, raw = step_loss(net, xt, t, u, x1, sup_true, codes, h_base, occ_weight,
                                      occ_eps)
     if ablate:
+        if v0 is None:
+            with torch.no_grad():
+                v0 = net.prior_velocity(xt, t, radius, sph, vol)
         return loss, step_loss(net, xt, t, v0, x1, sup_true, codes, h_base, occ_weight,
                                occ_eps)[0], n_dropped
 
     fit = torch.zeros((), device=dev)
     if fit_weight > 0:
         sel = (t >= FIT_FROM) & (step_mask.sum(1) > 0)
+        if n_rep > 1:
+            sel = _one_per_body(sel, B)
         if bool(sel.any()):
             x1_hat = (xt + (1 - t[:, None]) * u)[sel]
             val, g_fit, n_bad = data_fit(net, op, x1_hat, h_base[sel], radius[sel], data[sel],
@@ -1113,7 +1153,7 @@ def main():
     stopped_at = a.steps
 
     t_run = t_step = time.time()
-    dropped = rolled = 0
+    dropped = rolled = seen = 0
     for s in range(start_step, a.steps):
         idx = train_idx[torch.randint(0, len(train_idx), (a.batch,)).to(dev)]
         x0 = torch.randn(a.batch, codes.shape[1], dtype=codes.dtype).to(dev)
@@ -1121,13 +1161,14 @@ def main():
         # [0, 1), which lowers the variance of the loss estimate at no extra cost.
         t = ((torch.arange(a.batch, dtype=codes.dtype) + torch.rand(a.batch)) / a.batch)
         t = t[torch.randperm(a.batch)].to(dev)
-        steps = None
-        if a.rollout_frac > 0 and float(torch.rand(())) < a.rollout_frac:
-            steps = torch.randint(0, N_STEPS, (a.batch,))   # the state after this many steps
-            rolled += 1
+        roll = a.rollout_frac > 0 and float(torch.rand(())) < a.rollout_frac
+        rolled += int(roll)
+        # a rolled step applies the operator once per state, so what `dropped` is a share of
+        # is the operator's calls, not the bodies drawn
+        seen += a.batch * (N_STEPS if roll else 1)
         turns = torch.randint(0, 4, (a.batch,)).to(dev) if augment else None
         loss, parts = flow_loss(net, op, data, eta, idx, x0, t, M, tag, mask,
-                                train_geoms=train_geoms, turns=turns, rollout_steps=steps,
+                                train_geoms=train_geoms, turns=turns, rollout=roll,
                                 return_diag=True, occ_weight=a.occ_weight, occ_eps=occ_eps,
                                 fit_weight=a.fit_weight)
         dropped += parts.dropped
@@ -1152,16 +1193,15 @@ def main():
                       f"finish inside one window.", flush=True)
         if (a.log_every and s % a.log_every == 0) or s == a.steps - 1:
             rate = (now - t_run) / (s - start_step + 1)
-            seen = (s - start_step + 1) * a.batch
             print(f"  [{_now()}] step {s:>5}  loss {float(loss.detach()):.5f}  "
                   f"(flow {parts.flow:.5f}, occupancy {parts.occ:.5f}, "
-                  f"data fit {parts.fit:.5f})  dropped {dropped}/{seen} bodies"
+                  f"data fit {parts.fit:.5f})  dropped {dropped}/{seen} states"
                   + (f"  rolled out {rolled} batches" if a.rollout_frac > 0 else "")
                   + f"  {step_s:.1f}s/step  elapsed {_hms(elapsed)}  "
                   f"eta {_hms(rate * (a.steps - s - 1))}", flush=True)
             if dropped > 0.5 * seen:
                 # a step that drops most of its batch is not training; say so every time
-                print(f"  WARNING: {dropped} of {seen} bodies had no curves so far -- the "
+                print(f"  WARNING: {dropped} of {seen} states had no curves so far -- the "
                       f"operator is failing on most endpoint estimates", flush=True)
 
         stop = False

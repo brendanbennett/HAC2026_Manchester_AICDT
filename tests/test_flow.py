@@ -5,7 +5,8 @@ import torch
 from hac26.conventions import cameras
 from hac26.field import CODE_DIM, N_DIR
 from hac26.solvers.lpd_flow import (N_FEAT, N_SPHERE_CH, N_VOL_CH, LATTICE_SHAPE, LPDFlow,
-                                    churn_step, flow_inputs, geometry_tags, time_embed)
+                                    PrimalNet, churn_step, descent_scale, flow_inputs,
+                                    geometry_tags, time_embed)
 
 
 def _codec():
@@ -77,7 +78,7 @@ def test_each_time_goes_to_its_own_expert():
     summary = net.reader(inp.resid, tag, inp.mask)
     for e, sel in ((0, [0, 1]), (1, [2, 3])):
         direct = (net.prior_velocity(code[sel], t[sel], rad[sel], inp.sphere[sel], inp.vol[sel])
-                  + net.experts[e](code[sel], summary[sel], time_embed(t[sel]),
+                  + net.experts[e](code[sel], t[sel], summary[sel], time_embed(t[sel]),
                                    torch.log(rad[sel]), inp.select(sel)))
         assert torch.allclose(v[sel], direct, atol=1e-6)
 
@@ -107,9 +108,11 @@ def test_branching_copies_the_trained_expert_and_shares_the_reader():
     assert torch.allclose(before, after, atol=1e-5)      # float32 rounding, summed differently
 
 
-def test_a_fresh_data_part_adds_nothing_to_the_prior():
-    """Every output path of a fresh expert is zero-initialised, so at the start of the data
-    part's training the velocity is the prior's alone."""
+def test_a_fresh_data_part_is_the_closed_form_descent_step():
+    """The branches and the skip of a fresh expert are zero-initialised and its correction to
+    the descent step is too, so at the start of the data part's training the velocity is the
+    prior's plus the step the conditional velocity asks for (descent_scale) and nothing else.
+    A body whose adjoint is zero gets no step."""
     net = _codec().eval()
     with torch.no_grad():                 # a prior that says something, unlike a fresh one
         net.prior.gain[-1].bias.fill_(0.3)
@@ -119,8 +122,13 @@ def test_a_fresh_data_part_adds_nothing_to_the_prior():
     code = torch.randn(B, CODE_DIM)
     inp = _inputs(B, C)
     v = net.velocity(code, t, torch.ones(B), geometry_tags().expand(B, -1, -1), inp)
-    assert torch.allclose(v, net.prior_velocity(code, t, torch.ones(B), inp.sphere, inp.vol))
-    assert v.abs().sum() > 0
+    prior = net.prior_velocity(code, t, torch.ones(B), inp.sphere, inp.vol)
+    size = descent_scale(t)[:, None] * torch.exp(inp.adj_log)
+    want = PrimalNet._capped(torch.cat([size[:, :1] * inp.adj[:, :N_DIR],
+                                        size[:, 1:] * inp.adj[:, N_DIR:]], -1), code)
+    assert torch.allclose(v - prior, want, atol=1e-6)
+    assert prior.abs().sum() > 0 and want.abs().sum() > 0
+    assert float(want[1].abs().max()) < 1e-5      # the body with no adjoint gets no step
 
 
 def test_sampler_runs_with_and_without_noise():
