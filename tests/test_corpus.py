@@ -8,7 +8,8 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 
-from hac26.field import CODE_DIM, N_DIR, ImplicitBody                          # noqa: E402
+from hac26.field import (CODE_DIM, LATTICE_SHAPE, N_DIR,                      # noqa: E402
+                         ImplicitBody)
 from hac26.shapes import icosphere, mesh_support                              # noqa: E402
 from build_corpus import correction, correction_matrix, corpus_radius          # noqa: E402
 from train_lpd import (Corpus, _quarter_turn_maps, held_out, inv_softplus,     # noqa: E402
@@ -114,8 +115,10 @@ def test_a_quarter_turn_is_the_pair_the_operator_would_render():
     op = _small_operator(P)
     h, _, _ = _support([1.0, 0.7, 1.2])                       # not symmetric under a quarter turn
     code = torch.zeros(1, CODE_DIM)
-    g = torch.zeros(12, 12, 12)
-    g[8, 3, 6] = 0.4                                          # one dent, off both axes
+    g = torch.zeros(LATTICE_SHAPE)
+    # one dent, off the spin axis and off the plane that a quarter turn would map to itself,
+    # placed by its position in the lattice so that it is the same dent at any lattice size
+    g[tuple(int(round(fr * s)) for fr, s in zip((0.67, 0.25, 0.5), LATTICE_SHAPE))] = 0.4
     code[0, N_DIR:] = g.reshape(-1)
     geoms = [0, 2, 5]
     curves, turned = op.curves_turned(h, code[0], 1.2, geoms=geoms)

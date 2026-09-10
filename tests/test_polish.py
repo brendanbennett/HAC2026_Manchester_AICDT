@@ -3,12 +3,14 @@ draw on the exact misfit, and the data-fit term's value and gradient."""
 import sys
 from pathlib import Path
 
+import numpy as np
 import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 
 from hac26.conventions import psi_grid                                         # noqa: E402
-from hac26.field import CODE_DIM, N_DIR, ImplicitBody                          # noqa: E402
+from hac26.field import (CODE_DIM, N_DIR, GaussianLattice, ImplicitBody,      # noqa: E402
+                         lattice_kernel)
 from hac26.forward.mesh.exact import RenderConfig                              # noqa: E402
 from hac26.forward.mesh.instrument import Instrument                           # noqa: E402
 from hac26.shapes import icosphere, mesh_support                              # noqa: E402
@@ -28,6 +30,29 @@ SMALL = RenderConfig(height=48, width=80, supersample=2, sun_res=128, phase_chun
                      radiosity_faces=48)
 GEOMS = [0, 7]
 
+_KERNEL = None
+
+
+def _at_depth(g: torch.Tensor, depth: float) -> torch.Tensor:
+    """Amplitudes rescaled so that the field they make at the sites is `depth` deep.
+
+    The bodies here are named by the dents they have, and a dent is a depth. Amplitudes are
+    not: the same amplitude makes a deeper field the more the kernels overlap and a narrower
+    one the finer the lattice, so a body written as a fixed amplitude is a different body on
+    a different lattice, which is how a test comes to check nothing."""
+    global _KERNEL
+    if _KERNEL is None:
+        _KERNEL = lattice_kernel()
+    made = float(np.abs(_KERNEL @ g.detach().numpy().astype(np.float64)).max())
+    return g * (depth / made) if made > 1e-9 else g * 0.0
+
+
+def _blob(centre, width: float) -> torch.Tensor:
+    """A single dent: a Gaussian of the given width in body units, at the given place."""
+    p = GaussianLattice().p.numpy()
+    return torch.tensor(np.exp(-((p - np.asarray(centre)) ** 2).sum(1) / width ** 2),
+                        dtype=torch.float32)
+
 
 def _setup():
     op = CodeOperator(Instrument(quantise=False), psi_grid(4), res=16, config=SMALL,
@@ -36,9 +61,8 @@ def _setup():
     v = v * [0.9, 0.7, 1.0]
     h = torch.tensor(mesh_support(v, ImplicitBody().core.n.numpy()), dtype=torch.float32)
     target = torch.zeros(CODE_DIM)
-    g = torch.zeros(12, 12, 12)
-    g[7, 4, 6] = 0.3                                    # the dent the data know about
-    target[N_DIR:] = g.reshape(-1)
+    # the dent the data know about, off both axes so that no symmetry hides it
+    target[N_DIR:] = _at_depth(_blob((0.35, -0.45, 0.0), 0.28), 0.30)
     data = op.curves(h, target, 1.2, geoms=GEOMS)       # (2, 2, P) of the geometries used
     full = torch.ones(28, 2, data.shape[-1])
     full[GEOMS] = data
@@ -47,10 +71,11 @@ def _setup():
     gen = torch.Generator().manual_seed(0)
     codes = torch.zeros(8, CODE_DIM)
     codes[:, :N_DIR] = 0.05 * torch.randn(8, N_DIR, generator=gen)
-    codes[:, N_DIR:] = 0.1 * torch.randn(8, CODE_DIM - N_DIR, generator=gen)
+    for i in range(len(codes)):                         # bodies dented to a tenth of a radius
+        codes[i, N_DIR:] = _at_depth(torch.randn(CODE_DIM - N_DIR, generator=gen), 0.10)
     net.codec.fit(codes)
     start = torch.zeros(CODE_DIM)                       # a generic body without the dent
-    start[N_DIR:] = 0.03 * torch.randn(CODE_DIM - N_DIR, generator=gen)
+    start[N_DIR:] = _at_depth(torch.randn(CODE_DIM - N_DIR, generator=gen), 0.05)
     return op, h, net, full, scale, net.codec.encode(start)
 
 

@@ -6,7 +6,7 @@ import torch
 
 from hac26.conventions import psi_grid
 from hac26.field import (CODE_DIM, LATTICE_SHAPE, N_RADIAL, N_SITES, GaussianLattice,
-                         ImplicitBody, lattice_kernel)
+                         ImplicitBody, lattice_kernel, radial_basis)
 from hac26.forward.mesh.exact import RenderConfig
 from hac26.forward.mesh.instrument import Instrument
 from hac26.shapes import canonicalize_r, icosphere, mesh_support, rescale_touch_z
@@ -74,12 +74,23 @@ def _operator_and_bodies():
                       device="cpu", backend="software")
     K = lattice_kernel()
     sites = GaussianLattice().p.numpy()
-    # a waist across the spin axis, the feature a convex inversion cannot see
-    target = 0.35 * np.exp(-((sites @ np.array([1.0, 0.0, 0.0])) / 0.30) ** 2)
-    g_true = target / float(np.asarray(K.sum(1)).ravel().max())
+    # a waist across the spin axis, the feature a convex inversion cannot see, at a depth
+    # measured through the kernel rather than estimated from its overlap, which is what
+    # waist_amplitudes does and what makes the depth the same at any lattice size
+    target = np.exp(-((sites @ np.array([1.0, 0.0, 0.0])) / 0.30) ** 2)
+    g_true = target * (0.35 / float(np.abs(K @ target).max()))
     c_true = np.zeros(N_RADIAL)
-    c_true[0] = 0.06                                  # and a hull that is slightly too large
+    # and a hull too large by about what a convex inversion of a body with a waist leaves
+    c_true[0] = 0.10
     return op, support, K, g_true, c_true
+
+
+def _correction(K, c, g):
+    """The correction field at the sites, both halves together. Neither half means anything
+    on its own: the same body is a larger hull carved more deeply or a smaller hull carved
+    less, so what a step has to move toward the body is this sum."""
+    sites = GaussianLattice().p
+    return (radial_basis(sites).numpy() @ np.asarray(c)) + (K @ np.asarray(g))
 
 
 @pytest.mark.slow
@@ -102,8 +113,7 @@ def test_one_step_moves_a_body_toward_the_one_its_curves_came_from():
     data = render(c_true, g_true)
     assert data is not None
     scale = np.full(len(data), 0.01)
-    fit = CarveFit(render, data, scale, K, LATTICE_SHAPE, n_radial=N_RADIAL,
-                   step_g=0.20, step_c=0.03, seed=0)
+    fit = CarveFit(render, data, scale, K, LATTICE_SHAPE, n_radial=N_RADIAL, seed=0)
 
     start = fit.residual(render(np.zeros(N_RADIAL), np.zeros(N_SITES)))
     chi0 = float(np.linalg.norm(start))
@@ -114,7 +124,6 @@ def test_one_step_moves_a_body_toward_the_one_its_curves_came_from():
     assert chi1 < chi0
 
     # and the body moved toward the truth, not merely toward the curves
-    field_true, field_fit = K @ g_true, K @ g
-    assert float(field_fit @ field_true) > 0.0
-    assert np.linalg.norm(field_fit - field_true) < np.linalg.norm(field_true)
-    assert abs(c[0] - c_true[0]) < abs(c_true[0])
+    want = _correction(K, c_true, g_true)
+    assert (np.linalg.norm(_correction(K, c, g) - want)
+            < np.linalg.norm(_correction(K, np.zeros(N_RADIAL), np.zeros(N_SITES)) - want))
