@@ -12,8 +12,9 @@ the rules.
 
 ## The submission
 
-The submitted bodies are the convex stage's answers, `results/submission/Asteroid04.stl` to
-`Asteroid10.stl`, produced by
+The submitted bodies are `results/submission/Asteroid04.stl` to `Asteroid10.stl`. They are
+built in two steps: a convex inversion, which is quick and always available, and a correction
+of it, which is accepted per model only where it has been shown to help. The convex stage is
 
 ```
 python scripts/make_submission.py
@@ -38,17 +39,20 @@ assumes, and the laboratory columns of several bodies are out of phase with thei
 geometry by tens of degrees. `scripts/reconstruct.py --channel` forces either channel for one
 model.
 
-Why the convex answer and not a carved one is measured rather than assumed. On the three
-public bodies, one of which is a contact binary, every refinement of the convex answer that
-this repository or its history has produced, the trained flow, gradient descent on the exact
-misfit, searches over carved bodies, scored below the convex answer or equal to it under the
-organisers' measures, because a body that fits the curves better than the convex answer is
-not, on the evidence of the public bodies, a body closer to the truth. `scripts/benchmark.py`
-scores any directory of reconstructions the same way, so a refinement earns its place by
-that number.
+The convex answer is not the body, and on a body with concavities it is not even the body's
+hull. A convex inversion returns the convex body whose own shadowing best imitates the
+concavities, which is larger than the hull of the body that cast them; of the three public
+bodies the answer exceeds the true hull on the one that has concavities and falls short of it
+on the two that do not. Correcting it is the subject of the non-convex path below, and a
+correction replaces a convex answer only where `scripts/select_answers.py` accepts it.
+`results/submission/selection.json` then records, per model, which answer was submitted and
+the numbers behind the choice.
+
+`scripts/benchmark.py` scores any directory of reconstructions against the released shapes
+with the organisers' own measures, which is how a change to the method earns its place.
 
 ```
-python scripts/benchmark.py results/public results/lpd
+python scripts/benchmark.py results/public results/gn
 ```
 
 ## Install
@@ -88,9 +92,17 @@ make.
 
 ## The non-convex path
 
-Everything beyond the convex stage is research code. It runs, it is tested, and none of its
-answers are submitted, for the reason above. It needs an instrument fitted to the channel it
-inverts, which `scripts/calibrate.py` writes from the public models' released shapes.
+The correction from the convex answer to the body is two moves at once: the hull shrinks and
+the surface is carved. Neither is worth making alone. Laid on the convex answer of the
+non-convex public model separately and scored against the released render, the reshaping
+alone raises the misfit and the carve alone barely lowers it, while the two together lower it
+by more than half and take the overlap with the truth from 0.69 to 0.99. That is why a search
+which moves one coordinate direction at a time walks away from the answer, and it is the
+reason every carve of a fixed hull that this repository has measured scored no better than
+not carving at all.
+
+Everything here needs an instrument fitted to the channel it inverts, which
+`scripts/calibrate.py` writes from the public models' released shapes.
 
 ```
 python scripts/calibrate.py                                # the laboratory channel
@@ -99,28 +111,46 @@ python scripts/calibrate.py --channel blender --models 1 3 # the Blender render
 
 The two channels are different instruments (`hac26/forward/mesh/instrument.py`). The
 laboratory curves come through a lens, a sensor and bounce light off a matte white print,
-while the render has none of those and a far camera, so it starts from `Instrument.blender_start`,
-a far camera with the interreflection switched off and an sRGB-like transfer curve, and is
-written to its own file. The calibration prints the residual of the exact forward model at
+while the render has none of those and its camera is at infinity, so it starts from
+`Instrument.blender_start`: an orthographic projection rather than a very distant perspective
+one, the interreflection switched off, and the power-law transfer a renderer's display
+transform applies. Both switches are saved with the instrument, so a loaded instrument
+renders as it was fitted. The calibration prints the residual of the exact forward model at
 the true shape divided by the noise, per geometry, which is the number that says how well
 the chain matches the channel, and a travel table that names any parameter still moving
 when the step budget ran out.
 
-Descent from the convex answer, with cameras held out as the check on whether a shape was
-recovered rather than curves fitted.
+The fit itself moves the nine reshaping coefficients and the lattice amplitudes in one damped
+Gauss-Newton step with a secant Jacobian, coarse to fine over the amplitudes and restarted
+from several shrunken and carved bodies (`hac26/solvers/gauss_newton.py`). Nothing
+differentiates the renderer. Run the non-convex public model first, because its truth is
+released and the gate below is calibrated on it, then the scored models.
 
 ```
-python scripts/reconstruct_map.py --model 3 --channel blender --hold-out-geoms 6 \
-    --out results/map/Asteroid03.stl
-python scripts/select_answers.py --refined results/map --ratio <measured on model 3>
+python scripts/reconstruct_gn.py --model 3 --channel blender --out results/gn/Asteroid03.stl
+for M in 4 5 6 7 8 9 10; do
+  python scripts/reconstruct_gn.py --model $M --channel blender \
+      --out "results/gn/Asteroid$(printf %02d $M).stl"
+done
+python scripts/select_answers.py --refined results/gn --calibrate results/gn/Asteroid03.json
 ```
 
-`reconstruct_map.py` records, for the body as written, its misfit on the fitted and on the
-held-out geometries beside the convex answer's, and on a public model the Dice against the
-released shape at every checkpoint. `select_answers.py` replaces a convex answer only where
-the refined body beats it on the held-out geometries by a ratio measured on the public
-model whose refinement raised the score, and writes `results/submission/selection.json`
-saying what it did.
+Cameras are held out of every fit, and the body's misfit on them is written beside the convex
+answer's on the same cameras. That pair is the only test of whether a shape was recovered
+rather than curves fitted: a body fitted on all of them can reach any misfit by overfitting.
+`select_answers.py` accepts a correction for a scored model only where it beats its convex
+answer on its held-out cameras by as much as the public model's correction did, and only if
+that public correction raised the overlap with its released shape. Where it did not, a lower
+misfit is not evidence of a better body and the convex answers stand.
+
+`scripts/reconstruct_map.py` is the same problem by gradient descent on the exact misfit,
+without the reshaping, and writes the same fields, so `select_answers.py` reads either.
+
+How fine the lattice has to be is not a free choice. A carve the field can only hold blurred
+fits the curves worse than no carve at all, because a shadow is cast by an edge, so the
+representation has to be able to hold the body before any solver can find it.
+`notes/representation.md` measures what each lattice can hold and why the one in
+`hac26/field.py` was chosen.
 
 The flow pipeline, `scripts/run_remote_pipeline.sh`, builds a shape library, fits shape codes
 to it, renders a corpus with the exact operator and the convex stage's starts, trains the
@@ -132,8 +162,9 @@ match, so a dropped run is safe to relaunch and a change to the code reruns the 
 it. `scripts/run_smoke_test.sh` runs the same stages small, as a wiring check. Every setting
 is a variable at the top of the pipeline script and can be overridden from the environment.
 Training states lie on the straight line between noise and body only, and `train_lpd.py`
-says why states from the sampler's own trajectory are not scored. The flow's answers are scored
-beside the convex ones by the pipeline's last stage and are not part of the submission.
+says why states from the sampler's own trajectory are not scored. The flow's answers are
+scored beside the convex ones by the pipeline's last stage and reach the submission by the
+same gate as any other correction.
 
 ## Tests
 
@@ -146,11 +177,13 @@ pytest -m "not slow"     # skip the extraction-scale ones
 
 ```
 hac26/forward/    forward models; see forward/__init__.py
-hac26/solvers/    lpd_convex, lpd_flow, minkowski, operator, output
+hac26/solvers/    lpd_convex, lpd_flow, gauss_newton, minkowski, operator, output
 hac26/scoring/    official (the organisers' measures), voxel, side_view
 hac26/            conventions, geometry, field, shapes, noise, shape_library, curves_mesh,
                   data_io, recon, library_io, library_metrics
-scripts/          entry points; make_submission.py is the submission
+scripts/          entry points; make_submission.py builds the submission and
+                  select_answers.py decides which corrections enter it
+notes/            measurements that settle a choice made in the code
 models/           the trained convex solver; the calibrations calibrate.py writes go here
 results/          submission/ the scored models, public/ the public ones, public_scores.json
 dataset/          challenge data, not tracked

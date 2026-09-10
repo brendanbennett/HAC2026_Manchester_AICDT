@@ -1,16 +1,22 @@
 #!/usr/bin/env python3
 """Decide, per scored model, whether a refined body replaces the convex answer.
 
-    python scripts/select_answers.py --refined results/map --ratio 0.7
+    python scripts/select_answers.py --refined results/gn --calibrate results/gn/Asteroid03.json
 
 A refinement is accepted for a model when its misfit on the geometries held out of its fit,
 measured on the body as written (`chi_held_export` in the refinement's JSON), is at most
-`--ratio` times the convex answer's misfit on the same geometries (`chi_held_convex`), and
-the file passes the submission check. The ratio is not a default of this script because it
-is a measured quantity: it comes from the public model whose refinement improved the score
-against the released shape, and a refinement of a scored model is trusted only where it
-beats its convex answer by at least as much as that one did. Without a public model on
-which the refinement passed, there is no ratio and the convex answers stand.
+`ratio` times the convex answer's misfit on the same geometries (`chi_held_convex`), and the
+file passes the submission check. The held-out geometries are the whole of the argument: a
+body fitted on every camera can reach any misfit by shape or by overfitting, and only a
+camera the fit never saw separates the two.
+
+The ratio is a measured quantity rather than a constant of this script. It comes from a
+public model, whose truth is released: `--calibrate` reads that model's refinement, checks
+that the refinement moved the body toward its truth rather than away from it, and takes the
+misfit ratio it reached there. A refinement of a scored model is then trusted only where it
+beats its convex answer by at least as much. Where no public model's refinement improved the
+overlap, there is no evidence that a lower misfit is a better shape, and the convex answers
+stand. `--ratio` sets the number directly, for a run whose calibrating model is not at hand.
 
 The accepted files are copied over the convex answers under results/submission, which
 scripts/make_submission.py regenerates in seconds, and results/submission/selection.json
@@ -32,6 +38,34 @@ from hac26.conventions import CYLINDER_R, PUBLIC_MODELS    # noqa: E402
 from reconstruct import answer_path                        # noqa: E402
 
 SELECTION_FILE = "results/submission/selection.json"
+RATIO_MARGIN = 1.0    # how much of a public model's ratio a scored model has to reproduce.
+                      # One asks for the same improvement; the ratio is one measurement of
+                      # one body, and asking a secret body to beat it is not warranted.
+
+
+def calibrated_ratio(meta: dict) -> float:
+    """The largest accepted misfit ratio, from a public model's refinement of known truth.
+
+    A refinement that lowered the misfit while lowering the overlap with the truth is the
+    failure this gate exists to catch, so it yields no ratio at all rather than a lenient
+    one. So does a refinement of a body whose truth is not released, or one fitted on every
+    camera, whose misfit is not a test of anything.
+    """
+    if not meta.get("held_out"):
+        raise SystemExit("the calibrating run held out no geometries, so its misfit ratio "
+                         "is not a test of a shape")
+    dice, base_dice = meta.get("final_dice"), meta.get("convex_dice")
+    if dice is None or base_dice is None or not (dice == dice and base_dice == base_dice):
+        raise SystemExit("the calibrating run is of a model whose truth is not released, so "
+                         "there is nothing to calibrate against")
+    if dice <= base_dice:
+        raise SystemExit(f"the calibrating refinement took the overlap from {base_dice:.4f} "
+                         f"to {dice:.4f}, so a lower misfit is not evidence of a better "
+                         f"shape and the convex answers stand")
+    held, convex = meta.get("chi_held_export"), meta.get("chi_held_convex")
+    if not held or not convex or not (held < float("inf")):
+        raise SystemExit("the calibrating run has no held-out misfit")
+    return RATIO_MARGIN * held / convex
 
 
 def decide(meta: dict, ratio: float) -> tuple:
@@ -51,18 +85,35 @@ def decide(meta: dict, ratio: float) -> tuple:
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--refined", required=True,
-                    help="directory of Asteroid<NN>.stl and .json written by reconstruct_map.py")
-    ap.add_argument("--ratio", type=float, required=True,
-                    help="largest accepted held-out misfit of a refinement, as a fraction of "
-                         "the convex answer's; measured on the public model that passed")
+                    help="directory of Asteroid<NN>.stl and .json written by "
+                         "reconstruct_gn.py or reconstruct_map.py")
+    ap.add_argument("--calibrate",
+                    help="a public model's refinement JSON from the same run; the accepted "
+                         "misfit ratio is the one it reached, and only if it improved the "
+                         "overlap with the released truth")
+    ap.add_argument("--ratio", type=float,
+                    help="the accepted ratio directly, when the calibrating run is not at "
+                         "hand; largest held-out misfit of a refinement as a fraction of the "
+                         "convex answer's")
     ap.add_argument("--models", nargs="+", type=int,
                     default=[M for M in range(1, 11) if M not in PUBLIC_MODELS])
     a = ap.parse_args()
-    if not 0.0 < a.ratio <= 1.0:
-        raise SystemExit("--ratio must lie in (0, 1]: a refinement that fits the held-out "
-                         "geometries no better than the convex answer is not accepted")
+    if (a.calibrate is None) == (a.ratio is None):
+        raise SystemExit("give either --calibrate, to measure the ratio on a public model, "
+                         "or --ratio to set it")
+    calibration = json.loads(Path(a.calibrate).read_text()) if a.calibrate else None
+    ratio = a.ratio if a.ratio is not None else calibrated_ratio(calibration)
+    if not 0.0 < ratio <= 1.0:
+        raise SystemExit(f"the accepted ratio {ratio:g} is outside (0, 1]: a refinement that "
+                         f"fits the held-out geometries no better than the convex answer is "
+                         f"not accepted")
+    if calibration is not None:
+        print(f"ratio {ratio:.3f}, from model {calibration['model']}, whose refinement took "
+              f"the overlap with its released truth from {calibration['convex_dice']:.4f} to "
+              f"{calibration['final_dice']:.4f}", flush=True)
 
-    selection = {"ratio": a.ratio, "refined_dir": a.refined, "models": {}}
+    selection = {"ratio": ratio, "refined_dir": a.refined,
+                 "calibrated_on": a.calibrate, "models": {}}
     for M in a.models:
         target = answer_path(M)
         stl = Path(a.refined) / f"Asteroid{M:02d}.stl"
@@ -72,7 +123,7 @@ def main() -> None:
             entry["reason"] = "no refinement written"
         else:
             meta = json.loads(js.read_text())
-            accept, reason = decide(meta, a.ratio)
+            accept, reason = decide(meta, ratio)
             check = inspect(stl, CYLINDER_R[M])
             if accept and check["fails"]:
                 accept, reason = False, "refined file fails the submission check: " + \

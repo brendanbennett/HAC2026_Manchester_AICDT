@@ -105,7 +105,6 @@ def test_the_radial_term_displaces_the_surface_by_its_own_amount():
     degree-two coefficient moves the surface along its own direction by about its size. This
     is why the reshaping is added to the field rather than to the support values inside a
     softplus, whose slope varies across the normals."""
-    import numpy as np
     from hac26.field import ImplicitBody, N_RADIAL, radial_basis
 
     body = ImplicitBody()

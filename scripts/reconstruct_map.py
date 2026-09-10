@@ -73,6 +73,16 @@ def truth_dice(verts, faces, model: int, data_dir: str) -> float:
                       mesh_occupancy(tv, tf, OCC_RES, e)))
 
 
+def convex_dice(stl: str, model: int, data_dir: str) -> float:
+    """Dice of the answer a refinement started from, against the released truth. It is what
+    says whether a refinement moved a public body toward its truth or away from it, and
+    therefore whether the misfit ratio it reached may be trusted on a body whose truth is
+    secret; scripts/select_answers.py reads both."""
+    import trimesh
+    m = trimesh.load(stl, process=False)
+    return truth_dice(np.asarray(m.vertices), np.asarray(m.faces), model, data_dir)
+
+
 def convexity(verts, faces) -> float:
     """Volume over convex-hull volume; nan for a mesh whose hull cannot be built."""
     import trimesh
@@ -269,6 +279,7 @@ def main() -> None:
                 "chi_fit_convex": convex_fit, "chi_held_convex": convex_held,
                 "chi_fit_export": fit_x, "chi_held_export": held_x,
                 "final_dice": truth_dice(v, f, a.model, a.data_dir),
+                "convex_dice": convex_dice(sup_stl, a.model, a.data_dir),
                 "final_convexity": convexity(v, f)}
         Path(a.out).with_suffix(".json").write_text(json.dumps(meta, indent=2))
         np.savez(Path(a.out).with_suffix(".code.npz"), code=z.cpu().numpy(),

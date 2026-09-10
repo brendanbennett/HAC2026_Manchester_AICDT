@@ -25,8 +25,8 @@ from __future__ import annotations
 import torch
 
 from hac26.conventions import PSI0
-from hac26.field import (CODE_DIM, EXTRACT_EXTENT, EXTRACT_RES, N_DIR, N_RADIAL,
-                         ImplicitBody, extract_mesh)
+from hac26.field import (CODE_DIM, EXTRACT_EXTENT, EXTRACT_RES, N_DIR, ImplicitBody,
+                         extract_mesh)
 from hac26.forward.mesh.exact import ExactForward, RenderConfig, normalise, normalise_vjp
 from hac26.forward.mesh.instrument import Instrument
 from hac26.forward.mesh.radiosity import RadiosityError
