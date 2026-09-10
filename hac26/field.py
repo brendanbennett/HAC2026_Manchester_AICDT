@@ -1,13 +1,16 @@
 """The shape representation: a convex core plus a signed correction on a fixed lattice.
 
-    f(y) = max_j (n_j . y - h_j) + Delta(y),   Delta(y) = sum_k g_k exp(-||(y-p_k)/sigma||^2/2)
+    f(y) = max_j (n_j . y - h_j) + q(y/|y|) + Delta(y),
+    Delta(y) = sum_k g_k exp(-||(y-p_k)/sigma||^2/2),   q(u) = sum_lm c_lm Ybar_lm(u)
 
 The body is where f < 0. The core is the intersection of half-spaces on fixed normals n_j
 with support values h_j, so on its own it is a convex polytope whose faces lie in the planes
 n_j . y = h_j. Delta is a sum of Gaussian bumps with signed amplitudes g_k on fixed sites p_k;
-it is the only part that can make the body non-convex. h also carries a small band-limited
-correction dh, because the convex stage that supplies h cannot see concavities and so gets
-the hull slightly wrong.
+it is the only part that can make the body non-convex. The convex stage that supplies h
+cannot see concavities and so gets the hull slightly wrong, and two corrections to it are
+available: dh, a band-limited correction to the support values themselves, and q, a
+degree-two field added to f, whose coefficients are displacements in body units. A caller
+uses one or the other.
 
 The max is a plain max, not a smooth one. Autodiff sends the gradient to the half-space that
 owns the surface at that point; a smooth maximum would pull every face inward.
@@ -31,7 +34,7 @@ import torch.nn.functional as F
 __all__ = ["spherical_design", "design_sha", "DESIGN_N", "DESIGN_T", "DESIGN_ITERS",
            "ConvexCore", "GaussianLattice", "ImplicitBody", "extract_mesh",
            "apply_constraints", "LATTICE_SHAPE", "LATTICE_EXTENT", "LATTICE_ALPHA",
-           "EXTRACT_EXTENT",
+           "EXTRACT_EXTENT", "RADIAL_DEGREE", "N_RADIAL", "radial_basis", "radial_field",
            "N_SITES", "N_DIR", "CODE_DIM", "SH_DEGREE", "dir_design", "sh_expand",
            "support_resample", "support_resample_weights"]
 
@@ -287,6 +290,41 @@ def _real_sh(x: np.ndarray, degree: int = SH_DEGREE) -> np.ndarray:
     return np.stack(cols, 1)                       # (len(x), (degree+1)^2)
 
 
+RADIAL_DEGREE = 2                          # band limit of the radial reshaping term
+N_RADIAL = (RADIAL_DEGREE + 1) ** 2        # its coefficients
+
+
+def radial_basis(u: torch.Tensor) -> torch.Tensor:
+    """The real spherical harmonics of degree at most RADIAL_DEGREE at the unit vectors u
+    (n, 3), as (n, N_RADIAL), each scaled to unit root mean square over the sphere.
+
+    Unit root mean square rather than unit integral so that a coefficient is a length. The
+    degree-zero column is then identically one, and a coefficient vector of size s displaces
+    the surface of a convex core by about s in body units, because on a facet of a polytope
+    the core's gradient has unit norm and adding a constant to the field moves the level set
+    by that constant.
+    """
+    u = u / u.norm(dim=-1, keepdim=True).clamp_min(1e-9)
+    x, y, z = u[..., 0], u[..., 1], u[..., 2]
+    r3, r15 = np.sqrt(3.0), np.sqrt(15.0)
+    one = torch.ones_like(x)
+    return torch.stack([
+        one,
+        r3 * y, r3 * z, r3 * x,
+        r15 * x * y, r15 * y * z,
+        0.5 * np.sqrt(5.0) * (3.0 * z ** 2 - 1.0),
+        r15 * x * z, 0.5 * r15 * (x ** 2 - y ** 2)], -1)
+
+
+def radial_field(y: torch.Tensor, c: torch.Tensor) -> torch.Tensor:
+    """sum_lm c_lm Ybar_lm(y / |y|) at the points y (n, 3).
+
+    The direction of a point is undefined at the origin, which is inside every body the
+    challenge poses and never on a level set, so it is guarded and not special-cased.
+    """
+    return radial_basis(y) @ c
+
+
 def support_resample_weights(src: np.ndarray, dst: np.ndarray, k: int = 6):
     """The resampling of support_resample as (indices, weights), both (len(dst), k): the k
     source directions each destination direction reads, and their weights. The form to use
@@ -386,7 +424,8 @@ class GaussianLattice(nn.Module):
 
 
 class ImplicitBody(nn.Module):
-    """f(y) = max_j (n_j . y - h_j) + Delta(y), with h = softplus(inv_softplus(h_base) + expand(dh)).
+    """f(y) = max_j (n_j . y - h_j) + q(y/|y|) + Delta(y), with
+    h = softplus(inv_softplus(h_base) + expand(dh)) and q the radial reshaping term.
 
     h_base is the support the body starts from: the hull support of a training body, or the
     convex stage's answer at reconstruction. dh is a band-limited correction to it, sampled on
@@ -399,6 +438,13 @@ class ImplicitBody(nn.Module):
 
     The band limit is exact on the argument of the softplus and only approximate on h itself,
     because the slope of softplus varies across normals.
+
+    q is the same correction written differently, and a caller uses one or the other. It is
+    the degree-two part alone, added to the field rather than inside the softplus, so a
+    coefficient is a displacement in body units and the reshaping enters linearly. What the
+    convex stage gets wrong about the hull of a non-convex body is almost all of degree two,
+    and a fit that must move the hull and carve it in the same step needs the reshaping in as
+    few coordinates as it can be written in.
     """
 
     def __init__(self, normals: np.ndarray | None = None):
@@ -424,10 +470,12 @@ class ImplicitBody(nn.Module):
         return F.softplus(self.core.raw_h + self.dh_expand @ d)
 
     def forward(self, y: torch.Tensor, dh: torch.Tensor | None = None,
-                g: torch.Tensor | None = None) -> torch.Tensor:
-        """f at the points y. `dh` and `g` override the stored code when given, so a caller
-        can differentiate f through a code it holds itself."""
-        return self.core(y, h=self.support(dh)) + self.delta(y, g=g)
+                g: torch.Tensor | None = None, c: torch.Tensor | None = None) -> torch.Tensor:
+        """f at the points y. `dh`, `g` and `c` override the stored code when given, so a
+        caller can differentiate f through parameters it holds itself. `c` is the radial
+        reshaping term and is absent unless it is passed."""
+        f = self.core(y, h=self.support(dh)) + self.delta(y, g=g)
+        return f if c is None else f + radial_field(y, c)
 
 
 # ----------------------------------------------------------------- extraction

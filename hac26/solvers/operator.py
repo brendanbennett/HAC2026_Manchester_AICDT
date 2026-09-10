@@ -1,7 +1,8 @@
 """The operator the flow is trained and run with: a raw code in, the mean-normalised curves
 of every geometry out, and the gradient of a weighted residual back onto the code.
 
-    code (dh, g) + base support h --ImplicitBody--> field f --extract_mesh--> mesh
+    code (dh, g), reshaping c, base support h --ImplicitBody--> field f
+        --extract_mesh--> mesh
         --xy scaled by the radius--> --ExactForward--> unnormalised curves
         --normalise--> curves
 
@@ -24,7 +25,8 @@ from __future__ import annotations
 import torch
 
 from hac26.conventions import PSI0
-from hac26.field import CODE_DIM, EXTRACT_EXTENT, N_DIR, ImplicitBody, extract_mesh
+from hac26.field import (CODE_DIM, EXTRACT_EXTENT, N_DIR, N_RADIAL, ImplicitBody,
+                         extract_mesh)
 from hac26.forward.mesh.exact import ExactForward, RenderConfig, normalise, normalise_vjp
 from hac26.forward.mesh.instrument import Instrument
 from hac26.forward.mesh.radiosity import RadiosityError
@@ -35,7 +37,10 @@ MIN_FACES = 8      # an extracted mesh with fewer faces is not a body
 
 
 def split_code(code: torch.Tensor):
-    """(dh, g) from a raw code (CODE_DIM,)."""
+    """(dh, g) from a raw code (CODE_DIM,). The reshaping coefficients c are not part of the
+    code: the flow's architecture is built around the code's two blocks, one on the sphere
+    and one on the lattice, and c belongs to neither. A solver that fits c passes it beside
+    the code."""
     if code.numel() != CODE_DIM:
         raise ValueError(f"code has {code.numel()} entries, expected CODE_DIM={CODE_DIM}")
     return code[:N_DIR], code[N_DIR:]
@@ -58,13 +63,16 @@ class CodeOperator:
         self.body = ImplicitBody().to(device)
 
     def mesh(self, support: torch.Tensor, code: torch.Tensor, res: int | None = None,
-             grad: bool = False):
+             grad: bool = False, c: torch.Tensor | None = None):
         """The surface of the body the code describes on top of `support`, as (verts, faces)
         torch tensors on the operator's device, or None when it is degenerate. With
-        `grad=True` the vertices are differentiable in `code`."""
+        `grad=True` the vertices are differentiable in `code`. `c` is the radial reshaping
+        term (field.radial_field) and is absent unless it is passed."""
         self.body.set_support(support.to(self.device))
         dh, g = split_code(code.to(self.device))
-        verts, faces = extract_mesh(lambda y: self.body(y, dh=dh, g=g), EXTRACT_EXTENT,
+        if c is not None:
+            c = c.to(self.device)
+        verts, faces = extract_mesh(lambda y: self.body(y, dh=dh, g=g, c=c), EXTRACT_EXTENT,
                                     res=res or self.res, device=self.device, grad=grad)
         if len(faces) < MIN_FACES:
             return None
@@ -101,10 +109,11 @@ class CodeOperator:
         scale = torch.tensor([radius, radius, 1.0], dtype=verts.dtype, device=verts.device)
         return cls.canonical(verts, faces) * scale
 
-    def curves(self, support: torch.Tensor, code: torch.Tensor, radius: float, geoms=None):
+    def curves(self, support: torch.Tensor, code: torch.Tensor, radius: float, geoms=None,
+               c: torch.Tensor | None = None, res: int | None = None):
         """Mean-normalised curves (G, 2, P) of the body at the physical radius, without
         gradient, or None."""
-        m = self.mesh(support, code)
+        m = self.mesh(support, code, res=res, c=c)
         if m is None:
             return None
         try:

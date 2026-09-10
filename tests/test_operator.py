@@ -1,6 +1,7 @@
 """The code operator on the software rasteriser: curves of a code, and the adjoint back onto
 the code."""
 import numpy as np
+import pytest
 import torch
 
 from hac26.conventions import psi_grid
@@ -96,3 +97,40 @@ def test_canonical_pose_does_not_move_the_body_off_the_rotation_axis():
     scale = float(c[:, :2].norm(dim=1).max()) / float(off[:, :2].norm(dim=1).max())
     assert torch.allclose(c[:, :2], off[:, :2] * scale, atol=1e-6)   # a pure scaling
     assert float(c[:, :2].mean(0).norm()) > 0.1                      # still off the axis
+
+
+def test_the_radial_term_displaces_the_surface_by_its_own_amount():
+    """The reshaping coefficients are lengths. On a convex core the field's gradient has unit
+    norm on a facet, so adding a constant field moves the level set by that constant, and a
+    degree-two coefficient moves the surface along its own direction by about its size. This
+    is why the reshaping is added to the field rather than to the support values inside a
+    softplus, whose slope varies across the normals."""
+    import numpy as np
+    from hac26.field import ImplicitBody, N_RADIAL, radial_basis
+
+    body = ImplicitBody()
+    body.set_support(torch.full((body.core.n.shape[0],), 0.8))
+
+    def radius_along(u, c):
+        """Where the field crosses zero along the ray u, by bisection."""
+        lo, hi = torch.tensor(0.05), torch.tensor(3.0)
+        for _ in range(50):
+            mid = 0.5 * (lo + hi)
+            f = body(mid * u[None], c=c)[0]
+            lo, hi = torch.where(f < 0, mid, lo), torch.where(f < 0, hi, mid)
+        return float(0.5 * (lo + hi))
+
+    u = torch.tensor([0.48, -0.64, 0.6])
+    u = u / u.norm()
+    base = radius_along(u, None)
+    assert base == pytest.approx(0.8, abs=0.02)          # the polytope's own facet
+
+    for k, amount in ((0, 0.12), (3, -0.09), (6, 0.07)):
+        c = torch.zeros(N_RADIAL)
+        c[k] = amount
+        expected = base - amount * float(radial_basis(u[None])[0, k])
+        assert radius_along(u, c) == pytest.approx(expected, abs=0.02)
+
+    # zero coefficients are the body the code alone describes
+    y = torch.randn(64, 3)
+    assert torch.allclose(body(y, c=torch.zeros(N_RADIAL)), body(y), atol=1e-6)
