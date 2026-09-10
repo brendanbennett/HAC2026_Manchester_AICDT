@@ -1,0 +1,388 @@
+#!/usr/bin/env python3
+"""Fit the instrument against the real curves of the public models, whose shapes are released.
+
+What is fitted, all at once and all by gradient: the albedo rho, the source radius delta, the
+camera distance, the intensity threshold tau_i, the per-curve pedestal, the per-curve model
+error eta, the sensor chain (PSF width, vignetting, OETF knots, saturation), and one start
+phase psi0 per public body. The thresholds pass a gradient through the coarea formula, the
+rest through the rendering itself. The objective is the Gaussian log-likelihood of the real
+curves given the rendered ones,
+
+    sum over present curves and phases of  (pred - real)^2 / s^2 + log s^2,
+    s_c^2 = sigma_c^2 + eta_c^2,
+
+with sigma_c the measurement noise of each curve, estimated from its own high-frequency
+content at the files' native frame rate (hac26.noise). The log term is what stops the fit
+from explaining every residual by a larger eta, and eta is where the A/B mounting mismatch
+between the two columns of a geometry belongs.
+
+psi0 is first found by a search over whole-frame shifts of the rendered curves against the
+data, within an eighth of a turn either way, then refined with everything else. Its fitted
+values are the check on hac26.conventions.PSI0: if they agree with each other and differ
+from PSI0, PSI0 is wrong.
+
+The released meshes are decimated to TRUTH_FACES faces before rendering; the interreflection
+runs on the operator's usual patches.
+
+Adam moves a parameter by about lr per step whatever the gradient, so `--steps x --lr` is a
+hard cap on how far any of them can travel in raw (unsquashed) space. A fit that spends most
+of that cap stopped because the run ended, not because it converged, and its parameters are
+wherever the cap left them. The run therefore stops early once the likelihood plateaus, and
+prints how far every parameter travelled against its budget, naming the ones that were still
+moving. Read that table before the residuals: while it names anything, the residuals are
+those of a truncated fit.
+
+Writes the Instrument to models/instrument_calibration.pt, and the fitted psi0 per body with
+the per-geometry residual report and the movement table to
+models/instrument_calibration.json. The residual at the true shape divided by the noise, per
+geometry, is the number that says whether the forward model reproduces the organisers'
+processing; everything downstream rests on it.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+import time
+from pathlib import Path
+
+import numpy as np
+import torch
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from hac26.conventions import PUBLIC_MODELS, SENSE, cameras, psi_grid   # noqa: E402
+from hac26.data_io import (N_CAMS, load_model_curves, native_sigma,    # noqa: E402
+                           public_stl)
+from hac26.forward.mesh.exact import (ExactForward, RenderConfig, decimate, normalise,   # noqa: E402
+                                      normalise_vjp)
+from hac26.forward.mesh.instrument import Instrument                  # noqa: E402
+from hac26.noise import ab_mismatch                                   # noqa: E402
+from hac26.shapes import rescale_touch_z                              # noqa: E402
+from hac26.stl_io import load_stl                                     # noqa: E402
+
+TRUTH_FACES = 20000       # faces the released meshes are decimated to before rendering
+PSI0_SEARCH = 1.0 / 8.0   # the start phase is searched within this fraction of a turn each way
+OUT_INSTRUMENT = "models/instrument_calibration.pt"
+OUT_REPORT = "models/instrument_calibration.json"
+
+
+def load_truth(data_dir: str, model: int, device: str):
+    """The released mesh of a public model, posed and decimated, as torch tensors."""
+    v, f = load_stl(public_stl(data_dir, model))
+    # centre_xy=False: the released STL is already posed on the rotation axis, and moving it
+    # onto its own centroid would move it off (hac26.shapes.rescale_touch_z)
+    v = rescale_touch_z(v, f, centre_xy=False)
+    v, f = decimate(np.asarray(v, dtype=np.float64), np.asarray(f, dtype=np.int64), TRUTH_FACES)
+    return (torch.tensor(v, dtype=torch.float32, device=device),
+            torch.tensor(f, dtype=torch.long, device=device))
+
+
+def load_data(data_dir: str, model: int, phases: int, device: str):
+    """The real mean-normalised curves (N_CAMS, 2, P), which geometries are present (N_CAMS,)
+    and the measured noise per curve (N_CAMS, 2).
+
+    The noise comes from the high-frequency content of each curve at the files' own frame
+    rate, not from the difference of the two columns of a geometry: those two columns are
+    separate recordings of the body in its two mountings, so their difference is dominated by
+    the A/B mismatch and runs 1-277x the actual noise, median 12x (hac26.noise). That
+    difference is reported beside sigma as a diagnostic and is left for eta to absorb.
+    """
+    d = load_model_curves(data_dir, model, m=phases)
+    pairs = np.stack([d["curves"][:N_CAMS], d["curves"][N_CAMS:]], axis=1)
+    present = (d["mask"][:N_CAMS] > 0) & (d["mask"][N_CAMS:] > 0)
+    sigma = native_sigma(d).reshape(2, N_CAMS).T
+    mismatch = ab_mismatch(d["curves"], d["mask"]).reshape(2, N_CAMS).T
+    return (torch.tensor(pairs, dtype=torch.float32, device=device),
+            torch.tensor(present, device=device),
+            torch.tensor(sigma, dtype=torch.float32, device=device),
+            torch.tensor(mismatch, dtype=torch.float32, device=device))
+
+
+def initial_psi0(fwd: ExactForward, verts, faces, real, present, sigma) -> float:
+    """The whole-frame shift of the rendered curves that fits the data best, as a start
+    phase. Shifting psi0 by one grid step moves every curve by one frame, so one rendering
+    serves every candidate."""
+    P = real.shape[-1]
+    pred = normalise(fwd.raw_curves(verts, faces, psi0=0.0))
+    best, best_j = float("inf"), 0
+    for j in range(-int(P * PSI0_SEARCH), int(P * PSI0_SEARCH) + 1):
+        r = (torch.roll(pred, -j, dims=-1) - real) / sigma[..., None]
+        m = float((r ** 2)[present].mean())
+        if m < best:
+            best, best_j = m, j
+    return float(SENSE * 2.0 * np.pi * best_j / P)
+
+
+def nll(pred, real, present, sigma, eta):
+    """The Gaussian negative log-likelihood per present curve and phase, and its derivative
+    with respect to the prediction."""
+    s2 = sigma ** 2 + eta ** 2
+    r = pred - real
+    n = float(present.sum()) * real.shape[-1]
+    loss = (((r ** 2 / s2[..., None]) + torch.log(s2)[..., None]) * present[:, None, None]).sum() / n
+    cot = 2.0 * r / s2[..., None] * present[:, None, None] / n
+    return loss, cot
+
+
+def likelihood_cotangent(raw, body, eta):
+    """The cotangent on the unnormalised curves: the likelihood's derivative with respect to
+    the normalised curves, taken back through the normalisation."""
+    _, cot = nll(normalise(raw), body["real"], body["present"], body["sigma"], eta)
+    return normalise_vjp(raw, cot)
+
+
+def residual_report(pred, real, present, sigma, eta) -> dict:
+    """RMS residual per geometry over the phases, divided by the noise alone and by the total
+    scale sqrt(sigma^2 + eta^2), for the intensity and the binary curves."""
+    r = (pred - real)
+    per_sigma = (r / sigma[..., None]).pow(2).mean(-1).sqrt()
+    per_s = (r / torch.sqrt(sigma ** 2 + eta ** 2)[..., None]).pow(2).mean(-1).sqrt()
+    keep = present.cpu().numpy()
+    out = {}
+    for k, name in enumerate(("intensity", "binary")):
+        a = np.where(keep, per_sigma[:, k].cpu().numpy(), np.nan)
+        b = np.where(keep, per_s[:, k].cpu().numpy(), np.nan)
+        out[name] = {"per_sigma": a.tolist(), "per_s": b.tolist()}
+    return out
+
+
+def _shift(curves: torch.Tensor, frac: float) -> torch.Tensor:
+    """Circularly shift along the phase axis by `frac` frames, linearly interpolated. The
+    curves are periodic, so this is exact wraparound; fractional because the shifts worth
+    seeing are smaller than one frame of the calibration's grid -- the organisers' realignment
+    of model 1 was up to 12 frames of 841, which is 0.7 of a frame at 48 phases."""
+    P = curves.shape[-1]
+    idx = torch.arange(P, dtype=torch.float32, device=curves.device) - frac
+    i0 = torch.floor(idx)
+    w = (idx - i0).to(curves.dtype)
+    i0 = i0.long() % P
+    return curves[..., i0] * (1 - w) + curves[..., (i0 + 1) % P] * w
+
+
+def phase_offset_report(pred, real, present, sigma, search: float = PSI0_SEARCH,
+                        step: float = 0.125) -> dict:
+    """The shift each azimuth group would still like, in degrees of rotation, at the fitted
+    psi0.
+
+    The calibration fits one start phase per body, which is right if the body's frames are
+    aligned with each other. The organisers align them per azimuth: the 17/25 Aug 2026 update
+    to model 1's real curves shifted each azimuth's four columns by its own whole-frame offset
+    (0 deg by -12 frames of 841, 90 and 135 by +3, 225 by -4, 270 by -2, 45 and 315 not at
+    all), leaving the shifted curves matching the old ones at corr = 1.0000. No single psi0
+    absorbs that, so a residual per-azimuth misalignment lands in the residual table looking
+    like forward-model error -- and it costs most where the curves move fastest, which is the
+    high phase angles that carry the most shape.
+
+    Reported, not fitted: seven more free parameters per body would explain away real misfit
+    just as readily. Groups that all want the same shift mean psi0 is off; groups that
+    disagree mean the curves are not aligned with each other, and the fix is a fresh download
+    rather than a wider fit (scripts/check_data.py).
+    """
+    P = real.shape[-1]
+    w = present[:, None, None] / sigma[..., None]
+    span = P * search
+    grid = [k * step for k in range(-int(span / step), int(span / step) + 1)]
+    out = {}
+    for az in sorted({c.azimuth_deg for c in cameras()}):
+        idx = [i for i, c in enumerate(cameras()) if c.azimuth_deg == az]
+        pr, rl, ww = pred[idx], real[idx], w[idx]
+        best, best_f = float("inf"), 0.0
+        for f in grid:
+            m = float(((_shift(pr, f) - rl) * ww).pow(2).mean())
+            if m < best:
+                best, best_f = m, f
+        out[str(az)] = 360.0 * best_f / P
+    return out
+
+
+def print_phase_offsets(model: int, off: dict, frames: int) -> None:
+    """One row per body, in degrees of rotation. All zero is a correctly aligned set."""
+    az = sorted(off, key=float)
+    res = 360.0 * 0.125 / frames
+    print(f"    model {model}: " + "  ".join(f"{float(a):>3.0f}deg {off[a]:+6.2f}" for a in az)
+          + f"   (deg, resolution {res:.2f})")
+
+
+def movement_report(start: dict, now: dict, budget: dict) -> dict:
+    """How far each fitted parameter travelled in its raw (unsquashed) space, against how far
+    the optimiser could have moved it.
+
+    Adam's step is about lr in magnitude whatever the gradient, so `steps * lr` is a hard cap
+    on the travel of any parameter. A parameter that spends most of that cap has not
+    converged -- it stopped because the run ended. Every quantity here is stored through a
+    squashing function, so the raw space is the one the cap applies in.
+    """
+    out = {}
+    for name, x0 in start.items():
+        moved = float((now[name] - x0).abs().max())
+        out[name] = {"moved": moved, "budget": budget[name],
+                     "fraction": moved / max(budget[name], 1e-12)}
+    return out
+
+
+def print_movement(rep: dict, limit: float = 0.5) -> list:
+    """The movement table, and the names that used more than `limit` of their budget."""
+    print("\n[budget] travel of each parameter in raw space, against steps x lr")
+    limited = [n for n, r in rep.items() if r["fraction"] > limit]
+    for name, r in sorted(rep.items(), key=lambda kv: -kv[1]["fraction"]):
+        flag = "  <-- still moving when the run ended" if r["fraction"] > limit else ""
+        print(f"    {name:<24} {r['moved']:8.3f} of {r['budget']:7.3f}  "
+              f"({100 * r['fraction']:5.1f}%){flag}")
+    if limited:
+        print(f"  !!! {len(limited)} parameter(s) used more than {100 * limit:.0f}% of the "
+              f"travel the step budget allows: {', '.join(limited)}.")
+        print("  !!! The fit is bounded by --steps, not by the data. Rerun with more steps "
+              "(or a larger --lr) until this list is empty before trusting the residuals.")
+    else:
+        print("  every parameter settled well inside its budget")
+    return limited
+
+
+def print_report(model: int, rep: dict) -> None:
+    """One row per camera kind, one column per azimuth, for each curve type and each
+    denominator; nothing is aggregated except the medians on the last line."""
+    cams = cameras()
+    kinds = ("hor_a", "hor_b", "top", "bottom")
+    azimuths = sorted({c.azimuth_deg for c in cams})
+    print(f"  model {model}:" + " " * 22 + " ".join(f"{z:>6.0f}" for z in azimuths))
+    for name in ("intensity", "binary"):
+        for denom in ("per_sigma", "per_s"):
+            vals = np.asarray(rep[name][denom])
+            for kind in kinds:
+                row = [vals[i] for i, c in enumerate(cams) if c.kind == kind]
+                print(f"    {name:<9} /{denom[4:]:<5} {kind:<7} "
+                      + " ".join(f"{v:>6.1f}" for v in row))
+        a = np.asarray(rep[name]["per_sigma"]); b = np.asarray(rep[name]["per_s"])
+        print(f"    {name:<9} median /sigma {np.nanmedian(a):.2f}, median /s "
+              f"{np.nanmedian(b):.2f}")
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--phases", type=int, default=48)
+    ap.add_argument("--steps", type=int, default=600,
+                    help="cap on the number of steps. Adam moves a parameter by about lr per "
+                         "step, so steps x lr is a hard cap on how far any of them can "
+                         "travel in raw space; the run reports what each one used")
+    ap.add_argument("--lr", type=float, default=0.03)
+    ap.add_argument("--tol", type=float, default=1e-4,
+                    help="stop early once the mean -logL has improved by less than this over "
+                         "the last --patience steps")
+    ap.add_argument("--patience", type=int, default=60,
+                    help="window of steps the --tol improvement is measured over")
+    ap.add_argument("--data-dir", default="dataset/raw")
+    ap.add_argument("--out", default=OUT_INSTRUMENT)
+    ap.add_argument("--report", default=OUT_REPORT)
+    render = RenderConfig()
+    ap.add_argument("--phase-chunk", type=int, default=render.phase_chunk,
+                    help="phases per rendering batch; with --geom-chunk it sets the GPU "
+                         "memory the rendering takes, not the result")
+    ap.add_argument("--geom-chunk", type=int, default=render.geom_chunk,
+                    help="geometries per rendering batch")
+    a = ap.parse_args()
+    dev = "cuda" if torch.cuda.is_available() else "cpu"
+
+    inst = Instrument().to(dev)
+    render = RenderConfig(phase_chunk=a.phase_chunk, geom_chunk=a.geom_chunk)
+    fwd = ExactForward(inst, psi_grid(a.phases), render, device=dev)
+    fit_params = [p for n, p in inst.named_parameters() if n != "raw_eta"]
+
+    bodies = {}
+    for M in PUBLIC_MODELS:
+        t0 = time.time()
+        verts, faces = load_truth(a.data_dir, M, dev)
+        real, present, sigma, mismatch = load_data(a.data_dir, M, a.phases, dev)
+        with torch.no_grad():
+            psi0 = initial_psi0(fwd, verts, faces, real, present, sigma)
+        bodies[M] = dict(verts=verts, faces=faces, real=real, present=present, sigma=sigma,
+                         psi0=torch.tensor(psi0, device=dev, requires_grad=True))
+        print(f"  model {M}: {len(faces)} faces, {int(present.sum())}/{N_CAMS} geometries, "
+              f"noise median {float(sigma.median()):.4f} (A/B mismatch "
+              f"{float(mismatch.median()):.4f}, {float(mismatch.median()/sigma.median()):.0f}x), "
+              f"start phase {np.degrees(psi0):+.1f} deg ({time.time()-t0:.0f}s)", flush=True)
+
+    opt = torch.optim.Adam([{"params": fit_params + [inst.raw_eta]},
+                            {"params": [b["psi0"] for b in bodies.values()], "lr": a.lr / 10}],
+                           lr=a.lr)
+    # raw-space starting point and travel budget of everything being fitted, for the
+    # convergence report at the end
+    named = {n: p for n, p in inst.named_parameters()}
+    named.update({f"psi0[{M}]": b["psi0"] for M, b in bodies.items()})
+    start = {n: p.detach().clone() for n, p in named.items()}
+    budget = {n: a.steps * (a.lr / 10 if n.startswith("psi0") else a.lr) for n in named}
+
+    print(f"[fit] up to {a.steps} steps over {len(bodies)} bodies at {a.phases} phases "
+          f"(early stop: -logL improving by < {a.tol:g} over {a.patience} steps)", flush=True)
+    history = []
+    for step in range(a.steps):
+        opt.zero_grad()
+        total = 0.0
+        for M, b in bodies.items():
+            eta = inst.eta.reshape(2, N_CAMS).T
+            # the curves and the gradient of the likelihood with respect to every instrument
+            # parameter and this body's start phase, through the rendering
+            raw, _, grads = fwd.vjp(
+                b["verts"], b["faces"], lambda r: likelihood_cotangent(r, b, eta.detach()),
+                psi0=b["psi0"], params=fit_params + [b["psi0"]])
+            for p, g in zip(fit_params + [b["psi0"]], grads):
+                p.grad = g if p.grad is None else p.grad + g
+            # eta enters only through the likelihood, so its gradient is direct
+            loss, _ = nll(normalise(raw), b["real"], b["present"], b["sigma"], eta)
+            loss.backward()
+            total += float(loss)
+        opt.step()
+        mean_loss = total / len(bodies)
+        history.append(mean_loss)
+        if step % 10 == 0 or step == a.steps - 1:
+            print(f"  step {step:>4}  -logL {mean_loss:.4f}  {inst.summary()}; "
+                  f"psi0 " + ", ".join(f"{np.degrees(float(b['psi0'])):+.1f}"
+                                       for b in bodies.values()) + " deg", flush=True)
+        if len(history) > a.patience and min(history[:-a.patience]) - mean_loss < a.tol:
+            print(f"  stopped at step {step}: -logL improved by less than {a.tol:g} over the "
+                  f"last {a.patience} steps", flush=True)
+            break
+    steps_run = len(history)
+    budget = {n: v * steps_run / a.steps for n, v in budget.items()}
+
+    print("\n[report] RMS residual at the true shape, per geometry (azimuth:value)")
+    print("    /sigma  against the measurement noise alone")
+    print("    /s      against sqrt(sigma^2 + eta^2), eta being the model error the fit admits")
+    moved = movement_report(start, {n: p.detach() for n, p in named.items()}, budget)
+    limited = print_movement(moved)
+    report = {"psi0_deg": {}, "residual": {}, "phase_offset_deg": {},
+              "instrument": inst.summary(),
+              "steps_run": steps_run, "movement": moved, "budget_limited": limited}
+    with torch.no_grad():
+        eta = inst.eta.reshape(2, N_CAMS).T
+        for M, b in bodies.items():
+            pred = normalise(fwd.raw_curves(b["verts"], b["faces"], psi0=float(b["psi0"])))
+            rep = residual_report(pred, b["real"], b["present"], b["sigma"], eta)
+            print_report(M, rep)
+            report["residual"][M] = rep
+            report["psi0_deg"][M] = float(np.degrees(float(b["psi0"])))
+            report["phase_offset_deg"][M] = phase_offset_report(
+                pred, b["real"], b["present"], b["sigma"])
+    print("\n[alignment] whole-frame shift each azimuth still wants at the fitted psi0")
+    print("    all zero = the body's frames agree with each other; a nonzero row means that")
+    print("    azimuth is misaligned with the others, which no single psi0 can absorb and")
+    print("    which the residual table above will show as forward-model error")
+    for M, off in report["phase_offset_deg"].items():
+        print_phase_offsets(M, off, a.phases)
+    worst = max((abs(v) for off in report["phase_offset_deg"].values()
+                 for v in off.values()), default=0.0)
+    if worst > 360.0 * 0.25 / a.phases:
+        print("  !!! Some azimuths are misaligned. Check the download against the manifest")
+        print("  !!! (scripts/check_data.py) before reading the residuals: the organisers have")
+        print("  !!! realigned these curves once already.")
+    print(f"  fitted: {inst.summary()}")
+    print("  start phases: " + ", ".join(f"model {M} {v:+.2f} deg"
+                                          for M, v in report["psi0_deg"].items()))
+    Path(a.out).parent.mkdir(parents=True, exist_ok=True)
+    inst.save(a.out)
+    Path(a.report).write_text(json.dumps(report, indent=1))
+    print(f"\nwrote {a.out} and {a.report}")
+
+
+if __name__ == "__main__":
+    main()
