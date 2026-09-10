@@ -79,6 +79,7 @@ CODES_FILE=runs/corpus_codes.npz
 
 CONVEX_CKPT=${CONVEX_CKPT:-models/lpd_convex.pt}   # the convex stage, whose starts the flow corrects
 CORPUS_FILE=runs/corpus.npz
+CORPUS_WORKERS=${CORPUS_WORKERS:-8}
 
 PRIOR_STEPS=${PRIOR_STEPS:-20000}   # a cap: the prior stops early once the held-out loss plateaus
 PRIOR_BATCH=${PRIOR_BATCH:-64}
@@ -410,7 +411,8 @@ fi
 run_stage corpus "$CORPUS_FILE" \
   $PY scripts/build_corpus.py \
     --bodies "$N_BODIES" --phases "$FLOW_PHASES" --operator-res "$FLOW_OPERATOR_RES" \
-    --codes-file "$CODES_FILE" --convex "$CONVEX_CKPT" --out "$CORPUS_FILE"
+    --codes-file "$CODES_FILE" --convex "$CONVEX_CKPT" --out "$CORPUS_FILE" \
+    --workers "$CORPUS_WORKERS"
 
 # ---------------------------------------------------------------- 4c. the prior part
 run_stage prior runs/prior_flow.pt \
