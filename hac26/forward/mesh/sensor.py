@@ -16,6 +16,11 @@ covers, which the rasteriser handles.
 The OETF is a spline rather than a power law because real transfer curves have a toe and a
 shoulder, and the shoulder decides which faint pixels survive the binary threshold. The knots
 are cumulative positive increments, so the curve is monotone by construction.
+
+That chain is the laboratory camera. The organisers also release a rendering of each body,
+which passed through no lens and no photosite, and PowerTransfer is the chain for it: a clamp
+at the saturation level and the power law a renderer's display transform applies. The two have
+the same signature and the Instrument holds whichever the channel calls for.
 """
 from __future__ import annotations
 
@@ -24,7 +29,11 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-__all__ = ["SensorModel", "gaussian_psf", "box_downsample", "quantise_ste"]
+__all__ = ["SensorModel", "PowerTransfer", "gaussian_psf", "box_downsample", "quantise_ste"]
+
+
+def _inv_softplus(x: float) -> float:
+    return float(np.log(np.expm1(x)))
 
 
 def gaussian_psf(sigma_px, radius: int | None = None,
@@ -154,3 +163,45 @@ class SensorModel(nn.Module):
         if self.quantise:
             x = quantise_ste(x, self.levels)
         return box_downsample(x, supersample)
+
+    def describe(self) -> str:
+        return (f"spline transfer, psf sigma {float(self.psf_sigma.detach()):.2f} px, "
+                f"saturation {float(self.saturation.detach()):.3f}")
+
+
+class PowerTransfer(nn.Module):
+    """Radiance to pixel value for a rendered channel: clamp at the saturation level, then a
+    power law.
+
+    A render has no lens and no photosite, so the vignetting, the point spread and the
+    quantisation of SensorModel all describe something that is not there. Left in the model
+    they are directions the rendered curves cannot see, and a calibration that is free to
+    move along them wanders instead of converging. What a renderer does apply is a display
+    transform, which is a power law over the range it does not clip, and that is what is
+    fitted here.
+
+    The signature matches SensorModel.forward so the two are interchangeable in the chain;
+    the off-axis cosine and the image radius are accepted and ignored.
+    """
+
+    def __init__(self, gamma: float = 1.0 / 2.2, saturation: float = 1.0):
+        super().__init__()
+        self.raw_gamma = nn.Parameter(torch.tensor(_inv_softplus(gamma)))
+        self.raw_sat = nn.Parameter(torch.tensor(_inv_softplus(saturation)))
+
+    @property
+    def gamma(self) -> torch.Tensor:
+        return F.softplus(self.raw_gamma)
+
+    @property
+    def saturation(self) -> torch.Tensor:
+        return F.softplus(self.raw_sat)
+
+    def forward(self, radiance: torch.Tensor, cos_off: torch.Tensor,
+                radius: torch.Tensor, supersample: int = 4) -> torch.Tensor:
+        x = (radiance / self.saturation.clamp_min(1e-6)).clamp(0.0, 1.0)
+        return box_downsample(x ** self.gamma, supersample)
+
+    def describe(self) -> str:
+        return (f"power transfer, gamma {float(self.gamma.detach()):.3f}, "
+                f"saturation {float(self.saturation.detach()):.3f}")

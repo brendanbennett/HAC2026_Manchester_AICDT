@@ -164,21 +164,87 @@ def test_without_interreflection_the_radiance_is_the_direct_term_alone():
     assert float((L_on - L_off).max()) > 0.1 * float(L_off.max())
 
 
-def test_the_blender_start_is_a_far_camera_without_bounce_light_and_survives_saving(tmp_path):
-    """The start of a calibration against the render has the far camera, the bounce light off
-    and the sRGB-like transfer curve, fits neither the albedo, the distance nor the
-    vignetting, and comes back from a saved file with the switch as it was."""
+def test_the_blender_start_is_a_camera_at_infinity_without_bounce_light(tmp_path):
+    """The start of a calibration against the render has the cameras at infinity, the bounce
+    light off and the power-law transfer curve, fits neither the albedo, the camera distance
+    nor the vignetting, and comes back from a saved file with both switches and the same
+    sensor chain."""
+    from hac26.forward.mesh.sensor import PowerTransfer, SensorModel
+
     inst = Instrument.blender_start()
     assert not bool(inst.interreflection)
-    assert float(inst.eye_distance) >= 300.0
-    x = torch.linspace(0, 1, 9)
-    assert torch.allclose(inst.sensor.oetf_knots(), x ** (1.0 / 2.2), atol=2e-3)
+    assert bool(inst.orthographic)
+    assert isinstance(inst.sensor, PowerTransfer)
+    assert float(inst.sensor.gamma) == pytest.approx(1.0 / 2.2, abs=2e-3)
     names = {n for n, _ in inst.fitted_parameters()}
     assert {"raw_rho", "raw_eye", "sensor.raw_vignette", "raw_eta"}.isdisjoint(names)
-    assert {"raw_delta", "raw_tau_i", "sensor.raw_oetf", "sensor.raw_sat"} <= names
-    lab = {n for n, _ in Instrument().fitted_parameters()}
-    assert {"raw_rho", "raw_eye", "sensor.raw_vignette"} <= lab
+    assert {"raw_delta", "raw_tau_i", "sensor.raw_gamma", "sensor.raw_sat"} <= names
+    lab = Instrument()
+    assert not bool(lab.orthographic) and isinstance(lab.sensor, SensorModel)
+    assert {"raw_rho", "raw_eye", "sensor.raw_vignette"} <= {n for n, _ in
+                                                             lab.fitted_parameters()}
     inst.save(tmp_path / "blender.pt")
     back = Instrument.load(tmp_path / "blender.pt")
-    assert not bool(back.interreflection)
-    assert float(back.eye_distance) == pytest.approx(float(inst.eye_distance))
+    assert not bool(back.interreflection) and bool(back.orthographic)
+    assert isinstance(back.sensor, PowerTransfer)
+    assert float(back.sensor.gamma) == pytest.approx(float(inst.sensor.gamma))
+    lab.save(tmp_path / "lab.pt")
+    back_lab = Instrument.load(tmp_path / "lab.pt")
+    assert isinstance(back_lab.sensor, SensorModel) and not bool(back_lab.orthographic)
+
+
+def _ortho_and_perspective(dist_list, geoms=(0,), phases=3):
+    """Normalised curves of one convex body under the orthographic camera and under
+    perspective cameras at the given distances, on the same small configuration."""
+    import trimesh
+    ico = trimesh.creation.icosphere(subdivisions=2, radius=1.0)
+    v = np.asarray(ico.vertices, float) * np.array([1.0, 0.7, 0.55])
+    f = np.asarray(ico.faces)
+    V = torch.tensor(v, dtype=torch.float32)
+    F = torch.tensor(f, dtype=torch.long)
+    psi = psi_grid(phases)
+    out = []
+    for inst in [Instrument.blender_start()] + [Instrument.blender_start()
+                                                for _ in dist_list]:
+        out.append(inst)
+    for inst, dist in zip(out[1:], dist_list):
+        with torch.no_grad():
+            inst.orthographic.fill_(False)
+            inst.raw_eye.fill_(float(np.log(np.expm1(dist))))
+    return [normalise(ExactForward(i, psi, SMALL, device="cpu", backend="software")
+                      .raw_curves(V, F, geoms=list(geoms))).numpy() for i in out]
+
+
+def test_the_orthographic_camera_is_the_limit_of_a_receding_perspective_one():
+    """A camera at infinity is its own projection, not a very distant perspective one, and
+    the two agree only in the limit. The intensity curves of a perspective camera must
+    approach the orthographic ones as the camera recedes, since the difference between the
+    projections is of the order of the body's size over the camera distance. The count
+    curves are not checked here: a count is an integer, and on a small image one pixel is
+    already a per cent of it."""
+    ortho, near, far = _ortho_and_perspective([6.0, 100.0])
+
+    def rms(a, b):
+        return float(np.sqrt(((a[:, 0] - b[:, 0]) ** 2).mean()))
+
+    assert rms(ortho, far) < 0.3 * rms(ortho, near)
+    assert rms(ortho, far) < 0.02
+
+
+def test_the_orthographic_projection_frames_the_body_as_the_perspective_one_does():
+    """Both projections put the body's own extent at the same fraction of the frame, so the
+    rendered intensity of a body is the same size under either, and the batched matrix is
+    the single-direction one it is built from."""
+    from hac26.forward.mesh.raster import orthographic, orthographic_view
+
+    d = torch.tensor([[0.0, 0.0, 1.0], [1.0, 0.0, 0.0], [0.3, -0.8, 0.2]])
+    batch = orthographic_view(d, 1.7, 5.1, aspect=1.0)
+    for i in range(len(d)):
+        assert torch.allclose(batch[i], orthographic(d[i], 1.7, 5.1), atol=1e-6)
+    wide = orthographic_view(d, 1.7, 5.1, aspect=2.0)
+    assert torch.allclose(2.0 * wide[:, 0], batch[:, 0], atol=1e-6)
+    assert torch.allclose(wide[:, 1:], batch[:, 1:], atol=1e-6)
+    # a point at the top of the frame lands on the clip-space edge
+    top = torch.tensor([[0.0, 1.7, 0.0, 1.0]])
+    y = torch.einsum("vj,bij->bvi", top, batch)[0, 0, 1]
+    assert float(y) == pytest.approx(1.0, abs=1e-5)

@@ -11,22 +11,29 @@ the calibration fits on the public models and the exact forward model then uses.
     eta           a per-curve model-error scale: the part of the residual at the true shape
                   that the noise does not explain. It weights the residual in the
                   calibration and at reconstruction; it does not enter the rendering
-    sensor        the SensorModel: vignetting, PSF, OETF, saturation
+    sensor        the chain from radiance to pixel value: SensorModel for the laboratory
+                  camera, PowerTransfer for a rendered channel
     interreflection
                   whether light bounces between facets. The laboratory body is matte white
                   and bounces light into its concavities; a rendering without bounce light
                   reproduces a simulated channel that was made without it
+    orthographic  whether the cameras sit at infinity. A rendered channel's camera does, and
+                  its own projection resolves depth over a range set by the body rather than
+                  by the camera distance; eye_distance then means nothing and is not fitted
 
 Every quantity with a range is stored through a squashing function so it stays in range:
-sigmoid for rho and tau_i, softplus for delta, eye_distance and eta. `interreflection` is a
-switch and is saved with the parameters, so a loaded instrument renders as it was fitted.
+sigmoid for rho and tau_i, softplus for delta, eye_distance and eta. `interreflection` and
+`orthographic` are switches and are saved with the parameters, so a loaded instrument renders
+as it was fitted; a caller cannot forget to set them, which is why they live here and not in
+the RenderConfig, whose fields are resolutions.
 
 The released data carry two channels, the laboratory curves and the organisers' Blender
 render of the true shape, and they are not the same measurement. The render has no lens,
 no sensor and no bounce light, and its camera sits far from the body, so an instrument fitted
 to the laboratory curves is the wrong instrument for it. `Instrument.blender_start` is the
-starting point of a calibration against the render: a far camera, no interreflection, a
-power-law encoding of the sRGB kind and no vignetting, with the same fitted quantities free.
+starting point of a calibration against the render: cameras at infinity, no interreflection
+and a power-law encoding of the sRGB kind, with the threshold, the transfer curve and the
+source disc free.
 """
 from __future__ import annotations
 
@@ -35,15 +42,11 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .sensor import SensorModel
+from .sensor import PowerTransfer, SensorModel
 
-__all__ = ["Instrument", "N_CURVES", "FAR_CAMERA", "SRGB_EXPONENT"]
+__all__ = ["Instrument", "N_CURVES", "SRGB_EXPONENT"]
 
 N_CURVES = 56          # the released curves: every camera geometry, intensity then binary
-FAR_CAMERA = 300.0     # camera distance, in body radii, at which the perspective view
-                       # differs from an orthographic one by a fraction of a percent of the
-                       # body's size, so the chain renders a simulated orthographic camera
-                       # without a second projection path
 SRGB_EXPONENT = 1.0 / 2.2   # the exponent of the sRGB-like transfer curve a renderer's
                             # standard view applies to linear radiance
 
@@ -71,11 +74,12 @@ class Instrument(nn.Module):
     def __init__(self, rho: float = 0.20, delta_deg: float = 1.0, eye_distance: float = 8.0,
                  tau_i: float = 0.02, eta: float = 0.02, n_curves: int = N_CURVES,
                  quantise: bool = True, interreflection: bool = True,
-                 sensor: SensorModel | None = None):
+                 orthographic: bool = False, sensor: nn.Module | None = None):
         super().__init__()
         self.sensor = SensorModel(quantise=quantise) if sensor is None else sensor
-        # a buffer rather than an attribute, so that save and load carry it
+        # buffers rather than attributes, so that save and load carry them
         self.register_buffer("interreflection", torch.tensor(bool(interreflection)))
+        self.register_buffer("orthographic", torch.tensor(bool(orthographic)))
         self.raw_rho = nn.Parameter(torch.tensor(_inv_sigmoid(rho)))
         self.raw_delta = nn.Parameter(torch.tensor(_inv_softplus(np.radians(delta_deg))))
         self.raw_eye = nn.Parameter(torch.tensor(_inv_softplus(eye_distance)))
@@ -125,29 +129,26 @@ class Instrument(nn.Module):
         return F.softplus(self.raw_eta)
 
     @classmethod
-    def blender_start(cls, delta_deg: float = 1.0, tau_i: float = 0.02, eta: float = 0.02,
-                      psf_sigma_px: float = 1.0, quantise: bool = True) -> "Instrument":
-        """The starting point of a calibration against the Blender channel: a far camera, no
-        bounce light, the sensor's transfer curve sampled from the sRGB-like power law and no
-        vignetting. The albedo is kept at one because without interreflection it only scales
-        the radiance, which the saturation already does."""
-        sensor = SensorModel(psf_sigma_px=psf_sigma_px, quantise=quantise)
-        sensor.set_oetf_power(SRGB_EXPONENT)
-        inst = cls(rho=0.999, delta_deg=delta_deg, eye_distance=FAR_CAMERA, tau_i=tau_i,
-                   eta=eta, quantise=quantise, interreflection=False, sensor=sensor)
-        return inst
+    def blender_start(cls, delta_deg: float = 1.0, tau_i: float = 0.02,
+                      eta: float = 0.02) -> "Instrument":
+        """The starting point of a calibration against the render: cameras at infinity, no
+        bounce light and the power-law transfer curve of a renderer's standard view. The
+        albedo is kept at one because without interreflection it only scales the radiance,
+        which the saturation already does."""
+        return cls(rho=0.999, delta_deg=delta_deg, tau_i=tau_i, eta=eta,
+                   interreflection=False, orthographic=True,
+                   sensor=PowerTransfer(gamma=SRGB_EXPONENT))
 
     def fitted_parameters(self) -> list:
         """(name, parameter) of everything a calibration moves. Without interreflection the
         albedo is a pure scale of the radiance, indistinguishable from the sensor's
-        saturation, so it is not fitted then. A camera at FAR_CAMERA or beyond is
-        orthographic to the rendering's precision and has no lens whose falloff could be
-        fitted, so its distance and the vignetting stay put. eta enters the likelihood and
+        saturation, so it is not fitted then. Cameras at infinity have no distance and no
+        lens whose falloff could be fitted, so neither moves. eta enters the likelihood and
         not the rendering and is fitted separately."""
         skip = {"raw_eta"}
         if not bool(self.interreflection):
             skip.add("raw_rho")
-        if float(self.eye_distance) >= FAR_CAMERA:
+        if bool(self.orthographic):
             skip |= {"raw_eye", "sensor.raw_vignette"}
         return [(n, p) for n, p in self.named_parameters() if n not in skip]
 
@@ -160,9 +161,9 @@ class Instrument(nn.Module):
         def f(x):
             return float(x.detach())
         return (f"rho {f(self.rho):.3f}, source radius {np.degrees(f(self.delta)):.2f} deg, "
-                f"eye distance {f(self.eye_distance):.2f}, tau_i {f(self.tau_i):.4f}, "
-                f"psf sigma {f(self.sensor.psf_sigma):.2f} px, "
-                f"saturation {f(self.sensor.saturation):.3f}, "
+                f"eye distance "
+                f"{'infinite' if bool(self.orthographic) else format(f(self.eye_distance), '.2f')}"
+                f", tau_i {f(self.tau_i):.4f}, {self.sensor.describe()}, "
                 f"interreflection {'on' if bool(self.interreflection) else 'off'}, "
                 f"eta median {f(self.eta.median()):.4f}")
 
@@ -171,8 +172,11 @@ class Instrument(nn.Module):
 
     @classmethod
     def load(cls, path, device="cpu") -> "Instrument":
-        inst = cls()
+        """A saved instrument, with the sensor chain it was saved with. Which chain that is
+        follows from the keys: a rendered channel's PowerTransfer has a gamma where the
+        laboratory camera's SensorModel has spline knots."""
         state = torch.load(path, map_location="cpu", weights_only=True)
+        inst = cls(sensor=PowerTransfer() if "sensor.raw_gamma" in state else None)
         try:
             inst.load_state_dict(state)
         except (RuntimeError, TypeError) as exc:

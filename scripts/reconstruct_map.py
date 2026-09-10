@@ -46,8 +46,8 @@ from hac26.shapes import rescale_touch_z                                 # noqa:
 from hac26.solvers.operator import CodeOperator                          # noqa: E402
 from hac26.solvers.output import export_stl, restore_constraints         # noqa: E402
 from reconstruct import answer_path                                      # noqa: E402
-from reconstruct_lpd import (curve_pairs, geometry_mask, residual_scale,  # noqa: E402
-                             support_from_convex, whitened_misfit)
+from reconstruct_lpd import (curve_pairs, curve_weight, geometry_mask,   # noqa: E402
+                             residual_scale, support_from_convex, whitened_misfit)
 from train_lpd import INSTRUMENT, RENDER, _enable_tf32, load_instrument   # noqa: E402
 
 OCC_RES = 128         # grid of the Dice reported at the checkpoints
@@ -137,10 +137,15 @@ def main() -> None:
     support = support_from_convex(sup_stl)
 
     d = load_inversion_curves(a.data_dir, a.model, m=a.phases, channel=a.channel)
-    if d["mask"].sum() < 2 * N_CAMS:
-        raise SystemExit(f"model {a.model}: only {int(d['mask'].sum())} of {2 * N_CAMS} "
-                         f"curves present; refusing to fit around missing data")
+    if set(d["files"]) != {"intensity", "binary"}:
+        raise SystemExit(f"model {a.model} needs both {a.channel} curve files under "
+                         f"{a.data_dir}; found {sorted(d['files'])}")
     data = curve_pairs(d["curves"])
+    weight = curve_weight(d["mask"])
+    if d["duplicate_columns"] or d["count_curves_refused"]:
+        print(f"  {len(d['duplicate_columns'])} repeated columns and "
+              f"{len(d['count_curves_refused'])} count curves dropped; "
+              f"{int(weight.sum())} curves fitted", flush=True)
     scale = residual_scale(d, inst.eta)
     print(f"  curves: {d['channel']}   eta median {float(inst.eta.median()):.4f}   "
           f"median scale {float(scale.median()):.4f}", flush=True)
@@ -157,16 +162,18 @@ def main() -> None:
 
     d_fit = data[fit_geoms].to(dev)
     s_fit = scale[fit_geoms].to(dev)
-    n_obs = d_fit.numel()
+
+    w_fit = weight[fit_geoms].to(dev)
+    n_obs = float(w_fit.sum()) * data.shape[-1]
 
     def cot_fn(cur):
-        return 2.0 * (cur - d_fit) / (s_fit[..., None] ** 2) / n_obs
+        return 2.0 * w_fit[..., None] * (cur - d_fit) / (s_fit[..., None] ** 2) / n_obs
 
     def objective(z):
         cur = op.curves(support, z, R, geoms=fit_geoms)
         if cur is None:
             return float("inf"), None
-        chi = whitened_misfit(cur.cpu(), data, scale, fit_geoms)
+        chi = whitened_misfit(cur.cpu(), data, scale, fit_geoms, weight)
         ridge = a.l2 * float((z[N_DIR:] ** 2).sum())
         return chi ** 2 + ridge, chi
 
@@ -174,12 +181,14 @@ def main() -> None:
         if not held:
             return float("nan")
         ch = operator.curves(support, z, R, geoms=held)
-        return whitened_misfit(ch.cpu(), data, scale, held) if ch is not None else float("inf")
+        return whitened_misfit(ch.cpu(), data, scale, held, weight) if ch is not None \
+            else float("inf")
 
     def export_misfits(z):
         """The misfits of the body as it would be written, extracted at EXPORT_RES."""
         cur = op_export.curves(support, z, R, geoms=fit_geoms)
-        fit = whitened_misfit(cur.cpu(), data, scale, fit_geoms) if cur is not None else float("inf")
+        fit = whitened_misfit(cur.cpu(), data, scale, fit_geoms, weight) if cur is not None \
+            else float("inf")
         return fit, held_misfit(op_export, z)
 
     code = torch.zeros(CODE_DIM, device=dev)

@@ -106,9 +106,22 @@ def curve_pairs(curves56: np.ndarray) -> torch.Tensor:
 
 
 def geometry_mask(mask56: np.ndarray) -> torch.Tensor:
-    """(1, N_CAMS): a geometry counts as present only if BOTH its curves are."""
-    return torch.tensor((mask56[:N_CAMS] > 0) & (mask56[N_CAMS:] > 0),
+    """(1, N_CAMS): a geometry counts as present when either of its curves is.
+
+    Either rather than both, because a single curve can be dropped on its own. A missing file
+    takes a whole block of twenty-eight, and then neither curve of any geometry is present;
+    but the released count curve of one body is a step function of the transfer curve rather
+    than of the shape and is refused by itself (data_io.count_curve_is_usable), and that
+    geometry still has an intensity curve to be fitted on. Which of the two a geometry
+    carries is `curve_weight`."""
+    return torch.tensor((mask56[:N_CAMS] > 0) | (mask56[N_CAMS:] > 0),
                         dtype=torch.float32)[None]
+
+
+def curve_weight(mask56: np.ndarray) -> torch.Tensor:
+    """(N_CAMS, 2): one for every released curve that carries shape, zero for the rest, laid
+    out as the residual is."""
+    return torch.tensor(np.asarray(mask56) > 0, dtype=torch.float32).reshape(2, N_CAMS).T
 
 
 def residual_scale(d: dict, eta56: torch.Tensor) -> torch.Tensor:
@@ -166,15 +179,20 @@ def make_resid_fn(net, op: CodeOperator, data, scale, geom_mask, M, cond, suppor
     return fn
 
 
-def whitened_misfit(pred, data, scale, geoms) -> float:
+def whitened_misfit(pred, data, scale, geoms, weight=None) -> float:
     """RMS of (data - pred) / scale over the geometries `geoms`, in standard deviations.
-    `pred` holds those geometries only, in that order, as the operator returns them; `data`
-    and `scale` hold every geometry."""
+    `pred` holds those geometries only, in that order, as the operator returns them; `data`,
+    `scale` and `weight` hold every geometry. `weight` is (N_CAMS, 2) and zeroes the curves
+    that carry no shape, and the mean is taken over the curves that are left."""
     r = (data[geoms] - pred) / scale[geoms][..., None]
-    return float(r.pow(2).mean().sqrt())
+    if weight is None:
+        return float(r.pow(2).mean().sqrt())
+    w = weight[geoms][..., None].to(r.device)
+    return float((r.pow(2) * w).sum().div(w.sum().clamp_min(1e-9) * r.shape[-1]).sqrt())
 
 
-def mesh_misfit_by_geom(op: CodeOperator, verts, faces, radius, data, scale) -> torch.Tensor:
+def mesh_misfit_by_geom(op: CodeOperator, verts, faces, radius, data, scale,
+                        weight=None) -> torch.Tensor:
     """Whitened RMS misfit of a mesh in the canonical frame against the curves, per geometry
     (N_CAMS,), in standard deviations; inf everywhere for a mesh that cannot be rendered, so
     that it is never accepted."""
@@ -185,10 +203,15 @@ def mesh_misfit_by_geom(op: CodeOperator, verts, faces, radius, data, scale) -> 
         pred = normalise(op.forward.raw_curves(v_t, f_t)).cpu()
     except RadiosityError:
         return torch.full((N_CAMS,), float("inf"))
-    return ((pred - data) / scale[..., None]).pow(2).mean((1, 2)).sqrt()
+    r = ((pred - data) / scale[..., None]).pow(2)
+    if weight is None:
+        return r.mean((1, 2)).sqrt()
+    w = weight[..., None].to(r.device)
+    return (r * w).sum((1, 2)).div((w.sum((1, 2)) * r.shape[-1]).clamp_min(1e-9)).sqrt()
 
 
-def polish(net, op: CodeOperator, z, support, radius, data, scale, geoms, steps: int):
+def polish(net, op: CodeOperator, z, support, radius, data, scale, geoms, steps: int,
+           weight=None):
     """Gradient descent on the whitened misfit of one draw, in the whitened code, from where
     the flow left it. Each iteration renders once with the adjoint, steps against the
     gradient by POLISH_STEP per coordinate at first, and halves the step until the misfit
@@ -199,17 +222,20 @@ def polish(net, op: CodeOperator, z, support, radius, data, scale, geoms, steps:
     iterations taken)."""
     def misfit_of(zz):
         cur = op.curves(support, net.codec.decode(zz), radius, geoms=geoms)
-        return float("inf") if cur is None else whitened_misfit(cur.cpu(), data, scale, geoms)
+        return float("inf") if cur is None else whitened_misfit(cur.cpu(), data, scale,
+                                                                geoms, weight)
 
     d_sel, s_sel = data[geoms].to(op.device), scale[geoms].to(op.device)
+    w_sel = None if weight is None else weight[geoms].to(op.device)[..., None]
     z = z.detach().clone()
     alpha, chi0, chi, it = POLISH_STEP, None, None, 0
     while it < steps:
         cur, g = op.adjoint(support, net.codec.decode(z), radius,
-                            lambda c: (d_sel - c) / s_sel[..., None] ** 2, geoms=geoms)
+                            lambda c: (d_sel - c) / s_sel[..., None] ** 2
+                            * (1.0 if w_sel is None else w_sel), geoms=geoms)
         if cur is None:
             break
-        chi = whitened_misfit(cur.cpu(), data, scale, geoms)
+        chi = whitened_misfit(cur.cpu(), data, scale, geoms, weight)
         chi0 = chi if chi0 is None else chi0
         if chi <= POLISH_TARGET:
             break
@@ -415,6 +441,7 @@ def main():
                          f"{a.data_dir}; found {sorted(d['files'])}")
     data = curve_pairs(d["curves"])                              # (N_CAMS, 2, P)
     mask = geometry_mask(d["mask"])
+    weight = curve_weight(d["mask"])                             # (N_CAMS, 2)
     scale = residual_scale(d, inst.eta)                          # (N_CAMS, 2)
     tag = geometry_tags()
     present = torch.nonzero(mask[0] > 0).flatten()
@@ -441,14 +468,14 @@ def main():
         t0 = time.time()
         for i in range(a.samples):
             codes[i], before, after, n_it = polish(net, op, codes[i], support, R, data, scale,
-                                                    seen.tolist(), a.polish_steps)
+                                                    seen.tolist(), a.polish_steps, weight)
             polished.append([before, after, n_it])
             print(f"  draw {i}: polished from {before:.2f} to {after:.2f} sigma in {n_it} "
                   f"steps", flush=True)
         print(f"  polish in {time.time()-t0:.0f}s", flush=True)
 
     def misfit_by_geom(w, faces):
-        return mesh_misfit_by_geom(op, w, faces, R, data, scale)
+        return mesh_misfit_by_geom(op, w, faces, R, data, scale, weight)
 
     def misfit(w, faces):
         """Whitened RMS misfit of a candidate mesh over the geometries the inversion saw."""

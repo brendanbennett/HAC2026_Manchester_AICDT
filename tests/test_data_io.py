@@ -81,3 +81,55 @@ def test_the_convex_recipe_poses_the_body_and_reads_the_render():
     assert info_lab["channel"] == "real"
     # the two channels are different recordings, so the two answers differ
     assert v_lab.shape != v.shape or not np.allclose(v_lab, v)
+
+
+def test_the_two_horizontal_columns_of_a_render_are_one_curve():
+    """Every azimuth is recorded by two columns of the same horizontal camera, and in the
+    released renders they carry the same numbers. Summing a likelihood over all 28 would give
+    those seven geometries twice the weight of the rest, so the repeat is masked out and the
+    render's 42 distinct curves are what is fitted. In the laboratory files the two columns
+    are two recordings and nothing is masked."""
+    from hac26.data_io import distinct_geometries
+
+    groups = distinct_geometries()
+    assert len(groups) == 21
+    assert sorted(c for g in groups for c in g) == list(range(N_CAMS))
+
+    for model in (1, 3, 10):
+        blender = load_inversion_curves(DATA, model, m=48, channel="blender")
+        for g in groups:
+            for first, other in ((g[0], c) for c in g[1:]):
+                for block in (0, N_CAMS):
+                    assert np.array_equal(blender["curves"][first + block],
+                                          blender["curves"][other + block])
+                    assert blender["mask"][other + block] == 0.0
+                    assert blender["mask"][first + block] == 1.0
+        assert len(blender["duplicate_columns"]) == 14
+        lab = load_inversion_curves(DATA, model, m=48, channel="real")
+        assert lab["duplicate_columns"] == []
+        assert lab["mask"].sum() == 2 * N_CAMS
+
+
+def test_a_count_curve_that_collapses_to_zero_is_refused():
+    """Otsu's threshold is taken on the first frame and applied to the rest. On a body with
+    large flat facets it can split the body's own brightness range instead of separating the
+    body from the background, and the count then falls to nothing at the phases where no
+    facet is bright enough. Model 2's released count curves do that; no other model's do, and
+    the geometry keeps its intensity curve either way."""
+    from hac26.data_io import count_curve_is_usable
+    from reconstruct_lpd import curve_weight, geometry_mask
+
+    cube = load_inversion_curves(DATA, 2, m=48, channel="blender")
+    assert len(cube["count_curves_refused"]) == 18
+    assert all(c >= N_CAMS for c in cube["count_curves_refused"])
+    # the intensity curves survive and every geometry is still fitted on something
+    assert int(geometry_mask(cube["mask"]).sum()) == 21
+    w = curve_weight(cube["mask"])
+    assert float(w[:, 0].sum()) == 21.0 and float(w[:, 1].sum()) == 8.0
+
+    for model in (1, 3, 4, 5, 6, 7, 8, 9, 10):
+        d = load_inversion_curves(DATA, model, m=48, channel="blender")
+        assert d["count_curves_refused"] == []
+
+    assert count_curve_is_usable(np.array([0.9, 1.0, 1.1]))
+    assert not count_curve_is_usable(np.array([0.0, 0.0, 3.0]))

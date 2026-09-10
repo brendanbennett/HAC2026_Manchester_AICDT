@@ -48,7 +48,8 @@ import torch
 from hac26.conventions import S_LAB, cameras
 from .instrument import Instrument
 from .radiosity import RadiosityError, RadiositySolver, form_factors
-from .raster import Rasteriser, flat_faces, look_at, orthographic, otsu_threshold, perspective
+from .raster import (Rasteriser, flat_faces, look_at, orthographic, orthographic_view,
+                     otsu_threshold, perspective)
 from ..shared.coarea import threshold_count, threshold_sum
 
 __all__ = ["RenderConfig", "ExactForward", "LitCoverage", "normalise", "normalise_vjp",
@@ -255,18 +256,34 @@ class ExactForward:
         indirect = (B - rho * E).gather(1, idx)                                     # (P, F)
         return prep.solver.radiance(rho * e + indirect)
 
+    def _camera_matrices(self, prep: Prepared, angle: torch.Tensor, geoms):
+        """(mvp (P G, 4, 4), field of view in radians) for every phase and geometry.
+
+        A camera at infinity is a projection of its own rather than a very distant
+        perspective one, because the depth buffer of a camera at distance d resolves two
+        nearly coincident faces over a range set by d, and the simulated channel's camera is
+        at infinity. Its field of view is zero, which makes the sensor's off-axis falloff
+        identically one, as it is for a render with no lens."""
+        inst, cfg = self.inst, self.cfg
+        dirs = rotate_z(self.cam_v[geoms], angle).reshape(-1, 3)                     # (P G, 3)
+        if bool(inst.orthographic):
+            mvp = orthographic_view(dirs, cfg.fov_scale * prep.extent,
+                                    3.0 * prep.extent, aspect=cfg.width / cfg.height,
+                                    device=self.device)
+            return mvp, torch.zeros((), device=self.device)
+        fov = 2.0 * torch.atan(cfg.fov_scale * prep.extent / inst.eye_distance)
+        # clip planes just around the body, whatever the camera distance, so a distant
+        # camera does not clip the body
+        near = (inst.eye_distance - 2.0 * prep.extent).clamp_min(0.05 * inst.eye_distance)
+        far = inst.eye_distance + 2.0 * prep.extent
+        proj = perspective(fov, cfg.width / cfg.height, near, far, device=self.device)
+        return proj @ look_at(dirs * inst.eye_distance, device=self.device), fov
+
     def _images(self, prep: Prepared, L: torch.Tensor, angle: torch.Tensor, geoms):
         """Sensor images (P, G, h, w) of the radiance L (P, F) at the body angles (P,)."""
         inst, cfg = self.inst, self.cfg
         P, G = len(angle), len(geoms)
-        eyes = rotate_z(self.cam_v[geoms], angle) * inst.eye_distance                # (P, G, 3)
-        fov = 2.0 * torch.atan(cfg.fov_scale * prep.extent / inst.eye_distance)
-        # clip planes just around the body, whatever the camera distance: a far camera is
-        # how a nearly orthographic view is expressed, and it must not clip the body
-        near = (inst.eye_distance - 2.0 * prep.extent).clamp_min(0.05 * inst.eye_distance)
-        far = inst.eye_distance + 2.0 * prep.extent
-        proj = perspective(fov, cfg.width / cfg.height, near, far, device=self.device)
-        mvp = proj @ look_at(eyes.reshape(-1, 3), device=self.device)                # (P G, 4, 4)
+        mvp, fov = self._camera_matrices(prep, angle, geoms)                         # (P G, 4, 4)
         hom = torch.cat([prep.fv, torch.ones(len(prep.fv), 1, device=self.device)], 1)
         clip = torch.einsum("vj,bij->bvi", hom, mvp)                                 # (P G, 3F, 4)
         attr = L[:, None, :].expand(P, G, -1).reshape(P * G, -1)

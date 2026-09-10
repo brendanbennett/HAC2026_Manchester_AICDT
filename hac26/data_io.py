@@ -20,6 +20,57 @@ from .geometry import build_cameras
 from .shapes import hull_mesh, mesh_curves_convex
 
 N_CAMS = 28
+COUNT_FLOOR = 0.05     # a count curve whose smallest value falls below this fraction of its
+                       # mean is refused; see count_curve_is_usable
+
+
+def distinct_geometries() -> list:
+    """The released columns grouped by camera geometry, as lists of column indices.
+
+    Twenty-eight columns cover twenty-one distinct (azimuth, elevation) pairs: at every
+    azimuth the first two columns are the same horizontal camera, recorded in the two
+    mountings of the body. A forward model that does not know which mounting a column came
+    from predicts one curve for both, so a likelihood that sums over all twenty-eight gives
+    those seven geometries twice the weight of the rest.
+    """
+    groups: dict = {}
+    for i, c in enumerate(build_cameras()):
+        groups.setdefault((c.azimuth_deg, c.elevation_deg), []).append(i)
+    return [groups[k] for k in sorted(groups)]
+
+
+def duplicate_columns(curves: np.ndarray, atol: float = 1e-12) -> np.ndarray:
+    """(2 * N_CAMS,) marking every column that repeats an earlier column of its own geometry
+    and curve type.
+
+    Which columns repeat is read off the file rather than assumed. In the released renders
+    the two horizontal columns of every azimuth carry the same numbers to the last digit, so
+    each contributes the same residual twice; in the laboratory files they differ, because
+    they are two recordings of two mountings, and nothing is masked.
+    """
+    dup = np.zeros(len(curves), dtype=bool)
+    for cols in distinct_geometries():
+        for block in (0, N_CAMS):
+            first = cols[0] + block
+            for c in cols[1:]:
+                if np.allclose(curves[c + block], curves[first], atol=atol, rtol=0.0):
+                    dup[c + block] = True
+    return dup
+
+
+def count_curve_is_usable(curve: np.ndarray, floor: float = COUNT_FLOOR) -> bool:
+    """Whether a released count curve carries shape rather than the transfer curve.
+
+    The organisers take Otsu's threshold on the first frame and apply it to every frame. On a
+    body with large flat facets the first frame's histogram has a mode per facet, and the
+    threshold that maximises the between-class variance can fall between two facet modes
+    rather than between the body and the background. The count is then the area of whichever
+    facets are brighter than that level, and it drops to nothing at the phases where none is.
+    A forward model cannot be relied on to land on the same side of that split, so a curve
+    whose smallest value is a small fraction of its mean is not a measurement of the shape.
+    """
+    curve = np.asarray(curve, dtype=float)
+    return bool(curve.min() > floor * max(curve.mean(), 1e-12))
 
 
 def public_stl(data_dir: str, model: int) -> str:
@@ -104,7 +155,19 @@ def load_model_curves(data_dir: str, model_idx: int, m: int = 360,
             mask[sl] = 1.0
             found[ctype] = str(p)
             native[ctype] = raw
-    return {"curves": stack, "mask": mask, "files": found, "native": native}
+    # A curve that repeats another, or that Otsu's threshold made a step function of the
+    # transfer curve rather than of the shape, is not a second measurement and is dropped
+    # here rather than by each caller, so that no likelihood in the tree can double-count or
+    # fit it by forgetting to ask.
+    dup = duplicate_columns(stack) & (mask > 0)
+    refused = np.zeros_like(dup)
+    for c in range(N_CAMS, 2 * N_CAMS):
+        if mask[c] > 0 and not count_curve_is_usable(stack[c]):
+            refused[c] = True
+    mask[dup | refused] = 0.0
+    return {"curves": stack, "mask": mask, "files": found, "native": native,
+            "duplicate_columns": np.nonzero(dup)[0].tolist(),
+            "count_curves_refused": np.nonzero(refused)[0].tolist()}
 
 
 CHANNELS = ("auto", "blender", "real")
