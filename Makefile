@@ -22,7 +22,7 @@
 VENV       ?= .venv
 PY_VERSION ?= 3.12
 CUDA       ?= auto
-EXTRAS     ?= test
+EXTRAS     ?= test,toolchain
 EDITABLE   ?= 1
 
 PYTEST_ARGS ?=
@@ -201,7 +201,8 @@ deps: | $(PY)
 
 # ---------------------------------------------------------------------------
 # nvdiffrast, for the exact forward model. GPU boxes only; the tests and the smoke test
-# run the pure-torch rasteriser instead and do not need this.
+# run the pure-torch rasteriser instead and do not need this. The build wants ninja, which
+# rides in on the toolchain extra (see pyproject.toml) that EXTRAS installs by default.
 # ---------------------------------------------------------------------------
 toolchain: venv
 	@if [ "$(TORCH_TAG)" = "cpu" ]; then \

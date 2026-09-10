@@ -121,6 +121,12 @@ if [ "$(cat "$STAMP" 2>/dev/null)" != "$INC_DIRS" ]; then
   find "$SRC" -name '_nvdiffrast_c*.so' -delete
   printf '%s\n' "$INC_DIRS" > "$STAMP"
 fi
+# torch's builder compiles with ninja when it finds it on PATH and falls back to one file at
+# a time when it does not. It comes from the toolchain extra in pyproject.toml, so this is
+# only reachable in a venv built with EXTRAS trimmed.
+command -v ninja >/dev/null 2>&1 || echo \
+  "[toolchain] no ninja on PATH: this build will be serial. make venv EXTRAS=test,toolchain" >&2
+
 cat > /tmp/build_nvdr.py <<'PY'
 import sys, torch.utils.cpp_extension as ce
 ce._check_cuda_version = lambda *a, **k: None      # the version guard; see the header comment

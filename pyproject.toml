@@ -34,6 +34,12 @@ dependencies = [
 [project.optional-dependencies]
 torch = ["torch>=2.1"]
 test = ["pytest>=7.0"]
+# Nothing imports ninja. It is here because torch's extension builder uses it when it is on
+# PATH and falls back to distutils when it is not, and distutils compiles nvdiffrast's ~15
+# translation units one after another -- minutes of a `make toolchain`, every time. The wheel
+# is a few hundred kB with no dependencies of its own, so `make venv` installs it everywhere
+# rather than only on the GPU boxes that run the build.
+toolchain = ["ninja"]
 
 # embreex is deliberately absent. It gives trimesh a compiled ray engine for the visibility
 # test in hac26/forward/mesh/radiosity.py, but the interreflection is solved on 600 patches
