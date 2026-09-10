@@ -12,7 +12,6 @@ from __future__ import annotations
 
 import numpy as np
 
-from .stl_io import save_stl
 
 
 def body_from_support(normals: np.ndarray, h: np.ndarray, eps: float = 1e-3) -> tuple:
@@ -62,13 +61,18 @@ def fit_to_cylinder(verts: np.ndarray, radius: float) -> np.ndarray:
 def save_submission_stl(path: str, verts: np.ndarray, faces: np.ndarray,
                         cylinder_radius: float | None = None) -> dict:
     """Write the STL and return the z range and largest axis distance, plus whether the body
-    lies inside the a-priori cylinder when a radius is given. Nothing is enforced."""
+    lies inside the a-priori cylinder when a radius is given. The radius is not enforced; the
+    mesh is repaired and refused if it is not one watertight body (solvers.output.export_stl).
+    """
     info = {"zmin": float(verts[:, 2].min()), "zmax": float(verts[:, 2].max()),
             "max_axis_dist": float(np.sqrt((verts[:, :2] ** 2).sum(1)).max())}
     if cylinder_radius is not None:
         info["cylinder_radius_prior"] = cylinder_radius
         info["inside_prior_cylinder"] = bool(info["max_axis_dist"] <= cylinder_radius + 1e-9)
-    save_stl(path, verts, faces)
+    # Through the same repair-and-check gate every solver's answer goes through, so a
+    # submission file cannot be written non-watertight or inside out.
+    from .solvers.output import export_stl
+    info.update(export_stl(path, verts, faces))
     return info
 
 

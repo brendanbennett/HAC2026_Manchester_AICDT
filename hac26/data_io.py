@@ -107,6 +107,42 @@ def load_model_curves(data_dir: str, model_idx: int, m: int = 360,
     return {"curves": stack, "mask": mask, "files": found, "native": native}
 
 
+CHANNELS = ("auto", "blender", "real")
+
+
+def load_inversion_curves(data_dir: str, model_idx: int, m: int = 360,
+                          channel: str = "auto") -> dict:
+    """The curve stack a shape is inverted from, with the channel it came from under
+    'channel'.
+
+    The released data carry two recordings of every body, the laboratory curves and the
+    organisers' Blender render of the true shape. The render is the cleaner measurement of
+    the shape. It has no sensor, no mounting, no beam non-uniformity and no per-column
+    realignment in front of it, its camera is far from the body, and its scattering is the
+    Lambertian kind the convex operator assumes, whereas the laboratory columns of several
+    bodies are out of phase with their own geometry by tens of degrees and one body's
+    vertical cameras only match the render with the body upside down. So the render is
+    inverted whenever it is released, and the laboratory curves are the fallback for a body
+    whose simulated curves the organisers withhold, which their rules allow for the harder
+    targets. `channel` forces one or the other; 'auto' takes the render only when both of
+    its files, intensity and binary, are present, so that a body is never inverted from
+    half of one recording and none of the other.
+    """
+    if channel not in CHANNELS:
+        raise ValueError(f"channel must be one of {CHANNELS}, not {channel!r}")
+    if channel in ("auto", "blender"):
+        d = load_model_curves(data_dir, model_idx, m=m, use_blender=True)
+        if len(d["files"]) == 2 or (channel == "blender" and d["files"]):
+            d["channel"] = "blender"
+            return d
+        if channel == "blender":
+            raise FileNotFoundError(f"model {model_idx}: no Blender curve file under "
+                                    f"{data_dir}")
+    d = load_model_curves(data_dir, model_idx, m=m, use_blender=False)
+    d["channel"] = "real"
+    return d
+
+
 def native_sigma(d: dict) -> np.ndarray:
     """(2 * N_CAMS,) noise sigma per curve of a `load_model_curves` result, estimated at the
     files' own frame rate. Blocks whose file is missing get the median of the present ones;
