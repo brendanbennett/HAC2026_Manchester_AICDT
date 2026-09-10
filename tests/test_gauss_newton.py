@@ -38,8 +38,9 @@ def test_a_block_coordinate_is_a_carve_depth():
     K = lattice_kernel()
     fit = CarveFit(lambda c, g: None, np.zeros(4), np.ones(4), K, LATTICE_SHAPE)
     for stage in (Stage(2, 0, 1), Stage(6, 0, 1), Stage(12, 0, 1), Stage(0, 8, 1)):
-        basis = fit._basis(stage)
+        basis, btb = fit._basis(stage)
         depth = np.abs(K @ basis.toarray()).max(axis=0)
+        assert np.allclose(btb, (basis.T @ basis).toarray())
         assert np.allclose(depth, 1.0, atol=1e-6), stage.name
 
     # the blocks partition the lattice: every site is driven by exactly one coordinate

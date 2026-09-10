@@ -14,7 +14,7 @@ PY=${PY:-.venv/bin/python}
 BODIES=${BODIES:-40}
 FLOW_PHASES=${FLOW_PHASES:-96}
 FLOW_BATCH=${FLOW_BATCH:-2}
-FLOW_OPERATOR_RES=${FLOW_OPERATOR_RES:-32}
+FLOW_OPERATOR_RES=${FLOW_OPERATOR_RES:-96}
 FLOW_TRAIN_GEOMS=${FLOW_TRAIN_GEOMS:-28}
 
 echo "=== train $(date)"
@@ -31,7 +31,7 @@ mkdir -p results/lpd
 for M in 1 2 3 4 5 6 7 8 9 10; do
   P=$(printf "%02d" "$M")
   echo "=== reconstruct model $M"
-  $PY -u scripts/reconstruct_lpd.py --model "$M" --samples "$SAMPLES" --res 48 \
+  $PY -u scripts/reconstruct_lpd.py --model "$M" --samples "$SAMPLES" --res 96 \
       --out "results/lpd/Asteroid$P.stl"
 done
 

@@ -34,7 +34,8 @@ import torch.nn.functional as F
 __all__ = ["spherical_design", "design_sha", "DESIGN_N", "DESIGN_T", "DESIGN_ITERS",
            "ConvexCore", "GaussianLattice", "ImplicitBody", "extract_mesh",
            "apply_constraints", "LATTICE_SHAPE", "LATTICE_EXTENT", "LATTICE_ALPHA",
-           "EXTRACT_EXTENT", "RADIAL_DEGREE", "N_RADIAL", "radial_basis", "radial_field",
+           "EXTRACT_EXTENT", "EXTRACT_RES", "RADIAL_DEGREE", "N_RADIAL", "radial_basis",
+           "radial_field",
            "lattice_kernel",
            "N_SITES", "N_DIR", "CODE_DIM", "SH_DEGREE", "dir_design", "sh_expand",
            "support_resample", "support_resample_weights"]
@@ -53,20 +54,32 @@ CORE_CHUNK_ELEMS = 6e7 # cap on the (points x normals) intermediate, in float32 
 #
 # The sites are not learned and are not part of the code; the code is g. Amplitudes add where
 # kernels overlap, so several sites together can carve deeper than one.
-LATTICE_SHAPE = (12, 12, 12)      # sites per axis
-N_SITES = 12 * 12 * 12
+LATTICE_SHAPE = (24, 24, 24)      # sites per axis. What decides this is how sharp a surface
+                                  # the lattice can make, because the curves are far more
+                                  # sensitive to the sharpness of a carve than the voxel
+                                  # overlap is: a carve the lattice can only hold blurred
+                                  # fits the curves worse than no carve at all, however well
+                                  # it overlaps the body. notes/representation.md measures
+                                  # what each size can hold.
+N_SITES = 24 * 24 * 24
 LATTICE_EXTENT = 1.1              # half-width of the site box. The canonical pose puts every
                                   # body inside [-1, 1]^3; the box is a little wider so that
                                   # cell centres straddle the surface instead of sitting on it.
-LATTICE_ALPHA = 0.9               # sigma = LATTICE_ALPHA * spacing, per axis. Too small and
+LATTICE_ALPHA = 0.75              # sigma = LATTICE_ALPHA * spacing, per axis. Too small and
                                   # the kernels stop overlapping, and a fit can punch a hole
-                                  # through a thin waist.
+                                  # through a thin waist; too large and no combination of
+                                  # amplitudes makes a surface sharp enough to fit the curves.
 EXTRACT_EXTENT = 1.6              # half-width of the grid extract_mesh runs on, in the canonical
                                   # frame. It has to cover the lattice plus its kernels;
                                   # extract_mesh checks that.
-LATTICE_CHUNK_ELEMS = 6e6         # cap on the (points x sites) intermediate. A small chunk is
+EXTRACT_RES = 96                  # side of that grid. It has to resolve the kernels, whose
+                                  # width is LATTICE_ALPHA times the site spacing, or the
+                                  # extraction is a coarser body than the one the amplitudes
+                                  # describe; extract_mesh reports the ratio.
+LATTICE_CHUNK_ELEMS = 1.2e7       # cap on the (points x sites) intermediate. A small chunk is
                                   # faster on a CPU and slower on a GPU, so GaussianLattice
-                                  # raises it on CUDA.
+                                  # raises it on CUDA; the raised value is what has to fit
+                                  # beside the rest of a render on an eight-gigabyte card.
 
 # ------------------------------------------------------------------- the support correction
 SH_DEGREE = 5                     # dh is band-limited to this spherical-harmonic degree. A
@@ -413,7 +426,7 @@ class GaussianLattice(nn.Module):
         """
         gg = self.g if g is None else g
         if chunk is None:
-            elems = LATTICE_CHUNK_ELEMS * (16.0 if y.is_cuda else 1.0)
+            elems = LATTICE_CHUNK_ELEMS * (8.0 if y.is_cuda else 1.0)
             chunk = max(1024, int(elems // max(len(self.p), 1)))
         out = []
         for i in range(0, y.shape[0], chunk):
@@ -537,7 +550,15 @@ def _voxel_grid(res: int, device):
     return _GRID_CACHE[key]
 
 
-def extract_mesh(field, extent: float, res: int = 128, device: str = "cpu",
+def kernel_pitch_ratio(res: int, extent: float = EXTRACT_EXTENT) -> float:
+    """Kernel width over grid pitch of an extraction. Below one the grid does not resolve the
+    correction's own kernels and the extracted body is coarser than the amplitudes describe;
+    the operator's default resolution keeps it at about two."""
+    sigma = LATTICE_ALPHA * 2.0 * LATTICE_EXTENT / max(LATTICE_SHAPE)
+    return sigma / (2.0 * extent / res)
+
+
+def extract_mesh(field, extent: float, res: int = EXTRACT_RES, device: str = "cpu",
                  chunk: int = 262144, grad: bool = False):
     """The surface f = 0 as a triangle mesh, by FlexiCubes on a res^3 grid over
     [-extent, extent]^3.

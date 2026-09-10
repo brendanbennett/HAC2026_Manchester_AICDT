@@ -56,7 +56,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from hac26.conventions import CYLINDER_R, PUBLIC_MODELS, psi_grid   # noqa: E402
 from hac26.data_io import N_CAMS, load_inversion_curves, public_stl    # noqa: E402
-from hac26.field import CODE_DIM, DESIGN_N, N_DIR, N_SITES   # noqa: E402
+from hac26.field import (CODE_DIM, DESIGN_N, EXTRACT_RES, N_DIR,   # noqa: E402
+                         N_SITES)
 from hac26.forward.mesh.exact import normalise                         # noqa: E402
 from hac26.forward.mesh.radiosity import RadiosityError                # noqa: E402
 from hac26.data_io import native_sigma                                 # noqa: E402
@@ -371,10 +372,10 @@ def main():
                          "scripts/decision_check.py measures which weight scores best on "
                          "bodies whose truth is known")
     ap.add_argument("--phases", type=int, default=96)
-    ap.add_argument("--operator-res", type=int, default=32,
+    ap.add_argument("--operator-res", type=int, default=EXTRACT_RES,
                     help="FlexiCubes resolution of the operator inside the flow; must match "
                          "the training run")
-    ap.add_argument("--res", type=int, default=64,
+    ap.add_argument("--res", type=int, default=EXTRACT_RES,
                     help="FlexiCubes resolution the final mesh is extracted at")
     ap.add_argument("--out", required=True)
     ap.add_argument("--seed", type=int, default=0)

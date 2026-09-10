@@ -25,8 +25,8 @@ from __future__ import annotations
 import torch
 
 from hac26.conventions import PSI0
-from hac26.field import (CODE_DIM, EXTRACT_EXTENT, N_DIR, N_RADIAL, ImplicitBody,
-                         extract_mesh)
+from hac26.field import (CODE_DIM, EXTRACT_EXTENT, EXTRACT_RES, N_DIR, N_RADIAL,
+                         ImplicitBody, extract_mesh)
 from hac26.forward.mesh.exact import ExactForward, RenderConfig, normalise, normalise_vjp
 from hac26.forward.mesh.instrument import Instrument
 from hac26.forward.mesh.radiosity import RadiosityError
@@ -49,12 +49,15 @@ def split_code(code: torch.Tensor):
 class CodeOperator:
     """A(x) and its adjoint for one phase grid, one instrument and one extraction resolution.
 
-    `res` is the FlexiCubes grid the surface is extracted on. The base support `support` of
-    every call is the origin the code's dh block corrects: the fitted hull of a corpus body
-    in training, the convex stage's answer at reconstruction.
+    `res` is the FlexiCubes grid the surface is extracted on. It has to resolve the
+    correction's kernels (field.kernel_pitch_ratio), or the body the operator renders is
+    coarser than the one its amplitudes describe and a fit is scored on something it is not
+    changing. The base support `support` of every call is the origin the code's dh block
+    corrects: the fitted hull of a corpus body in training, the convex stage's answer at
+    reconstruction.
     """
 
-    def __init__(self, instrument: Instrument, psi, res: int = 32,
+    def __init__(self, instrument: Instrument, psi, res: int = EXTRACT_RES,
                  config: RenderConfig = RenderConfig(), device: str = "cuda",
                  backend: str | None = None):
         self.forward = ExactForward(instrument, psi, config, device=device, backend=backend)

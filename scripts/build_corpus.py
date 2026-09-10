@@ -45,9 +45,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from eval_exact import decode, predict_h                                          # noqa: E402
 from hac26.conventions import CYLINDER_R, cameras, psi_grid                       # noqa: E402
 from hac26.data_io import resample_curves                                         # noqa: E402
-from hac26.field import (CODE_DIM, DESIGN_N, LATTICE_ALPHA, LATTICE_EXTENT,       # noqa: E402
-                         LATTICE_SHAPE, N_DIR, SH_DEGREE, _real_sh, design_sha, dir_design,
-                         spherical_design)
+from hac26.field import (CODE_DIM, DESIGN_N, EXTRACT_RES, LATTICE_ALPHA,          # noqa: E402
+                         LATTICE_EXTENT, LATTICE_SHAPE, N_DIR, SH_DEGREE, _real_sh,
+                         design_sha, dir_design, spherical_design)
 from hac26.forward.convex_egi import normalize_np                                 # noqa: E402
 from hac26.solvers.operator import CodeOperator                                   # noqa: E402
 from hac26.train import load_net                                                  # noqa: E402
@@ -217,7 +217,7 @@ def main():
                     help="how many bodies of the codes file to use; 0 takes all of them")
     ap.add_argument("--phases", type=int, default=96,
                     help="rotation phases per curve; reconstruction uses the same count")
-    ap.add_argument("--operator-res", type=int, default=32,
+    ap.add_argument("--operator-res", type=int, default=EXTRACT_RES,
                     help="mesh extraction resolution of the operator")
     ap.add_argument("--codes-file", default=CODES, help="output of scripts/fit_shapes.py")
     ap.add_argument("--calibration", default=CALIBRATION,

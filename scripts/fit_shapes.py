@@ -262,7 +262,8 @@ def main():
     ap.add_argument("--bodies", type=int, default=40)
     ap.add_argument("--workers", type=int, default=1,
                     help="parallel workers for independent SDF/support preprocessing")
-    ap.add_argument("--points", type=int, default=60000,
+    ap.add_argument("--points", type=int, default=int(np.ceil(POINTS_PER_SITE * N_SITES
+                                                             / 1.5)),
                     help="uniform SDF sample points per body; half as many jittered "
                          "surface points are added on top. The amplitudes are solved from "
                          "these, and how far the code is a property of the body rather than "

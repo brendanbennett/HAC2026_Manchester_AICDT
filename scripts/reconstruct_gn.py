@@ -39,8 +39,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from hac26.conventions import CYLINDER_R, psi_grid                       # noqa: E402
 from hac26.data_io import N_CAMS, load_inversion_curves                  # noqa: E402
-from hac26.field import (CODE_DIM, LATTICE_SHAPE, N_RADIAL, N_SITES,     # noqa: E402
-                         lattice_kernel)
+from hac26.field import (CODE_DIM, EXTRACT_RES, LATTICE_SHAPE, N_RADIAL,  # noqa: E402
+                         N_SITES, lattice_kernel)
 from hac26.recon import fit_to_cylinder                                  # noqa: E402
 from hac26.solvers.gauss_newton import CarveFit, Stage, waist_amplitudes  # noqa: E402
 from hac26.solvers.operator import CodeOperator                          # noqa: E402
@@ -48,6 +48,7 @@ from hac26.solvers.output import export_stl, restore_constraints         # noqa:
 from reconstruct import answer_path                                      # noqa: E402
 from reconstruct_lpd import (curve_pairs, curve_weight, geometry_mask,   # noqa: E402
                              residual_scale, support_from_convex)
+from calibrate import ETA_FLOOR                                          # noqa: E402
 from reconstruct_map import EXPORT_RES, convexity, truth_dice            # noqa: E402
 from train_lpd import INSTRUMENT, RENDER, _enable_tf32, load_instrument   # noqa: E402
 
@@ -58,8 +59,6 @@ RESTARTS = 8               # starts of the first stage
 RESTART_SCREEN = 2         # iterations every start is judged on before all but the best stop
 RESTART_KEEP = 2           # starts carried to the end of the first stage
 TARGET_SIGMA = 1.0         # a body that explains the curves to the model error is fitted
-ETA_FLOOR = 4e-3           # smallest per-curve model error the likelihood will believe; see
-                           # scripts/calibrate.py, which measures the spread across bodies
 
 
 def curve_index(weight: torch.Tensor, geoms) -> tuple:
@@ -88,7 +87,9 @@ def main() -> None:
     ap.add_argument("--phases", type=int, default=48)
     ap.add_argument("--export-phases", type=int, default=96,
                     help="phases the written body's misfits are measured at")
-    ap.add_argument("--operator-res", type=int, default=96)
+    ap.add_argument("--operator-res", type=int, default=EXTRACT_RES,
+                    help="extraction resolution of the fit's operator; it has to resolve "
+                         "the correction's kernels")
     ap.add_argument("--export-res", type=int, default=EXPORT_RES)
     ap.add_argument("--hold-out-geoms", type=int, default=5)
     ap.add_argument("--restarts", type=int, default=RESTARTS)

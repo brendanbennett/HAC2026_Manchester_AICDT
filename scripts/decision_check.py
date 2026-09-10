@@ -38,7 +38,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from hac26.conventions import cameras, psi_grid                             # noqa: E402
-from hac26.field import N_DIR, apply_constraints                           # noqa: E402
+from hac26.field import EXTRACT_RES, N_DIR, apply_constraints             # noqa: E402
 from hac26.recon import dice, fit_to_cylinder, mesh_occupancy              # noqa: E402
 from hac26.scoring.side_view import (measure_outlines, outline_extent,   # noqa: E402
                                      outline_set, surface_points)
@@ -95,7 +95,8 @@ def main():
                          "(churn, weight) pair from the same starts, so the comparison is "
                          "between the settings and not between the draws")
     ap.add_argument("--polish-steps", type=int, default=30)
-    ap.add_argument("--res", type=int, default=64, help="extraction resolution of the meshes")
+    ap.add_argument("--res", type=int, default=EXTRACT_RES,
+                    help="extraction resolution of the meshes")
     ap.add_argument("--side-points", type=int, default=200000,
                     help="surface samples per body for the side-view measure")
     ap.add_argument("--seed", type=int, default=0)

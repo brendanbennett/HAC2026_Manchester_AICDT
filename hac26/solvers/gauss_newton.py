@@ -157,14 +157,18 @@ class CarveFit:
         return float(r @ r + lam * (g @ g))
 
     def _basis(self, stage: Stage):
+        """The stage's coordinates as columns over the site amplitudes, scaled so that one
+        unit of a coordinate is one body unit of carve depth at the sites."""
         if stage.side:
             b = block_basis(self.shape, stage.side)
         else:
-            b = sparse.csr_matrix(subspace_basis(self.shape, stage.n_dirs, self.rng))
-        # one unit of a coordinate is one body unit of carve depth at the sites
-        field = np.abs(self.kernel @ b.toarray())
-        peak = np.maximum(field.max(axis=0), 1e-12)
-        return sparse.csr_matrix(b.multiply(1.0 / peak[None, :]))
+            b = sparse.csc_matrix(subspace_basis(self.shape, stage.n_dirs, self.rng))
+        peak = np.zeros(b.shape[1])
+        for i in range(0, b.shape[1], 256):                    # a block at a time, dense
+            sl = slice(i, min(i + 256, b.shape[1]))
+            peak[sl] = np.abs(self.kernel @ b[:, sl].toarray()).max(axis=0)
+        b = sparse.csc_matrix(b.multiply(1.0 / np.maximum(peak, 1e-12)[None, :]))
+        return b, (b.T @ b).toarray()
 
     # ------------------------------------------------------------------ one iteration
     def _jacobian(self, c, g, basis, r0):
@@ -177,29 +181,31 @@ class CarveFit:
             r = self.residual(self._render(cc, g))
             if r is not None:
                 J[:, j] = (r - r0) / self.step_c
-        cols = basis.T.toarray()                                   # (m, n_sites)
         for j in range(m):
-            r = self.residual(self._render(c, g + self.step_g * cols[j]))
+            col = np.asarray(basis[:, j].todense()).ravel()
+            r = self.residual(self._render(c, g + self.step_g * col))
             if r is not None:
                 J[:, self.n_radial + j] = (r - r0) / self.step_g
-        return J, cols
+        return J
 
-    def _step(self, J, r0, g, cols, mu):
-        """The damped Gauss-Newton step of the penalised objective."""
-        n = J.shape[1]
+    def _normal_equations(self, J, r0, g, basis, btb):
+        """(A, b, diagonal) of the penalised Gauss-Newton system, before the damping."""
         A = J.T @ J
         b = -(J.T @ r0)
         if self.lam_g:
-            # the ridge is on g, and g moves by cols^T applied to the carve coordinates
-            C = cols @ cols.T                                      # (m, m)
-            A[self.n_radial:, self.n_radial:] += self.lam_g * C
-            b[self.n_radial:] -= self.lam_g * (cols @ g)
+            # the ridge is on g, and g moves by the basis applied to the carve coordinates
+            A[self.n_radial:, self.n_radial:] += self.lam_g * btb
+            b[self.n_radial:] -= self.lam_g * (basis.T @ g)
         d = np.diag(A).copy()
         d[d <= 0] = np.mean(d[d > 0]) if np.any(d > 0) else 1.0
+        return A, b, d
+
+    @staticmethod
+    def _solve(A, b, d, mu):
         try:
             return np.linalg.solve(A + mu * np.diag(d), b)
         except np.linalg.LinAlgError:
-            return np.zeros(n)
+            return np.zeros(len(b))
 
     def run(self, c0, g0, stages=DEFAULT_STAGES, target: float = 1.0, log=None):
         """Fit from (c0, g0). Returns (c, g, history); the history has one row per accepted
@@ -211,25 +217,26 @@ class CarveFit:
             return c, g, [{"stage": "start", "chi": float("inf"), "note": "no curves"}]
         chi = float(np.linalg.norm(r))
         for si, stage in enumerate(stages):
-            basis = self._basis(stage)
+            basis, btb = self._basis(stage)
             tries = 0
             it = 0
             while it < stage.iters:
                 if chi <= target:
                     break
-                J, cols = self._jacobian(c, g, basis, r)
+                J = self._jacobian(c, g, basis, r)
                 if self.lam_g is None:
                     carve = np.diag(J.T @ J)[self.n_radial:]
                     scale = float(np.mean(np.maximum(carve, 0.0)))
-                    unit = float(np.mean((cols ** 2).sum(1)))
+                    unit = float(np.mean(np.diag(btb)))
                     self.lam_g = self.ridge_frac * scale / max(unit, 1e-12)
+                A, rhs, diag = self._normal_equations(J, r, g, basis, btb)
                 obj = self.objective(r, g, c)
                 moved = False
                 for mu in self.damping:
-                    step = self._step(J, r, g, cols, mu)
+                    step = self._solve(A, rhs, diag, mu)
                     for length in self.lengths:
                         cc = c + length * step[:self.n_radial]
-                        gg = g + length * (step[self.n_radial:] @ cols)
+                        gg = g + length * (basis @ step[self.n_radial:])
                         rr = self.residual(self._render(cc, gg))
                         if rr is None:
                             continue
@@ -251,7 +258,7 @@ class CarveFit:
                     tries += 1
                     if stage.side or tries >= self.subspace_tries:
                         break
-                    basis = self._basis(stage)
+                    basis, btb = self._basis(stage)
                     continue
                 it += 1
             if chi <= target:

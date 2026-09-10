@@ -71,6 +71,13 @@ from hac26.stl_io import load_stl                                     # noqa: E4
 
 TRUTH_FACES = 20000       # faces the released meshes are decimated to before rendering
 PSI0_SEARCH = 1.0 / 8.0   # the start phase is searched within this fraction of a turn each way
+ETA_FLOOR = 4e-3       # smallest per-curve model error the saved calibration will claim.
+                       # The residual of a curve at the true shape is partly the
+                       # discretisation of one particular mesh at one resolution, which does
+                       # not transfer to a body of a different size, and a curve whose model
+                       # error is fitted below that carries a weight the measurement does not
+                       # earn. The value is the spread of the per-curve residual across the
+                       # public bodies, which the report prints.
 OUT_INSTRUMENT = {"real": "models/instrument_calibration.pt",
                   "blender": "models/instrument_blender.pt"}
 OUT_REPORT = {"real": "models/instrument_calibration.json",
@@ -395,6 +402,7 @@ def main():
               "steps_run": steps_run, "movement": moved, "budget_limited": limited}
     with torch.no_grad():
         eta = inst.eta.reshape(2, N_CAMS).T
+        worst_eta = torch.zeros_like(eta)
         for M, b in bodies.items():
             pred = normalise(fwd.raw_curves(b["verts"], b["faces"], psi0=float(b["psi0"])))
             rep = residual_report(pred, b["real"], b["present"], b["sigma"], eta)
@@ -403,6 +411,23 @@ def main():
             report["psi0_deg"][M] = float(np.degrees(float(b["psi0"])))
             report["phase_offset_deg"][M] = phase_offset_report(
                 pred, b["real"], b["present"], b["sigma"])
+            r = (pred - b["real"]) * b["present"][..., None]
+            worst_eta = torch.maximum(worst_eta, r.pow(2).mean(-1).sqrt())
+        # The likelihood fits one eta per curve across the bodies, which is near the pooled
+        # residual and therefore under-covers the worst of them. What a curve's model error
+        # has to cover is the worst body the method will meet, and three public bodies are
+        # the only sample of that there is, so the saved eta is the largest residual any of
+        # them leaves. The floor is there because the smallest residuals are the
+        # discretisation of one mesh at one resolution and do not transfer to a body of a
+        # different size; without it one curve of one body would carry the whole likelihood.
+        inst.raw_eta.copy_(torch.log(torch.expm1(
+            worst_eta.T.reshape(-1).clamp_min(ETA_FLOOR))))
+        report["eta_pooled_median"] = float(eta.median())
+        report["eta_worst_body_median"] = float(inst.eta.median())
+        report["eta_floor"] = ETA_FLOOR
+    print(f"\n[eta] per-curve model error raised from the pooled fit to the worst public "
+          f"body's residual, floored at {ETA_FLOOR}: median "
+          f"{report['eta_pooled_median']:.4f} -> {report['eta_worst_body_median']:.4f}")
     print("\n[alignment] whole-frame shift each azimuth still wants at the fitted psi0")
     print("    all zero = the body's frames agree with each other; a nonzero row means that")
     print("    azimuth is misaligned with the others, which no single psi0 can absorb and")

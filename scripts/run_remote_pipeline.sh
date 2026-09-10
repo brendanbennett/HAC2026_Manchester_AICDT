@@ -74,7 +74,8 @@ DESIGN_N=${DESIGN_N:-4096}
 DESIGN_DEVICE=${DESIGN_DEVICE:-}
 
 FIT_WORKERS=${FIT_WORKERS:-$LIB_WORKERS}
-FIT_POINTS=${FIT_POINTS:-60000}
+FIT_POINTS=${FIT_POINTS:-120000}   # sample points per body of the lattice fit; the solve
+                                   # refuses fewer than twelve per amplitude
 CODES_FILE=runs/corpus_codes.npz
 
 CONVEX_CKPT=${CONVEX_CKPT:-models/lpd_convex.pt}   # the convex stage, whose starts the flow corrects
@@ -94,15 +95,18 @@ FLOW_CKPT_EVERY=${FLOW_CKPT_EVERY:-100}   # steps between resumable checkpoints;
 FLOW_CKPT=${FLOW_CKPT:-runs/lpd_flow.pt.ckpt}   # under runs/, not /tmp: it has to outlive
                                                 # the job that wrote it
 FLOW_LOG_EVERY=${FLOW_LOG_EVERY:-10}
-FLOW_OPERATOR_RES=${FLOW_OPERATOR_RES:-32}
+FLOW_OPERATOR_RES=${FLOW_OPERATOR_RES:-96}   # extraction resolution of the operator; it has
+                                   # to resolve the correction's kernels, whose width is a
+                                   # fraction of the site spacing
 FLOW_TRAIN_GEOMS=${FLOW_TRAIN_GEOMS:-28}   # geometries the operator renders per step; all of them
 FLOW_EXPERT_STEPS=${FLOW_EXPERT_STEPS:-1000}   # cap on the second run's extra steps, branched
                                                 # into one expert per interval of t; 0 skips it
 
 RECON_SAMPLES=${RECON_SAMPLES:-8}
 RECON_POLISH_STEPS=${RECON_POLISH_STEPS:-30}   # most gradient steps of the polish per draw; 0 skips it
-RECON_RES=${RECON_RES:-64}      # extraction resolution of the written body, the one the
-                                # shape codes were fitted at (scripts/fit_shapes.py)
+RECON_RES=${RECON_RES:-96}      # extraction resolution of the written body. It is the
+                                # operator's, so the body that is written is the body whose
+                                # misfit was accepted
 RECON_SNAP=${RECON_SNAP:-0}
 # Weight on the data part of the velocity when sampling (lpd_flow.LPDFlow.velocity).
 # One is the model as trained. The decision stage reconstructs held-out bodies at each

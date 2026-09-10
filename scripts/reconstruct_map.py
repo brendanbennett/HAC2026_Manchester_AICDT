@@ -40,7 +40,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from hac26.conventions import CYLINDER_R, PUBLIC_MODELS, psi_grid        # noqa: E402
 from hac26.data_io import N_CAMS, load_inversion_curves, public_stl      # noqa: E402
-from hac26.field import CODE_DIM, N_DIR                                  # noqa: E402
+from hac26.field import CODE_DIM, EXTRACT_RES, N_DIR                     # noqa: E402
 from hac26.recon import dice, fit_to_cylinder, mesh_occupancy            # noqa: E402
 from hac26.shapes import rescale_touch_z                                 # noqa: E402
 from hac26.solvers.operator import CodeOperator                          # noqa: E402
@@ -51,7 +51,9 @@ from reconstruct_lpd import (curve_pairs, curve_weight, geometry_mask,   # noqa:
 from train_lpd import INSTRUMENT, RENDER, _enable_tf32, load_instrument   # noqa: E402
 
 OCC_RES = 128         # grid of the Dice reported at the checkpoints
-EXPORT_RES = 64       # extraction resolution of the written mesh
+EXPORT_RES = EXTRACT_RES   # extraction resolution of the written mesh: the
+                           # operator's, so that the body written is the one whose misfit
+                           # was accepted
 TARGET_SIGMA = 1.0    # stop once the answer explains the data to the noise level
 MAX_HALVINGS = 8      # trial steps per iteration before declaring convergence
 STEP_GROW = 1.6       # a step that works makes the next trial bolder
@@ -115,7 +117,7 @@ def main() -> None:
                          "against few curves is not obviously determined, and the ridge "
                          "stops the fit spending them on noise")
     ap.add_argument("--phases", type=int, default=96)
-    ap.add_argument("--operator-res", type=int, default=32,
+    ap.add_argument("--operator-res", type=int, default=EXTRACT_RES,
                     help="extraction resolution of the descent's operator")
     ap.add_argument("--hold-out-geoms", type=int, default=0,
                     help="cameras kept out of the fit; their misfit is the honest test")
