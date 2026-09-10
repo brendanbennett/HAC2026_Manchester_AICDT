@@ -4,7 +4,10 @@
 #
 # The venv itself -- which interpreter, which torch, which dependencies -- is the Makefile's
 # job and is described there; this file only decides *where* it goes and activates it. Set
-# CUDA=12 or CUDA=13 in the environment to choose the torch build, as for make.
+# CUDA=12 or CUDA=13 in the environment to choose the torch build, as for make. Nothing here
+# names CUDA, so an existing venv keeps the torch it was built with: a pipeline run does not
+# swap a cu129 torch, deliberately installed for the nvdiffrast build, for the driver's
+# preferred cu130 behind your back.
 #
 # Location: REPO_ROOT/.venv is tried first. If creating it fails, as it can under WSL when
 # the repo lives on a Windows-mounted drive (/mnt/c/...), whose filesystem may refuse to

@@ -14,6 +14,10 @@
 #
 # `make venv` is a no-op once the venv is complete, and reinstalls by itself when
 # pyproject.toml changes or when the CUDA choice no longer matches the installed torch.
+#
+# A venv remembers the torch build it was made with, so `make smoke` -- or anything else
+# that reaches `make venv` without naming CUDA, as scripts/_venv_setup.sh does -- keeps it
+# rather than re-deciding. Name CUDA=12, CUDA=13 or CUDA=auto to change it.
 
 VENV       ?= .venv
 PY_VERSION ?= 3.12
@@ -25,6 +29,7 @@ PYTEST_ARGS ?=
 
 PY   := $(VENV)/bin/python
 MARK := $(VENV)/.hac26-deps
+TORCH_MARK := $(VENV)/.hac26-torch
 UV   := $(shell command -v uv 2>/dev/null)
 
 # ---------------------------------------------------------------------------
@@ -35,7 +40,22 @@ UV   := $(shell command -v uv 2>/dev/null)
 # driver, which imports fine and then fails at the first kernel launch. No nvidia-smi
 # means no GPU, so cpu. Pass CUDA=12 or CUDA=13 to decide it yourself; any other value is
 # handed to the wheel index unchanged, so CUDA=cu126 pins an older line.
+#
+# Auto-detection only ever applies to a venv that has not been built yet. `deps` records the
+# tag it installed in $(TORCH_MARK), and that record wins whenever CUDA is not named on this
+# invocation: `make venv CUDA=12` followed by `make smoke` has to keep the cu129 torch that
+# was asked for, and not quietly put the driver's preference back. Naming CUDA (on the
+# command line or in the environment, including CUDA=auto) overrides the record and rewrites
+# it; so does deleting the venv.
 # ---------------------------------------------------------------------------
+ifeq ($(origin CUDA),file)
+CUDA_RECORDED := $(shell cat $(TORCH_MARK) 2>/dev/null)
+endif
+
+ifneq ($(CUDA_RECORDED),)
+TORCH_TAG := $(CUDA_RECORDED)
+else
+
 ifeq ($(CUDA),auto)
 CUDA_RESOLVED := $(shell \
   if command -v nvidia-smi >/dev/null 2>&1; then \
@@ -55,6 +75,8 @@ else ifeq ($(CUDA_RESOLVED),cpu)
 TORCH_TAG := cpu
 else
 TORCH_TAG := $(CUDA_RESOLVED)
+endif
+
 endif
 
 # macOS has no cpu index of its own; the plain PyPI wheel is the Metal/MPS build.
@@ -98,7 +120,7 @@ endif
 help:
 	@awk '/^#/ {sub(/^# ?/, ""); print; next} {exit}' Makefile
 	@echo ""
-	@echo "this machine: CUDA=$(CUDA) -> torch $(TORCH_TAG)$(if $(TORCH_INDEX), from $(TORCH_INDEX), from PyPI)"
+	@echo "this machine: CUDA=$(CUDA) -> torch $(TORCH_TAG)$(if $(TORCH_INDEX), from $(TORCH_INDEX), from PyPI)$(if $(CUDA_RECORDED), (the build $(VENV) was made with; name CUDA to change it),)"
 	@echo "installer:    $(if $(UV),uv ($(UV)),pip)"
 
 # ---------------------------------------------------------------------------
@@ -159,7 +181,8 @@ venv: $(MARK)
 	if [ "$$have" != "$(TORCH_TAG)" ]; then \
 	  [ -z "$$have" ] || echo "==> torch in $(VENV) is $$have, wanted $(TORCH_TAG); replacing it"; \
 	  $(MAKE) --no-print-directory deps TORCH_REPLACE=$${have:+1}; \
-	fi
+	fi; \
+	printf '%s\n' "$(TORCH_TAG)" > $(TORCH_MARK)
 	@echo "==> $(VENV) ready: $$($(PY) --version), torch $(TORCH_TAG), extras [$(EXTRAS)]"
 
 $(MARK): pyproject.toml | $(PY)
@@ -171,6 +194,7 @@ deps: | $(PY)
 	@echo "==> torch $(TORCH_TAG)$(if $(TORCH_INDEX), from $(TORCH_INDEX), from PyPI)"
 	@[ -z "$(TORCH_REPLACE)" ] || $(PIP_UNINSTALL) torch
 	$(PIP_INSTALL) $(TORCH_INDEX_FLAG) "torch>=2.1"
+	@printf '%s\n' "$(TORCH_TAG)" > $(TORCH_MARK)
 	@echo "==> hac26 and its dependencies, from pyproject.toml"
 	$(PIP_INSTALL) $(PROJECT_SPEC)
 	@printf '%s\n' "$(EXTRAS)" > $(MARK)
