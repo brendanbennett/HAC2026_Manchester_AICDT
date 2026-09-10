@@ -522,7 +522,8 @@ class LibrarySpec:
                                          # the bare base family, which for four of the eight
                                          # families is a convex primitive.
     mod_weights: dict = _dcfield(default_factory=lambda: {
-        "basin": 0.35, "saw": 0.20, "bulge": 0.15, "roughness": 0.20, "ridge": 0.10})
+        "basin": 0.28, "saw": 0.16, "roughness": 0.16, "waist": 0.12, "bulge": 0.12,
+        "ridge": 0.08, "bite": 0.08})
     # Which principal axis becomes the rotation axis. The choice sets the body's bounding
     # radius, since the axis fixes what is height and what is width: mounted on its short
     # axis a body lies down and is wide, on its long axis it stands up and is narrow.
@@ -820,6 +821,25 @@ def min_feature_radius(res: int, extent: float, voxels_across: float = 2.5) -> f
     return voxels_across * spacing
 
 
+CUT_SHARE = 0.6          # deepest a cutter may reach, as a share of the body's thickness
+                         # along the direction it comes in on. A cut that goes right through
+                         # parts the body, and `_repair` keeps the larger piece, so the draw
+                         # becomes a fragment carrying the recipe of the body it was cut from
+                         # -- silently, since every check in `_finish` runs after the repair.
+                         # Measured over the families, uncapped cutters part about a quarter
+                         # of all bodies; the base families on their own part none.
+
+
+def _cut_depth(f: Field, u: np.ndarray, rb: float, depth: float, floor: float) -> float:
+    """The depth a cutter coming in along `u` may reach: what was asked for, capped at
+    CUT_SHARE of the body's through-thickness there. Returns 0.0 when the body is too thin
+    for any cut the grid could render, which the caller takes as "leave this one out"."""
+    back = float(_ray_radius(f, -u[None])[0])
+    cap = CUT_SHARE * (rb + max(back, 0.0))
+    depth = min(depth, cap)
+    return depth if depth >= floor else 0.0
+
+
 def _apply_modifier(f: Field, rng: np.random.Generator, kind: str, s: float,
                     floor: float = 0.0) -> tuple:
     """One large-scale edit of `f`. Every cutter and lobe is placed relative to the body's
@@ -850,9 +870,13 @@ def _apply_modifier(f: Field, rng: np.random.Generator, kind: str, s: float,
             # `rho * sqrt(frac (2 - frac))`, and the smaller of the two decides whether the
             # grid sees a bowl or a pinch. Widening the cutter raises both together.
             rho = max(rho, floor / min(frac, np.sqrt(frac * (2.0 - frac))))
-            depth = rho * frac
+            depth = _cut_depth(f, u, rb, rho * frac, floor)
+            if depth <= 0.0:
+                continue
             cuts.append(sd_sphere(u * (rb + rho - depth), rho))
-        return op_subtract(f, *cuts), {"n_basins": k}
+        if not cuts:
+            return f, {"n_basins": 0}
+        return op_subtract(f, *cuts), {"n_basins": len(cuts)}
     if kind == "saw":
         k = int(rng.integers(1, 3))
         dirs = np.stack([_unit(rng) for _ in range(k)])
@@ -866,6 +890,49 @@ def _apply_modifier(f: Field, rng: np.random.Generator, kind: str, s: float,
     if kind == "roughness":
         L = int(rng.integers(5, 11))
         return op_displace(f, _sh_displacement(rng, 4, L, s * rng.uniform(0.01, 0.05))), {"rough_L": L}
+    if kind == "waist":
+        # A pinch right around the body: `ridge` with the sign of the displacement reversed,
+        # over a wider band. It is the only modifier that moves the whole outline rather than
+        # a patch of it, which is what the challenge's side-view measure compares -- the
+        # projection of a hull is the hull of the projection, so a waist is a concavity no
+        # convex reconstruction can produce from any direction.
+        #
+        # The amplitude is capped well below the body size on purpose. A pinch deep enough to
+        # part the body leaves two pieces, and `_repair` keeps the larger and discards the
+        # rest, so what reaches the library is a fragment carrying the recipe of the body it
+        # was cut from rather than a rejected draw.
+        w = _unit(rng)
+        c = rng.uniform(-0.25, 0.25) * s
+        width = max(s * rng.uniform(0.18, 0.40), floor)
+        amp = s * rng.uniform(0.08, 0.18)
+
+        def d(p, w=w, c=c, amp=amp, width=width):
+            return amp * np.exp(-((p @ w - c) ** 2) / (2.0 * width * width))
+        return op_displace(f, d), {"waist": float(amp / s)}
+    if kind == "bite":
+        # One lobe-scale piece taken out of the limb with an ellipsoidal cutter. A `basin` is
+        # a sphere dishing a face; this is bigger, single, and not round, so it leaves a
+        # facet-and-edge scar rather than a bowl.
+        u, rb = _surface_direction(f, rng, s)
+        ax = np.maximum(s * rng.uniform(0.35, 0.75, 3), floor)
+        R = _rand_rot(rng)
+        # How far the cutter reaches from its own centre along u. sd_ellipsoid measures in
+        # the frame q = (p - c) @ R.T, so u in that frame is u @ R.T.
+        r_u = 1.0 / max(float(np.sqrt((((u @ R.T) / ax) ** 2).sum())), 1e-12)
+        # Depth in units of that reach, on the same reasoning as `basin`: at one the cutter's
+        # centre sits on the surface and the scar is as deep as it is wide, and past that the
+        # mouth narrows. The cutter is widened if either the depth or the mouth would fall
+        # below what the grid resolves.
+        frac = rng.uniform(0.8, 1.4)
+        grow = floor / max(r_u * min(frac, np.sqrt(frac * (2.0 - frac))), 1e-12)
+        if grow > 1.0:
+            ax, r_u = ax * grow, r_u * grow
+        depth = _cut_depth(f, u, rb, r_u * frac, floor)
+        if depth <= 0.0:
+            return f, {"bite": None}
+        centre = u * (rb + r_u - depth)
+        return (op_subtract(f, sd_ellipsoid(centre, ax, R)),
+                {"bite": (ax / s).round(3).tolist(), "bite_depth": round(depth / s, 3)})
     if kind == "ridge":
         w = _unit(rng)
         c = rng.uniform(-0.3, 0.3) * s
@@ -888,6 +955,12 @@ def _finish(f: Field, rng: np.random.Generator, spec: LibrarySpec, recipe: dict,
     if len(fc) < 100 or info.get("clipped"):
         return None
     if not is_edge_manifold(fc) or n_components(v, fc) != 1:
+        return None
+    # `_repair` has already thrown the smaller pieces away by this point, so nothing above
+    # can see that the body was parted: it is watertight, one component and of a plausible
+    # convexity. Only the count `extract` recorded says so. Redraw instead, rather than
+    # writing a fragment into the library under the whole body's recipe and family.
+    if int(info.get("n_solid_components", 1)) > 1:
         return None
     v, rec_mount = mount(v, fc, rng, spec.mount_weights, spec.tilt_deg, spec.max_tilt_deg,
                          spec.radius)
