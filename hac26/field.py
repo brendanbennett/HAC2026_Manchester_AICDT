@@ -35,6 +35,7 @@ __all__ = ["spherical_design", "design_sha", "DESIGN_N", "DESIGN_T", "DESIGN_ITE
            "ConvexCore", "GaussianLattice", "ImplicitBody", "extract_mesh",
            "apply_constraints", "LATTICE_SHAPE", "LATTICE_EXTENT", "LATTICE_ALPHA",
            "EXTRACT_EXTENT", "RADIAL_DEGREE", "N_RADIAL", "radial_basis", "radial_field",
+           "lattice_kernel",
            "N_SITES", "N_DIR", "CODE_DIM", "SH_DEGREE", "dir_design", "sh_expand",
            "support_resample", "support_resample_weights"]
 
@@ -421,6 +422,46 @@ class GaussianLattice(nn.Module):
                 + self.pb[None] - 2.0 * ((q * self.inv2) @ self.p.T)
             out.append(torch.exp(-0.5 * d2.clamp_min(0.0)) @ gg)
         return torch.cat(out) if len(out) > 1 else out[0]
+
+
+def lattice_kernel(shape=LATTICE_SHAPE, extent: float = LATTICE_EXTENT,
+                   alpha: float = LATTICE_ALPHA, cut: float = 4.0):
+    """The kernels of one lattice evaluated at the lattice's own sites, sparse.
+
+    K[j, k] = phi_k(p_j), so K g is the field the amplitudes g make at the sites. It is what
+    turns a requested carve depth into amplitudes and back, and a solver uses it to say what
+    a coordinate is worth before spending a render on it.
+
+    A kernel is dropped beyond `cut` standard deviations, where it is 3e-4 of its peak. The
+    sites are a regular grid, so the neighbours within that radius are an index box and are
+    found by arithmetic rather than by a search, which is what keeps this affordable when the
+    lattice has more than ten thousand sites.
+    """
+    from scipy import sparse
+
+    sites, spacing = _grid_lattice(shape, extent)
+    sig = alpha * spacing                                       # (3,)
+    n = np.asarray(shape, dtype=np.int64)
+    half = np.ceil(cut * sig / spacing).astype(np.int64)
+    idx = np.stack(np.meshgrid(*[np.arange(s) for s in shape], indexing="ij"), -1)
+    idx = idx.reshape(-1, 3)
+    rows, cols, vals = [], [], []
+    box = np.stack(np.meshgrid(*[np.arange(-h, h + 1) for h in half], indexing="ij"), -1)
+    for d in box.reshape(-1, 3):
+        j = idx + d
+        ok = np.all((j >= 0) & (j < n), axis=1)
+        if not ok.any():
+            continue
+        v = np.exp(-0.5 * (((d * spacing) / sig) ** 2).sum())
+        if v < np.exp(-0.5 * cut ** 2):
+            continue
+        flat = j[ok, 0] * shape[1] * shape[2] + j[ok, 1] * shape[2] + j[ok, 2]
+        rows.append(np.nonzero(ok)[0])
+        cols.append(flat)
+        vals.append(np.full(int(ok.sum()), v))
+    m = int(np.prod(shape))
+    return sparse.csr_matrix((np.concatenate(vals), (np.concatenate(rows),
+                                                     np.concatenate(cols))), shape=(m, m))
 
 
 class ImplicitBody(nn.Module):
