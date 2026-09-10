@@ -130,11 +130,20 @@ PY
 cd "$SRC"
 CUDA_HOME=$CUDA PATH=$CUDA/bin:$PATH CPATH=$MATHINC:$CUDA/include \
   CPLUS_INCLUDE_PATH=$MATHINC:$CUDA/include $PYBIN /tmp/build_nvdr.py
-V=$(grep -oE "__version__[[:space:]]*=[[:space:]]*['\"][0-9.]+" nvdiffrast/__init__.py \
-    | grep -oE "[0-9.]+$" | head -1)
-D=$SRC/nvdiffrast-${V:-0.3.3}.dist-info; mkdir -p "$D"
-printf 'Metadata-Version: 2.1\nName: nvdiffrast\nVersion: %s\n' "${V:-0.3.3}" > "$D/METADATA"
+# The .dist-info below is not bookkeeping: since 0.4.0 nvdiffrast/__init__.py reads its own
+# version through importlib.metadata, so `import nvdiffrast` raises PackageNotFoundError
+# without it. That release also moved the number into pyproject.toml; older checkouts keep a
+# literal in __init__.py, so both are read, and neither may fail the script under `set -e`
+# (grep exits 1 on no match, and pipefail passes that on).
+V=$(grep -m1 -oE '^version[[:space:]]*=[[:space:]]*"[0-9][0-9.]*"' pyproject.toml 2>/dev/null \
+    | grep -oE '[0-9][0-9.]*' || true)
+[ -n "$V" ] || V=$(grep -oE "__version__[[:space:]]*=[[:space:]]*['\"][0-9.]+" \
+                     nvdiffrast/__init__.py 2>/dev/null | grep -oE "[0-9.]+$" | head -1 || true)
+rm -rf "$SRC"/nvdiffrast-*.dist-info      # a stale one is a second distribution to metadata
+D=$SRC/nvdiffrast-${V:-0.4.0}.dist-info; mkdir -p "$D"
+printf 'Metadata-Version: 2.1\nName: nvdiffrast\nVersion: %s\n' "${V:-0.4.0}" > "$D/METADATA"
 : > "$D/RECORD"
+echo "[toolchain] built nvdiffrast ${V:-0.4.0} in $SRC"
 
 # Wire it into the venv, so that neither the pipeline scripts nor a bare `python` need
 # PYTHONPATH set: a .pth puts the build directory on sys.path, and the library path the
