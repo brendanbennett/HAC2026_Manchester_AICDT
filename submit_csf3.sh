@@ -34,6 +34,27 @@ module load python/3.13.1                    # the Makefile builds its own venv 
 echo "proxy: ${http_proxy:-UNSET -- downloads will hang}"
 nvidia-smi || echo "WARNING: no GPU visible; corpus, flow and reconstruct will fail"
 
+# ---------------------------------------------------------------- scratch
+# Home is quota'd and the bulky parts of a run do not fit in it: the Thingi10K
+# cache reached 39G on its own and the challenge archive died mid-extract with
+# ENOSPC. Everything large is put on scratch and reached through symlinks, so
+# the scripts keep using their own default paths -- `make data` runs
+# fetch_data.py with no arguments, so its destination cannot be set by an
+# environment variable, and a symlink is the only thing that redirects it.
+SCRATCH=${SCRATCH_DIR:-$HOME/scratch/hac26}
+mkdir -p "$SCRATCH"/{cache,raw,generated,shape_models,runs}
+export XDG_CACHE_HOME="$SCRATCH/cache"    # pip, and thingi10k via platformdirs
+mkdir -p dataset
+for pair in dataset/raw:raw dataset/generated:generated             dataset/shape_models:shape_models runs:runs; do
+  link=${pair%%:*}
+  target="$SCRATCH/${pair##*:}"
+  if [ ! -L "$link" ]; then
+    rm -rf "$link"
+    ln -s "$target" "$link"
+  fi
+done
+echo "scratch: $SCRATCH"; df -h "$SCRATCH" | tail -1
+
 # ---------------------------------------------------------------- sizing
 # build_corpus.py renders every body once with the exact forward model on the
 # GPU and runs the convex stage on it, so wall time is linear in N_BODIES. That
