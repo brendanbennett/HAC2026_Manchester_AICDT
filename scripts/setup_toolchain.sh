@@ -111,16 +111,27 @@ printf '%s' "$USED" | sed 's/^/  /' >&2
 
 [ -d "$SRC" ] || git clone --depth 1 -q https://github.com/NVlabs/nvdiffrast.git "$SRC"
 
-# setup.py rebuilds no object whose file is newer than its source, so a tree left from a build
-# against different headers would end up half relinked. When the header set changes -- a torch
-# swapped for another CUDA line, or a build that failed the way this check exists for -- the
-# objects go.
-STAMP=$SRC/.hac26-mathinc
-if [ "$(cat "$STAMP" 2>/dev/null)" != "$INC_DIRS" ]; then
+# setup.py rebuilds no object whose file is newer than its source, so a tree left from an
+# earlier build would be relinked in part and kept in part. What that build has to match is
+# recorded here and compared on every run; when it differs, the objects go.
+#
+# torch belongs in that record as much as the headers do. The extension is compiled against
+# torch's C++ headers and linked against libc10/libtorch, and those symbols are not stable
+# between releases: an extension built against 2.14 and imported under 2.13 fails at import
+# with an undefined `c10::` symbol, which says nothing about what to do. Swapping the torch
+# build (`make venv CUDA=12` after a cu13 venv) need not change the header set at all, so the
+# header set alone does not catch it.
+BUILT_FOR=$($PYBIN -c 'import sys, torch; print("torch", torch.__version__, "cuda", \
+    torch.version.cuda, "python", "%d.%d" % sys.version_info[:2])')
+STAMP=$SRC/.hac26-build
+rm -f "$SRC/.hac26-mathinc"                # the record before torch was part of it
+if [ "$(cat "$STAMP" 2>/dev/null)" != "$BUILT_FOR
+$INC_DIRS" ]; then
   rm -rf "$SRC/build"
   find "$SRC" -name '_nvdiffrast_c*.so' -delete
-  printf '%s\n' "$INC_DIRS" > "$STAMP"
+  printf '%s\n%s\n' "$BUILT_FOR" "$INC_DIRS" > "$STAMP"
 fi
+echo "[toolchain] building against $BUILT_FOR" >&2
 # torch's builder compiles with ninja when it finds it on PATH and falls back to one file at
 # a time when it does not. It comes from the toolchain extra in pyproject.toml, so this is
 # only reachable in a venv built with EXTRAS trimmed.

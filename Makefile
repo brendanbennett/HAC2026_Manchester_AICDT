@@ -181,6 +181,18 @@ venv: $(MARK)
 	if [ "$$have" != "$(TORCH_TAG)" ]; then \
 	  [ -z "$$have" ] || echo "==> torch in $(VENV) is $$have, wanted $(TORCH_TAG); replacing it"; \
 	  $(MAKE) --no-print-directory deps TORCH_REPLACE=$${have:+1}; \
+	  if [ -n "$$have" ] && [ -f $(VENV)/etc/nvdiffrast-env.sh ]; then \
+	    echo "==> nvdiffrast here was compiled against the torch just replaced and will not"; \
+	    echo "    import under the new one: it links libc10 and libtorch, whose symbols do"; \
+	    echo "    not survive a version change."; \
+	    if [ "$(TORCH_TAG)" = "cpu" ]; then \
+	      echo "    A CPU torch cannot rebuild it; it stays broken until a CUDA torch is back."; \
+	    else \
+	      echo "==> rebuilding it against $(TORCH_TAG)"; \
+	      $(MAKE) --no-print-directory toolchain \
+	        || echo "==> that rebuild failed; nvdiffrast stays broken until \`make toolchain\` works"; \
+	    fi; \
+	  fi; \
 	fi; \
 	printf '%s\n' "$(TORCH_TAG)" > $(TORCH_MARK)
 	@echo "==> $(VENV) ready: $$($(PY) --version), torch $(TORCH_TAG), extras [$(EXTRAS)]"
