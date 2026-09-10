@@ -16,11 +16,16 @@
 # drift in the CUDA runtime; nvdiffrast uses launch, memcpy and texture APIs, which are stable
 # across this pair, so the guard is bypassed in the build script below. Against a cu12 torch
 # the guard would pass anyway; bypassing it is harmless there.
+#
+# What is *not* free across that pair is the math-library headers: see the comment on
+# $MATHINC below. They have to come from the 12.x line nvcc belongs to, whatever torch is.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
 PREFIX=${PREFIX:-$HOME/.local}
 REDIST=https://developer.download.nvidia.com/compute/cuda/redist
+CUDA_VER=12.9.0                 # see the header comment; do not move this to 13.x
+CUDA_MAJOR=${CUDA_VER%%.*}
 CUDA=$PREFIX/cuda129
 # Not /tmp: the venv is pointed at this directory afterwards, and it has to survive a reboot.
 SRC=${NVDIFFRAST_SRC:-$PREFIX/src/nvdiffrast}
@@ -33,7 +38,7 @@ $PYBIN -c 'import torch' >/dev/null 2>&1 || {
 
 mkdir -p "$CUDA" /tmp/cudadl && cd /tmp/cudadl
 for c in cuda_nvcc cuda_cudart cuda_cccl; do
-  p=$(curl -s "$REDIST/redistrib_12.9.0.json" | $PYBIN -c "import json,sys;print(json.load(sys.stdin)['$c']['linux-x86_64']['relative_path'])")
+  p=$(curl -s "$REDIST/redistrib_$CUDA_VER.json" | $PYBIN -c "import json,sys;print(json.load(sys.stdin)['$c']['linux-x86_64']['relative_path'])")
   [ -f "$(basename "$p")" ] || curl -sL "$REDIST/$p" -o "$(basename "$p")"
   tar -xf "$(basename "$p")"
 done
@@ -41,24 +46,81 @@ for d in cuda_*-archive; do cp -rn "$d"/* "$CUDA"/; done
 
 # The math-library headers come from torch's own CUDA bundle, wherever it keeps them: a cu13
 # torch has one nvidia/cu13/include tree, a cu12 torch has one include directory per library
-# (nvidia/cublas/include, ...). Both are searched. The CUDA core headers must stay consistent
-# with nvcc 12.9, so only the math ones are copied.
-mkdir -p /tmp/mathinc
-INC_DIRS=$($PYBIN - <<'PY'
-import os, glob, torch
+# (nvidia/cublas/include, ...). The CUDA core headers stay nvcc 12.9's, and the math headers
+# have to belong to that same line: CUDA 13's cublas_api.h and cusolverDn.h declare functions
+# taking cudaEmulation* types that the 12.9 runtime headers never define, so a 13.x tree does
+# not compile against this toolkit however torch itself was built -- ATen/cuda/CUDAContext.h
+# pulls cublas_v2.h into every translation unit. The trees are therefore filtered by CUDA
+# major and only the matching line is copied. What the extension links against is untouched by
+# this: nvdiffrast calls no cublas, cusolver or cusparse entry point, it only has to compile
+# past their declarations.
+#
+# The directory is rebuilt on every run. It used to be filled with cp -n and never cleared, so
+# the first torch a machine ever had decided its contents for good.
+MATHINC=/tmp/mathinc
+rm -rf "$MATHINC"; mkdir -p "$MATHINC"
+INC_DIRS=$($PYBIN - "$CUDA_MAJOR" <<'PY'
+import glob, os, re, sys, torch
+
+want = int(sys.argv[1])
 base = os.path.join(os.path.dirname(os.path.dirname(torch.__file__)), "nvidia")
-print("\n".join(d for d in glob.glob(os.path.join(base, "*", "include")) if os.path.isdir(d)))
+
+def cuda_major(inc):
+    """Which CUDA line an include tree belongs to, or None when it does not say."""
+    m = re.fullmatch(r"cu(\d+)", os.path.basename(os.path.dirname(inc)))
+    if m:
+        return int(m.group(1))                     # the cu13 layout names its line
+    for header, macro in (("cublas_api.h", "CUBLAS_VER_MAJOR"),
+                          ("cusparse.h", "CUSPARSE_VER_MAJOR")):
+        try:
+            text = open(os.path.join(inc, header)).read()
+        except OSError:
+            continue
+        m = re.search(r"#define\s+%s\s+(\d+)" % macro, text)
+        if m:
+            return int(m.group(1))                 # the per-library layout does not
+    return None    # curand, nvrtc and friends say nothing, and are not what breaks
+
+print("\n".join(d for d in sorted(glob.glob(os.path.join(base, "*", "include")))
+                if os.path.isdir(d) and cuda_major(d) in (None, want)))
 PY
 )
-[ -n "$INC_DIRS" ] || echo "[toolchain] warning: no bundled CUDA headers found under torch's nvidia/" >&2
+USED=
 while IFS= read -r inc; do
   [ -n "$inc" ] || continue
+  before=$(find "$MATHINC" -type f | wc -l)
   for pat in 'cublas*' 'cusparse*' 'cusolver*' 'cufft*' 'curand*' 'nvrtc*' 'library_types.h' 'cuComplex.h'; do
-    cp -n "$inc"/$pat /tmp/mathinc/ 2>/dev/null || true
+    cp -n "$inc"/$pat "$MATHINC"/ 2>/dev/null || true
   done
+  [ "$(find "$MATHINC" -type f | wc -l)" = "$before" ] || USED="$USED$inc"$'\n'
 done <<< "$INC_DIRS"
 
+# A missing tree is silent above, so what was actually collected is checked here.
+if ! grep -qsE "^#define CUBLAS_VER_MAJOR $CUDA_MAJOR[[:space:]]*$" "$MATHINC/cublas_api.h"; then
+  echo "ERROR: no CUDA $CUDA_MAJOR math-library headers to build against." >&2
+  echo "       torch here is $($PYBIN -c 'import torch; print(torch.__version__)'), and a cu13" >&2
+  echo "       torch bundles CUDA 13 headers only, which nvcc $CUDA_VER cannot parse (see the" >&2
+  echo "       comment above this check). They cannot be fetched on their own either: the" >&2
+  echo "       redistributable that carries them is ~2 GB. Install a CUDA 12 torch instead:" >&2
+  echo "         make venv CUDA=12 && make toolchain" >&2
+  echo "       That venv keeps its cu129 torch afterwards; no other target swaps it back." >&2
+  exit 1
+fi
+echo "[toolchain] CUDA $CUDA_MAJOR math headers from:" >&2
+printf '%s' "$USED" | sed 's/^/  /' >&2
+
 [ -d "$SRC" ] || git clone --depth 1 -q https://github.com/NVlabs/nvdiffrast.git "$SRC"
+
+# setup.py rebuilds no object whose file is newer than its source, so a tree left from a build
+# against different headers would end up half relinked. When the header set changes -- a torch
+# swapped for another CUDA line, or a build that failed the way this check exists for -- the
+# objects go.
+STAMP=$SRC/.hac26-mathinc
+if [ "$(cat "$STAMP" 2>/dev/null)" != "$INC_DIRS" ]; then
+  rm -rf "$SRC/build"
+  find "$SRC" -name '_nvdiffrast_c*.so' -delete
+  printf '%s\n' "$INC_DIRS" > "$STAMP"
+fi
 cat > /tmp/build_nvdr.py <<'PY'
 import sys, torch.utils.cpp_extension as ce
 ce._check_cuda_version = lambda *a, **k: None      # the version guard; see the header comment
@@ -66,8 +128,8 @@ sys.argv = ["setup.py", "build_ext", "--inplace"]
 exec(open("setup.py").read())
 PY
 cd "$SRC"
-CUDA_HOME=$CUDA PATH=$CUDA/bin:$PATH CPATH=/tmp/mathinc:$CUDA/include \
-  CPLUS_INCLUDE_PATH=/tmp/mathinc:$CUDA/include $PYBIN /tmp/build_nvdr.py
+CUDA_HOME=$CUDA PATH=$CUDA/bin:$PATH CPATH=$MATHINC:$CUDA/include \
+  CPLUS_INCLUDE_PATH=$MATHINC:$CUDA/include $PYBIN /tmp/build_nvdr.py
 V=$(grep -oE "__version__[[:space:]]*=[[:space:]]*['\"][0-9.]+" nvdiffrast/__init__.py \
     | grep -oE "[0-9.]+$" | head -1)
 D=$SRC/nvdiffrast-${V:-0.3.3}.dist-info; mkdir -p "$D"
