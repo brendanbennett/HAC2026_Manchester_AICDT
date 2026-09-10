@@ -23,15 +23,16 @@ mkdir -p logs
 # ---------------------------------------------------------------- modules
 # The Makefile installs torch itself against the driver it finds, so the module
 # system only has to supply a CUDA toolkit (for the nvdiffrast build) and a
-# Python >= 3.10. Outbound HTTP on CSF3 goes through a proxy: pip, the Dropbox
-# data fetch, the JPL/PDS shape models and the Thingi10K download all need it,
-# and without it they hang rather than fail.
+# Python >= 3.10. The proxy module is loaded in case outbound HTTP needs it,
+# but it does not set http_proxy on these nodes and downloads work regardless:
+# torch came from download.pytorch.org and all 28 JPL/PDS shape models arrived
+# with it unset. So the line below reports the value rather than warning about it.
 module purge
 module load tools/env/proxy2                 # http_proxy is unset without this
 module load cuda/12.6.2                      # the only CUDA module on the merged CSF
 module load python/3.13.1                    # the Makefile builds its own venv from it
 
-echo "proxy: ${http_proxy:-UNSET -- downloads will hang}"
+echo "proxy: ${http_proxy:-unset (fine; direct egress works on these nodes)}"
 nvidia-smi || echo "WARNING: no GPU visible; corpus, flow and reconstruct will fail"
 
 # ---------------------------------------------------------------- scratch

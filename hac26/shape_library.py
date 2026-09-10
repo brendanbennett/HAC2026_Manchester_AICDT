@@ -956,12 +956,6 @@ def _finish(f: Field, rng: np.random.Generator, spec: LibrarySpec, recipe: dict,
         return None
     if not is_edge_manifold(fc) or n_components(v, fc) != 1:
         return None
-    # `_repair` has already thrown the smaller pieces away by this point, so nothing above
-    # can see that the body was parted: it is watertight, one component and of a plausible
-    # convexity. Only the count `extract` recorded says so. Redraw instead, rather than
-    # writing a fragment into the library under the whole body's recipe and family.
-    if int(info.get("n_solid_components", 1)) > 1:
-        return None
     v, rec_mount = mount(v, fc, rng, spec.mount_weights, spec.tilt_deg, spec.max_tilt_deg,
                          spec.radius)
     # Orientation is checked again after the mount, not only after the extraction. A mesh
@@ -985,6 +979,7 @@ def _one_body(rng: np.random.Generator, spec: LibrarySpec) -> Body:
     `spec.max_attempts` failures."""
     kind = _draw(spec.weights(), rng)
     s = GRID_FILL * spec.extent                          # the size every body is brought to
+    severed = None                                       # the best of a bad job, if it comes to it
     for attempt in range(spec.max_attempts):
         f, rec = _base(rng, kind, 1.0, spec)
         if kind not in ("real", "object"):
@@ -996,8 +991,21 @@ def _one_body(rng: np.random.Generator, spec: LibrarySpec) -> Body:
                                       min_feature_radius(spec.res, spec.extent))
             recipe["mods"].append({"kind": mk, **mrec})
         body = _finish(f, rng, spec, recipe, attempt)
-        if body is not None:
-            return body
+        if body is None:
+            continue
+        # `_repair` has already thrown the smaller pieces away by this point, so nothing in
+        # `_finish` can see that the body was parted: it is watertight, one component and of
+        # a plausible convexity. Only the count `extract` recorded says so. Prefer a body
+        # that was never parted -- but prefer a parted one to no body at all, because the
+        # caller builds a library of thousands and a raise here kills the whole pool. The
+        # count stays in `info` either way, so the manifest says which happened.
+        if int(body.info.get("n_solid_components", 1)) > 1:
+            if severed is None:
+                severed = body
+            continue
+        return body
+    if severed is not None:
+        return severed
     raise RuntimeError(f"no {kind} body passed the checks in {spec.max_attempts} attempts")
 
 
