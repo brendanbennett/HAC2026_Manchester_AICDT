@@ -139,14 +139,15 @@ class LatticeFit:
     hull and is largest in the concavities, which is what g has to supply.
     """
 
-    def __init__(self, dev):
-        ref = ImplicitBody().to(dev)
+    def __init__(self, dev, lattice_shape=LATTICE_SHAPE):
+        ref = ImplicitBody(lattice_shape=lattice_shape).to(dev)
         self.dev = dev
         self.normals = ref.core.n                                   # (DESIGN_N, 3)
         self.lat = ref.delta
+        self.n_sites = len(ref.delta.p)
 
     def _phi(self, pts):
-        """The lattice kernels at the sample points, (n_pts, N_SITES): the same expanded
+        """The lattice kernels at the sample points, (n_pts, n_sites): the same expanded
         square GaussianLattice evaluates."""
         lat = self.lat
         d2 = (pts ** 2 * lat.inv2).sum(-1, keepdim=True) + lat.pb \
@@ -168,8 +169,8 @@ class LatticeFit:
                           for i in range(0, len(pts), SOLVE_CHUNK)])       # (n_pts,)
         target = sd - core
         w = torch.exp(-0.5 * (sd / SURFACE_BAND) ** 2) + WEIGHT_FLOOR
-        A = torch.zeros(N_SITES, N_SITES, dtype=torch.float64, device=self.dev)
-        b = torch.zeros(N_SITES, dtype=torch.float64, device=self.dev)
+        A = torch.zeros(self.n_sites, self.n_sites, dtype=torch.float64, device=self.dev)
+        b = torch.zeros(self.n_sites, dtype=torch.float64, device=self.dev)
         for i in range(0, len(pts), SOLVE_CHUNK):
             sl = slice(i, i + SOLVE_CHUNK)
             phi = self._phi(pts[sl])                                # (chunk, N_SITES)

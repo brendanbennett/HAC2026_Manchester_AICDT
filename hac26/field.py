@@ -501,12 +501,12 @@ class ImplicitBody(nn.Module):
     few coordinates as it can be written in.
     """
 
-    def __init__(self, normals: np.ndarray | None = None):
+    def __init__(self, normals: np.ndarray | None = None, lattice_shape=LATTICE_SHAPE):
         super().__init__()
         if normals is None:
             normals = spherical_design(DESIGN_N)
         self.core = ConvexCore(normals)
-        self.delta = GaussianLattice()
+        self.delta = GaussianLattice(shape=lattice_shape)
         self.dh = nn.Parameter(torch.zeros(N_DIR))
         self.register_buffer("dh_expand",
                              torch.from_numpy(sh_expand(dir_design(N_DIR), normals)),

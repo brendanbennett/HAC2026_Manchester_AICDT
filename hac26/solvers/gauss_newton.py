@@ -29,7 +29,20 @@ import numpy as np
 from scipy import ndimage, sparse
 
 __all__ = ["Stage", "DEFAULT_STAGES", "CarveFit", "block_basis", "subspace_basis",
-           "waist_amplitudes"]
+           "waist_amplitudes", "conjunction_start", "SHRINK_RANGE", "STEP_G", "STEP_C"]
+
+# The secant steps, in body units of the canonical pose. Each is the size the answer's own
+# correction is likely to have, not a small number: the response of a curve to either half of
+# the correction begins rather than scales, so a probe much shorter than the answer measures
+# the wrong regime. STEP_G is a carve depth and STEP_C a displacement of the hull.
+STEP_G = 0.20
+STEP_C = 0.08
+
+SHRINK_RANGE = (0.02, 0.14)   # inward displacements of the hull a start draws from, in body
+                              # units of the canonical pose, where a body spans [-1, 1]. The
+                              # range covers a body that is barely non-convex through a
+                              # contact binary; which of them a body is, is what the restarts
+                              # decide.
 
 
 @dataclass(frozen=True)
@@ -108,17 +121,45 @@ def waist_amplitudes(sites: np.ndarray, kernel, rng, equatorial_bias: float = 0.
                "depth": float(depth)}
 
 
+def conjunction_start(sites: np.ndarray, kernel, rng, n_radial: int = 9) -> tuple:
+    """A start with both halves of the correction present: (c, g, recipe).
+
+    A convex inversion of a non-convex body does not return that body's hull. It returns a
+    larger one, because enlarging the hull is how a convex body imitates the shadowing of a
+    concavity, so the correction from that answer to the body shrinks the hull and carves it
+    at the same time. A start that leaves the hull where the convex inversion put it asks the
+    fit to find both from a linearisation taken where neither is active, and there a hull
+    shrink alone raises the misfit; the fit then spends the step on the carve, which is the
+    convex inversion's own mistake made once more one level down. Drawing the shrink with the
+    waist puts the first linearisation somewhere both are already doing something.
+
+    The shrink is uniform, the degree-zero coefficient alone, because that is the part of the
+    excess that does not depend on which way a body is turned; the rest is left to the fit.
+    """
+    g, rec = waist_amplitudes(sites, kernel, rng)
+    c = np.zeros(int(n_radial))
+    c[0] = rng.uniform(*SHRINK_RANGE)
+    return c, g, {**rec, "shrink": float(c[0])}
+
+
 class CarveFit:
     """Damped Gauss-Newton on (c, g) against one body's curves.
 
     `render(c, g)` returns the kept curves as a flat array in the same order as `data`, or
     None for a body the forward model cannot render. `scale` is the per-entry model error the
     residual is divided by, so the reported misfit is in standard deviations of it.
+
+    Both secant steps are taken over the size the answer's own correction is likely to have
+    rather than at zero, because the response of the curves to either half of the correction
+    begins rather than scales: a dent shadows itself only once it is deep enough to, and a
+    hull shrink lowers the misfit only once there is a carve for it to uncover. A probe much
+    shorter than the answer therefore returns a column of the Jacobian whose sign is that of
+    the wrong regime.
     """
 
     def __init__(self, render, data: np.ndarray, scale: np.ndarray, kernel,
                  lattice_shape, n_radial: int = 9, ridge_frac: float = 1e-2,
-                 step_g: float = 0.20, step_c: float = 0.03,
+                 step_g: float = STEP_G, step_c: float = STEP_C,
                  damping=(1e-1, 1e-2, 1e-3, 1.0, 10.0), lengths=(1.0, 0.5, 0.25),
                  subspace_tries: int = 3, seed: int = 0):
         self.render = render

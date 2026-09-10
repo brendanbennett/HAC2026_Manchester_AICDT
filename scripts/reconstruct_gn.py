@@ -6,17 +6,20 @@
 
 The convex stage's answer supplies the base support h. It is not the body's hull: a convex
 inversion of a non-convex body returns the convex body whose own shadowing best imitates the
-concavities, which is larger, and on the one non-convex public model it has 1.37 times the
-volume of the true hull. The fit therefore does not treat h as fixed and does not treat the
-hull as something to be corrected before carving. It moves nine coefficients that reshape h
-and the lattice amplitudes that carve it in one step, because each half raises the misfit or
-barely lowers it on its own while the two together lower it by more than half.
+concavities, which is larger. Of the three public bodies the answer exceeds the body's own
+hull on the one that has concavities and falls short of it on the two that do not, which is
+the mechanism and not a bias of the network. The fit therefore does not treat h as fixed and
+does not treat the hull as something to be corrected before carving. It moves nine
+coefficients that reshape h and the lattice amplitudes that carve it in one step, because
+each half raises the misfit or barely lowers it on its own while the two together lower it by
+more than half.
 
 The step is damped Gauss-Newton with a secant Jacobian, coarse to fine over the amplitudes
 (hac26.solvers.gauss_newton). Nothing differentiates the renderer. The fit is started several
-times, once from the convex answer itself and otherwise from a single deep waist, because the
-first linearisation from an uncarved body is taken where a carve's effect on the curves has
-not yet begun.
+times, once from the convex answer itself and otherwise from a shrunken hull carved by a
+single deep waist, because the first linearisation from the convex answer is taken where
+neither half of the correction is yet doing anything and the step there goes into the carve
+alone, which is the convex inversion's own mistake made once more.
 
 --hold-out-geoms keeps cameras out of the fit and reports the written body's misfit on them
 beside the convex answer's on the same cameras. That pair is what scripts/select_answers.py
@@ -42,14 +45,16 @@ from hac26.data_io import N_CAMS, load_inversion_curves                  # noqa:
 from hac26.field import (CODE_DIM, EXTRACT_RES, LATTICE_SHAPE, N_RADIAL,  # noqa: E402
                          N_SITES, lattice_kernel)
 from hac26.recon import fit_to_cylinder                                  # noqa: E402
-from hac26.solvers.gauss_newton import CarveFit, Stage, waist_amplitudes  # noqa: E402
+from hac26.solvers.gauss_newton import (STEP_C, STEP_G, CarveFit,     # noqa: E402
+                                        Stage, conjunction_start)
 from hac26.solvers.operator import CodeOperator                          # noqa: E402
 from hac26.solvers.output import export_stl, restore_constraints         # noqa: E402
 from reconstruct import answer_path                                      # noqa: E402
 from reconstruct_lpd import (curve_pairs, curve_weight, geometry_mask,   # noqa: E402
                              residual_scale, support_from_convex)
 from calibrate import ETA_FLOOR                                          # noqa: E402
-from reconstruct_map import EXPORT_RES, convexity, truth_dice            # noqa: E402
+from reconstruct_map import (EXPORT_RES, convex_dice, convexity,     # noqa: E402
+                             truth_dice)
 from train_lpd import INSTRUMENT, RENDER, _enable_tf32, load_instrument   # noqa: E402
 
 STAGE_SIDES = (6, 12)      # sub-lattices the carve is fitted on before the random subspace
@@ -96,9 +101,9 @@ def main() -> None:
     ap.add_argument("--ridge", type=float, default=1e-2,
                     help="ridge on the amplitudes, as a fraction of the mean curvature of "
                          "the misfit in the carve coordinates")
-    ap.add_argument("--step-g", type=float, default=0.20,
+    ap.add_argument("--step-g", type=float, default=STEP_G,
                     help="secant step of a carve coordinate, in body units of depth")
-    ap.add_argument("--step-c", type=float, default=0.03,
+    ap.add_argument("--step-c", type=float, default=STEP_C,
                     help="secant step of a reshaping coefficient, in body units")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--device", default="cuda")
@@ -162,15 +167,13 @@ def main() -> None:
     # start that is descending from one that is not; the best are then carried to the end.
     t0 = time.time()
     starts, recipes = [(np.zeros(N_RADIAL), np.zeros(N_SITES))], [{"start": "convex answer"}]
-    sites = kernel.shape[0]
-    site_xyz = None
     if a.restarts > 1:
         from hac26.field import GaussianLattice
         site_xyz = GaussianLattice().p.numpy()
         for _ in range(a.restarts - 1):
-            g0, rec = waist_amplitudes(site_xyz, kernel, rng)
-            starts.append((np.zeros(N_RADIAL), g0))
-            recipes.append({"start": "waist", **rec})
+            c0, g0, rec = conjunction_start(site_xyz, kernel, rng, n_radial=N_RADIAL)
+            starts.append((c0, g0))
+            recipes.append({"start": "conjunction", **rec})
     screened = []
     for i, (c0, g0) in enumerate(starts):
         f = new_fit(a.seed + i)
@@ -252,6 +255,7 @@ def main() -> None:
             "reshaping": best["c"].tolist(),
             "carve_depth_max": float(np.abs(kernel @ best["g"]).max()),
             "final_dice": truth_dice(v, f, a.model, a.data_dir),
+            "convex_dice": convex_dice(sup_stl, a.model, a.data_dir),
             "final_convexity": convexity(v, f)}
     Path(a.out).with_suffix(".json").write_text(json.dumps(meta, indent=2))
     np.savez(Path(a.out).with_suffix(".fit.npz"), c=best["c"], g=best["g"],
