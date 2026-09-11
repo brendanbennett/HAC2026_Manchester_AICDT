@@ -36,6 +36,9 @@ for M in 1 2 3 4 5 6 7 8 9 10; do
 done
 
 echo "=== score $(date)"
+# The two scorers live outside scripts/, which is what puts the repo root on sys.path, and the
+# venv holds the dependencies but not this package; without this `import hac26` fails.
+export PYTHONPATH="$PWD${PYTHONPATH:+:$PYTHONPATH}"
 $PY hac26/scoring/voxel.py --stl results/lpd/Asteroid0{1,2,3}.stl \
     --models 1 2 3 --label "LPD flow"
 $PY hac26/scoring/side_view.py --models 1 2 3 --recon-dir results/lpd
