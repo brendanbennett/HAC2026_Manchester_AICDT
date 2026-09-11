@@ -132,8 +132,25 @@ when the step budget ran out.
 The fit itself moves the nine reshaping coefficients and the lattice amplitudes in one damped
 Gauss-Newton step with a secant Jacobian, coarse to fine over the amplitudes and restarted
 from several shrunken and carved bodies (`hac26/solvers/gauss_newton.py`). Nothing
-differentiates the renderer. Run the non-convex public model first, because its truth is
-released and the gate below is calibrated on it, then the scored models.
+differentiates the renderer.
+
+What it minimises is not the misfit. Both released reductions are sums over a thresholded
+image, so their error is the quantisation of the boundary of the lit region, and a body with
+more surface has more boundary to place accurately: a corrugation one grid cell wide, laid on a
+convex answer, lowers the misfit more than moving a third of the way to the body does and moves
+the overlap by a thirtieth as much. The objective therefore carries the body's surface area
+beside its misfit, which is what charges a rough surface and leaves a smooth dent of any depth
+nearly free, and it carries it as a logarithm plus an area so the balance survives the descent.
+`notes/objective.md` measures all of that, gives the window the weight has to lie in, and
+records the three things the penalty exposed that a ridge on the amplitudes had been hiding.
+Two consequences reach the rest of the pipeline: a body whose convex answer already explains
+its curves is left alone, because there the penalty costs overlap while improving the misfit
+and nothing downstream could catch it; and `select_answers.py` judges a correction by the
+functional it was fitted under, because on the misfit alone that gate prefers a corrugated body
+to a shaped one.
+
+Run the non-convex public model first, because its truth is released and the gate below is
+calibrated on it, then the scored models.
 
 ```
 scripts/run_nonconvex.sh
