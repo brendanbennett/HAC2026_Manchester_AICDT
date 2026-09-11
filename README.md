@@ -10,14 +10,48 @@ boundary curves of 2D projections. `docs/challenge_info.md` has the rules.
 
 ## Install
 
+`make` does the whole setup; `pyproject.toml` is the only dependency list.
+
 ```
-pip install -e ".[torch]"
+make venv               # a .venv with the right Python and dependencies
+make venv CUDA=12       # torch built against CUDA 12.x  (cu129 wheels)
+make venv CUDA=13       # torch built against CUDA 13.x  (cu130 wheels)
+make check              # what the venv has: python, torch, CUDA, nvdiffrast
 ```
 
+Without `CUDA=`, the torch build is chosen from the driver `nvidia-smi` reports (CUDA 13
+wheels need a 580-series driver or newer), and a machine with no GPU gets the CPU build --
+on macOS that is the MPS build. Switching between 12 and 13 later is `make venv CUDA=13`;
+it notices the installed torch is the wrong build and replaces it.
+
+The Python is chosen by version, not by whichever `python3` comes first on PATH: the project
+needs 3.10 or newer and cluster images often ship an older one as `python3`, which otherwise
+produces a venv that fails much later. `uv`, if it is installed, is used and fetches a
+matching interpreter itself; otherwise the newest suitable `python3.X` on PATH is used.
+`make venv PY_VERSION=3.11` asks for a particular one, `make venv VENV=/scratch/env` puts it
+elsewhere, and `make deps` reinstalls everything.
+
 The exact forward model renders with nvdiffrast on a GPU; nvdiffrast is not on PyPI and
-compiles CUDA at install time, and `scripts/setup_toolchain.sh` builds it without root. The
-calibration, the flow training and the reconstruction all render with it. The tests run the
-same code on a slow pure-torch rasteriser, so they need neither.
+compiles CUDA at install time, so it is built from source against a toolkit assembled
+without root:
+
+```
+make toolchain
+```
+
+That leaves it importable from the venv, with no `PYTHONPATH` to set. The calibration, the
+flow training and the reconstruction all render with it. The tests run the same code on a
+slow pure-torch rasteriser, so they need neither it nor a GPU.
+
+It is compiled for the GPU architectures in `TORCH_CUDA_ARCH_LIST`, or, when that is unset,
+for the card the build runs on. A build made on a newer card fails on an older one with "no
+kernel image is available", so where one build serves several kinds of GPU, name them all:
+`TORCH_CUDA_ARCH_LIST="8.0;8.9;9.0+PTX" make toolchain`. The list is recorded with the build,
+and changing it rebuilds.
+
+`scripts/run_smoke_test.sh` and `scripts/run_remote_pipeline.sh` build the same venv through
+the same Makefile if it is not there yet, so `make smoke` and `make pipeline`, or the scripts
+by hand, are equivalent.
 
 ## Data
 
@@ -53,8 +87,8 @@ scripts/run_smoke_test.sh        # wiring check: minutes, no dataset needed
 scripts/run_remote_pipeline.sh   # the real run
 ```
 
-`run_remote_pipeline.sh` creates and activates a `.venv`, installs anything missing, and runs
-the stages in order:
+`run_remote_pipeline.sh` builds and activates the venv through the Makefile if it is not
+already there, then runs the stages in order:
 
 | stage | script | notes |
 | --- | --- | --- |
@@ -82,6 +116,39 @@ environment:
 ```
 N_BODIES=2000 scripts/run_remote_pipeline.sh
 scripts/run_remote_pipeline.sh --force-stage fit    # redo fit and everything after it
+```
+
+### On CSF3
+
+`submit_csf3.sh` runs the whole pipeline as one Slurm job on the University of Manchester
+CSF3. Run it from a login node; it submits itself:
+
+```
+./submit_csf3.sh                            # gpuA (A100 80GB), 4-day limit
+CSF_PARTITION=gpuH_short ./submit_csf3.sh   # H200, 1-day limit
+CSF_PARTITION=gpuH ./submit_csf3.sh         # H200, 4-day limit
+CSF_PARTITION=gpuL ./submit_csf3.sh         # L40S 48GB, 4-day limit
+./submit_csf3.sh -d afterany:1234           # other arguments go to sbatch
+```
+
+`#SBATCH` lines cannot read the environment, so the partition is passed on the `sbatch`
+command line instead, together with what it needs: the H200 partitions take an account
+(`gpu-h200-fse-pgdr`, or `CSF_ACCOUNT`), at most 8 cores per GPU rather than 12, and on
+`gpuH_short` a wallclock of one day at most. `CSF_TIME` overrides the wallclock. Plain
+`sbatch submit_csf3.sh` still works but always lands on gpuA; with `CSF_PARTITION` set it stops
+at once instead of running on the wrong GPU. Pipeline variables such as `N_BODIES` pass
+through the environment as usual.
+
+The job loads its modules, puts caches, the challenge data, the shape models, the library
+and `runs/` on `~/scratch/hac26` (`SCRATCH_DIR` to move it) because home is too small, builds
+the venv and nvdiffrast for the A100, L40S and H200 alike, and then runs
+`run_remote_pipeline.sh`. Its own output is in `logs/csf3_<jobid>.out`. A job that hits its
+wallclock resumes where it stopped when resubmitted, so on `gpuH_short` the run is a chain of
+one-day jobs:
+
+```
+J=$(CSF_PARTITION=gpuH_short ./submit_csf3.sh --parsable)
+CSF_PARTITION=gpuH_short ./submit_csf3.sh -d afterany:$J
 ```
 
 ## Running stages by hand
@@ -182,17 +249,20 @@ PYTHONPATH=. python hac26/scoring/side_view.py --models 1 2 3 --recon-dir result
 ```
 
 The answer to a model is picked among the draws and their consensus bodies by expected
-score against the draws. Whether that rule beats the alternatives (the best-fitting draw,
-the medoid, a fixed consensus level) can only be measured on bodies whose truth is known,
-which the held-out corpus bodies are; the pipeline's `decision` stage does that and writes
-`runs/decision_check.json`:
+score against the draws, after rejecting candidates with non-finite misfit, open surfaces or
+bad volume. Whether that rule beats the alternatives (the best-fitting draw, the medoid, a
+fixed consensus level) can only be measured on bodies whose truth is known, which the
+held-out corpus bodies are; the pipeline's `decision` stage does that and writes
+`runs/decision_check.json`, including the best guidance weight and the gain over the convex
+start in each carving bin:
 
 ```
 python scripts/decision_check.py --bodies 16 --val-bodies 16
 ```
 
-Check that the flow is using the lightcurves rather than memorising the corpus, by
-rerunning its own validation with the prior's velocity alone beside the full one:
+Check that the flow is using the lightcurves rather than memorising the corpus. This reruns
+the flow loss on held-out bodies with real curves, shuffled curves and masked curves, and
+prints the data-branch margin by time and carving bin:
 
 ```
 python scripts/ablate_flow.py

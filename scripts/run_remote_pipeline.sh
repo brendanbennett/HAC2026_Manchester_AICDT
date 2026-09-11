@@ -79,6 +79,7 @@ CODES_FILE=runs/corpus_codes.npz
 
 CONVEX_CKPT=${CONVEX_CKPT:-models/lpd_convex.pt}   # the convex stage, whose starts the flow corrects
 CORPUS_FILE=runs/corpus.npz
+CORPUS_WORKERS=${CORPUS_WORKERS:-8}
 
 PRIOR_STEPS=${PRIOR_STEPS:-20000}   # a cap: the prior stops early once the held-out loss plateaus
 PRIOR_BATCH=${PRIOR_BATCH:-64}
@@ -96,6 +97,8 @@ FLOW_CKPT=${FLOW_CKPT:-runs/lpd_flow.pt.ckpt}   # under runs/, not /tmp: it has 
 FLOW_LOG_EVERY=${FLOW_LOG_EVERY:-10}
 FLOW_OPERATOR_RES=${FLOW_OPERATOR_RES:-32}
 FLOW_TRAIN_GEOMS=${FLOW_TRAIN_GEOMS:-28}   # geometries the operator renders per step; all of them
+FLOW_FIT_WEIGHT=${FLOW_FIT_WEIGHT:-1.0}
+FLOW_FIT_FROM=${FLOW_FIT_FROM:-0.75}
 FLOW_ROLLOUT_STEPS=${FLOW_ROLLOUT_STEPS:-1000}  # cap on the second run's extra steps: branched into
                                                 # experts, rolled out, the main phase; 0 skips it
 FLOW_ROLLOUT_FRAC=${FLOW_ROLLOUT_FRAC:-0.5}     # share of its draws that come from the sampler
@@ -106,9 +109,10 @@ RECON_RES=${RECON_RES:-96}
 RECON_SNAP=${RECON_SNAP:-0}
 # Weight on the data part of the velocity when sampling (lpd_flow.LPDFlow.velocity).
 # One is the model as trained. The decision stage reconstructs held-out bodies at each
-# of RECON_GUIDANCE_SWEEP and names the weight that scores best; set this to it and
-# rerun the reconstruct stage, which is cheap beside the training.
-RECON_GUIDANCE=${RECON_GUIDANCE:-1.0}
+# of RECON_GUIDANCE_SWEEP and names the weight that scores best. When RECON_GUIDANCE is
+# not set by the caller, the pipeline reads that value before reconstruction.
+RECON_GUIDANCE_WAS_SET=${RECON_GUIDANCE+x}
+RECON_GUIDANCE=${RECON_GUIDANCE:-}
 RECON_GUIDANCE_SWEEP=${RECON_GUIDANCE_SWEEP:-1.0 1.5 2.0 3.0}
 MEDOID_VOLUME_ONLY=${MEDOID_VOLUME_ONLY:-0}
 MEDOID_SIDE_POINTS=${MEDOID_SIDE_POINTS:-200000}
@@ -208,9 +212,10 @@ stage_signature() {
       ;;
     flow)
       stage_signature prior | sed 's/^stage=prior$/stage=flow/'
-      printf 'FLOW_STEPS=%s\nFLOW_BATCH=%s\nFLOW_VAL_EVERY=%s\nFLOW_PATIENCE=%s\nFLOW_CKPT_EVERY=%s\nFLOW_CKPT=%s\nFLOW_LOG_EVERY=%s\nFLOW_TRAIN_GEOMS=%s\n' \
+      printf 'FLOW_STEPS=%s\nFLOW_BATCH=%s\nFLOW_VAL_EVERY=%s\nFLOW_PATIENCE=%s\nFLOW_CKPT_EVERY=%s\nFLOW_CKPT=%s\nFLOW_LOG_EVERY=%s\nFLOW_TRAIN_GEOMS=%s\nFLOW_FIT_WEIGHT=%s\nFLOW_FIT_FROM=%s\n' \
         "$FLOW_STEPS" "$FLOW_BATCH" "$FLOW_VAL_EVERY" "$FLOW_PATIENCE" \
-        "$FLOW_CKPT_EVERY" "$FLOW_CKPT" "$FLOW_LOG_EVERY" "$FLOW_TRAIN_GEOMS"
+        "$FLOW_CKPT_EVERY" "$FLOW_CKPT" "$FLOW_LOG_EVERY" "$FLOW_TRAIN_GEOMS" \
+        "$FLOW_FIT_WEIGHT" "$FLOW_FIT_FROM"
       ;;
     flow-rollout)
       stage_signature flow | sed 's/^stage=flow$/stage=flow-rollout/'
@@ -407,7 +412,8 @@ fi
 run_stage corpus "$CORPUS_FILE" \
   $PY scripts/build_corpus.py \
     --bodies "$N_BODIES" --phases "$FLOW_PHASES" --operator-res "$FLOW_OPERATOR_RES" \
-    --codes-file "$CODES_FILE" --convex "$CONVEX_CKPT" --out "$CORPUS_FILE"
+    --codes-file "$CODES_FILE" --convex "$CONVEX_CKPT" --out "$CORPUS_FILE" \
+    --workers "$CORPUS_WORKERS"
 
 # ---------------------------------------------------------------- 4c. the prior part
 run_stage prior runs/prior_flow.pt \
@@ -425,6 +431,7 @@ run_stage flow runs/lpd_flow.pt \
     --patience "$FLOW_PATIENCE" \
     --ckpt-every "$FLOW_CKPT_EVERY" --ckpt-file "$FLOW_CKPT" \
     --log-every "$FLOW_LOG_EVERY" \
+    --fit-weight "$FLOW_FIT_WEIGHT" --fit-from "$FLOW_FIT_FROM" \
     --corpus "$CORPUS_FILE"
 
 # ---------------------------------------------------------------- 5b. flow, rolled out
@@ -441,6 +448,7 @@ if [ "$FLOW_ROLLOUT_STEPS" -gt 0 ]; then
       --patience "$FLOW_PATIENCE" \
       --ckpt-every "$FLOW_CKPT_EVERY" --ckpt-file "$FLOW_CKPT" \
       --log-every "$FLOW_LOG_EVERY" \
+      --fit-weight "$FLOW_FIT_WEIGHT" --fit-from "$FLOW_FIT_FROM" \
       --rollout-frac "$FLOW_ROLLOUT_FRAC" \
       --corpus "$CORPUS_FILE"
 else
@@ -461,6 +469,21 @@ if [ "$FLOW_VAL_BODIES" -gt 0 ]; then
       --side-points "$MEDOID_SIDE_POINTS" --out runs/decision_check.json
 else
   log "=== decision: skipped (FLOW_VAL_BODIES=0)"
+fi
+
+if [ -f runs/decision_check.json ]; then
+  BEST_GUIDANCE=$($PY -c "import json, sys; p=sys.argv[1]; d=json.load(open(p)); v=d.get('best_guidance'); print('' if v is None else v)" runs/decision_check.json)
+  if [ -z "${RECON_GUIDANCE:-}" ] && [ -n "$BEST_GUIDANCE" ]; then
+    RECON_GUIDANCE="$BEST_GUIDANCE"
+    log "=== reconstruct: using best guidance from runs/decision_check.json: $RECON_GUIDANCE"
+  elif [ -n "${RECON_GUIDANCE_WAS_SET:-}" ] && [ -n "$BEST_GUIDANCE" ] \
+       && [ "$RECON_GUIDANCE" != "$BEST_GUIDANCE" ]; then
+    log "!!! reconstruct: RECON_GUIDANCE=$RECON_GUIDANCE overrides decision best $BEST_GUIDANCE"
+  fi
+fi
+if [ -z "${RECON_GUIDANCE:-}" ]; then
+  RECON_GUIDANCE=1.0
+  log "!!! reconstruct: no decision best guidance available; falling back to RECON_GUIDANCE=1.0"
 fi
 
 # ---------------------------------------------------------------- 6. the convex starts

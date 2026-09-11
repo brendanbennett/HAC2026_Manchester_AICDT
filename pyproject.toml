@@ -2,6 +2,9 @@
 requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
+# This file is the only list of dependencies. The Makefile installs from it, and
+# scripts/_venv_setup.sh (which the pipeline wrappers source) goes through the Makefile,
+# so nothing else hardcodes a package list.
 [project]
 name = "hac26"
 version = "0.1.0"
@@ -12,17 +15,37 @@ dependencies = [
     "scipy>=1.10",
     "trimesh",
     "scikit-image",
+    # trimesh imports these lazily, so their absence only shows when that code runs: rtree
+    # backs nearest.signed_distance (fit_shapes.py), fast_simplification backs
+    # simplify_quadric_decimation (the radiosity patches and the released meshes in
+    # hac26/forward/mesh/exact.py).
     "rtree",
     "fast_simplification",
-    "embreex",
+    # Both reach hosts whose certificate chains the stdlib ssl module's static CA bundle
+    # does not cover: truststore for fetch_shape_models.py, spiceypy for fetch_dsk_shapes.py.
     "truststore",
     "spiceypy",
 ]
 
+# torch is deliberately not a dependency above: which build is right depends on the machine's
+# CUDA, so `make venv` installs it first from the matching wheel index (make venv CUDA=12|13)
+# and everything here resolves against that. This extra is for a plain `pip install -e .`
+# on a machine where the default PyPI build will do.
 [project.optional-dependencies]
 torch = ["torch>=2.1"]
 test = ["pytest>=7.0"]
-pipeline = ["torch>=2.1"]
+# Nothing imports ninja. It is here because torch's extension builder uses it when it is on
+# PATH and falls back to distutils when it is not, and distutils compiles nvdiffrast's ~15
+# translation units one after another -- minutes of a `make toolchain`, every time. The wheel
+# is a few hundred kB with no dependencies of its own, so `make venv` installs it everywhere
+# rather than only on the GPU boxes that run the build.
+toolchain = ["ninja"]
+
+# embreex is deliberately absent. It gives trimesh a compiled ray engine for the visibility
+# test in hac26/forward/mesh/radiosity.py, but the interreflection is solved on 600 patches
+# (ExactConfig.radiosity_faces), and at that size trimesh's pure-numpy ray engine is just as
+# fast -- measured at 1280 facets, 0.14 s against 0.16 s. It was the dependency most likely
+# to fail to build on an unfamiliar machine, and it bought nothing.
 
 [tool.setuptools]
 packages = ["hac26"]

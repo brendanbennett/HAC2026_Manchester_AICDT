@@ -418,6 +418,8 @@ def operator_inputs(net, op: CodeOperator, x1_hat, h, radius, data, sigma, geoms
     adj = torch.zeros(B, CODE_DIM, device=dev)
     live = torch.ones(B, device=dev)
     for b in range(B):
+        if step_mask[b, gsel].sum() == 0:
+            continue
         d_b, s_b = data[b, gsel].to(op.device), sigma[b, gsel].to(op.device)
         # the cotangent on the normalised curves: the descent direction of the whitened
         # misfit, (data - A(x)) / sigma^2
@@ -566,7 +568,7 @@ class Diag(NamedTuple):
 def flow_loss(net, op: CodeOperator, corpus: Corpus, eta, idx, x0, t, M, tag, mask,
               train_geoms=None, sigma=None, xi=None, zeta=None, turns=None, rollout_steps=None,
               return_diag=False, ablate=False, occ_weight=OCC_WEIGHT, occ_eps=None,
-              fit_weight=FIT_WEIGHT):
+              fit_weight=FIT_WEIGHT, fit_from=FIT_FROM):
     """The training loss for one batch, given the draws (idx, x0, t, sigma, xi, zeta, turns):
     the flow term and the occupancy term of step_loss, plus the data-fit term of data_fit for
     the draws in the last expert's interval.
@@ -602,7 +604,7 @@ def flow_loss(net, op: CodeOperator, corpus: Corpus, eta, idx, x0, t, M, tag, ma
     and frozen, so this point is stable while the data part trains; it costs one network
     forward and no operator call.
 
-    The data-fit term. For the draws with t >= FIT_FROM the endpoint the velocity implies,
+    The data-fit term. For the draws with t >= fit_from the endpoint the velocity implies,
     x_t + (1-t) v, is rendered once more and must fit the data to within the noise
     (data_fit). There the endpoint is nearly the answer. At earlier t the flow term's target is
     the average of the bodies that could be behind the state, which the data-fit term would
@@ -684,7 +686,7 @@ def flow_loss(net, op: CodeOperator, corpus: Corpus, eta, idx, x0, t, M, tag, ma
 
     fit = torch.zeros((), device=dev)
     if fit_weight > 0:
-        sel = (t >= FIT_FROM) & (step_mask.sum(1) > 0)
+        sel = (t >= fit_from) & (step_mask.sum(1) > 0)
         if bool(sel.any()):
             x1_hat = (xt + (1 - t[:, None]) * u)[sel]
             val, g_fit, n_bad = data_fit(net, op, x1_hat, h_base[sel], radius[sel], data[sel],
@@ -703,7 +705,8 @@ def flow_loss(net, op: CodeOperator, corpus: Corpus, eta, idx, x0, t, M, tag, ma
 
 
 def validate(net, op, corpus, eta, val_idx, val_x0, val_t, val_sigma, val_xi, val_zeta, M,
-             tag, mask, chunk, occ_weight=OCC_WEIGHT, occ_eps=None, fit_weight=FIT_WEIGHT):
+             tag, mask, chunk, occ_weight=OCC_WEIGHT, occ_eps=None, fit_weight=FIT_WEIGHT,
+             fit_from=FIT_FROM):
     """Mean loss over the held-out bodies at fixed draws, and the mean Diag, chunked to bound
     memory. The bodies are not turned, so every evaluation scores the same draws."""
     was_training = net.training
@@ -716,7 +719,7 @@ def validate(net, op, corpus, eta, val_idx, val_x0, val_t, val_sigma, val_xi, va
             l, d = flow_loss(net, op, corpus, eta, val_idx[sl], val_x0[sl], val_t[sl], M,
                              tag, mask, sigma=val_sigma[sl], xi=val_xi[sl],
                              zeta=val_zeta[sl], return_diag=True, occ_weight=occ_weight,
-                             occ_eps=occ_eps, fit_weight=fit_weight)
+                             occ_eps=occ_eps, fit_weight=fit_weight, fit_from=fit_from)
             tot += b * float(l)
             acc += b * np.array([0.0 if v != v else v for v in d[:-1]])   # a nan spread is 0
             dropped += d.dropped
@@ -845,6 +848,67 @@ def load_instrument(path: str, device: str) -> Instrument:
     return inst
 
 
+def load_flow_file(path: str, map_location="cpu") -> tuple:
+    """Load a finished flow file or a resumable training checkpoint.
+
+    New finished files are {"state_dict", "meta"}. Older finished files are bare state dicts.
+    Resumable checkpoints are accepted for diagnostics and reconstruction by taking their best
+    held-out state when available, as reconstruct_lpd.py already did before metadata was added.
+    Returns (state_dict, metadata).
+    """
+    st = torch.load(path, map_location=map_location, weights_only=False)
+    if isinstance(st, dict) and "state_dict" in st and "meta" in st:
+        return st["state_dict"], dict(st.get("meta") or {})
+    if isinstance(st, dict) and "net" in st and isinstance(st.get("step"), int):
+        meta = {k: v for k, v in st.items()
+                if k not in {"net", "opt", "best_state", "rng", "ema"}}
+        meta["checkpoint_step"] = int(st["step"])
+        meta["loaded_step"] = int(st.get("best_step", st["step"])) if st.get("best_state") else int(st["step"])
+        meta["loaded_best_state"] = bool(st.get("best_state") is not None)
+        return st.get("best_state") or st["net"], meta
+    return st, {}
+
+
+def check_flow_metadata(meta: dict, *, corpus: str | None = None, calibration: str | None = None,
+                        phases: int | None = None, operator_res: int | None = None,
+                        context: str = "flow checkpoint") -> None:
+    """Refuse known mismatches between a flow file and the run trying to use it."""
+    if not meta:
+        print(f"  WARNING: {context} has no metadata; cannot verify corpus/calibration/operator "
+              f"settings", flush=True)
+        return
+    problems, missing = [], []
+
+    def expect_digest(key, path):
+        if path is None:
+            return
+        if key not in meta:
+            missing.append(key)
+            return
+        live = file_digest(path)
+        if meta[key] != live:
+            problems.append(f"{key}: checkpoint={meta[key]!r}, current={live!r}")
+
+    def expect_int(key, value):
+        if value is None:
+            return
+        if key not in meta:
+            missing.append(key)
+            return
+        if int(meta[key]) != int(value):
+            problems.append(f"{key}: checkpoint={meta[key]!r}, current={int(value)!r}")
+
+    expect_digest("corpus", corpus)
+    expect_digest("calibration", calibration)
+    expect_int("phases", phases)
+    expect_int("operator_res", operator_res)
+    if problems:
+        raise SystemExit(f"{context} was written for different settings ({'; '.join(problems)})")
+    if missing:
+        print(f"  WARNING: {context} metadata is missing {', '.join(sorted(set(missing)))}; "
+              f"verified the fields it did carry", flush=True)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--steps", type=int, default=1500)
@@ -861,6 +925,10 @@ def main():
                     help="weight of the data-fit term on the endpoint estimate for draws in "
                          "the last expert's interval (see flow_loss); 0 turns it off and "
                          "saves its operator call")
+    ap.add_argument("--fit-from", type=float, default=FIT_FROM,
+                    help="apply the endpoint data-fit term to draws with t at or above this "
+                         "value; lower values give the curves more direct pull during the "
+                         "rollout phase")
     ap.add_argument("--experts", type=int, default=N_EXPERTS,
                     help="experts of the data part, one per interval of t. A run resumed "
                          "from a checkpoint with fewer experts branches: every new expert "
@@ -923,6 +991,8 @@ def main():
                          "that continues the first run's checkpoint. Changing it resets "
                          "the early-stopping record and keeps the weights.")
     a = ap.parse_args()
+    if not (0.0 <= a.fit_from < 1.0):
+        raise SystemExit("--fit-from must be in [0, 1)")
     _enable_tf32()
     torch.manual_seed(a.seed)
     if torch.cuda.is_available():
@@ -1006,7 +1076,7 @@ def main():
     occ_eps = a.occ_eps if a.occ_eps is not None else occ_eps_default()
     print(f"  occupancy term: weight {a.occ_weight:g}, soft edge {occ_eps:.4f} "
           f"(lattice spacing {2.0 * LATTICE_EXTENT / max(LATTICE_SHAPE):.4f})", flush=True)
-    print(f"  data-fit term: weight {a.fit_weight:g} on draws with t >= {FIT_FROM:g}"
+    print(f"  data-fit term: weight {a.fit_weight:g} on draws with t >= {a.fit_from:g}"
           + ("" if a.fit_weight > 0 else " (off)"), flush=True)
     augment = phases % 4 == 0
     print("  quarter turns: on, four training pairs per body" if augment else
@@ -1058,13 +1128,14 @@ def main():
         "occ_weight": float(a.occ_weight),
         "occ_eps": float(occ_eps),
         "fit_weight": float(a.fit_weight),
-        "fit_from": float(FIT_FROM),
+        "fit_from": float(a.fit_from),
         "n_val": n_val,
         "phases": phases,
         "operator_res": op_res,
         "train_geoms": train_geoms,
         "corpus": file_digest(a.corpus),
         "prior": file_digest(a.prior),
+        "calibration": cmeta["calibration"],
     }
 
     if st is not None:
@@ -1129,7 +1200,7 @@ def main():
         loss, parts = flow_loss(net, op, data, eta, idx, x0, t, M, tag, mask,
                                 train_geoms=train_geoms, turns=turns, rollout_steps=steps,
                                 return_diag=True, occ_weight=a.occ_weight, occ_eps=occ_eps,
-                                fit_weight=a.fit_weight)
+                                fit_weight=a.fit_weight, fit_from=a.fit_from)
         dropped += parts.dropped
         opt.zero_grad(); loss.backward(); opt.step(); ema.update(net)
         now = time.time()
@@ -1171,7 +1242,7 @@ def main():
                 vl, diag = validate(net, op, data, eta, val_idx, val_x0, val_t,
                                     val_sigma, val_xi, val_zeta, M, tag, mask, a.batch,
                                     occ_weight=a.occ_weight, occ_eps=occ_eps,
-                                    fit_weight=a.fit_weight)
+                                    fit_weight=a.fit_weight, fit_from=a.fit_from)
             # A collapse check: |g| of the model's own endpoint estimate against the corpus.
             # A flow that has regressed to the mean produces amplitudes smaller than any real
             # body, and a small spread across draws means it produces the same body
@@ -1217,10 +1288,19 @@ def main():
         net.load_state_dict(ema.state(net))
         print(f"  no best checkpoint was selected; keeping the EMA weights over {ema.n} "
               f"steps", flush=True)
+    trained_elapsed = elapsed_before + (time.time() - t_run)
+    final_meta = dict(meta)
+    final_meta.update({
+        "format": "lpd_flow_state_dict_with_meta",
+        "steps_trained": int(stopped_at),
+        "best_step": int(best_step),
+        "best_val": None if best == float("inf") else float(best),
+        "rollout_frac": float(a.rollout_frac),
+        "elapsed_seconds": float(trained_elapsed),
+    })
     Path(a.out).parent.mkdir(parents=True, exist_ok=True)
-    torch.save(net.state_dict(), a.out)
-    print(f"[{_now()}] wrote {a.out} after {_hms(elapsed_before + (time.time() - t_run))} "
-          f"of training", flush=True)
+    torch.save({"state_dict": net.state_dict(), "meta": final_meta}, a.out)
+    print(f"[{_now()}] wrote {a.out} after {_hms(trained_elapsed)} of training", flush=True)
 
 
 if __name__ == "__main__":

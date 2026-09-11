@@ -30,5 +30,20 @@ def _preload() -> None:
 def load():
     """Return nvdiffrast.torch, or raise ImportError with the reason."""
     _preload()
-    import nvdiffrast.torch as dr
+    try:
+        import nvdiffrast.torch as dr
+    except ImportError as e:
+        # The extension links libc10/libtorch, so a torch that is not the one it was built
+        # against fails here on a mangled C++ symbol that names neither torch nor the fix.
+        # `make venv` rebuilds it when it swaps torch itself; this catches the cases it
+        # cannot see, such as a torch installed by hand.
+        if "undefined symbol" in str(e):
+            import torch
+
+            raise ImportError(
+                f"nvdiffrast's compiled extension does not match torch {torch.__version__} "
+                f"in this environment -- it was built against a different one. Rebuild it "
+                f"with `make toolchain`. ({e})"
+            ) from e
+        raise
     return dr
