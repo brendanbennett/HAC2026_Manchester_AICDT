@@ -383,6 +383,10 @@ if [ "$STAGES_AFTER_FORCE" != "1" ] && [ "$FORCE_STAGE" != "calibrate" ] \
   log "=== calibrate: skipped (models/instrument_calibration.pt already present)"
   mark_done calibrate
 elif [ -d "$DATA_DIR" ]; then
+  if [ -f models/instrument_calibration.pt ] && ! valid_instrument; then
+    log "=== calibrate: models/instrument_calibration.pt does not load into the current"
+    log "    Instrument, so it is refitted. Commit the new one so later runs skip this stage."
+  fi
   run_stage calibrate models/instrument_calibration.pt \
     $PY scripts/calibrate.py --data-dir "$DATA_DIR"
 else
