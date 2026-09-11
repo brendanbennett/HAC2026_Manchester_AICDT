@@ -47,8 +47,14 @@ of an area term does not. Making the objective scale free in the misfit,
 
 fixes the balance: stationarity then compares a relative change of misfit with an absolute
 change of area. The window opens, and where it opens to depends on the representation, which is
-the subject of the next section. In the one this repository now uses it is
-0.30 <= mu <= 2.40; `AREA_WEIGHT` sits inside it and `CarveFit` refuses a value outside it.
+the subject of the next section. In the one this repository now uses the top of it is measured:
+around the released body a further uniform carve of 0.03 is refused for any mu below 2.48, so
+above that a weight walks a correct answer away, and `AREA_WINDOW` stops at 2.40. The bottom,
+0.30, is assumed: nothing breaks below it and the penalty simply does less, and what is measured
+is the end of that road -- with the penalty off altogether the same ladder converges having
+barely moved, at an overlap of 0.7226 against the 0.7477 it reaches with it, so the penalty is
+worth 0.025 of overlap and removing it is not the fix for anything. `AREA_WEIGHT` sits inside
+the window and `CarveFit` refuses a value outside it.
 
 The penalty does not forbid concavities, and that was tested rather than argued. A hemispherical
 pit of radius 0.15 cut into the released body at 35 places over its surface costs between

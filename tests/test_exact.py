@@ -259,3 +259,18 @@ def test_the_orthographic_projection_frames_the_body_as_the_perspective_one_does
     top = torch.tensor([[0.0, 1.7, 0.0, 1.0]])
     y = torch.einsum("vj,bij->bvi", top, batch)[0, 0, 1]
     assert float(y) == pytest.approx(1.0, abs=1e-5)
+
+
+def test_a_cpu_run_gets_the_only_rasteriser_that_can_serve_it():
+    """nvdiffrast has no CPU path, so on a CPU device there is one backend and not a choice.
+    Defaulting to nvdiffrast there turned every --device cpu run into a missing-module
+    traceback from inside the forward model, which reads as a broken install rather than as
+    the one thing it is. An explicit name still wins, and a CUDA device still gets the fast
+    one asked for."""
+    from hac26.forward.mesh.raster import _backend
+    from hac26.forward.shared import software_raster
+
+    assert _backend(None, "cpu") is software_raster
+    assert _backend("software", "cuda") is software_raster
+    with pytest.raises(ValueError):
+        _backend("something else", "cpu")

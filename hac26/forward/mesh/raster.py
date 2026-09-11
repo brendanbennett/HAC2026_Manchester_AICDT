@@ -117,10 +117,16 @@ def flat_faces(verts: torch.Tensor, faces: torch.Tensor):
     return fv, ff
 
 
-def _backend(name: str | None):
-    """nvdiffrast, or the pure-torch stand-in when asked for by name or by the
-    HAC26_SOFTWARE_RASTER environment variable."""
-    name = name or ("software" if os.environ.get("HAC26_SOFTWARE_RASTER") else "nvdiffrast")
+def _backend(name: str | None, device: str = "cuda"):
+    """nvdiffrast, or the pure-torch stand-in when asked for by name, by the
+    HAC26_SOFTWARE_RASTER environment variable, or because the device is not a CUDA one.
+
+    nvdiffrast has no CPU path, so on a CPU there is one backend and not a choice; defaulting to
+    it there turned every --device cpu run into a missing-module traceback from inside the
+    forward model, which reads as a broken install rather than as the one thing it is."""
+    if name is None:
+        name = ("software" if os.environ.get("HAC26_SOFTWARE_RASTER")
+                or not str(device).startswith("cuda") else "nvdiffrast")
     if name == "software":
         from hac26.forward.shared import software_raster
         return software_raster
@@ -136,7 +142,7 @@ class Rasteriser:
 
     def __init__(self, height: int, width: int, supersample: int = 1, device: str = "cuda",
                  backend: str | None = None):
-        self.dr = _backend(backend)
+        self.dr = _backend(backend, device)
         self.h, self.w, self.ss = int(height), int(width), int(supersample)
         self.device = device
         self.ctx = self.dr.RasterizeCudaContext(device=device)

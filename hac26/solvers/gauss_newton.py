@@ -63,8 +63,11 @@ STEP_C = 0.08
 # is what removes that direction, not this weight.
 #
 # What the weight is left doing, and does, is keeping the body a minimiser against a further
-# uniform carve; that holds below the top of the window. The bottom is where a smooth dent of
-# the size the correction has stops being profitable.
+# uniform carve. The top of the window is measured: above it the released body is beaten by
+# itself carved a little further, and a weight there would walk a correct answer away. The
+# bottom is assumed rather than measured -- nothing breaks below it, the penalty simply stops
+# doing enough to matter, and what is measured is the end of that road, since turning it off
+# altogether costs overlap the misfit alone will not recover.
 AREA_WEIGHT = 0.9
 AREA_WINDOW = (0.30, 2.40)
 
