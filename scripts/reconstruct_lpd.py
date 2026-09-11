@@ -253,10 +253,14 @@ def dice_optimal_level(occs: list, extent: float, radius: float, iters: int = 3,
     the upper clamp only guards against a degenerate estimate.
     """
     t = 0.5
+    good = None                  # the last level that actually produced a body
     for _ in range(iters):
         made = consensus_bodies(occs, extent, radius, levels=(t,))
         if not made:
-            break
+            # t is outside the range of the draw fraction, so it would produce nothing
+            # downstream either; fall back to the last level that did produce a body.
+            return good if good is not None else 0.5
+        good = t
         _, v, f = made[0]
         occ = mesh_occupancy(v, f, occs[0].shape[0], extent)
         d = float(np.mean([dice(occ, o) for o in occs]))
@@ -264,19 +268,47 @@ def dice_optimal_level(occs: list, extent: float, radius: float, iters: int = 3,
     return t
 
 
+def off_lattice_level(level: float, n_draws: int) -> float:
+    """A level strictly between two attainable draw fractions.
+
+    The fraction of draws occupying a voxel takes only the values k / n_draws, so a level
+    equal to one of them puts the isosurface exactly through the sampled values. Marching
+    cubes then places vertices on grid points and emits zero-area triangles and pinch
+    points: the body comes back with a fifth of its faces degenerate and its winding
+    inverted, which `export_stl` cannot repair and no voxel measure that relies on
+    orientation can read. CONSENSUS_LEVELS holds 0.5 and the default draw count is 8, so
+    the majority level landed on the lattice on every run.
+
+    The level is moved down to the middle of the cell below it, (k - 0.5) / n_draws. That
+    keeps exactly the voxels the requested level meant -- those where at least k of the
+    n_draws agree -- while passing strictly between attainable values, so every triangle
+    has area. A level that is not on the lattice is returned unchanged.
+    """
+    if n_draws < 1:
+        return float(level)
+    k = float(level) * n_draws
+    kr = round(k)
+    return (kr - 0.5) / n_draws if abs(k - kr) < 1e-9 else float(level)
+
+
 def consensus_bodies(occs: list, extent: float, radius: float, levels=CONSENSUS_LEVELS):
     """Meshes of the level sets of the fraction of draws containing each voxel, for boolean
     grids `occs` on [-extent, extent]^3, posed like the draws. Returns [(level, verts,
-    faces)]; a level with no closed surface is left out."""
+    faces)]; a level with no closed surface is left out.
+
+    Each requested level is nudged off the k / len(occs) lattice before the isosurface is
+    extracted (see off_lattice_level); the level reported back is the one that was asked
+    for, since that is what names the candidate."""
     from skimage import measure
     prob = np.mean([o.astype(np.float32) for o in occs], axis=0)
     n = prob.shape[0]
     spacing = 2.0 * extent / n
     out = []
     for level in levels:
-        if not (prob.min() < level < prob.max()):
+        lv = off_lattice_level(float(level), len(occs))
+        if not (prob.min() < lv < prob.max()):
             continue
-        v, f, _, _ = measure.marching_cubes(prob, level=level, spacing=(spacing,) * 3)
+        v, f, _, _ = measure.marching_cubes(prob, level=lv, spacing=(spacing,) * 3)
         v = v - extent + spacing / 2.0                  # cell centres, not cell corners
         # The radius is capped here rather than set, unlike the draws', which are put at the
         # published radius exactly. A level set is a contour of a probability, not a body: it
@@ -492,8 +524,13 @@ def main():
     n_draws = len(meshes)
     # the consensus bodies join the draws as candidates; the draws alone are the reference
     # the derived level joins the fixed two; see dice_optimal_level
-    levels_used = (CONSENSUS_LEVELS + (dice_optimal_level(occs, occ_extent, R),)
-                   if n_draws > 1 else ())
+    if n_draws > 1:
+        asked = CONSENSUS_LEVELS + (dice_optimal_level(occs, occ_extent, R),)
+        # the derived level can land on one of the fixed ones; asking for it twice builds,
+        # samples and scores the same body twice and reports it as two candidates
+        levels_used = tuple(dict.fromkeys(round(float(x), 9) for x in asked))
+    else:
+        levels_used = ()
     extra = consensus_bodies(occs, occ_extent, R, levels=levels_used) if n_draws > 1 else []
     levels = [lv for lv, _, _ in extra]
     candidates = meshes + [(mv, mf) for _, mv, mf in extra]
@@ -555,6 +592,10 @@ def main():
     info = export_stl(a.out, v, f)
     res = {"model": a.model, "radius": R, "draws": n_draws, "answer": chosen,
            "candidate": int(k), "consensus_levels": [float(x) for x in levels_used],
+           # the levels asked for above, and the ones that actually produced a body: a
+           # level outside the range of the draw fraction makes none, and it is the second
+           # list that indexes the candidates the answer was chosen from
+           "consensus_levels_built": [float(x) for x in levels],
            "spread": spread, "spread_off_medoid": spread_off,
            "collapsed": bool(collapsed),
            "medoid_metric": medoid_metric,
