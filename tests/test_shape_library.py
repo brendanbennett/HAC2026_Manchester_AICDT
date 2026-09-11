@@ -317,13 +317,19 @@ def test_principal_frame_orders_axes_by_decreasing_moment():
 def test_mesh_curve_renderer_matches_the_exact_convex_operator():
     """For a convex body the mesh renderer and the convex operator must agree, since ray-cast
     visibility and the mu > 0, mu0 > 0 test coincide; this checks rotation sense, camera
-    geometry and thresholds without measured data."""
+    geometry, the photometric kernel and the level the count is thresholded at, without any
+    measured data.
+
+    It is the only check of the kernel that needs nothing but the two models. A kernel that
+    describes a scattering law this rig does not have, or a count thresholded on a brightness
+    that varies with the direction of view, fails it by a factor of fifty, which is why the
+    tolerance is tight enough to see that."""
     u, f = icosphere(1)
     v = u * np.array([1.0, 0.7, 1.3])
     hv, hf = hull_mesh(v)
     geoms = cameras()[:4]
-    res = convex_cross_check(hv, hf, m=10, geoms=geoms, res=44, c_lambert=0.12, delta=1.0)
-    assert res["mean_abs_diff_normalised"] < 0.03
+    res = convex_cross_check(hv, hf, m=10, geoms=geoms, res=64, delta=1.0)
+    assert res["mean_abs_diff_normalised"] < 0.01, res["mean_abs_diff_normalised"]
 
 
 def test_mesh_curve_renderer_produces_a_time_directional_curve():

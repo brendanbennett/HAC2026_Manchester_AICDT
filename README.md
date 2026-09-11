@@ -48,6 +48,14 @@ correction replaces a convex answer only where `scripts/select_answers.py` accep
 `results/submission/selection.json` then records, per model, which answer was submitted and
 the numbers behind the choice.
 
+The convex network was trained against a photometric kernel that has since been measured to
+be wrong (`notes/photometry.md`). An unrolled scheme is an estimator fitted against one
+operator and is not the same estimator against another, so the checkpoint records which law
+it was trained with and is run against that one; its answers are unchanged. Retraining it
+against the corrected operator is outstanding work and is the largest single thing left.
+`hac26/solvers/convex_direct.py` solves the same problem directly, on the corrected operator
+and without training, and does not yet score as well; its docstring says by how much.
+
 `scripts/benchmark.py` scores any directory of reconstructions against the released shapes
 with the organisers' own measures, which is how a change to the method earns its place.
 
@@ -110,12 +118,13 @@ python scripts/calibrate.py --channel blender --models 1 3 # the Blender render
 ```
 
 The two channels are different instruments (`hac26/forward/mesh/instrument.py`). The
-laboratory curves come through a lens, a sensor and bounce light off a matte white print,
-while the render has none of those and its camera is at infinity, so it starts from
-`Instrument.blender_start`: an orthographic projection rather than a very distant perspective
-one, the interreflection switched off, and the power-law transfer a renderer's display
-transform applies. Both switches are saved with the instrument, so a loaded instrument
-renders as it was fitted. The calibration prints the residual of the exact forward model at
+laboratory curves come through a lens, a sensor and bounce light off a matte white print, and
+that instrument is fitted. The rendered channel is not fitted at all: a render has no lens, no
+point spread, no penumbra and no spline transfer, its camera is at infinity, and its one
+constant is the exponent of the view transform, which belongs to the channel rather than to
+any body and is measured once. `Instrument.blender_start` is that instrument rather than a
+starting point, and `notes/photometry.md` derives what the rig measures and records where the
+code had it wrong. The calibration prints the residual of the exact forward model at
 the true shape divided by the noise, per geometry, which is the number that says how well
 the chain matches the channel, and a travel table that names any parameter still moving
 when the step budget ran out.
@@ -152,7 +161,9 @@ representation has to be able to hold the body before any solver can find it.
 `notes/representation.md` measures what each lattice can hold and why the one in
 `hac26/field.py` was chosen.
 
-Read the calibration's residual at the released shapes before reading any reconstruction.
+Read the calibration's residual at the released shapes before reading any reconstruction. On
+the rendered channel a model of this kind reaches about 0.004 against curves of a released
+body, so a residual much above that is a fault in the chain and not a property of the data.
 Written in the fit's own coordinates, the non-convex public body has a lower misfit than the
 body the fit reaches from its convex answer, and the fit released from the body stays there,
 so the curves do prefer the body; but the two are separated by less than the forward model's

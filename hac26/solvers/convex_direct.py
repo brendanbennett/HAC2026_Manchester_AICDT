@@ -23,6 +23,14 @@ the histogram bin they are read from.
 Nothing here is trained. The alternative in this repository is an unrolled primal-dual network
 whose weights were fitted against a different photometric kernel, and whose operator is a
 fixed tensor that cannot carry a threshold that depends on the body it is reconstructing.
+
+It does not yet replace that network. Scored against the released shapes on the same measure,
+this solve reaches 0.948, 0.832 and 0.710 on the three public bodies where the trained stage
+reaches 0.983, 0.893 and 0.708, and a sweep of the smoothness over two decades does not close
+the gap on the first two. What the trained network has and this does not is a prior over
+bodies; the smoothness penalty here is the crudest possible stand-in for one. The residual of
+this solve at its own answer is small on bodies 1 and 3, so what it is missing is not fit to
+the curves but the part of the body the curves do not determine.
 """
 from __future__ import annotations
 

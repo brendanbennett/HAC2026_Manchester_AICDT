@@ -4,7 +4,7 @@ import numpy as np
 import pytest
 import torch
 
-from hac26.conventions import SENSE, cameras, psi_grid
+from hac26.conventions import SENSE, TRANSFER_EXPONENT, cameras, psi_grid
 from hac26.forward.mesh.exact import (ExactForward, LitCoverage, RenderConfig, normalise,
                                       normalise_vjp)
 from hac26.forward.mesh.instrument import Instrument
@@ -65,23 +65,27 @@ def test_coverage_never_exceeds_the_projected_area_and_shadows_reduce_it():
 
 
 def test_exact_intensity_matches_the_convex_operator_on_a_convex_body():
-    """A convex body has no interreflection (no two faces see each other), so the exact chain
-    reduces to Lambert scattering and its intensity curves must agree with the analytic convex
-    operator's Lambert curves, which checks the rotation sense, the camera geometry and the
-    projection end to end. The threshold is set very low so it does not cut dim faces."""
+    """A convex body has no interreflection, since no two of its faces see each other, so the
+    chain that renders an image and the one that sums over facets are computing the same
+    integral and must agree. That is the end-to-end check of the rotation sense, the camera
+    geometry, the projection and the photometric kernel, and it needs no measured data.
+
+    Both sides are the rendered channel's instrument, whose transfer is the measured power
+    law; comparing an image-based model against a facet sum at a different exponent would be
+    comparing two different measurements."""
     u, f = icosphere(1)
     v = u * np.array([1.0, 0.7, 1.3])
     hv, hf = hull_mesh(v)
     P, geoms = 8, [0, 2, 9, 15]
-    inst = Instrument(tau_i=1e-3, quantise=False)
+    inst = Instrument.blender_start(tau_i=1e-3)
     op = ExactForward(inst, psi_grid(P), MEDIUM, device="cpu", backend="software")
     raw = op.raw_curves(torch.tensor(hv, dtype=torch.float32), torch.tensor(hf), geoms=geoms)
     mine = normalise(raw)[:, 0].numpy()                                   # intensity only
     ref_cams = [build_cameras()[g] for g in geoms]
     ref = mesh_curves_convex(hv, hf, ref_cams, P, ["intensity"] * len(geoms),
-                             c_lambert=1.0, ls_weight=0.0, sigma=SENSE)
+                             gamma=TRANSFER_EXPONENT, sigma=SENSE)
     ref = ref / ref.mean(1, keepdims=True)
-    assert np.abs(mine - ref).mean() < 0.05
+    assert np.abs(mine - ref).mean() < 0.02, np.abs(mine - ref).mean()
 
 
 def test_vjp_returns_the_same_curves_and_finite_gradients():
@@ -165,20 +169,27 @@ def test_without_interreflection_the_radiance_is_the_direct_term_alone():
 
 
 def test_the_blender_start_is_a_camera_at_infinity_without_bounce_light(tmp_path):
-    """The start of a calibration against the render has the cameras at infinity, the bounce
-    light off and the power-law transfer curve, fits neither the albedo, the camera distance
-    nor the vignetting, and comes back from a saved file with both switches and the same
-    sensor chain."""
+    """The rendered channel's instrument has the cameras at infinity, the bounce light off
+    and the measured power-law transfer, fits nothing at all, and comes back from a saved file
+    with both switches and the same sensor chain.
+
+    Nothing is fitted because a render has none of the things a calibration would move: no
+    lens whose falloff could be fitted, no photosite whose point spread could, no penumbra and
+    no spline transfer. Each of those is a direction a fit would otherwise use to absorb an
+    error of shape, and the penumbra is the worst of them, being a blur of the shadow edge,
+    which is the feature that carries concavity. The laboratory channel is a different
+    instrument and is fitted."""
     from hac26.forward.mesh.sensor import PowerTransfer, SensorModel
 
     inst = Instrument.blender_start()
     assert not bool(inst.interreflection)
     assert bool(inst.orthographic)
     assert isinstance(inst.sensor, PowerTransfer)
-    assert float(inst.sensor.gamma) == pytest.approx(1.0 / 2.2, abs=2e-3)
-    names = {n for n, _ in inst.fitted_parameters()}
-    assert {"raw_rho", "raw_eye", "sensor.raw_vignette", "raw_eta"}.isdisjoint(names)
-    assert {"raw_delta", "raw_tau_i", "sensor.raw_gamma", "sensor.raw_sat"} <= names
+    assert float(inst.sensor.gamma.detach()) == pytest.approx(TRANSFER_EXPONENT, abs=1e-4)
+    assert inst.fitted_parameters() == []
+    # a parallel beam, not a disc: the parameter is stored unsquashed and floored there, so
+    # the source radius is zero to any precision that matters and not exactly zero
+    assert float(inst.delta.detach()) < 1e-9
     lab = Instrument()
     assert not bool(lab.orthographic) and isinstance(lab.sensor, SensorModel)
     assert {"raw_rho", "raw_eye", "sensor.raw_vignette"} <= {n for n, _ in

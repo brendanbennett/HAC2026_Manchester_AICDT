@@ -8,8 +8,8 @@ from hac26.forward.convex_egi import (build_A, deriv_adjoint_np, dn_adjoint_np, 
                            forward_np, normalize_np, stack_A)
 from hac26.geometry import (build_cameras, make_grid, project_closure)
 from hac26.solvers.minkowski import solve_minkowski
-from hac26.shapes import (mesh_curves_convex, mesh_to_egi,
-                          sample_training_shape)
+from hac26.shapes import (face_normals_areas, icosphere, mesh_curves_convex,
+                          mesh_to_egi, sample_training_shape)
 
 RNG = np.random.default_rng(0)
 
@@ -213,3 +213,48 @@ def test_lpd_forward_backward():
     assert torch.allclose(p.sum(1), torch.ones(2), atol=1e-5)
     p.sum().backward()
     assert all(q.grad is not None for q in net.parameters() if q.requires_grad)
+
+
+def test_the_count_is_thresholded_at_the_level_the_first_frame_gives():
+    """The organisers count pixels above Otsu's level of each video's own first frame, so the
+    level is derived and not fitted. Otsu's criterion needs only the histogram of a frame, and
+    for a convex body that histogram is known from the facets, so the level can be computed
+    without rendering anything. It has to be the level a rendered frame of the same body
+    gives, and it has to be insensitive to how much of the frame the body is set in, since
+    the framing is not something the released files say."""
+    from hac26.forward.convex_egi import otsu_threshold
+    from hac26.conventions import TRANSFER_EXPONENT
+
+    v, f = icosphere(3)
+    v = np.asarray(v) * np.array([1.0, 0.7, 1.2])
+    n, a = face_normals_areas(v, np.asarray(f))
+    s = np.array([-1.0, 0.0, 0.0])
+    view = np.array([-0.7, 0.7, 0.0]) / np.sqrt(2.0)
+    mu, mu0 = n @ view, n @ s
+    proj = 0.5 * float(np.abs(mu) @ a)
+
+    # the same level, whatever the body is set in
+    levels = [otsu_threshold(mu, mu0, a, k * proj) for k in (1.5, 2.5, 5.0)]
+    assert max(levels) - min(levels) < 0.01, levels
+    assert 0.0 < levels[0] < 1.0
+
+    # and it is the level a histogram of the frame gives, by the criterion's own definition:
+    # no other level separates the frame into two parts of larger between-class variance
+    c = levels[1]
+    lit = (mu > 0) & (mu0 > 0)
+    val = np.where(lit, np.abs(mu0) ** TRANSFER_EXPONENT, 0.0)
+    w = np.where(lit, a * mu, 0.0)
+    dark = max(2.5 * proj - w.sum(), 0.0)
+
+    def between(level):
+        hi = val > level ** TRANSFER_EXPONENT
+        w1 = float(w[hi].sum())
+        w0 = float(w[~hi].sum()) + dark
+        if w0 <= 0 or w1 <= 0:
+            return -1.0
+        m1 = float((w[hi] * val[hi]).sum()) / w1
+        m0 = float((w[~hi] * val[~hi]).sum()) / w0
+        return w0 * w1 * (m0 - m1) ** 2
+
+    best = max(np.linspace(0.02, 0.95, 94), key=between)
+    assert abs(best - c) < 0.03, (best, c)

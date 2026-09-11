@@ -9,6 +9,7 @@ import numpy as np
 import pytest
 
 from hac26.conventions import (AZIMUTHS_DEG, FRAMES, S_LAB, SENSE, TOP_ELEVATION_DEG,
+                               TRANSFER_EXPONENT,
                                R_z, camera_vector, cameras, lab_azimuth_deg,
                                phase_angle_deg, psi_grid, source_directions, to_body)
 
@@ -190,3 +191,27 @@ def test_centring_a_public_body_moves_it_off_the_axis(model):
         assert err_centred > err_axis, why
         assert r_of(centre_xy=True) > CYLINDER_R[model], why
 
+
+
+def test_the_camera_elevations_are_the_ones_the_render_was_made_at():
+    """Six of the seven top-camera elevations are the published ones and the seventh is not.
+
+    The elevation of each is measurable against the released render of a body whose shape is
+    released, because a two-degree error there costs a factor of three to five in the
+    residual of that column. At azimuth 135 the render says 24 degrees where the published
+    table says 26, and that azimuth is one of the two at the largest phase angle, where the
+    shadows are longest. The table is held here and in hac26.geometry and the two must not
+    drift apart."""
+    from hac26.geometry import TOP_ALPHA_DEG
+    assert TOP_ELEVATION_DEG == TOP_ALPHA_DEG
+    assert TOP_ELEVATION_DEG[135.0] == 24.0
+    assert [TOP_ELEVATION_DEG[a] for a in (0.0, 45.0, 90.0, 225.0, 270.0, 315.0)] == \
+        [21.0, 26.0, 26.0, 24.0, 24.0, 24.0]
+
+
+def test_the_transfer_exponent_is_a_property_of_the_channel():
+    """It is the exponent of the view transform the released render was written through, so
+    it is one number for every body and every geometry. Fitting it per body, or per curve,
+    would let it absorb a shape error, since a body that is too large in one direction and a
+    transfer that is too steep both flatten a curve's peaks."""
+    assert 0.4 < TRANSFER_EXPONENT < 0.55
