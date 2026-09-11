@@ -10,7 +10,8 @@ from scipy.spatial import ConvexHull
 from scipy.special import gammaln, lpmv
 
 from .geometry import OMEGA0, NormalGrid, body_frame_dirs, cell_index, project_closure, psi_grid
-from hac26.forward.convex_egi import kernel
+from hac26.conventions import TRANSFER_EXPONENT
+from hac26.forward.convex_egi import curve_thresholds, kernel
 
 
 # ---------- icosphere ---------------------------------------------------------------
@@ -200,19 +201,26 @@ def mesh_support(verts: np.ndarray, normals: np.ndarray) -> np.ndarray:
 
 # ---------- brute-force convex renderer ----------------------------------------------
 def mesh_curves_convex(verts: np.ndarray, faces: np.ndarray, cameras: list, m: int,
-                       curve_types: list, c_lambert: float = 0.1, sigma: float = 1.0,
-                       delta: float = 1.0, psi0: float = 0.0,
-                       ls_weight: float = 1.0) -> np.ndarray:
-    """Raw (unnormalized) curves of a CONVEX mesh, shape (n_curves, m)."""
+                       curve_types: list, gamma: float = TRANSFER_EXPONENT,
+                       sigma: float = 1.0, delta: float = 1.0, psi0: float = 0.0,
+                       frame_area: float | None = None) -> np.ndarray:
+    """Raw (unnormalized) curves of a CONVEX mesh, shape (n_curves, m).
+
+    On a convex body nothing shadows, so summing the kernel over the facets is the whole
+    forward model and agrees with a ray cast of the same body. The binary curves are
+    thresholded at the level the body's own first frame gives, as the organisers threshold
+    theirs at the level their first frame gives."""
     n, a = face_normals_areas(verts, faces)
     psi = psi_grid(m, sigma=sigma, psi0=psi0)
     v0 = body_frame_dirs(OMEGA0, psi)
     mu0 = n @ v0.T
+    thr = curve_thresholds(n, a, cameras, m, curve_types, gamma=gamma,
+                           frame_area=frame_area, sigma=sigma, delta=delta, psi0=psi0)
     out = []
-    for cam, ctype in zip(cameras, curve_types):
+    for cam, ctype, c in zip(cameras, curve_types, thr):
         v = body_frame_dirs(cam.omega(delta=delta), psi)
         mu = n @ v.T
-        out.append(a @ kernel(mu, mu0, ctype, c_lambert, ls_weight=ls_weight))
+        out.append(a @ kernel(mu, mu0, ctype, gamma=gamma, threshold=float(c)))
     return np.stack(out, axis=0)
 
 

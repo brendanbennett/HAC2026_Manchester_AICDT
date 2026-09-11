@@ -23,7 +23,7 @@ import numpy as np
 
 # --- challenge constants (fips.fi HAC 2026 page) ---------------------------------
 AZIMUTHS_DEG: tuple = (0.0, 45.0, 90.0, 135.0, 225.0, 270.0, 315.0)
-TOP_ALPHA_DEG: dict = {0.0: 21.0, 45.0: 26.0, 90.0: 26.0, 135.0: 26.0,
+TOP_ALPHA_DEG: dict = {0.0: 21.0, 45.0: 26.0, 90.0: 26.0, 135.0: 24.0,
                        225.0: 24.0, 270.0: 24.0, 315.0: 24.0}
 CAM_KINDS: tuple = ("hor_a", "hor_b", "top", "bottom")  # column order within each azimuth group
 OMEGA0 = np.array([-1.0, 0.0, 0.0])

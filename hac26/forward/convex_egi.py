@@ -2,10 +2,9 @@
 
 A is the photometric tensor on the normal grid,
     A[c, k, i] = s_c( <R3(psi_k) u_i, omega_c>, <R3(psi_k) u_i, OMEGA0> ),
-where s_c is the kernel of curve c (see `kernel`): Lommel-Seeliger plus Lambert for an
-intensity curve, projected area for a binary curve, both zero where the normal faces away
-from the camera or the light. Per-curve constant factors cancel under normalization and are
-omitted. N is the per-curve mean normalization N(y) = y / mean(y), implemented with a guard
+where s_c is the kernel of curve c (see `kernel`), zero where the normal faces away from the
+camera or the light. Per-curve constant factors cancel under normalization and are omitted.
+N is the per-curve mean normalization N(y) = y / mean(y), implemented with a guard
 N_eps(y) = y / max(mean(y), eps); it equals N whenever mean(y) >= eps.
 
 Closed forms used by the LPD:
@@ -17,20 +16,35 @@ from __future__ import annotations
 
 import numpy as np
 
+from hac26.conventions import TRANSFER_EXPONENT
+
+# How much of a frame the body is set in, as a multiple of its largest silhouette area. It
+# enters only through Otsu's criterion, which weighs the body against the dark part of the
+# frame, and the level it gives moves by under a hundredth of the illumination cosine across
+# any framing that keeps a body of this shape inside the frame at every phase.
+FRAME_OVER_BODY = 2.5
+
+# Which photometric law builds the tensor. MEASURED is the rig's own; LEGACY is what this
+# repository used before it was measured and exists only so that a checkpoint trained against
+# that tensor can be loaded and run as the estimator it was trained to be.
+MEASURED = "measured"
+LEGACY = "lommel_seeliger"
 from hac26.geometry import OMEGA0, NormalGrid, body_frame_dirs, psi_grid
 
 
-def kernel(mu: np.ndarray, mu0: np.ndarray, curve_type: str, c_lambert: float,
-           ls_weight: float = 1.0, tau: float = 0.0) -> np.ndarray:
-    """Per-normal weight of one curve type, from the cosines to the camera (mu) and to the
-    light (mu0).
+def legacy_kernel(mu: np.ndarray, mu0: np.ndarray, curve_type: str,
+                  c_lambert: float = 0.1, ls_weight: float = 1.0,
+                  tau: float = 0.0) -> np.ndarray:
+    """The photometric kernel this repository used before the rig's own was measured:
+    Lommel-Seeliger plus Lambert for intensity, and for the count a threshold on the product
+    of the two cosines.
 
-        intensity   ls_weight * mu*mu0/(mu+mu0) + c_lambert * mu*mu0   (Lommel-Seeliger + Lambert)
-        binary      mu                                                (projected area)
-
-    The binary curve counts lit pixels, so a facet contributes its projected area whatever
-    its brightness. A normal contributes only where mu > 0, mu0 > 0 and mu*mu0 > tau; tau is
-    a brightness threshold below which a facet is not counted at all.
+    It is not what the rig measures, by a factor of fifty on a body where the facet sum and a
+    ray cast must agree, and nothing new should be built on it. It is kept because
+    `models/lpd_convex.pt` is an unrolled scheme whose weights were fitted against the tensor
+    this kernel builds, so the operator has to be reconstructible to load that checkpoint at
+    all; a network trained against one operator and run against another is not the estimator
+    that was trained.
     """
     rad = np.where((mu > 0.0) & (mu0 > 0.0), mu * mu0, 0.0)
     lit = rad > tau
@@ -42,35 +56,143 @@ def kernel(mu: np.ndarray, mu0: np.ndarray, curve_type: str, c_lambert: float,
     raise ValueError(curve_type)
 
 
+def kernel(mu: np.ndarray, mu0: np.ndarray, curve_type: str,
+           gamma: float = TRANSFER_EXPONENT, threshold: float = 0.0) -> np.ndarray:
+    """Per-normal weight of one curve type, from the cosines to the camera (mu) and to the
+    light (mu0).
+
+        intensity   mu * mu0**gamma
+        binary      mu  where mu0 > threshold
+
+    Both follow from what the rig measures. A Lambertian facet leaves a radiance proportional
+    to mu0 that does not depend on the direction it is seen from; it covers mu times its own
+    area of the image; and the stored value of each of its pixels is that radiance through a
+    transfer of exponent gamma. Summing the stored values over the facet therefore gives
+    mu * mu0**gamma, and counting the pixels above a level gives mu wherever the radiance
+    clears that level, which is a condition on mu0 alone.
+
+    The emission cosine enters only as the area a facet covers. A kernel that thresholds the
+    product mu*mu0 is thresholding a brightness that varies with the direction of view, which
+    a Lambertian surface's does not, and an intensity kernel of the Lommel-Seeliger form is a
+    scattering law this rig does not have. On the convex hull of a public body, where the
+    facet sum and a ray cast of the same body must agree exactly, these kernels reproduce the
+    cast to about a thousandth and those two do not.
+
+    `threshold` is a level of mu0, one per curve; `otsu_threshold` derives it the way the
+    organisers do, from the first frame.
+    """
+    lit = (mu > 0.0) & (mu0 > 0.0)
+    if curve_type == "intensity":
+        return np.where(lit, mu * np.abs(mu0) ** gamma, 0.0)
+    if curve_type == "binary":
+        return np.where(lit & (mu0 > threshold), mu, 0.0)
+    raise ValueError(curve_type)
+
+
+def otsu_threshold(mu: np.ndarray, mu0: np.ndarray, areas: np.ndarray,
+                   frame_area: float, gamma: float = TRANSFER_EXPONENT,
+                   bins: int = 256) -> float:
+    """The level of mu0 that Otsu's criterion puts on one frame of this body, without
+    rendering it.
+
+    The organisers threshold each video at Otsu's level of its own first frame and hold that
+    level for the rotation, so the level is not free and must not be fitted. Otsu's criterion
+    needs only the histogram of the frame, and that histogram is known from the facets: a lit
+    and visible facet contributes its projected area at the stored value mu0**gamma, and the
+    rest of the frame contributes at zero. The returned level is in mu0 rather than in stored
+    value, which is where the kernel wants it.
+    """
+    lit = (mu > 0.0) & (mu0 > 0.0)
+    val = np.zeros_like(mu0)
+    val[lit] = np.abs(mu0[lit]) ** gamma
+    w = np.where(lit, areas * mu, 0.0)
+    idx = np.clip(np.round(val * (bins - 1)).astype(int), 0, bins - 1)
+    hist = np.bincount(idx, weights=w, minlength=bins).astype(float)
+    hist[0] += max(frame_area - w.sum(), 0.0)               # the unlit part of the frame
+    lev = np.arange(bins) / (bins - 1)
+    w0 = np.cumsum(hist)
+    w1 = w0[-1] - w0
+    m0 = np.cumsum(hist * lev)
+    mu_0 = m0 / np.maximum(w0, 1e-12)
+    mu_1 = (m0[-1] - m0) / np.maximum(w1, 1e-12)
+    between = w0 * w1 * (mu_0 - mu_1) ** 2
+    k = int(np.argmax(between[:-1]))
+    return float(lev[k] ** (1.0 / gamma))
+
+
 def build_A(normals: np.ndarray, cameras: list, m: int, curve_types: list,
-            c_lambert: float = 0.1, sigma: float = 1.0, delta: float = 1.0,
-            psi0: float = 0.0, ls_weight: float = 1.0,
-            tau_i: float = 0.0, tau_b: float = 0.0) -> np.ndarray:
+            gamma: float = TRANSFER_EXPONENT, thresholds=None, sigma: float = 1.0,
+            delta: float = 1.0, psi0: float = 0.0, law: str = MEASURED,
+            c_lambert: float = 0.1) -> np.ndarray:
     """Photometric tensor A of shape (n_curves, m, N) for the given normals.
 
-    `cameras` and `curve_types` are parallel lists, one entry per output curve. stack_A()
-    builds the full stack of every camera as intensity and then as binary.
+    `cameras` and `curve_types` are parallel lists, one entry per output curve, and
+    `thresholds` gives the level of the illumination cosine for each of them, which only the
+    binary ones use. stack_A() builds the full stack of every camera as intensity and then as
+    binary.
     """
     psi = psi_grid(m, sigma=sigma, psi0=psi0)
     v0 = body_frame_dirs(OMEGA0, psi)                    # (m,3)
     mu0 = normals @ v0.T                                 # (N,m)
+    if thresholds is None:
+        thresholds = np.zeros(len(curve_types))
     rows = []
-    for cam, ctype in zip(cameras, curve_types):
+    for cam, ctype, c in zip(cameras, curve_types, np.asarray(thresholds, float)):
         v = body_frame_dirs(cam.omega(delta=delta), psi)  # (m,3)
         mu = normals @ v.T                                # (N,m)
-        rows.append(kernel(mu, mu0, ctype, c_lambert, ls_weight=ls_weight,
-                       tau=(tau_i if ctype == 'intensity' else tau_b)).T)  # (m,N)
+        if law == LEGACY:
+            rows.append(legacy_kernel(mu, mu0, ctype, c_lambert=c_lambert).T)
+        else:
+            rows.append(kernel(mu, mu0, ctype, gamma=gamma, threshold=float(c)).T)
     return np.stack(rows, axis=0)
 
 
-def stack_A(grid: NormalGrid, cameras: list, m: int, c_lambert: float = 0.1,
-            sigma: float = 1.0, delta: float = 1.0, psi0: float = 0.0) -> tuple:
+def curve_thresholds(normals: np.ndarray, areas: np.ndarray, cameras: list, m: int,
+                     curve_types: list, gamma: float = TRANSFER_EXPONENT,
+                     frame_area: float | None = None, sigma: float = 1.0,
+                     delta: float = 1.0, psi0: float = 0.0) -> np.ndarray:
+    """The level of the illumination cosine each curve is thresholded at, derived from the
+    body's own first frame as the organisers derive theirs from the video's.
+
+    `areas` are the facet areas of the extended Gaussian image, so this is a property of the
+    body being modelled and changes as an inversion changes it. Intensity curves get zero,
+    which their kernel ignores. `frame_area` is how much of the image the body is set in;
+    left out, it is taken as four times the body's largest projected area, which is the order
+    a framing that keeps the body inside the frame at every phase gives.
+    """
+    psi = psi_grid(m, sigma=sigma, psi0=psi0)
+    v0 = body_frame_dirs(OMEGA0, psi)
+    mu0 = normals @ v0[0]
+    out = np.zeros(len(curve_types))
+    proj = 0.5 * np.abs(normals @ v0.T).T @ areas          # silhouette area at each phase
+    if frame_area is None:
+        frame_area = FRAME_OVER_BODY * float(proj.max())
+    for j, (cam, ctype) in enumerate(zip(cameras, curve_types)):
+        if ctype != "binary":
+            continue
+        mu = normals @ body_frame_dirs(cam.omega(delta=delta), psi)[0]
+        out[j] = otsu_threshold(mu, mu0, areas, frame_area, gamma=gamma)
+    return out
+
+
+def stack_A(grid: NormalGrid, cameras: list, m: int, areas: np.ndarray | None = None,
+            gamma: float = TRANSFER_EXPONENT, sigma: float = 1.0, delta: float = 1.0,
+            psi0: float = 0.0, frame_area: float | None = None, law: str = MEASURED,
+            c_lambert: float = 0.1) -> tuple:
     """Full operator for one model: every camera's intensity curve, then every camera's
-    binary curve. Returns (A, curve_types) with A of shape (2 * len(cameras), m, N)."""
+    binary curve. Returns (A, curve_types) with A of shape (2 * len(cameras), m, N).
+
+    `areas` is the extended Gaussian image the binary curves' thresholds are derived from. A
+    caller that has no estimate yet passes none and gets zero thresholds, which counts the
+    whole lit and visible area rather than the part above the level the organisers used.
+    """
     cams2 = list(cameras) + list(cameras)
     types = ["intensity"] * len(cameras) + ["binary"] * len(cameras)
-    A = build_A(grid.normals, cams2, m, types, c_lambert=c_lambert,
-                sigma=sigma, delta=delta, psi0=psi0)
+    thr = None if (areas is None or law == LEGACY) else curve_thresholds(
+        grid.normals, areas, cams2, m, types, gamma=gamma, frame_area=frame_area,
+        sigma=sigma, delta=delta, psi0=psi0)
+    A = build_A(grid.normals, cams2, m, types, gamma=gamma, thresholds=thr,
+                sigma=sigma, delta=delta, psi0=psi0, law=law, c_lambert=c_lambert)
     return A, types
 
 

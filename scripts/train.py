@@ -99,11 +99,12 @@ def main() -> None:
     dataset = None
     if args.data:
         from hac26.adapter import FigurineCurves, load_pairs
-        from hac26.forward.convex_egi import stack_A
+        from hac26.forward.convex_egi import LEGACY, stack_A
         from hac26.geometry import build_cameras, make_grid
         grid = make_grid(pr.n_theta, pr.n_phi)
-        A, _ = stack_A(grid, build_cameras(), pr.m, c_lambert=pr.c_lambert,
-                       sigma=pr.sigma, delta=pr.delta)
+        A, _ = stack_A(grid, build_cameras(), pr.m,
+                       law=getattr(pr, "photometry", LEGACY),
+                       c_lambert=pr.c_lambert, sigma=pr.sigma, delta=pr.delta)
         from hac26.radial import fibonacci_sphere
         pairs = load_pairs(args.data, grid, A, eps=pr.eps_norm,
                            canonical_r=pr.canonical_r,

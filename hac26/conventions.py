@@ -21,6 +21,7 @@ from __future__ import annotations
 import numpy as np
 
 __all__ = ["S_LAB", "AZIMUTHS_DEG", "TOP_ELEVATION_DEG", "CAM_KINDS", "FRAMES",
+           "TRANSFER_EXPONENT",
            "CYLINDER_R", "PUBLIC_MODELS", "Camera", "cameras", "camera_vector",
            "lab_azimuth_deg", "phase_angle_deg", "R_z", "to_body", "source_directions",
            "psi_grid", "SENSE", "PSI0"]
@@ -30,7 +31,11 @@ S_LAB = np.array([-1.0, 0.0, 0.0])
 AZIMUTHS_DEG = (0.0, 45.0, 90.0, 135.0, 225.0, 270.0, 315.0)
 
 # Top-camera elevation per azimuth; the "virtual bottom" camera sits at its negative.
-TOP_ELEVATION_DEG = {0.0: 21.0, 45.0: 26.0, 90.0: 26.0, 135.0: 26.0,
+# Measured against the released render of a public body, not taken from the published table,
+# which gives 26 degrees at azimuth 135. Every other entry agrees with the table; that one
+# does not, and a two-degree error there costs a factor of three in the residual of the two
+# columns at the largest phase angle, where the shadows are longest.
+TOP_ELEVATION_DEG = {0.0: 21.0, 45.0: 26.0, 90.0: 26.0, 135.0: 24.0,
                      225.0: 24.0, 270.0: 24.0, 315.0: 24.0}
 
 # Column order within each azimuth group, matching the released curve files.
@@ -42,6 +47,13 @@ FRAMES = 360
 # value is approximate; see the module docstring.
 CYLINDER_R = {1: 1.12, 2: 1.42, 3: 0.88, 4: 1.475, 5: 1.22,
               6: 0.925, 7: 1.205, 8: 1.24, 9: 0.67, 10: 3.95}
+
+# Exponent of the transfer from radiance to stored pixel value, measured on the released
+# render of a public body against its released shape. It is a property of the renderer's view
+# transform and not of any body, so it is the same for every body and every geometry, and it
+# is what makes the intensity curve the gamma-th moment of the illumination cosine rather than
+# the disk-integrated brightness an astronomical lightcurve would be.
+TRANSFER_EXPONENT = 0.475
 
 # The models whose true shape was released.
 PUBLIC_MODELS = (1, 2, 3)

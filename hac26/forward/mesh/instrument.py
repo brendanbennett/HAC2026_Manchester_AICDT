@@ -42,21 +42,34 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from hac26.conventions import TRANSFER_EXPONENT
+
 from .sensor import PowerTransfer, SensorModel
 
-__all__ = ["Instrument", "N_CURVES", "SRGB_EXPONENT"]
+__all__ = ["Instrument", "N_CURVES"]
 
 N_CURVES = 56          # the released curves: every camera geometry, intensity then binary
-SRGB_EXPONENT = 1.0 / 2.2   # the exponent of the sRGB-like transfer curve a renderer's
-                            # standard view applies to linear radiance
+
+
+# Parameters are stored unsquashed, so a value of exactly zero is minus infinity there. A
+# stored infinity is finite in the forward direction but poisons any arithmetic on the
+# parameter itself, so the inverses are floored: below this the squashed value is zero to
+# float32 anyway.
+_UNSQUASHED_FLOOR = -30.0
 
 
 def _inv_softplus(x: float) -> float:
-    return float(np.log(np.expm1(x)))
+    if x <= 0.0:
+        return _UNSQUASHED_FLOOR
+    return float(max(np.log(np.expm1(x)), _UNSQUASHED_FLOOR))
 
 
 def _inv_sigmoid(x: float) -> float:
-    return float(np.log(x / (1.0 - x)))
+    if x <= 0.0:
+        return _UNSQUASHED_FLOOR
+    if x >= 1.0:
+        return -_UNSQUASHED_FLOOR
+    return float(np.clip(np.log(x / (1.0 - x)), _UNSQUASHED_FLOOR, -_UNSQUASHED_FLOOR))
 
 
 class Instrument(nn.Module):
@@ -129,15 +142,22 @@ class Instrument(nn.Module):
         return F.softplus(self.raw_eta)
 
     @classmethod
-    def blender_start(cls, delta_deg: float = 1.0, tau_i: float = 0.02,
+    def blender_start(cls, delta_deg: float = 0.0, tau_i: float = 0.0,
                       eta: float = 0.02) -> "Instrument":
-        """The starting point of a calibration against the render: cameras at infinity, no
-        bounce light and the power-law transfer curve of a renderer's standard view. The
-        albedo is kept at one because without interreflection it only scales the radiance,
-        which the saturation already does."""
+        """The instrument of the released render. Not a starting point: every one of these is
+        measured against a released body rather than fitted against it.
+
+        The camera is at infinity, the source is a parallel beam, there is no bounce light,
+        and the transfer from radiance to stored value is the power law of the renderer's
+        view transform at the measured exponent. The albedo is kept at one because without
+        interreflection it only scales the radiance, and the scale is removed when each curve
+        is divided by its own mean. What a calibration would otherwise be free to move --
+        a penumbra, a lens falloff, a point spread, a spline transfer -- are all absent from
+        a render, and each of them is a direction a fit would use to absorb an error of
+        shape instead."""
         return cls(rho=0.999, delta_deg=delta_deg, tau_i=tau_i, eta=eta,
                    interreflection=False, orthographic=True,
-                   sensor=PowerTransfer(gamma=SRGB_EXPONENT))
+                   sensor=PowerTransfer(gamma=TRANSFER_EXPONENT))
 
     def fitted_parameters(self) -> list:
         """(name, parameter) of everything a calibration moves. Without interreflection the
@@ -150,6 +170,8 @@ class Instrument(nn.Module):
             skip.add("raw_rho")
         if bool(self.orthographic):
             skip |= {"raw_eye", "sensor.raw_vignette"}
+        if bool(self.orthographic) and not bool(self.interreflection):
+            return []            # the rendered channel: measured, not fitted
         return [(n, p) for n, p in self.named_parameters() if n not in skip]
 
     def scene_parameters(self) -> list:

@@ -134,9 +134,12 @@ def test_minkowski_roundtrip_and_bruteforce():
     p, pb = g / g.sum(), g_back / g_back.sum()
     assert np.abs(p - pb).sum() < 0.05
     # (b) the matrix route against the facet sum on the same polytope; the psi0 offset keeps
-    # the samples away from mu0 = 0, where the discontinuous binary kernel amplifies
-    # floating-point differences between the two normal computations
-    A, types = stack_A(grid, cams, m, psi0=0.789)
+    # the samples away from the level the binary kernel steps at, where a discontinuous
+    # kernel amplifies floating-point differences between the two normal computations. The
+    # matrix is built from the same extended Gaussian image the facet sum will be taken over,
+    # so both derive the same threshold from the same first frame; a matrix built without one
+    # thresholds at zero and counts a different set of facets.
+    A, types = stack_A(grid, cams, m, areas=g_back, psi0=0.789)
     y_mat = np.einsum("cmn,n->cm", A, g_back)
     y_brt = mesh_curves_convex(sol["verts"], sol["faces"], cams + cams, m, types,
                                psi0=0.789)

@@ -21,7 +21,8 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader, IterableDataset, get_worker_info
 
-from hac26.forward.convex_egi import ConvexPhotometricOperator, stack_A
+from hac26.forward.convex_egi import (LEGACY, MEASURED, ConvexPhotometricOperator,
+                                      stack_A)
 from .geometry import build_cameras, make_grid
 from hac26.solvers.lpd_convex import LPDNet
 from .radial import (fibonacci_sphere, mesh_radial, support_ray_matrix,
@@ -48,7 +49,11 @@ class Preset:
     n_theta: int = 24
     n_phi: int = 48
     lr: float = 1e-3
-    c_lambert: float = 0.1  # Lambert weight of the intensity kernel (convex_egi.kernel)
+    # Which photometric law the operator is built from. The measured one is the rig's own;
+    # a preset written before it was measured carries no such field and is read as the legacy
+    # law, so a checkpoint is always run against the operator it was trained against.
+    photometry: str = MEASURED
+    c_lambert: float = 0.1  # Lambert weight of the legacy intensity kernel, and nothing else
     sigma: float = -1.0     # rotation sense, fitted on the public models by data_io.fit_conventions
     delta: float = 1.0      # azimuth handedness, fitted the same way
     eps_norm: float = 1e-3
@@ -156,8 +161,8 @@ def build_model(pr: Preset, device: str) -> tuple:
     """Operator and network for a preset; returns (net, grid, A, cameras, curve_types)."""
     grid = make_grid(pr.n_theta, pr.n_phi)
     cameras = build_cameras()
-    A, types = stack_A(grid, cameras, pr.m, c_lambert=pr.c_lambert,
-                       sigma=pr.sigma, delta=pr.delta)
+    A, types = stack_A(grid, cameras, pr.m, law=getattr(pr, "photometry", LEGACY),
+                       c_lambert=pr.c_lambert, sigma=pr.sigma, delta=pr.delta)
     op = ConvexPhotometricOperator(A, eps=pr.eps_norm)
     net = LPDNet(op, pr.n_theta, pr.n_phi, cameras + cameras, types,
                  n_iter=pr.n_iter, n_primal=pr.n_primal, n_dual=pr.n_dual,
@@ -355,7 +360,12 @@ def load_net(ckpt_path: str, device: str | None = None) -> tuple:
     stale = sorted(set(ck["preset"]) - known)
     if stale:
         print(f"note: ignoring retired preset keys {stale}")
-    pr = Preset(**{k: v for k, v in ck["preset"].items() if k in known})
+    saved = {k: v for k, v in ck["preset"].items() if k in known}
+    # A checkpoint written before the rig's photometry was measured names no law, and its
+    # weights were fitted against the tensor the old one builds. Running it against a
+    # different tensor is running a different estimator, so absence means the old law.
+    saved.setdefault("photometry", LEGACY)
+    pr = Preset(**saved)
     net, grid, A, cameras, types = build_model(pr, device)
     missing, unexpected = net.load_state_dict(ck["model"], strict=False)
     # strict=False only to allow the regenerable buffers to be absent; any other

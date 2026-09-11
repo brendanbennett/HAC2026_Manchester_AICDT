@@ -60,8 +60,13 @@ __all__ = ["RenderConfig", "ExactForward", "LitCoverage", "normalise", "normalis
 class RenderConfig:
     """The discretisation of the chain. Every value here is a resolution, not a model
     parameter; the model parameters live in Instrument."""
-    height: int = 108          # sensor image, before supersampling
-    width: int = 192
+    # The sensor image before supersampling. What sets it is that the reductions are sums
+    # over pixels of a thresholded image, so their error is the quantisation of the lit
+    # region's boundary and falls as the body's width in pixels grows; the body spans
+    # height / fov_scale of them. Halving the pitch halves the residual at the geometries
+    # that are not already at the render's own floor.
+    height: int = 320
+    width: int = 568
     supersample: int = 2
     sun_res: int = 512         # side of the square sun view, in pixels
     fov_scale: float = 1.6     # the camera's half-height covers this many body extents

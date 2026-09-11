@@ -7,7 +7,7 @@ The true STL of a public model is rendered with `hac26.curves_mesh.render_curves
 CPU renderer, and compared with the measured curves for that model. Agreement is evidence
 about the conventions (rotation sense, camera geometry, thresholds), not about the scattering
 law: the renderer has no interreflection and no sensor chain, so a residual offset after the
-best-fit (delta, c_lambert) is expected; a sign or phase error is not.
+best-fit delta is expected; a sign or phase error is not.
 
 Needs the challenge data under --data (see the README). `--stl` takes a path; without it,
 every .stl under --data is searched for one whose name ends in the model number, ignoring
@@ -69,7 +69,7 @@ def main() -> None:
     print(f"rendering {len(types)} curves x {a.m} frames at res={a.res} "
           f"(this is the slow, exact step)")
     sim = render_curves_mesh(verts, faces, m=a.m, curve_types=types, geoms=geoms,
-                             c_lambert=fit["c_lambert"], delta=fit["delta"], res=a.res)
+                             delta=fit["delta"], res=a.res)
     sim_n = normalize_np(sim)
 
     err = (sim_n - curves56) * mask[:, None]

@@ -4,18 +4,19 @@ conventions.
 `hac26.shapes.mesh_curves_convex` counts every facet with mu > 0 and mu0 > 0 as seen and
 lit, which is exact only for convex bodies. Bodies from hac26.shape_library can occlude and
 shadow themselves, so they need a renderer that casts rays. This one takes the rotation
-sense, camera directions and light direction from `hac26.conventions`; delta and c_lambert
-are parameters, so values fitted by `hac26.data_io.fit_conventions` can be passed in.
+sense, camera directions and light direction from `hac26.conventions`; delta is a parameter,
+so the value `hac26.data_io.fit_conventions` finds can be passed in.
 
-Scope: single-bounce Lambert plus Lommel-Seeliger radiance, orthographic projection, hard
-cast shadows, no interreflection and no sensor chain. The mesh forward chain
+Scope: Lambert radiance through the measured power-law transfer, orthographic projection,
+hard cast shadows, no interreflection and no sensor chain. The mesh forward chain
 (hac26.forward.mesh) adds those; this module runs without torch or a GPU.
 """
 from __future__ import annotations
 
 import numpy as np
 
-from .conventions import S_LAB, SENSE, cameras, psi_grid, to_body
+from .conventions import (S_LAB, SENSE, TRANSFER_EXPONENT, cameras, psi_grid,
+                          to_body)
 from .shape_library import decimate_mesh
 
 __all__ = ["render_curves_mesh", "convex_cross_check"]
@@ -63,10 +64,25 @@ def _shadowed(hit, sun_dir, v0, v1, v2, eps: float = 1e-4, chunk_t: int = 4000):
     return np.isfinite(t)
 
 
+def _otsu(val: np.ndarray, bins: int = 256) -> float:
+    """Otsu's level of one frame, which is what the organisers threshold each video at and
+    then hold for the rotation."""
+    x = np.clip(np.asarray(val, float).ravel(), 0.0, 1.0)
+    hist = np.bincount(np.round(x * (bins - 1)).astype(int), minlength=bins).astype(float)
+    lev = np.arange(bins) / (bins - 1)
+    w0 = np.cumsum(hist)
+    w1 = w0[-1] - w0
+    m0 = np.cumsum(hist * lev)
+    a = m0 / np.maximum(w0, 1e-12)
+    b = (m0[-1] - m0) / np.maximum(w1, 1e-12)
+    return float(lev[int(np.argmax((w0 * w1 * (a - b) ** 2)[:-1]))])
+
+
 def render_curves_mesh(verts: np.ndarray, faces: np.ndarray, m: int = 360,
                        curve_types: list | None = None, geoms: list | None = None,
-                       psi0: float = 0.0, delta: float = 1.0, c_lambert: float = 0.1,
-                       ls_weight: float = 1.0, tau_i: float = 0.0, tau_b: float = 0.02,
+                       psi0: float = 0.0, delta: float = 1.0,
+                       gamma: float = TRANSFER_EXPONENT, tau_i: float = 0.0,
+                       tau_b: float | None = None,
                        res: int = 96, extent: float | None = None, shadows: bool = True,
                        chunk_t: int = 4000, decimate_to: int | None = 4000) -> np.ndarray:
     """Raw (unnormalised) curves, one row per entry of `curve_types`; row i uses geometry
@@ -76,7 +92,9 @@ def render_curves_mesh(verts: np.ndarray, faces: np.ndarray, m: int = 360,
     quick check. `delta` is the azimuth handedness; the rotation sense is always
     `hac26.conventions.SENSE`. Frames are `res` x `res` orthographic pixels over
     [-extent, extent]; the intensity curve sums pixel values above tau_i, the binary curve
-    counts pixels above tau_b, both times the pixel area.
+    counts pixels above tau_b, both times the pixel area. `tau_b` defaults to Otsu's level of
+    each geometry's first frame, which is how the organisers threshold each video, and is
+    then held over the rotation.
 
     `decimate_to` caps the triangle count before ray casting, whose cost grows with
     triangles x pixels x frames (see `shape_library.decimate_mesh`); pass None to render
@@ -112,6 +130,9 @@ def render_curves_mesh(verts: np.ndarray, faces: np.ndarray, m: int = 360,
     inten = np.zeros((n_geom_types, m))
     binar = np.zeros((n_geom_types, m))
     for ci, cam in enumerate(geoms):
+        # Each geometry is its own video, so each gets its own level from its own first
+        # frame unless the caller names one.
+        level = tau_b
         cam_lab = cam.v if hasattr(cam, "v") else camera_vector_compat(cam)
         cam_body = to_body(np.asarray(cam_lab, float), psi, psi0)   # (m, 3)
         for k in range(m):
@@ -135,12 +156,14 @@ def render_curves_mesh(verts: np.ndarray, faces: np.ndarray, m: int = 360,
                     lit_full[lit_geo] = ~sh
                 else:
                     lit_full = lit_geo
-                den = np.where(lit_full, mu + mu0, 1.0)
-                rad = np.where(lit_full,
-                              ls_weight * mu0 / den + c_lambert * mu0, 0.0)
-                val[hit_mask] = rad
+                # A Lambertian surface leaves a radiance proportional to the illumination
+                # cosine and independent of the direction it is seen from; the stored pixel
+                # value is that radiance through a transfer of exponent gamma.
+                val[hit_mask] = np.where(lit_full, np.abs(mu0) ** gamma, 0.0)
+            if level is None:
+                level = _otsu(val)          # the level the organisers take from frame one
             inten[ci, k] = float((val * (val > tau_i)).sum() * px_area)
-            binar[ci, k] = float((val > tau_b).sum() * px_area)
+            binar[ci, k] = float((val > level).sum() * px_area)
     out = []
     for ci, ct in enumerate(curve_types[:n_geom_types]):
         out.append(inten[ci] if ct == "intensity" else binar[ci])
@@ -173,9 +196,8 @@ def convex_cross_check(hull_verts: np.ndarray, hull_faces: np.ndarray, m: int = 
                               res=res, **kw)
     ref_cams = build_cameras()[:len(geoms)]
     ref = mesh_curves_convex(hull_verts, hull_faces, ref_cams + ref_cams, m, types,
-                             c_lambert=kw.get("c_lambert", 0.1),
-                             sigma=SENSE, delta=kw.get("delta", 1.0),
-                             ls_weight=kw.get("ls_weight", 1.0))
+                             gamma=kw.get("gamma", TRANSFER_EXPONENT),
+                             sigma=SENSE, delta=kw.get("delta", 1.0))
 
     def _norm(y):
         mbar = y.mean(axis=1, keepdims=True)

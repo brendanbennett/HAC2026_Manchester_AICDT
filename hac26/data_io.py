@@ -222,14 +222,17 @@ def native_sigma(d: dict) -> np.ndarray:
 
 
 def fit_conventions(verts: np.ndarray, faces: np.ndarray, curves56: np.ndarray,
-                    mask: np.ndarray, m: int,
-                    c_grid=(0.0, 0.05, 0.1, 0.2, 0.4, 0.8)) -> dict:
-    """Estimate (sigma, delta, c_lambert) for a public model with a known mesh.
+                    mask: np.ndarray, m: int) -> dict:
+    """Estimate the two signs (sigma, delta) for a public model with a known mesh.
 
     Minimises the summed squared misfit between the measured normalised curves and the
-    normalised convex-operator curves of the mesh's convex hull, over the finite candidate
-    set {+-1} x {+-1} x c_grid. The true body may be non-convex; the hull is enough to
-    identify the signs. Returns the best candidate with its misfit under 'err'.
+    normalised convex-operator curves of the mesh's convex hull, over {+-1} x {+-1}. The true
+    body may be non-convex; the hull is enough to identify the signs, which is all these
+    curves can determine about the conventions. The photometry itself is not fitted here: the
+    intensity kernel's exponent is a property of the channel and is measured once
+    (conventions.TRANSFER_EXPONENT), and the binary kernel's level is derived from the body's
+    own first frame rather than searched. Returns the best candidate with its misfit under
+    'err'.
     """
     cams = build_cameras()
     types = ["intensity"] * N_CAMS + ["binary"] * N_CAMS
@@ -237,11 +240,10 @@ def fit_conventions(verts: np.ndarray, faces: np.ndarray, curves56: np.ndarray,
     best = None
     for sigma in (1.0, -1.0):
         for delta in (1.0, -1.0):
-            for c in c_grid:
-                sim = mesh_curves_convex(hv, hf, cams + cams, m, types,
-                                         c_lambert=c, sigma=sigma, delta=delta)
-                r = (normalize_np(sim) - curves56) * mask[:, None]
-                err = float((r ** 2).sum())
-                if best is None or err < best["err"]:
-                    best = {"sigma": sigma, "delta": delta, "c_lambert": c, "err": err}
+            sim = mesh_curves_convex(hv, hf, cams + cams, m, types,
+                                     sigma=sigma, delta=delta)
+            r = (normalize_np(sim) - curves56) * mask[:, None]
+            err = float((r ** 2).sum())
+            if best is None or err < best["err"]:
+                best = {"sigma": sigma, "delta": delta, "err": err}
     return best
