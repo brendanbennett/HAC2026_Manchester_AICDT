@@ -4,8 +4,10 @@
 The flow sees x_t = (1 - t) x0 + t x1, which reveals x1 more and more as t grows, and with a
 small corpus a network can recognise which body it is near without consulting a curve. This
 script evaluates the trained flow twice on the same draws: the full velocity, prior plus
-data part, and the prior's velocity alone, which reads no curve. If the two losses are close,
-the data part is decoration; if dropping it hurts, the curves are contributing by that margin.
+data part, and the prior's velocity alone, which reads no curve. It does that on held-out
+bodies by default, then repeats the full arm with shuffled curves and with no curves. If the
+real curves help only on training bodies, the network has memorised the corpus; if shuffled or
+masked curves help as much as the real curves, the data branch is not using the measurement.
 The flow and occupancy terms are compared; the data-fit term is left out of both arms.
 
 Both arms come from one call of train_lpd.flow_loss, off one operator call, so they differ by
@@ -24,11 +26,45 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from hac26.conventions import cameras, psi_grid          # noqa: E402
+from hac26.field import N_DIR                            # noqa: E402
 from hac26.solvers.lpd_flow import N_MODES, LPDFlow, geometry_tags   # noqa: E402
 from hac26.solvers.operator import CodeOperator          # noqa: E402
-from train_lpd import (CALIBRATION, CORPUS, OCC_WEIGHT, RENDER, file_digest, flow_loss,   # noqa: E402
-                       held_out, load_corpus, load_instrument, model_error_scale,
-                       noise_sigma, smooth_noise_like)
+from train_lpd import (CALIBRATION, CORPUS, FIT_FROM, OCC_WEIGHT, RENDER,   # noqa: E402
+                       Corpus, check_flow_metadata, file_digest, flow_loss, held_out,
+                       load_corpus, load_flow_file, load_instrument, model_error_scale,
+                       noise_sigma, site_field, smooth_noise_like)
+
+
+def carving(corpus: Corpus) -> torch.Tensor:
+    """Fraction of hull lattice sites removed by each body's fitted nonconvex code."""
+    g = corpus.codes[:, N_DIR:]
+    body = (site_field(corpus.support_true, g) < 0).float().sum(1)
+    hull = (site_field(corpus.support_true, torch.zeros_like(g)) < 0).float().sum(1)
+    return (1.0 - body / hull.clamp_min(1.0)).clamp_min(0.0)
+
+
+def carve_bin(x: float) -> str:
+    if x < 0.05:
+        return "low"
+    if x < 0.15:
+        return "medium"
+    return "high"
+
+
+def with_curves(corpus: Corpus, curves: torch.Tensor,
+                turned_counts: torch.Tensor | None = None) -> Corpus:
+    return Corpus(corpus.codes, curves, corpus.turned_counts if turned_counts is None else turned_counts,
+                  corpus.support, corpus.support_true, corpus.radius, corpus.index)
+
+
+def shuffled_curves(corpus: Corpus, pool: torch.Tensor, generator: torch.Generator) -> Corpus:
+    perm = torch.arange(len(corpus.codes), device=corpus.codes.device)
+    if len(pool) > 1:
+        shuffled = pool[torch.randperm(len(pool), generator=generator).to(pool.device)]
+        if torch.equal(shuffled, pool):
+            shuffled = torch.roll(shuffled, 1)
+        perm[pool] = shuffled
+    return with_curves(corpus, corpus.curves[perm], corpus.turned_counts[perm])
 
 
 def main():
@@ -40,10 +76,15 @@ def main():
                     help="must match the training run")
     ap.add_argument("--val-bodies", type=int, default=8,
                     help="must match the training run, so the same bodies are held out")
+    ap.add_argument("--split", choices=("heldout", "train", "all"), default="heldout",
+                    help="which bodies to draw from; heldout tests generalisation, train tests "
+                         "memorisation")
     ap.add_argument("--occ-weight", type=float, default=OCC_WEIGHT,
                     help="must match the training run")
     ap.add_argument("--occ-eps", type=float, default=None,
                     help="must match the training run")
+    ap.add_argument("--fit-from", type=float, default=FIT_FROM,
+                    help="must match the training run; used for metadata consistency")
     a = ap.parse_args()
 
     data, meta = load_corpus(a.corpus)
@@ -55,21 +96,34 @@ def main():
     inst = load_instrument(a.calibration, dev)
     eta = model_error_scale(inst)
     op = CodeOperator(inst, psi_grid(phases), res=op_res, config=RENDER, device=dev)
-    net = LPDFlow.from_state_dict(torch.load(a.ckpt, map_location="cpu", weights_only=True))
+    sd, flow_meta = load_flow_file(a.ckpt, map_location="cpu")
+    check_flow_metadata(flow_meta, corpus=a.corpus, calibration=a.calibration,
+                        phases=phases, operator_res=op_res, context=a.ckpt)
+    net = LPDFlow.from_state_dict(sd)
     net = net.to(dev).eval()
     data = data.to(dev)
     codes = data.codes
+    carved = carving(data)
 
     C = len(cameras())
     tag = geometry_tags().to(dev)
     mask = torch.ones(1, C, device=dev)
 
-    # Score the training bodies, split off by the same rule train_lpd.py uses (held_out, by
-    # codes-file index). A held-out body cannot have been memorised, so only the training
-    # bodies can show the failure this script looks for.
+    # Split off by the same rule train_lpd.py uses (held_out, by codes-file index). Held-out
+    # mode asks whether the curves help on bodies the flow did not train on.
     n_val = max(0, min(a.val_bodies, len(codes) - 1))
     is_val = np.isin(data.index.cpu().numpy(), held_out(int(meta["bodies"]), n_val))
-    pool = torch.nonzero(torch.as_tensor(~is_val)).flatten()
+    if a.split == "heldout":
+        pool = torch.nonzero(torch.as_tensor(is_val)).flatten()
+    elif a.split == "train":
+        pool = torch.nonzero(torch.as_tensor(~is_val)).flatten()
+    else:
+        pool = torch.arange(len(codes))
+    pool = pool.to(dev)
+    if len(pool) == 0:
+        raise SystemExit(f"no bodies available for split {a.split!r}; check --val-bodies")
+    print(f"  split {a.split}: {len(pool)} bodies, carved "
+          f"{float(carved[pool].min()):.2f}-{float(carved[pool].max()):.2f}", flush=True)
 
     # t is stratified over the bins and continuous within each, as in training. The bins are
     # only for reporting.
@@ -83,37 +137,64 @@ def main():
     xi = torch.randn(a.draws, C, 2, phases, generator=gen).to(dev)
     zeta = smooth_noise_like(data.curves[idx].cpu(), generator=gen).to(dev)
 
-    real_loss, zero_loss, n_bad = [], [], 0
-    per_t = {k: ([], []) for k in range(n_bins)}
+    arms = [("real curves", data, mask, zeta)]
+    if len(pool) > 1:
+        shuf = shuffled_curves(data, pool, torch.Generator().manual_seed(17))
+        arms.append(("shuffled curves", shuf, mask,
+                     smooth_noise_like(shuf.curves[idx].cpu(), generator=gen).to(dev)))
+    arms.append(("no curves", data, torch.zeros_like(mask), zeta))
+
+    results = {name: {"full": [], "prior": [], "dropped": 0,
+                      "per_t": {k: ([], []) for k in range(n_bins)},
+                      "per_carve": {k: ([], []) for k in ("low", "medium", "high")}}
+               for name, _, _, _ in arms}
     for d in range(a.draws):
         sl = slice(d, d + 1)
-        with torch.no_grad():
-            r_, z_, bad = flow_loss(net, op, data, eta, idx[sl], x0[sl], t[sl], M, tag,
-                                    mask, sigma=sigma[sl], xi=xi[sl], zeta=zeta[sl],
-                                    ablate=True, occ_weight=a.occ_weight, occ_eps=a.occ_eps)
-        r_, z_ = float(r_), float(z_); n_bad += int(bad)
-        real_loss.append(r_); zero_loss.append(z_)
         kb = d % n_bins
-        per_t[kb][0].append(r_); per_t[kb][1].append(z_)
-        print(f"  draw {d:>3}  t={float(t[d]):.3f}  full {r_:.5f}   prior only {z_:.5f}",
-              flush=True)
+        cb = carve_bin(float(carved[idx[d]]))
+        line = [f"  draw {d:>3}  t={float(t[d]):.3f}  carved {float(carved[idx[d]]):.2f}"]
+        for name, corp, arm_mask, arm_zeta in arms:
+            with torch.no_grad():
+                r_, z_, bad = flow_loss(net, op, corp, eta, idx[sl], x0[sl], t[sl], M, tag,
+                                        arm_mask, sigma=sigma[sl], xi=xi[sl],
+                                        zeta=arm_zeta[sl], ablate=True,
+                                        occ_weight=a.occ_weight, occ_eps=a.occ_eps,
+                                        fit_from=a.fit_from)
+            r_, z_ = float(r_), float(z_)
+            row = results[name]
+            row["dropped"] += int(bad)
+            row["full"].append(r_); row["prior"].append(z_)
+            row["per_t"][kb][0].append(r_); row["per_t"][kb][1].append(z_)
+            row["per_carve"][cb][0].append(r_); row["per_carve"][cb][1].append(z_)
+            line.append(f"{name}: {z_ - r_:+.5f}")
+        print("   ".join(line), flush=True)
 
-    print("\n  per t bin:")
-    for k in range(n_bins):
-        rr, zz = per_t[k]
-        if rr:
-            print(f"    t={(k+0.5)/n_bins:.3f}   full {np.mean(rr):.5f}   "
-                  f"prior only {np.mean(zz):.5f}")
-    r_, z_ = float(np.mean(real_loss)), float(np.mean(zero_loss))
-    print(f"\n  prior plus data part : {r_:.5f}")
-    print(f"  prior only           : {z_:.5f}")
-    print(f"  the data part is worth : {z_ - r_:+.5f}  ({100*(z_-r_)/max(z_,1e-12):+.1f}%)")
-    if n_bad:
-        print(f"\n  WARNING: {n_bad}/{a.draws} draws had no curves (degenerate mesh or "
-              f"\n  unusable patches), so both arms saw a body without data on those draws, "
-              f"\n  which pulls the margin toward zero.")
-    print("\n  A margin near zero means the curves are decoration and the flow is"
-          "\n  identifying corpus bodies from x_t and the prior alone.")
+    for name, row in results.items():
+        r_, z_ = float(np.mean(row["full"])), float(np.mean(row["prior"]))
+        print(f"\n  {name}:")
+        print(f"    prior plus data part : {r_:.5f}")
+        print(f"    prior only           : {z_:.5f}")
+        print(f"    data-branch margin   : {z_ - r_:+.5f}  "
+              f"({100*(z_-r_)/max(z_,1e-12):+.1f}%)")
+        print("    per t bin:")
+        for k in range(n_bins):
+            rr, zz = row["per_t"][k]
+            if rr:
+                print(f"      t={(k+0.5)/n_bins:.3f}   full {np.mean(rr):.5f}   "
+                      f"prior only {np.mean(zz):.5f}   margin {np.mean(zz)-np.mean(rr):+.5f}")
+        print("    per carving bin:")
+        for bname in ("low", "medium", "high"):
+            rr, zz = row["per_carve"][bname]
+            if rr:
+                print(f"      {bname:<6} n={len(rr):>3}   full {np.mean(rr):.5f}   "
+                      f"prior only {np.mean(zz):.5f}   margin {np.mean(zz)-np.mean(rr):+.5f}")
+        if row["dropped"]:
+            print(f"    WARNING: {row['dropped']}/{a.draws} draws had no curves "
+                  f"(degenerate mesh or unusable patches), pulling the margin toward zero.")
+    print("\n  Real held-out curves should beat prior-only by more than shuffled or no curves,"
+          "\n  especially in the high-carve bin. A margin near zero means the curves are"
+          "\n  decoration; a shuffled/no-curve margin as large as the real margin means the"
+          "\n  data branch is not using the measurement.")
 
 
 if __name__ == "__main__":

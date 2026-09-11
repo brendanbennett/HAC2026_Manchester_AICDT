@@ -8,7 +8,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 
 from hac26.recon import mesh_occupancy                     # noqa: E402
 from hac26.solvers.output import metric_medoid            # noqa: E402
-from reconstruct_lpd import consensus_bodies              # noqa: E402
+from reconstruct_lpd import candidate_diagnostic, consensus_bodies              # noqa: E402
 
 
 def _ball(radius, n=32, extent=1.3):
@@ -24,6 +24,18 @@ def test_candidates_are_scored_against_the_draws_only():
     draws = [_ball(0.6), _ball(0.8), _ball(1.0)]
     k = metric_medoid(draws + [_ball(0.8)], n_ref=3)
     assert k in (1, 3)
+
+
+def test_candidate_diagnostic_rejects_unrenderable_answers():
+    """A candidate with non-finite data misfit must not be eligible to win."""
+    import trimesh
+    m = trimesh.creation.icosphere(subdivisions=1, radius=1.0)
+    ok = candidate_diagnostic("draw", "draw 0", m.vertices, m.faces, 1.2)
+    bad = candidate_diagnostic("consensus", "consensus at level 0.5", m.vertices, m.faces,
+                               float("inf"))
+    assert ok["eligible"] and ok["watertight"] and ok["volume"] > 0
+    assert not bad["eligible"]
+    assert "nonfinite_misfit" in bad["ineligible_reasons"]
 
 
 def test_consensus_levels_keep_or_fill_a_dent():

@@ -203,7 +203,8 @@ def _load_part(path: Path, expected: dict, i: int):
                                         if k != "bodies"):
         print(f"  ignoring stale part {path}", flush=True)
         return None
-    return {k: z[k] for k in ("code", "curve", "support", "support_true", "radius")}
+    return {k: z[k] for k in ("code", "curve", "turned_counts", "support",
+                              "support_true", "radius")}
 
 
 def _save_part(path: Path, i: int, part: dict, expected: dict):

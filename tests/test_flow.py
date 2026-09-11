@@ -1,5 +1,7 @@
 """The flow network: the codec's pullback, the routing of times to experts, the inputs, and
 the sampler."""
+from pathlib import Path
+
 import torch
 
 from hac26.conventions import cameras
@@ -172,6 +174,22 @@ def test_from_state_dict_restores_the_expert_count_and_edges():
     again = LPDFlow.from_state_dict(net.state_dict())
     assert len(again.experts) == 3 and torch.allclose(again.edges, torch.tensor([0.5, 0.9]))
     assert again.expert_of(torch.tensor([0.2, 0.6, 0.95])).tolist() == [0, 1, 2]
+
+
+def test_flow_file_loader_accepts_bare_and_metadata_wrapped_state_dicts(tmp_path):
+    import sys
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
+    from train_lpd import load_flow_file                 # noqa: E402
+
+    net = LPDFlow(n_experts=1)
+    bare = tmp_path / "bare.pt"
+    wrapped = tmp_path / "wrapped.pt"
+    torch.save(net.state_dict(), bare)
+    torch.save({"state_dict": net.state_dict(), "meta": {"phases": 96}}, wrapped)
+    s0, m0 = load_flow_file(str(bare))
+    s1, m1 = load_flow_file(str(wrapped))
+    assert m0 == {} and m1["phases"] == 96
+    assert set(s0) == set(net.state_dict()) == set(s1)
 
 
 def test_the_summary_is_a_response_to_the_curves():

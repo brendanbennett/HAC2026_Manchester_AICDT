@@ -133,3 +133,20 @@ def test_a_distant_camera_still_sees_the_body():
                       device="cpu", backend="software")
     raw = op.raw_curves(vt, ft, geoms=[0, 9])
     assert torch.isfinite(raw).all() and (raw > 0).all()
+
+
+def test_a_mesh_that_does_not_decimate_is_refused():
+    """A surface in many pieces keeps faces in every piece and stops far above the patch
+    target, and the form factors of that many patches would cost the square of it: the mesh
+    is refused with the error every caller already handles, before anything is built."""
+    from scipy.ndimage import gaussian_filter
+    from skimage import measure
+
+    from hac26.forward.mesh.radiosity import RadiosityError
+    field = gaussian_filter(np.random.default_rng(0).random((20, 20, 20)), 0.8)
+    v, f, _, _ = measure.marching_cubes(field, level=float(np.median(field)))
+    op = ExactForward(Instrument(quantise=False), psi_grid(4), SMALL, device="cpu",
+                      backend="software")
+    with pytest.raises(RadiosityError, match="above the limit"):
+        op.raw_curves(torch.tensor(v / 10.0 - 1.0, dtype=torch.float32),
+                      torch.tensor(f.astype(np.int64)))

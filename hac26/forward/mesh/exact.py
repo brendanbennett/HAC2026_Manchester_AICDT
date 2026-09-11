@@ -68,6 +68,8 @@ class RenderConfig:
     geom_chunk: int = 7        # geometries per rendering batch: the memory of the camera
                                # renders and the sensor grows with phase_chunk * geom_chunk
     radiosity_faces: int = 600 # patches the interreflection is solved on
+    radiosity_slack: float = 2.0  # a mesh left with more than this many times
+                                  # radiosity_faces patches is refused (_prepare)
     form_factor_samples: int = 4
     bad_rows: str = "raise"    # what RadiositySolver does with a broken form-factor row
 
@@ -216,6 +218,20 @@ class ExactForward:
             raise RadiosityError(f"could not build the radiosity patches: {exc}") from exc
         if len(pf) < 4:
             raise RadiosityError("the mesh decimates to fewer than four patches")
+        # Quadric decimation lands on the target for a surface in one piece, but a surface in
+        # thousands of pieces keeps a few faces per piece and stops far above it. The level
+        # set of two draws that have little in common is such a surface: from a barely trained
+        # flow, consensus bodies of 19k-59k faces in 5k-20k pieces stopped at 15k-48k patches.
+        # The form factors of n patches cost n^2 -- the pair arrays of 15k patches are over
+        # 5 GB each -- so a mesh like that is refused like any other the interreflection
+        # cannot be built on. It is not a body either way: a candidate in more than one piece
+        # is ineligible (reconstruct_lpd.candidate_diagnostic).
+        limit = int(self.cfg.radiosity_slack * self.cfg.radiosity_faces)
+        if len(pf) > limit:
+            raise RadiosityError(
+                f"the mesh decimates to {len(pf)} patches, above the limit of {limit} "
+                f"({self.cfg.radiosity_slack:g} x {self.cfg.radiosity_faces}); a mesh in many "
+                f"pieces does not simplify, and its form factors would cost n^2")
         F, _, _, pc = form_factors(pv, pf, n_samples=self.cfg.form_factor_samples,
                                    device=self.device)
         solver = RadiositySolver(F.to(torch.float32), self.inst.rho, bad_rows=self.cfg.bad_rows)
