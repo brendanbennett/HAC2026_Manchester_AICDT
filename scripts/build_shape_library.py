@@ -194,6 +194,39 @@ def write_report(out_dir: str, entries: list, spec: LibrarySpec, sample_n: int =
     print("\n" + text)
 
 
+def check_spec(out_dir: str, seed: int, spec: LibrarySpec) -> None:
+    """Refuse to add to a library that was built from a different sampler.
+
+    `_worker` reuses any body file that is already on disk, which is what makes a killed run
+    resumable -- and also what silently keeps a stale library alive. A run whose shape-model
+    directory was empty writes 1500 procedural bodies; point the same --out at a run that now
+    has the models and every one of them is reused, the "real" and "object" families never
+    appear, and the only sign is that the stage finished in seconds. Everything downstream
+    then trains on the old bodies. So the sampler is recorded beside them and compared.
+    """
+    import json
+    keys = ("family_weights", "mod_weights", "mount_weights", "convexity_bins",
+            "convexity_shares", "n_modifiers", "res", "extent", "radius")
+    now = {k: getattr(spec, k) for k in keys}
+    now["seed"] = seed
+    now["n_shape_models"] = len(spec.shape_models)
+    now["n_object_models"] = len(spec.object_models)
+    now = json.loads(json.dumps(now, sort_keys=True, default=list))   # tuples -> lists
+    path = Path(out_dir) / "spec.json"
+    if path.exists():
+        was = json.loads(path.read_text())
+        if was != now:
+            diff = [k for k in set(was) | set(now) if was.get(k) != now.get(k)]
+            raise SystemExit(
+                f"{out_dir} holds a library built from a different sampler; these differ: "
+                f"{', '.join(sorted(diff))}. Reusing those bodies would keep "
+                f"the old library and say nothing about it. Delete {out_dir} to "
+                f"rebuild, or pass --out somewhere else.")
+    else:
+        Path(out_dir).mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(now, sort_keys=True, indent=1))
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -230,6 +263,7 @@ def main() -> None:
     print(f"[1/3] bodies: n={a.n}, workers={a.workers}, res={a.res}, out={a.out}; "
           f"{len(models)} real shape models, {len(objects)} objects; families "
           + ", ".join(f"{k} {v / sum(w.values()):.2f}" for k, v in w.items()), flush=True)
+    check_spec(a.out, a.seed, spec)
     entries = build(a.n, a.seed, a.out, a.workers, spec, a.checkpoint_every)
 
     entries += ingest_damit(a.out, len(entries), spec, a.seed, a.damit_points)
