@@ -36,6 +36,19 @@ __all__ = ["CodeOperator", "MIN_FACES"]
 MIN_FACES = 8      # an extracted mesh with fewer faces is not a body
 
 
+def mesh_area(verts: torch.Tensor, faces: torch.Tensor) -> float:
+    """Surface area of a triangle mesh, which for a closed one is the total variation of its
+    indicator: what a corrugation costs and a smooth dent does not."""
+    a, b, c = (verts[faces[:, i]] for i in range(3))
+    return float(0.5 * torch.cross(b - a, c - a, dim=1).norm(dim=1).sum())
+
+
+def mesh_volume(verts: torch.Tensor, faces: torch.Tensor) -> float:
+    """Signed volume of a closed triangle mesh by the divergence theorem."""
+    a, b, c = (verts[faces[:, i]] for i in range(3))
+    return float(torch.einsum("ij,ij->i", a, torch.cross(b, c, dim=1)).sum() / 6.0)
+
+
 def split_code(code: torch.Tensor):
     """(dh, g) from a raw code (CODE_DIM,). The reshaping coefficients c are not part of the
     code: the flow's architecture is built around the code's two blocks, one on the sphere
@@ -124,6 +137,28 @@ class CodeOperator:
                                                      geoms=geoms, psi0=PSI0))
         except RadiosityError:
             return None
+
+    def curves_with_shape(self, support: torch.Tensor, code: torch.Tensor, radius: float,
+                          geoms=None, c: torch.Tensor | None = None, res: int | None = None):
+        """`curves`, together with the surface area and the volume of the canonically posed
+        body, or None.
+
+        The two shape numbers are taken from the mesh the extraction has already built, so
+        they cost a per cent of a render rather than one of their own, and they are taken in
+        the canonical pose rather than the physical one because a penalty in units of area
+        has to mean the same thing on a body whose published radius is 0.67 as on one whose
+        radius is 3.95.
+        """
+        m = self.mesh(support, code, res=res, c=c)
+        if m is None:
+            return None
+        v, f = m
+        try:
+            cur = normalise(self.forward.raw_curves(self.physical(v, f, radius), f,
+                                                    geoms=geoms, psi0=PSI0))
+        except RadiosityError:
+            return None
+        return cur, mesh_area(self.canonical(v, f), f), mesh_volume(self.canonical(v, f), f)
 
     def curves_turned(self, support: torch.Tensor, code: torch.Tensor, radius: float,
                       geoms=None):

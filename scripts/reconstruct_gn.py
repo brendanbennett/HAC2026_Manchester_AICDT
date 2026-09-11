@@ -21,10 +21,22 @@ single deep waist, because the first linearisation from the convex answer is tak
 neither half of the correction is yet doing anything and the step there goes into the carve
 alone, which is the convex inversion's own mistake made once more.
 
---hold-out-geoms keeps cameras out of the fit and reports the written body's misfit on them
-beside the convex answer's on the same cameras. That pair is what scripts/select_answers.py
-reads, and it is the only test of whether a shape was recovered rather than curves fitted.
-On a public model the overlap with the released shape is reported as well.
+What is minimised carries the body's surface area beside its misfit, because the misfit of a
+rendered body reports how finely its surface is resolved almost as strongly as it reports
+whether the shape is right. The run is therefore two phases: to convergence under the
+penalised objective, then a polish on the misfit alone with the volume still held, which
+recovers the misfit without giving the shape back.
+
+A body whose convex answer already explains its curves is left alone. There is no concavity
+there for the correction to find, and an objective that charges surface will trade overlap for
+a misfit it does not need; that failure raises the misfit's opinion of the body while lowering
+its overlap, so it cannot be caught afterwards and is refused before the fit instead.
+
+--hold-out-geoms keeps cameras out of the fit and reports the written body's misfit and
+objective on them beside the convex answer's on the same cameras. That pair is what
+scripts/select_answers.py reads, and it is the only test of whether a shape was recovered
+rather than curves fitted. On a public model the overlap with the released shape is reported
+as well.
 """
 from __future__ import annotations
 
@@ -45,8 +57,9 @@ from hac26.data_io import N_CAMS, load_inversion_curves                  # noqa:
 from hac26.field import (CODE_DIM, EXTRACT_RES, LATTICE_SHAPE, N_RADIAL,  # noqa: E402
                          N_SITES, lattice_kernel)
 from hac26.recon import fit_to_cylinder                                  # noqa: E402
-from hac26.solvers.gauss_newton import (STEP_C, STEP_G, CarveFit,     # noqa: E402
-                                        Stage, conjunction_start)
+from hac26.solvers.gauss_newton import (AREA_WEIGHT, AREA_WINDOW,    # noqa: E402
+                                        STEP_C, STEP_G, TARGET_SIGMA, VOLUME_TRUST,
+                                        CarveFit, Stage, conjunction_start)
 from hac26.solvers.operator import CodeOperator                          # noqa: E402
 from hac26.solvers.output import export_stl, restore_constraints         # noqa: E402
 from reconstruct import answer_path                                      # noqa: E402
@@ -63,7 +76,14 @@ STAGE_ITERS = (6, 6, 10)
 RESTARTS = 8               # starts of the first stage
 RESTART_SCREEN = 2         # iterations every start is judged on before all but the best stop
 RESTART_KEEP = 2           # starts carried to the end of the first stage
-TARGET_SIGMA = 1.0         # a body that explains the curves to the model error is fitted
+MIN_CONVEX_SIGMAS = 4.0    # how badly the convex answer must fit before a body is worth
+                           # correcting, in model errors. A body whose convex answer already
+                           # explains its curves has no concavity for the correction to find,
+                           # and an objective that charges surface will then trade overlap it
+                           # cannot regain for a misfit it does not need. Measured on the most
+                           # nearly convex public body, that costs a sixth of the overlap while
+                           # improving the misfit, so no gate that reads a misfit catches it;
+                           # this one is read before the fit instead.
 
 
 def curve_index(weight: torch.Tensor, geoms) -> tuple:
@@ -98,9 +118,15 @@ def main() -> None:
     ap.add_argument("--export-res", type=int, default=EXPORT_RES)
     ap.add_argument("--hold-out-geoms", type=int, default=5)
     ap.add_argument("--restarts", type=int, default=RESTARTS)
-    ap.add_argument("--ridge", type=float, default=1e-2,
-                    help="ridge on the amplitudes, as a fraction of the mean curvature of "
-                         "the misfit in the carve coordinates")
+    ap.add_argument("--area-weight", type=float, default=AREA_WEIGHT,
+                    help="weight of the posed body's surface area in the objective, in "
+                         f"inverse area of the canonical pose; measured window {AREA_WINDOW}, "
+                         "and zero minimises the misfit alone")
+    ap.add_argument("--volume-trust", type=float, default=VOLUME_TRUST,
+                    help="largest fractional change of volume an accepted step may make")
+    ap.add_argument("--min-convex-sigmas", type=float, default=MIN_CONVEX_SIGMAS,
+                    help="leave a body alone whose convex answer already explains its curves "
+                         "to fewer than this many model errors")
     ap.add_argument("--step-g", type=float, default=STEP_G,
                     help="secant step of a carve coordinate, in body units of depth")
     ap.add_argument("--step-c", type=float, default=STEP_C,
@@ -149,9 +175,13 @@ def main() -> None:
     def render(c, g):
         code = zero_code.clone()
         code[-N_SITES:] = torch.tensor(np.asarray(g), dtype=torch.float32, device=dev)
-        cur = op.curves(support, code, R, geoms=fit_g,
-                        c=torch.tensor(np.asarray(c), dtype=torch.float32, device=dev))
-        return None if cur is None else flat_curves(cur, keep_fit)
+        out = op.curves_with_shape(support, code, R, geoms=fit_g,
+                                   c=torch.tensor(np.asarray(c), dtype=torch.float32,
+                                                  device=dev))
+        if out is None:
+            return None
+        cur, area, vol = out
+        return flat_curves(cur, keep_fit), area, vol
 
     kernel = lattice_kernel()
     stages = tuple(Stage(side=s, n_dirs=0, iters=n)
@@ -160,8 +190,24 @@ def main() -> None:
 
     def new_fit(seed):
         return CarveFit(render, data_fit, scale_fit, kernel, LATTICE_SHAPE,
-                        n_radial=N_RADIAL, ridge_frac=a.ridge, step_g=a.step_g,
-                        step_c=a.step_c, seed=seed)
+                        n_radial=N_RADIAL, area_weight=a.area_weight,
+                        volume_trust=a.volume_trust, step_g=a.step_g, step_c=a.step_c,
+                        seed=seed)
+
+    zeros = (np.zeros(N_RADIAL), np.zeros(N_SITES))
+    gate = new_fit(a.seed)
+    r0, area0, vol0 = gate._render(*zeros)
+    if r0 is None:
+        raise SystemExit("the convex answer does not render; nothing to correct")
+    convex_sigmas = float(np.linalg.norm(r0))
+    print(f"  the convex answer explains the fitted curves to {convex_sigmas:.2f} model "
+          f"errors; area {area0:.3f}, volume {vol0:.3f}", flush=True)
+    if convex_sigmas < a.min_convex_sigmas:
+        raise SystemExit(
+            f"model {a.model}: the convex answer already fits to {convex_sigmas:.2f} model "
+            f"errors, under the {a.min_convex_sigmas:g} this correction is worth running at. "
+            f"A body with no concavity to find loses overlap to an objective that charges "
+            f"surface, so it is left alone and its convex answer stands.")
 
     # Every start is judged on the first few iterations of the coarse stage, which tells a
     # start that is descending from one that is not; the best are then carried to the end.
@@ -174,31 +220,49 @@ def main() -> None:
             c0, g0, rec = conjunction_start(site_xyz, kernel, rng, n_radial=N_RADIAL)
             starts.append((c0, g0))
             recipes.append({"start": "conjunction", **rec})
+    def last(hist, key):
+        rows = [h for h in hist if key in h]
+        return rows[-1][key] if rows else float("inf")
+
+    def show(row):
+        print(f"    {row['stage']:>14}  it {row['iteration']}  chi {row['chi']:.4f}"
+              f"  area {row['area']:.3f}  volume {row['volume']:.3f}"
+              f"  {'step' if row['accepted'] else 'no step'}  [{time.time()-t0:.0f}s]",
+              flush=True)
+
     screened = []
     for i, (c0, g0) in enumerate(starts):
         f = new_fit(a.seed + i)
         c, g, hist = f.run(c0, g0, stages=(Stage(STAGE_SIDES[0], 0, RESTART_SCREEN),),
                            target=TARGET_SIGMA)
-        chi = hist[-1]["chi"] if hist else float("inf")
-        screened.append({"i": i, "chi": chi, "c": c, "g": g, "renders": f.renders})
-        print(f"  start {i} ({recipes[i]['start']}): chi {chi:.4f} after {RESTART_SCREEN} "
-              f"coarse steps, {f.renders} renders [{time.time()-t0:.0f}s]", flush=True)
-    screened.sort(key=lambda s: s["chi"])
+        screened.append({"i": i, "objective": last(hist, "objective"),
+                         "chi": last(hist, "chi"), "c": c, "g": g, "renders": f.renders})
+        print(f"  start {i} ({recipes[i]['start']}): objective "
+              f"{screened[-1]['objective']:.4f}, chi {screened[-1]['chi']:.4f} after "
+              f"{RESTART_SCREEN} coarse steps, {f.renders} renders "
+              f"[{time.time()-t0:.0f}s]", flush=True)
+    # Starts are compared on what is being minimised. A start that has bought misfit with
+    # surface is not ahead of one that has not.
+    screened.sort(key=lambda s: s["objective"])
 
     best = None
     for s in screened[:max(1, RESTART_KEEP)]:
         f = new_fit(a.seed + s["i"] + 100)
-        c, g, hist = f.run(s["c"], s["g"], stages=stages, target=TARGET_SIGMA,
-                           log=lambda row: print(f"    {row['stage']:>14}  it {row['iteration']}"
-                                                 f"  chi {row['chi']:.4f}"
-                                                 f"  {'step' if row['accepted'] else 'no step'}"
-                                                 f"  [{time.time()-t0:.0f}s]", flush=True))
-        chi = hist[-1]["chi"] if hist else float("inf")
-        print(f"  start {s['i']} finished at chi {chi:.4f} "
+        c, g, hist = f.run(s["c"], s["g"], stages=stages, target=TARGET_SIGMA, log=show)
+        # The penalty has put the shape where it goes and left the misfit above where the
+        # data alone would put it. Minimising the misfit alone from there, with the trust
+        # region still holding the volume, recovers the misfit without giving the shape back.
+        print("    polish, on the misfit alone", flush=True)
+        c, g, polish = f.run(c, g, stages=(stages[-1],), target=TARGET_SIGMA,
+                             area_weight=0.0, log=show)
+        hist = hist + polish
+        obj, chi = last(hist, "objective"), last(hist, "chi")
+        print(f"  start {s['i']} finished at chi {chi:.4f}, objective {obj:.4f} "
               f"({f.renders + s['renders']} renders)", flush=True)
-        if best is None or chi < best["chi"]:
-            best = {"chi": chi, "c": c, "g": g, "start": s["i"], "history": hist,
-                    "renders": f.renders + s["renders"], "recipe": recipes[s["i"]]}
+        if best is None or obj < best["objective"]:
+            best = {"objective": obj, "chi": chi, "c": c, "g": g, "start": s["i"],
+                    "history": hist, "renders": f.renders + s["renders"],
+                    "recipe": recipes[s["i"]]}
 
     if not a.out:
         return
@@ -211,26 +275,35 @@ def main() -> None:
     data_x = curve_pairs(d_x["curves"])
     scale_x = residual_scale(d_x, inst.eta).clamp_min(ETA_FLOOR)
 
-    def misfit_at_export(c, g, geoms):
+    def measure_at_export(c, g, geoms):
+        """(misfit, objective) on those cameras, at the resolution and phase count a written
+        body is scored at.
+
+        The objective goes beside the misfit because it is what was minimised. A gate that
+        reads the misfit alone prefers a corrugated body to a shaped one, which is the thing
+        the penalty exists to stop, so selecting on a different functional from the one that
+        was minimised undoes the fit."""
         if not geoms:
-            return float("nan")
+            return float("nan"), float("nan")
         gg, keep = curve_index(weight, geoms)
         code = zero_code.clone()
         code[-N_SITES:] = torch.tensor(np.asarray(g), dtype=torch.float32, device=dev)
-        cur = op_x.curves(support, code, R, geoms=gg,
-                          c=torch.tensor(np.asarray(c), dtype=torch.float32, device=dev))
-        if cur is None:
-            return float("inf")
+        out = op_x.curves_with_shape(support, code, R, geoms=gg,
+                                     c=torch.tensor(np.asarray(c), dtype=torch.float32,
+                                                    device=dev))
+        if out is None:
+            return float("inf"), float("inf")
+        cur, area, _ = out
         pred = flat_curves(cur, keep)
         obs = flat_curves(data_x[gg], keep)
         sc = np.repeat(scale_x[gg].numpy()[keep.numpy()], data_x.shape[-1])
-        return float(np.sqrt(np.mean(((pred - obs) / sc) ** 2)))
+        chi2 = float(np.mean(((pred - obs) / sc) ** 2))
+        return float(np.sqrt(chi2)), float(np.log(max(chi2, 1e-300)) + a.area_weight * area)
 
-    zeros = (np.zeros(N_RADIAL), np.zeros(N_SITES))
-    convex_fit = misfit_at_export(*zeros, fit_geoms)
-    convex_held = misfit_at_export(*zeros, held)
-    fit_x = misfit_at_export(best["c"], best["g"], fit_geoms)
-    held_x = misfit_at_export(best["c"], best["g"], held)
+    convex_fit, convex_fit_obj = measure_at_export(*zeros, fit_geoms)
+    convex_held, convex_held_obj = measure_at_export(*zeros, held)
+    fit_x, fit_x_obj = measure_at_export(best["c"], best["g"], fit_geoms)
+    held_x, held_x_obj = measure_at_export(best["c"], best["g"], held)
 
     code = zero_code.clone()
     code[-N_SITES:] = torch.tensor(best["g"], dtype=torch.float32, device=dev)
@@ -246,12 +319,16 @@ def main() -> None:
     meta = {"model": a.model, "channel": d["channel"], "radius": R, "phases": a.phases,
             "export_phases": a.export_phases, "operator_res": a.operator_res,
             "export_res": a.export_res, "held_out": held, "fit_geoms": fit_g,
-            "curves_fitted": int(weight.sum()), "ridge": a.ridge,
+            "curves_fitted": int(weight.sum()), "area_weight": a.area_weight,
+            "volume_trust": a.volume_trust, "convex_sigmas": convex_sigmas,
             "step_g": a.step_g, "step_c": a.step_c, "restarts": a.restarts,
             "start": best["recipe"], "renders": best["renders"],
-            "chi_fit": best["chi"], "history": best["history"], "export": rep,
+            "chi_fit": best["chi"], "objective_fit": best["objective"],
+            "history": best["history"], "export": rep,
             "chi_fit_convex": convex_fit, "chi_held_convex": convex_held,
             "chi_fit_export": fit_x, "chi_held_export": held_x,
+            "objective_fit_convex": convex_fit_obj, "objective_held_convex": convex_held_obj,
+            "objective_fit_export": fit_x_obj, "objective_held_export": held_x_obj,
             "reshaping": best["c"].tolist(),
             "carve_depth_max": float(np.abs(kernel @ best["g"]).max()),
             "final_dice": truth_dice(v, f, a.model, a.data_dir),
