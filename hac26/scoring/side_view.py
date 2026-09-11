@@ -12,6 +12,7 @@ reconstruction can produce.
 """
 import argparse
 import json
+import sys
 from pathlib import Path
 
 import numpy as np
@@ -173,6 +174,7 @@ def main():
     args = ap.parse_args()
 
     out = {}
+    missing = []
     for M in args.models:
         try:
             tf = public_stl(args.data_dir, M)
@@ -180,6 +182,7 @@ def main():
             tf = None
         if tf is None or not Path(tf).exists():
             print(f"model {M}: no truth STL", flush=True)
+            missing.append(f"model {M}: no truth STL")
             continue
         tv, tfc = load_stl(tf)
         tv = rescale_touch_z(tv, tfc, centre_xy=False)
@@ -200,6 +203,10 @@ def main():
             rv = rescale_touch_z(rv, rfc, centre_xy=False)
             rows["shipped_vs_truth"] = side_view_measure(
                 surface_points(rv, rfc), tp, args.n_dirs, args.res)
+        else:
+            # the only row that scores a reconstruction; without it the two baseline rows
+            # below still print and the file still parses, which reads as a healthy run
+            missing.append(f"model {M}: no reconstruction at {rf}")
 
         out[M] = rows
         print(f"\nmodel {M}", flush=True)
@@ -209,6 +216,11 @@ def main():
 
     Path(args.out).write_text(json.dumps(out, indent=2))
     print(f"\nwrote {args.out}", flush=True)
+    if missing:
+        for m in missing:
+            print(f"MISSING: {m}", file=sys.stderr, flush=True)
+        raise SystemExit(f"scored no reconstruction for {len(missing)} of "
+                         f"{len(args.models)} models; see MISSING above")
 
 
 if __name__ == "__main__":
