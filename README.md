@@ -43,6 +43,12 @@ That leaves it importable from the venv, with no `PYTHONPATH` to set. The calibr
 flow training and the reconstruction all render with it. The tests run the same code on a
 slow pure-torch rasteriser, so they need neither it nor a GPU.
 
+It is compiled for the GPU architectures in `TORCH_CUDA_ARCH_LIST`, or, when that is unset,
+for the card the build runs on. A build made on a newer card fails on an older one with "no
+kernel image is available", so where one build serves several kinds of GPU, name them all:
+`TORCH_CUDA_ARCH_LIST="8.0;8.9;9.0+PTX" make toolchain`. The list is recorded with the build,
+and changing it rebuilds.
+
 `scripts/run_smoke_test.sh` and `scripts/run_remote_pipeline.sh` build the same venv through
 the same Makefile if it is not there yet, so `make smoke` and `make pipeline`, or the scripts
 by hand, are equivalent.
@@ -110,6 +116,39 @@ environment:
 ```
 N_BODIES=2000 scripts/run_remote_pipeline.sh
 scripts/run_remote_pipeline.sh --force-stage fit    # redo fit and everything after it
+```
+
+### On CSF3
+
+`submit_csf3.sh` runs the whole pipeline as one Slurm job on the University of Manchester
+CSF3. Run it from a login node; it submits itself:
+
+```
+./submit_csf3.sh                            # gpuA (A100 80GB), 4-day limit
+CSF_PARTITION=gpuH_short ./submit_csf3.sh   # H200, 1-day limit
+CSF_PARTITION=gpuH ./submit_csf3.sh         # H200, 4-day limit
+CSF_PARTITION=gpuL ./submit_csf3.sh         # L40S 48GB, 4-day limit
+./submit_csf3.sh -d afterany:1234           # other arguments go to sbatch
+```
+
+`#SBATCH` lines cannot read the environment, so the partition is passed on the `sbatch`
+command line instead, together with what it needs: the H200 partitions take an account
+(`gpu-h200-fse-pgdr`, or `CSF_ACCOUNT`), at most 8 cores per GPU rather than 12, and on
+`gpuH_short` a wallclock of one day at most. `CSF_TIME` overrides the wallclock. Plain
+`sbatch submit_csf3.sh` still works but always lands on gpuA; with `CSF_PARTITION` set it stops
+at once instead of running on the wrong GPU. Pipeline variables such as `N_BODIES` pass
+through the environment as usual.
+
+The job loads its modules, puts caches, the challenge data, the shape models, the library
+and `runs/` on `~/scratch/hac26` (`SCRATCH_DIR` to move it) because home is too small, builds
+the venv and nvdiffrast for the A100, L40S and H200 alike, and then runs
+`run_remote_pipeline.sh`. Its own output is in `logs/csf3_<jobid>.out`. A job that hits its
+wallclock resumes where it stopped when resubmitted, so on `gpuH_short` the run is a chain of
+one-day jobs:
+
+```
+J=$(CSF_PARTITION=gpuH_short ./submit_csf3.sh --parsable)
+CSF_PARTITION=gpuH_short ./submit_csf3.sh -d afterany:$J
 ```
 
 ## Running stages by hand

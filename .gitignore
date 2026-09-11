@@ -27,6 +27,10 @@ scripts/visualize_shape_models.py
 # Written into the repo root by a run, not source.
 calibration.json
 logs/
+# ...but keep the directory itself: Slurm opens the jobscript's -o and -e files
+# before the body runs and will not create it, so a fresh checkout must already
+# have it or the first submission dies with no log to say why.
+!logs/.gitkeep
 projection_scores.json
 
 # Local scratch: put one-off benchmarks and probes in scratch/ so they cannot be

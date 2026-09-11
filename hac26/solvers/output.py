@@ -200,17 +200,33 @@ def restore_constraints(verts: np.ndarray, radius: float, tol: float = 0.03) -> 
 
 
 def export_stl(path: str, verts: np.ndarray, faces: np.ndarray) -> dict:
-    """Write a watertight binary STL with outward normals; returns a report of the repairs."""
+    """Write a watertight binary STL with outward normals; returns a report of the repairs.
+
+    Raises ValueError rather than writing a body that is not a closed solid of positive
+    volume. An open or inside-out mesh is not an answer: the voxel measure is read off a
+    parity scan, which a hole inverts over the whole column through it, and a negative
+    volume means the winding is reversed. The repairs run in the order that can actually
+    fix one -- holes are filled first, so that fix_normals sees a closed surface and
+    orients the patches with everything else -- and the volume is measured after them
+    rather than before, so the number in the report describes the body on disk.
+    """
     import trimesh
     m = trimesh.Trimesh(np.asarray(verts), np.asarray(faces), process=True)
     m.remove_unreferenced_vertices()
     m.merge_vertices()
-    m.fix_normals()                      # consistent winding, outward
-    report = {"watertight": bool(m.is_watertight), "volume": float(m.volume),
-              "faces": int(len(m.faces))}
+    m.update_faces(m.nondegenerate_faces())   # a zero-area face carries no orientation
+    report = {"watertight_as_built": bool(m.is_watertight)}
     if not m.is_watertight:
         m.fill_holes()
         report["filled_holes"] = True
-        report["watertight"] = bool(m.is_watertight)
+    m.fix_normals()                      # consistent winding, outward
+    report.update(watertight=bool(m.is_watertight), volume=float(m.volume),
+                  faces=int(len(m.faces)))
+    if not report["watertight"] or report["volume"] <= 0.0:
+        raise ValueError(
+            f"refusing to write {path}: not a closed solid after repair "
+            f"(watertight={report['watertight']}, volume={report['volume']:.4g}, "
+            f"faces={report['faces']}). A level set taken exactly on the k/n_draws "
+            f"lattice is the usual cause; see reconstruct_lpd.off_lattice_level.")
     m.export(path, file_type="stl")      # trimesh writes binary STL by default
     return report

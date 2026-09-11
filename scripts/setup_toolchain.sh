@@ -121,8 +121,13 @@ printf '%s' "$USED" | sed 's/^/  /' >&2
 # with an undefined `c10::` symbol, which says nothing about what to do. Swapping the torch
 # build (`make venv CUDA=12` after a cu13 venv) need not change the header set at all, so the
 # header set alone does not catch it.
+#
+# Nor do the GPU architectures. nvdiffrast's setup.py names none, so torch compiles for
+# TORCH_CUDA_ARCH_LIST, or for the card visible to the build when that is unset. A build
+# made on one card and run on an older one fails at the first kernel launch.
 BUILT_FOR=$($PYBIN -c 'import sys, torch; print("torch", torch.__version__, "cuda", \
     torch.version.cuda, "python", "%d.%d" % sys.version_info[:2])')
+BUILT_FOR="$BUILT_FOR arch ${TORCH_CUDA_ARCH_LIST:-visible}"
 STAMP=$SRC/.hac26-build
 rm -f "$SRC/.hac26-mathinc"                # the record before torch was part of it
 if [ "$(cat "$STAMP" 2>/dev/null)" != "$BUILT_FOR
