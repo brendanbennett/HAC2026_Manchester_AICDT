@@ -55,7 +55,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from hac26.conventions import CYLINDER_R, psi_grid                       # noqa: E402
 from hac26.data_io import N_CAMS, load_inversion_curves                  # noqa: E402
 from hac26.field import (CODE_DIM, EXTRACT_RES, LATTICE_SHAPE, N_RADIAL,  # noqa: E402
-                         N_SITES, lattice_kernel)
+                         N_SITES, lattice_kernel, searchable_sites)
 from hac26.recon import fit_to_cylinder                                  # noqa: E402
 from hac26.solvers.gauss_newton import (AREA_WEIGHT, AREA_WINDOW,    # noqa: E402
                                         STEP_C, STEP_G, TARGET_SIGMA, VOLUME_TRUST,
@@ -188,11 +188,15 @@ def main() -> None:
                    for s, n in zip(STAGE_SIDES, STAGE_ITERS)) \
         + (Stage(side=0, n_dirs=SUBSPACE_DIRS, iters=STAGE_ITERS[-1]),)
 
+    mask = searchable_sites(support.numpy())
+    print(f"  {int(mask.sum())} of {N_SITES} sites can move the surface of the body the fit "
+          f"starts from; a Jacobian is spent on those", flush=True)
+
     def new_fit(seed):
         return CarveFit(render, data_fit, scale_fit, kernel, LATTICE_SHAPE,
                         n_radial=N_RADIAL, area_weight=a.area_weight,
                         volume_trust=a.volume_trust, step_g=a.step_g, step_c=a.step_c,
-                        seed=seed)
+                        seed=seed, site_mask=mask)
 
     zeros = (np.zeros(N_RADIAL), np.zeros(N_SITES))
     gate = new_fit(a.seed)

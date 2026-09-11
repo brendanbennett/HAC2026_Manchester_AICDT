@@ -188,3 +188,43 @@ def test_a_step_that_moves_the_volume_too_far_is_refused():
     _, _, hist = fit.run(np.zeros(N_RADIAL), np.zeros(N_SITES), stages=(Stage(2, 0, 1),),
                          target=0.0)
     assert hist and not hist[0]["accepted"], "a step halving the volume was accepted"
+
+
+def test_the_search_is_spent_only_where_it_can_move_the_surface():
+    """A secant Jacobian costs one render per coordinate, so a coordinate over sites that
+    cannot move the surface is a render thrown away. Over half the lattice of a body of this
+    size is in the corners of the box, outside the body the fit starts from.
+
+    The band has to be one-sided. The sites a carve needs run from the starting surface all
+    the way inward, so a band about the surface throws the carve away; what is null is the
+    outside. The mask therefore keeps everything inside the start and a shell beyond it, and
+    the coordinates it leaves still carry unit peak depth, or one finite-difference step would
+    no longer be right for all of them."""
+    from hac26.field import searchable_sites
+    from hac26.shapes import canonicalize_r, rescale_touch_z
+
+    v, f = icosphere(2)
+    v = canonicalize_r(rescale_touch_z(np.asarray(v) * np.array([1.0, 0.82, 0.72]),
+                                       np.asarray(f), centre_xy=False))
+    mask = searchable_sites(mesh_support(v, ImplicitBody().core.n.numpy()))
+    assert 0.2 * N_SITES < mask.sum() < 0.8 * N_SITES, int(mask.sum())
+
+    # every site the body's own surface passes through is kept
+    sites = GaussianLattice().p.numpy()
+    core = (sites @ ImplicitBody().core.n.numpy().T
+            - mesh_support(v, ImplicitBody().core.n.numpy())[None, :]).max(axis=1)
+    assert mask[core <= 0.0].all(), "a site inside the starting body was masked out"
+
+    K = lattice_kernel()
+    full = CarveFit(lambda c, g: None, np.zeros(4), np.ones(4), K, LATTICE_SHAPE)
+    lean = CarveFit(lambda c, g: None, np.zeros(4), np.ones(4), K, LATTICE_SHAPE,
+                    site_mask=mask)
+    for stage in (Stage(6, 0, 1), Stage(12, 0, 1)):
+        b_full, _ = full._basis(stage)
+        b_lean, btb = lean._basis(stage)
+        assert b_lean.shape[1] < b_full.shape[1], stage.name
+        depth = np.abs(K @ b_lean.toarray()).max(axis=0)
+        assert np.allclose(depth, 1.0, atol=1e-6), stage.name
+        assert np.allclose(btb, (b_lean.T @ b_lean).toarray())
+        # and nothing the mask refuses is driven
+        assert not b_lean.toarray()[~mask].any()

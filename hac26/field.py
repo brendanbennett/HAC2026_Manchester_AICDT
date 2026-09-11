@@ -36,7 +36,7 @@ __all__ = ["spherical_design", "design_sha", "DESIGN_N", "DESIGN_T", "DESIGN_ITE
            "apply_constraints", "LATTICE_SHAPE", "LATTICE_EXTENT", "LATTICE_ALPHA",
            "EXTRACT_EXTENT", "EXTRACT_RES", "RADIAL_DEGREE", "N_RADIAL", "radial_basis",
            "radial_field",
-           "lattice_kernel",
+           "lattice_kernel", "searchable_sites", "SEARCH_SHELL",
            "N_SITES", "N_DIR", "CODE_DIM", "SH_DEGREE", "dir_design", "sh_expand",
            "support_resample", "support_resample_weights"]
 
@@ -76,6 +76,12 @@ EXTRACT_RES = 96                  # side of that grid. It has to resolve the ker
                                   # width is LATTICE_ALPHA times the site spacing, or the
                                   # extraction is a coarser body than the one the amplitudes
                                   # describe; extract_mesh reports the ratio.
+SEARCH_SHELL = 3.0                # how far outside the body a fit starts from a site may sit
+                                  # and still be worth a render, in kernel widths. Measured on
+                                  # the non-convex public body: at three the representational
+                                  # floor is unchanged and a little under half the lattice is
+                                  # searched, so a secant Jacobian costs a little under half
+                                  # the renders. See searchable_sites.
 LATTICE_CHUNK_ELEMS = 1.2e7       # cap on the (points x sites) intermediate. A small chunk is
                                   # faster on a CPU and slower on a GPU, so GaussianLattice
                                   # raises it on CUDA; the raised value is what has to fit
@@ -548,6 +554,31 @@ def _voxel_grid(res: int, device):
         fc = FlexiCubes(device=device)
         _GRID_CACHE[key] = (fc,) + tuple(fc.construct_voxel_grid(res))
     return _GRID_CACHE[key]
+
+
+def searchable_sites(support, shell: float = SEARCH_SHELL) -> np.ndarray:
+    """Boolean over the lattice sites: those a fit's search may spend a render on.
+
+    A secant Jacobian costs one render per coordinate, so a coordinate that cannot move the
+    surface is a render thrown away. What cannot move it is the outside: a site far beyond the
+    body the fit starts from carries a kernel that is below a hundredth of its peak anywhere
+    the surface can reach, and rather more than half the lattice of a body of this size lies
+    there, in the corners of the box.
+
+    The band is one-sided and that is not a detail. The sites a carve needs run from the
+    starting surface all the way inward -- the non-convex public body's surface lies seven
+    kernel widths inside its convex answer -- so a band *about* the surface throws away the
+    carve itself and costs the representation most of what it can hold. Everything inside the
+    start, plus a shell outside it, keeps the whole of it.
+
+    `support` is the support function of the body the fit starts from, on the core's normals,
+    so the test is the sign of that body's own core field at each site.
+    """
+    n = spherical_design(DESIGN_N)
+    h = np.asarray(support, dtype=np.float64).ravel()
+    sites, spacing = _grid_lattice(LATTICE_SHAPE, LATTICE_EXTENT)
+    core = (sites.astype(np.float64) @ n.T - h[None, :]).max(axis=1)
+    return core < shell * LATTICE_ALPHA * float(spacing.min())
 
 
 def kernel_pitch_ratio(res: int, extent: float = EXTRACT_EXTENT) -> float:

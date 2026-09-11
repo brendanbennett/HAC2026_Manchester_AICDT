@@ -199,7 +199,7 @@ class CarveFit:
                  step_g: float = STEP_G, step_c: float = STEP_C,
                  damping=(1e-1, 1e-2, 1e-3, 1.0, 10.0),
                  lengths=(1.0, 0.5, 0.25, 0.1, 0.04),
-                 subspace_tries: int = 3, seed: int = 0):
+                 subspace_tries: int = 3, seed: int = 0, site_mask=None):
         if area_weight and not AREA_WINDOW[0] <= area_weight <= AREA_WINDOW[1]:
             raise ValueError(f"area weight {area_weight} is outside the measured window "
                              f"{AREA_WINDOW}; below it a corrugation one cell wide is still "
@@ -211,6 +211,10 @@ class CarveFit:
         self.kernel = kernel
         self.shape = tuple(int(s) for s in lattice_shape)
         self.n_sites = int(np.prod(self.shape))
+        self.site_mask = None if site_mask is None else np.asarray(site_mask, bool).ravel()
+        if self.site_mask is not None and len(self.site_mask) != self.n_sites:
+            raise ValueError(f"the site mask has {len(self.site_mask)} entries for "
+                             f"{self.n_sites} sites")
         self.n_radial = int(n_radial)
         self.area_weight = float(area_weight)
         self.volume_trust = float(volume_trust)
@@ -266,11 +270,23 @@ class CarveFit:
 
     def _basis(self, stage: Stage):
         """The stage's coordinates as columns over the site amplitudes, scaled so that one
-        unit of a coordinate is one body unit of carve depth at the sites."""
+        unit of a coordinate is one body unit of carve depth at the sites.
+
+        Where a site mask is given, the coordinates are confined to it and any column left
+        with nothing to drive is dropped. A secant Jacobian spends one render per column, so a
+        column over sites that cannot move the surface is a render thrown away; field
+        .searchable_sites says which those are and why the band is one-sided.
+        """
         if stage.side:
             b = block_basis(self.shape, stage.side)
         else:
             b = sparse.csc_matrix(subspace_basis(self.shape, stage.n_dirs, self.rng))
+        if self.site_mask is not None:
+            b = sparse.csc_matrix(sparse.diags(self.site_mask.astype(float)) @ b)
+            b.eliminate_zeros()
+            alive = np.diff(b.indptr) > 0
+            if alive.any():
+                b = b[:, np.flatnonzero(alive)]
         peak = np.zeros(b.shape[1])
         for i in range(0, b.shape[1], 256):                    # a block at a time, dense
             sl = slice(i, min(i + 256, b.shape[1]))
