@@ -208,7 +208,9 @@ def main():
             n_draws = len(meshes)
             ext = max(float(np.abs(mv).max()) for mv, _ in meshes + [(tv, tf)]) * 1.05
             occs = [mesh_occupancy(mv, mf, OCC_RES, ext) for mv, mf in meshes]
-            opt = dice_optimal_level(occs, ext, R)
+            # rounded as the levels below are: consensus_bodies names each body by the level
+            # it was asked for, so an unrounded opt would never be found among them
+            opt = round(float(dice_optimal_level(occs, ext, R)), 9)
             # asking for a level twice builds and scores the same body twice; the rules
             # consensus_opt and consensus_<lv> then simply name one shared candidate
             asked = tuple(dict.fromkeys(round(float(x), 9)
@@ -248,10 +250,11 @@ def main():
             medoid = eligible_draws[metric_medoid(medoid_draw_occs, n_ref=len(eligible_draws))]
             best_fit = eligible_draws[int(np.argmin([candidate_fits[i] for i in eligible_draws]))]
 
-            # Every candidate against the truth, with both measures. The grid here is fixed
-            # at 128 rather than following OCC_RES on purpose: the candidates are chosen on
-            # OCC_RES and a consensus body is built out of it, so scoring on the same grid
-            # would flatter whichever candidate that grid happens to suit.
+            # Every eligible candidate against the truth, with both measures. The grid here is
+            # --score-res rather than OCC_RES on purpose (the script refuses the two equal):
+            # the candidates are chosen on OCC_RES and a consensus body is built out of it, so
+            # scoring on the same grid would flatter whichever candidate that grid happens to
+            # suit.
             truth_occ = mesh_occupancy(tv, tf, a.score_res, ext)
             truth_pts = surface_points(tv, tf, n=a.side_points, seed=a.seed)
             score_outlines = {i: surface_points(candidates[i][0], candidates[i][1],
