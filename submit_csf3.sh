@@ -1,7 +1,14 @@
 #!/bin/bash --login
 # hac26 full pipeline on CSF3, branch facet-radiance-surrogate, N_BODIES=1500.
 #
-#   sbatch submit_csf3.sh
+#   ./submit_csf3.sh                            # gpuA (A100 80GB), 4-day limit
+#   CSF_PARTITION=gpuH_short ./submit_csf3.sh   # H200, 1-day limit
+#   CSF_PARTITION=gpuH ./submit_csf3.sh         # H200, 4-day limit
+#   CSF_PARTITION=gpuL ./submit_csf3.sh         # L40S 48GB, 4-day limit
+#   ./submit_csf3.sh -d afterany:1234           # other arguments go to sbatch
+#   sbatch submit_csf3.sh                       # gpuA only; ignores CSF_PARTITION
+#
+# CSF_TIME overrides the wallclock and CSF_ACCOUNT the H200 account code.
 #
 # =============================================================================
 # Partition, modules and the torch build are all confirmed against this cluster:
@@ -16,9 +23,42 @@
 #SBATCH --output=logs/csf3_%j.out
 #SBATCH --error=logs/csf3_%j.err
 
+# ---------------------------------------------------------------- submission
+# Slurm reads the #SBATCH lines before any shell runs and expands no variables in
+# them, so they cannot take the partition from the environment. Run outside a job,
+# this file submits itself instead, passing what the partition needs on the sbatch
+# command line, which overrides the lines above. H200 differs from the default in
+# three ways: it needs an account, it allows at most 8 cores per GPU, and gpuH_short
+# rejects any wallclock over one day.
+if [ -z "${SLURM_JOB_ID:-}" ]; then
+  set -euo pipefail
+  PARTITION=${CSF_PARTITION:-gpuA}
+  H200_ACCOUNT=${CSF_ACCOUNT:-gpu-h200-fse-pgdr}
+  case "$PARTITION" in
+    gpuA|gpuL)  ARGS=(-c 12 -t "${CSF_TIME:-4-0}") ;;
+    gpuH)       ARGS=(-c 8  -t "${CSF_TIME:-4-0}" -A "$H200_ACCOUNT") ;;
+    gpuH_short) ARGS=(-c 8  -t "${CSF_TIME:-1-0}" -A "$H200_ACCOUNT") ;;
+    *) echo "CSF_PARTITION=$PARTITION: expected gpuA, gpuL, gpuH or gpuH_short" >&2
+       exit 1 ;;
+  esac
+  # Slurm opens -o and -e before the job starts, and the job starts in the directory
+  # it was submitted from, so both have to be settled here.
+  cd "$(dirname "$0")"
+  mkdir -p logs
+  exec sbatch -p "$PARTITION" "${ARGS[@]}" "$@" "$(basename "$0")"
+fi
+
 set -uo pipefail
 cd "${SLURM_SUBMIT_DIR:-${SGE_O_WORKDIR:-$PWD}}"
 mkdir -p logs
+
+# `CSF_PARTITION=gpuH sbatch submit_csf3.sh` lands on gpuA, because sbatch never
+# runs the block above. Stop now rather than spend days on the wrong GPU.
+if [ -n "${CSF_PARTITION:-}" ] && [ "$CSF_PARTITION" != "${SLURM_JOB_PARTITION:-}" ]; then
+  echo "ERROR: CSF_PARTITION=$CSF_PARTITION, but this job is on ${SLURM_JOB_PARTITION:-?}." >&2
+  echo "       Submit with ./submit_csf3.sh rather than sbatch to use it." >&2
+  exit 1
+fi
 
 # ---------------------------------------------------------------- modules
 # The Makefile installs torch itself against the driver it finds, so the module
@@ -98,6 +138,13 @@ set -e
 # choose a CUDA 13 torch (cu130) -- but cuda/12.6.2 is the only toolkit module here, and
 # nvdiffrast is compiled with that toolkit against torch's headers. cu129 keeps the two
 # on the same CUDA major version. The venv records this, so later `make` calls keep it.
+#
+# nvdiffrast is compiled for the GPUs listed in TORCH_CUDA_ARCH_LIST. Unset, torch builds
+# for whichever card the build job landed on, and the build is shared by every later job:
+# one made on an H200 (sm_90) fails on an A100 with "no kernel image is available". So all
+# three CSF3 cards are named: A100 8.0, L40S 8.9, H200 9.0, plus PTX for anything newer.
+# setup_toolchain.sh records the list and rebuilds when it changes.
+export TORCH_CUDA_ARCH_LIST=${TORCH_CUDA_ARCH_LIST:-8.0;8.9;9.0+PTX}
 make venv CUDA=12 2>&1 | tee logs/csf3_venv.log
 make toolchain      2>&1 | tee logs/csf3_toolchain.log
 make check          2>&1 | tee logs/csf3_check.log
