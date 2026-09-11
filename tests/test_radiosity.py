@@ -3,7 +3,8 @@ import numpy as np
 import pytest
 import torch
 
-from hac26.forward.mesh.radiosity import RadiosityError, RadiositySolver, form_factors
+from hac26.forward.mesh.radiosity import (RadiosityError, RadiositySolver, _visibility_matrix,
+                                          facet_geometry, form_factors)
 
 
 def contact_binary(sep: float = 0.75, r: float = 0.55):
@@ -62,3 +63,14 @@ def test_a_bad_row_raises_or_is_scaled():
         RadiositySolver(F, rho=0.5)
     s = RadiositySolver(F, rho=0.5, bad_rows="scale")
     assert s.n_bad_rows == 1 and s.max_row_sum <= 1.0 + 1e-6
+
+
+def test_the_ray_test_gives_the_same_visibility_in_blocks():
+    """The visibility is ray-tested a block of rays at a time, to bound the memory of
+    trimesh's ray engine; each ray's answer depends on that ray alone, so any block size
+    gives the same matrix."""
+    v, f = contact_binary()
+    c, n, _ = facet_geometry(v, f)
+    whole = _visibility_matrix(c, n, v, f, ray_chunk=10 ** 9)
+    assert 0 < whole.sum() < whole.size - len(c)     # some pairs see each other, some do not
+    assert np.array_equal(_visibility_matrix(c, n, v, f, ray_chunk=7), whole)

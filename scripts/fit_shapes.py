@@ -72,6 +72,32 @@ POINTS_PER_SITE = 12   # fewest sample points per amplitude the fit will accept.
                        # this floor is set by the bodies that matter. See main.
 DICE_FLOOR = 0.75      # median fitted Dice below which the corpus is refused; see
                        # report_corpus
+FIT_CONVEXITY_BINS = (0.55, 0.7, 0.85, 0.95)
+
+
+def _trimesh_signed_distance(m, pts):
+    """Signed distances with this file's convention: positive outside."""
+    return -np.concatenate([m.nearest.signed_distance(pts[i:i + SD_CHUNK])
+                            for i in range(0, len(pts), SD_CHUNK)])
+
+
+def _contains_signed_distance(m, pts):
+    """Robust fallback: unsigned nearest-surface distance, sign from ray parity."""
+    out = []
+    for i in range(0, len(pts), SD_CHUNK):
+        block = pts[i:i + SD_CHUNK]
+        _, distance, _ = m.nearest.on_surface(block)
+        signed = np.asarray(distance, dtype=np.float64)
+        inside = np.asarray(m.contains(block), dtype=bool)
+        signed[inside] *= -1.0
+        out.append(signed)
+    return np.concatenate(out)
+
+
+def _bad_signed_distances(sd, far):
+    if not np.isfinite(sd).all():
+        return True
+    return bool(far.any() and sd[far].min() <= 0.0)
 
 
 def sample_arrays(verts, faces, n_pts=6000, seed=0):
@@ -83,20 +109,33 @@ def sample_arrays(verts, faces, n_pts=6000, seed=0):
     the point count, which is the one thing the point count must not cost; the blocks also
     stay in cache, so they are quicker than the single call they replace."""
     import trimesh
-    m = trimesh.Trimesh(verts, faces, process=False)
+    m = trimesh.Trimesh(verts, faces, process=True)
+    m.remove_unreferenced_vertices()
+    m.merge_vertices()
+    m.fix_normals()
+    if m.volume < 0.0:
+        m.invert()
     rng = np.random.default_rng(seed)
+    verts = np.asarray(m.vertices, dtype=np.float64)
     ext = max(float(np.abs(verts).max()) * 1.3, SAMPLE_EXTENT)
     pts = rng.uniform(-ext, ext, (n_pts, 3))
-    surf, _ = trimesh.sample.sample_surface(m, n_pts // 2)
+    surf, _ = trimesh.sample.sample_surface(m, n_pts // 2, seed=seed)
     pts = np.vstack([pts, surf + rng.normal(0, 0.03, surf.shape)])
-    sd = -np.concatenate([m.nearest.signed_distance(pts[i:i + SD_CHUNK])
-                          for i in range(0, len(pts), SD_CHUNK)])   # trimesh: positive inside
+    sd = _trimesh_signed_distance(m, pts)
     # The sign comes from the mesh's winding, so a mesh that is inside out returns the whole
     # field negated and the body is fitted as its own complement, with no sign of it in the
     # residual. A point beyond the body's own bounding sphere is outside whatever the mesh
     # says, so it is the cheapest thing that can tell the two apart.
     far = np.linalg.norm(pts, axis=1) > float(np.linalg.norm(verts, axis=1).max()) + 1e-6
-    if far.any() and sd[far].min() <= 0.0:
+    if _bad_signed_distances(sd, far):
+        m.invert()
+        sd = _trimesh_signed_distance(m, pts)
+    if _bad_signed_distances(sd, far):
+        sd = _contains_signed_distance(m, pts)
+        # A point beyond every vertex radius is outside by construction, even when a
+        # degeneracy makes the ray-parity fallback undecidable on that exact ray.
+        sd[far] = np.maximum(sd[far], 1e-6)
+    if _bad_signed_distances(sd, far):
         raise ValueError("the signed distance calls points outside the body's bounding sphere "
                          "inside it: the mesh is oriented inward. Check mesh_volume.")
     return pts.astype(np.float32), sd.astype(np.float32)
@@ -105,7 +144,10 @@ def sample_arrays(verts, faces, n_pts=6000, seed=0):
 def _prepare_shape(args):
     """One body's sample points, signed distances and hull support, for a worker pool."""
     i, verts, faces, normals, n_pts = args
-    pts, sd = sample_arrays(verts, faces, n_pts=n_pts, seed=i)
+    try:
+        pts, sd = sample_arrays(verts, faces, n_pts=n_pts, seed=i)
+    except Exception as exc:
+        raise RuntimeError(f"failed to prepare library body {i}") from exc
     h0 = np.maximum((verts @ normals.T).max(axis=0), 1e-3).astype(np.float32)
     return i, pts, sd, h0
 
@@ -211,7 +253,16 @@ def fitted_dice(bodies, shape_list, families, n_sample: int, seed: int = 0) -> n
     return out
 
 
-def report_corpus(bodies, data, codes, before, after, fit_dice=None) -> bool:
+def _bin_name(lo: float, hi: float) -> str:
+    if not np.isfinite(lo):
+        return f"<{hi:g}"
+    if not np.isfinite(hi):
+        return f">={lo:g}"
+    return f"{lo:g}-{hi:g}"
+
+
+def report_corpus(bodies, data, codes, before, after, fit_dice=None,
+                  convexity: np.ndarray | None = None) -> bool:
     """Report on the finished corpus. Returns True if it looks usable.
 
     Called after the corpus is written, never before: a fit that took hours must be flagged,
@@ -252,6 +303,30 @@ def report_corpus(bodies, data, codes, before, after, fit_dice=None) -> bool:
                        f"median Dice {float(np.median(d)):.3f} over {len(d)} sampled bodies, "
                        f"against a floor of {DICE_FLOOR}. The usual cause is too few sample "
                        f"points for how deeply carved the library is; raise --points.")
+        if convexity is not None:
+            conv = np.asarray(convexity, dtype=float)
+            raw_dice = np.asarray(fit_dice, dtype=float)
+            edges = (-np.inf,) + tuple(FIT_CONVEXITY_BINS) + (np.inf,)
+            print("  [dice] fitted Dice by source convexity bin:", flush=True)
+            for lo, hi in zip(edges[:-1], edges[1:]):
+                in_bin = (conv >= lo) & (conv < hi)
+                sampled = in_bin & np.isfinite(raw_dice)
+                if not in_bin.any():
+                    continue
+                if sampled.any():
+                    med = float(np.median(raw_dice[sampled]))
+                    mn = float(np.min(raw_dice[sampled]))
+                    print(f"    {_bin_name(lo, hi):<9} bodies {int(in_bin.sum()):>5}  "
+                          f"sampled {int(sampled.sum()):>3}  median {med:.3f}  min {mn:.3f}",
+                          flush=True)
+                    if hi <= 0.85 and int(sampled.sum()) >= 3 and med < DICE_FLOOR:
+                        bad.append(f"nonconvex fitted bodies in convexity bin "
+                                   f"{_bin_name(lo, hi)} have median Dice {med:.3f}, "
+                                   f"below {DICE_FLOOR}; raise --points or simplify the "
+                                   f"library before training the flow.")
+                else:
+                    print(f"    {_bin_name(lo, hi):<9} bodies {int(in_bin.sum()):>5}  "
+                          f"sampled   0  WARNING no fitted-Dice coverage", flush=True)
     for b_ in bad:
         print(f"  ERROR: {b_}", flush=True)
     return not bad
@@ -298,6 +373,7 @@ def main():
     loaded = load_library_dir(a.shapes_dir, n=a.bodies, seed=a.seed, with_entries=True)
     shape_list = [(v, f) for v, f, _ in loaded]
     families = [str(e.get("base", "unknown")) for _, _, e in loaded]
+    convexity = np.array([float(e.get("convexity", np.nan)) for _, _, e in loaded])
     # the width over half-height each body was mounted with; a library written before that
     # was recorded carries none, and build_corpus.py then draws a radius instead
     radii = np.array([float(e.get("radius", np.nan)) for _, _, e in loaded])
@@ -406,10 +482,12 @@ def main():
     fit_d = (fitted_dice(bodies, shape_list, families, a.dice_bodies, seed=a.seed)
              if a.dice_bodies > 0 else np.full(len(bodies), np.nan))
     np.savez(a.out, codes=codes, support=sup, fit_dice=fit_d, family=np.array(families),
-             radius=radii, meta=json.dumps(meta, sort_keys=True))
+             convexity=convexity.astype(np.float32), radius=radii,
+             meta=json.dumps(meta, sort_keys=True))
     print(f"  codes {codes.shape}, amplitude variance {codes[:, N_DIR:].var(0).mean():.5f}")
     print(f"  wrote {a.out}")
-    if not report_corpus(bodies, data, codes, before, after, fit_dice=fit_d):
+    if not report_corpus(bodies, data, codes, before, after, fit_dice=fit_d,
+                         convexity=convexity):
         raise SystemExit("fit_shapes: the corpus above is degenerate. It was written so the "
                          "fit is not lost, but do not train on it.")
 

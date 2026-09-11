@@ -68,7 +68,8 @@ from hac26.solvers.output import (export_stl, metric_medoid, planar_snap,      #
 from hac26.recon import dice, fit_to_cylinder, mesh_occupancy          # noqa: E402
 from hac26.shapes import rescale_touch_z                              # noqa: E402
 from train_lpd import (CALIBRATION, RENDER, _enable_tf32, cond_channels,   # noqa: E402
-                       load_instrument, residual_features, support_from_mesh)
+                       check_flow_metadata, load_flow_file, load_instrument, residual_features,
+                       support_from_mesh)
 
 SPREAD_MAX = 0.95    # mean Dice of the other draws against the medoid above which the draws
                      # are reported as one body rather than a spread of answers
@@ -185,6 +186,70 @@ def mesh_misfit_by_geom(op: CodeOperator, verts, faces, radius, data, scale) -> 
     except RadiosityError:
         return torch.full((N_CAMS,), float("inf"))
     return ((pred - data) / scale[..., None]).pow(2).mean((1, 2)).sqrt()
+
+
+def candidate_diagnostic(kind: str, label: str, verts, faces, misfit_sigma: float) -> dict:
+    """Validity and geometry diagnostics for one selectable reconstruction candidate."""
+    import trimesh
+    from scipy.spatial import ConvexHull
+
+    report = {"kind": kind, "label": label,
+              "misfit_sigma": float(misfit_sigma) if np.isfinite(misfit_sigma) else float("inf")}
+    try:
+        m = trimesh.Trimesh(np.asarray(verts), np.asarray(faces), process=True)
+        m.remove_unreferenced_vertices()
+        m.merge_vertices()
+        m.fix_normals()
+        v = np.asarray(m.vertices, dtype=float)
+        hull_volume = float(ConvexHull(v).volume) if len(v) >= 4 else float("nan")
+        volume = float(m.volume)
+        convexity = (abs(volume) / hull_volume
+                     if np.isfinite(hull_volume) and hull_volume > 0 else float("nan"))
+        report.update({
+            "watertight": bool(m.is_watertight),
+            "winding_consistent": bool(m.is_winding_consistent),
+            "components": int(len(m.split(only_watertight=False))),
+            "volume": volume,
+            "faces": int(len(m.faces)),
+            "convexity": float(convexity),
+            "carved_volume_fraction": float(max(0.0, 1.0 - convexity))
+                                      if np.isfinite(convexity) else float("nan"),
+        })
+    except Exception as exc:                         # noqa: BLE001  diagnostic path
+        report.update({"watertight": False, "winding_consistent": False,
+                       "components": 0, "volume": float("nan"), "faces": 0,
+                       "convexity": float("nan"),
+                       "carved_volume_fraction": float("nan"), "error": str(exc)})
+    report["eligible"] = bool(
+        np.isfinite(report["misfit_sigma"])
+        and bool(report["watertight"])
+        and int(report["components"]) == 1
+        and np.isfinite(report["volume"])
+        and report["volume"] > 0.0
+        and int(report["faces"]) >= 8
+    )
+    reasons = []
+    if not np.isfinite(report["misfit_sigma"]):
+        reasons.append("nonfinite_misfit")
+    if not report["watertight"]:
+        reasons.append("not_watertight")
+    if int(report["components"]) != 1:
+        reasons.append("not_single_component")
+    if not np.isfinite(report["volume"]) or report["volume"] <= 0.0:
+        reasons.append("bad_volume")
+    if int(report["faces"]) < 8:
+        reasons.append("too_few_faces")
+    report["ineligible_reasons"] = reasons
+    return report
+
+
+def json_default(obj):
+    """Convert NumPy scalar diagnostics to plain JSON values."""
+    if isinstance(obj, np.generic):
+        return obj.item()
+    if isinstance(obj, np.ndarray):
+        return obj.tolist()
+    raise TypeError(f"Object of type {obj.__class__.__name__} is not JSON serializable")
 
 
 def polish(net, op: CodeOperator, z, support, radius, data, scale, geoms, steps: int):
@@ -385,15 +450,13 @@ def main():
     inst = load_instrument(a.calibration, dev)
     op = CodeOperator(inst, psi, res=a.operator_res, config=RENDER, device=dev)
 
-    sd = torch.load(a.ckpt, map_location="cpu", weights_only=False)
-    if "net" in sd and isinstance(sd.get("step"), int):
-        # a train_lpd.py resume checkpoint rather than a finished run's weights: use its
-        # best held-out state if it has one
-        print(f"  {a.ckpt} is a training checkpoint at step {sd['step']}"
-              + (f", using its best weights from step {sd['best_step']} "
-                 f"(val {sd['best']:.5f})" if sd.get("best_state") else ", using its "
-                 "current weights (no held-out evaluation in it yet)"), flush=True)
-        sd = sd["best_state"] or sd["net"]
+    sd, flow_meta = load_flow_file(a.ckpt, map_location="cpu")
+    if "checkpoint_step" in flow_meta:
+        print(f"  {a.ckpt} is a training checkpoint at step {flow_meta['checkpoint_step']}, "
+              f"using {'best' if flow_meta.get('loaded_best_state') else 'current'} weights "
+              f"from step {flow_meta['loaded_step']}", flush=True)
+    check_flow_metadata(flow_meta, calibration=a.calibration, phases=a.phases,
+                        operator_res=a.operator_res, context=a.ckpt)
     net = LPDFlow.from_state_dict(sd)
     net.eval()
 
@@ -472,7 +535,7 @@ def main():
         print(f"  WARNING: could not save the codes to {codes_path}: {exc}", flush=True)
         codes_path = None
 
-    meshes, snaps, fits = [], [], []
+    meshes, snaps, fits, sources = [], [], [], []
     for i in range(a.samples):
         v, f, kept = decode(op, raw_codes[i], support, res=a.res, misfit_fn=misfit,
                             snap=a.snap, snap_planes=a.snap_planes,
@@ -483,6 +546,7 @@ def main():
         print(f"  draw {i}: misfit {chi:.2f} sigma", flush=True)
         v = fit_to_cylinder(v, R)            # canonical -> physical: xy only
         meshes.append((v, f)); snaps.append(kept); fits.append(chi)
+        sources.append({"kind": "draw", "label": f"draw {i}", "draw": int(i)})
     if not meshes:
         raise SystemExit("every draw was degenerate")
     # one grid for every draw, sized to the widest of them, so the pairwise Dice below
@@ -497,12 +561,37 @@ def main():
     extra = consensus_bodies(occs, occ_extent, R, levels=levels_used) if n_draws > 1 else []
     levels = [lv for lv, _, _ in extra]
     candidates = meshes + [(mv, mf) for _, mv, mf in extra]
+    sources += [{"kind": "consensus", "label": f"consensus at level {lv:g}",
+                 "level": float(lv)} for lv, _, _ in extra]
     occs = occs + [mesh_occupancy(mv, mf, OCC_RES, occ_extent)
                    for _, mv, mf in extra]
 
+    candidate_fits = list(fits)
+    for _, mv, mf in extra:
+        candidate_fits.append(misfit(mv / np.array([R, R, 1.0]), mf))
+    candidate_diagnostics = [
+        candidate_diagnostic(src["kind"], src["label"], candidates[i][0], candidates[i][1],
+                             candidate_fits[i])
+        for i, src in enumerate(sources)
+    ]
+    eligible = [i for i, row in enumerate(candidate_diagnostics) if row["eligible"]]
+    eligible_draws = [i for i in eligible if i < n_draws]
+    if not eligible_draws:
+        raise SystemExit("no valid draw candidate has finite misfit; refusing to choose an "
+                         "answer from consensus bodies alone")
+    if not eligible:
+        raise SystemExit("no valid LPD candidate has finite misfit")
+    invalid = len(candidate_diagnostics) - len(eligible)
+    if invalid:
+        print(f"  candidate gate: {invalid}/{len(candidate_diagnostics)} candidates ineligible; "
+              f"selecting among {len(eligible)} valid candidates", flush=True)
+    eligible_occs = [occs[i] for i in eligible]
+    eligible_candidates = [candidates[i] for i in eligible]
+    n_ref = len(eligible_draws)
+
     medoid_metric = "volume"
     if a.medoid_volume_only:
-        k = metric_medoid(occs, n_ref=n_draws)
+        k_local = metric_medoid(eligible_occs, n_ref=n_ref)
     else:
         try:
             from hac26.scoring.side_view import surface_points
@@ -513,15 +602,16 @@ def main():
         print(f"  side-view medoid: {a.medoid_side_points} surface points/draw, "
               f"{a.medoid_side_dirs} dirs, res {a.medoid_side_res}", flush=True)
         outlines = [surface_points(v, f, n=a.medoid_side_points, seed=a.seed + i)
-                    for i, (v, f) in enumerate(candidates)]
-        k = metric_medoid(occs, outlines, side_n_dirs=a.medoid_side_dirs,
-                          side_res=a.medoid_side_res, side_mode=a.medoid_side_mode,
-                          n_ref=n_draws)
+                    for i, (v, f) in enumerate(eligible_candidates)]
+        k_local = metric_medoid(eligible_occs, outlines, side_n_dirs=a.medoid_side_dirs,
+                                side_res=a.medoid_side_res, side_mode=a.medoid_side_mode,
+                                n_ref=n_ref)
         medoid_metric = "volume+side_view"
         del outlines            # large, and nothing reads it after the medoid
+    k = eligible[k_local]
 
     v, f = candidates[k]
-    chosen = f"draw {k}" if k < n_draws else f"consensus at level {levels[k - n_draws]:g}"
+    chosen = sources[k]["label"]
     if a.snap:
         print(f"  planes accepted per draw (allowed rise {SNAP_MAX_RISE}): {snaps}", flush=True)
     else:
@@ -530,8 +620,7 @@ def main():
     off = ([dice(occs[k], o) for j, o in enumerate(occs[:n_draws]) if j != k] or [0.0])
     spread_off = float(np.mean(off))
     # a consensus body is in the physical frame; the misfit takes canonical vertices
-    chosen_fit = (fits[k] if k < n_draws
-                  else misfit(candidates[k][0] / np.array([R, R, 1.0]), candidates[k][1]))
+    chosen_fit = float(candidate_diagnostics[k]["misfit_sigma"])
     print(f"  answer = {chosen} of {n_draws} draws and {len(extra)} consensus bodies by "
           f"{medoid_metric}; mean Dice to the draws {spread_off:.4f}; misfit "
           f"{chosen_fit:.2f} sigma (draws {min(fits):.2f}-{max(fits):.2f})", flush=True)
@@ -558,6 +647,8 @@ def main():
            "spread": spread, "spread_off_medoid": spread_off,
            "collapsed": bool(collapsed),
            "medoid_metric": medoid_metric,
+           "candidate_diagnostics": candidate_diagnostics,
+           "eligible_candidates": [int(i) for i in eligible],
            "medoid_volume_only": bool(a.medoid_volume_only),
            "medoid_side_points": 0 if a.medoid_volume_only else int(a.medoid_side_points),
            "medoid_side_dirs": int(a.medoid_side_dirs),
@@ -585,8 +676,9 @@ def main():
                                  mesh_occupancy(rv, f, 128, e)))
         print(f"  DICE vs truth: {res['dice']:.4f}", flush=True)
 
-    print(json.dumps(res))
-    Path(a.out).with_suffix(".json").write_text(json.dumps(res, indent=2))
+    print(json.dumps(res, default=json_default))
+    Path(a.out).with_suffix(".json").write_text(json.dumps(res, indent=2,
+                                                           default=json_default))
 
 
 if __name__ == "__main__":

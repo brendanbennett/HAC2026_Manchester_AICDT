@@ -31,6 +31,10 @@ class RadiosityError(ValueError):
     """The form factors of this mesh are not usable."""
 
 
+# Rays handed to trimesh per call in _visibility_matrix; see the comment there.
+RAY_CHUNK = 2048
+
+
 def facet_geometry(verts: np.ndarray, faces: np.ndarray):
     """Centroids, unit normals and areas of every facet, degenerate facets dropped."""
     tv = verts[faces]
@@ -43,9 +47,10 @@ def facet_geometry(verts: np.ndarray, faces: np.ndarray):
 
 def _visibility_matrix(centroids: np.ndarray, normals: np.ndarray,
                        verts: np.ndarray, faces: np.ndarray,
-                       backface_only: bool = False) -> np.ndarray:
+                       backface_only: bool = False, ray_chunk: int = RAY_CHUNK) -> np.ndarray:
     """V(i,j): 1 if facet centroids i and j see each other, else 0. Pairs that do not face
-    each other are excluded first, and only the rest are ray-tested."""
+    each other are excluded first, and only the rest are ray-tested, `ray_chunk` rays at a
+    time."""
     import trimesh
     m = trimesh.Trimesh(verts, faces, process=False)
     n_f = len(centroids)
@@ -60,19 +65,25 @@ def _visibility_matrix(centroids: np.ndarray, normals: np.ndarray,
         return facing.astype(np.float64)
     ii, jj = np.nonzero(np.triu(facing, 1))
     V = np.zeros((n_f, n_f), dtype=bool)
-    if len(ii):
-        eps = 1e-4 * np.maximum(r[ii, jj], 1e-9)
-        o = centroids[ii] + normals[ii] * eps[:, None]
-        dirs = u[ii, jj]
+    # The rays go to trimesh a block at a time. Its engine gathers the candidate triangles of
+    # every ray it is handed before testing any, and that grows far faster than the number of
+    # rays: on a torus, 19k rays (600 patches) took 0.7 GB in one call and 74k rays (1200
+    # patches) 4.8 GB, against 0.1 and 0.3 GB in blocks of RAY_CHUNK. Each ray's answer
+    # depends on that ray alone, so the blocks change the memory and nothing else.
+    for s in range(0, len(ii), ray_chunk):
+        a, b = ii[s:s + ray_chunk], jj[s:s + ray_chunk]
+        rr = r[a, b]
+        eps = 1e-4 * np.maximum(rr, 1e-9)
+        o = centroids[a] + normals[a] * eps[:, None]
         # a hit beyond the partner does not block, so the hit distance is tested
-        loc, idx_ray, _ = m.ray.intersects_location(o, dirs, multiple_hits=False)
-        blocked = np.zeros(len(ii), dtype=bool)
+        loc, idx_ray, _ = m.ray.intersects_location(o, u[a, b], multiple_hits=False)
+        blocked = np.zeros(len(a), dtype=bool)
         if len(idx_ray):
             dist = np.linalg.norm(loc - o[idx_ray], axis=1)
-            blocked[idx_ray] = dist < r[ii, jj][idx_ray] * (1 - 1e-3)
+            blocked[idx_ray] = dist < rr[idx_ray] * (1 - 1e-3)
         ok = ~blocked
-        V[ii[ok], jj[ok]] = True
-        V[jj[ok], ii[ok]] = True
+        V[a[ok], b[ok]] = True
+        V[b[ok], a[ok]] = True
     return V.astype(np.float64)
 
 

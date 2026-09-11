@@ -42,3 +42,4 @@ surrogate_check.py
 *.out
 *.pid
 
+uv.lock
