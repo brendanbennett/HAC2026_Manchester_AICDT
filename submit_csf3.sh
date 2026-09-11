@@ -9,10 +9,10 @@
 # =============================================================================
 #SBATCH --job-name=hac26-pipeline
 #SBATCH --partition=gpuA                  # 19 nodes, 4-day limit
-#SBATCH --gres=gpu:1
-#SBATCH --cpus-per-task=8
-#SBATCH --mem=64G
-#SBATCH --time=4-00:00:00                 # gpuA maximum; the run resumes if it is hit
+#SBATCH -G 1
+#SBATCH -n 1                              # one task; the body is a single process
+#SBATCH --cpus-per-task=12                # gpuA allows <=12 cores per GPU
+#SBATCH -t 4-0                            # gpuA maximum; the run resumes if it is hit
 #SBATCH --output=logs/csf3_%j.out
 #SBATCH --error=logs/csf3_%j.err
 
@@ -31,6 +31,10 @@ module purge
 module load tools/env/proxy2                 # http_proxy is unset without this
 module load cuda/12.6.2                      # the only CUDA module on the merged CSF
 module load python/3.13.1                    # the Makefile builds its own venv from it
+
+# Required whenever -c is used, or every library that reads the core count will
+# oversubscribe against the multiprocessing pools the pipeline already runs.
+export OMP_NUM_THREADS=$SLURM_CPUS_PER_TASK
 
 echo "proxy: ${http_proxy:-unset (fine; direct egress works on these nodes)}"
 nvidia-smi || echo "WARNING: no GPU visible; corpus, flow and reconstruct will fail"
