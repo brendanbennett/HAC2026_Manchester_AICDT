@@ -46,6 +46,7 @@ from hac26.solvers.lpd_flow import CHURN, N_MODES, N_STEPS, LPDFlow, geometry_ta
 from hac26.solvers.operator import CodeOperator                            # noqa: E402
 from hac26.solvers.output import metric_medoid                             # noqa: E402
 from reconstruct_lpd import (CONSENSUS_LEVELS, OCC_RES, consensus_bodies, decode,   # noqa: E402
+                             json_default,
                              dice_optimal_level, make_resid_fn, mesh_misfit_by_geom, polish)
 from train_lpd import (CALIBRATION, CORPUS, RENDER, _enable_tf32, cond_channels,   # noqa: E402
                        file_digest, held_out, load_corpus, load_instrument,
@@ -269,7 +270,7 @@ def main():
            "best_guidance": (None if best[0] is None else float(best[0][1])),
            "summary": summary, "bodies": results}
     Path(a.out).parent.mkdir(parents=True, exist_ok=True)
-    Path(a.out).write_text(json.dumps(out, indent=2))
+    Path(a.out).write_text(json.dumps(out, indent=2, default=json_default))
     print(f"  wrote {a.out}")
 
 

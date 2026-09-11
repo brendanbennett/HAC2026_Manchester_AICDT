@@ -180,6 +180,19 @@ def make_resid_fn(net, op: CodeOperator, data, scale, geom_mask, M, cond, suppor
     return fn
 
 
+def json_default(obj):
+    """Plain JSON values for the numpy scalars and arrays a diagnostic collects.
+
+    Every number in a report passes through numpy somewhere, and json refuses a numpy scalar.
+    A run that has done its work and cannot write its report has lost the work, so the encoder
+    is told how to spell them rather than every producer being asked to cast."""
+    if isinstance(obj, np.generic):
+        return obj.item()
+    if isinstance(obj, np.ndarray):
+        return obj.tolist()
+    raise TypeError(f"Object of type {obj.__class__.__name__} is not JSON serializable")
+
+
 def whitened_misfit(pred, data, scale, geoms, weight=None) -> float:
     """RMS of (data - pred) / scale over the geometries `geoms`, in standard deviations.
     `pred` holds those geometries only, in that order, as the operator returns them; `data`,
@@ -617,8 +630,9 @@ def main():
                                  mesh_occupancy(rv, f, 128, e)))
         print(f"  DICE vs truth: {res['dice']:.4f}", flush=True)
 
-    print(json.dumps(res))
-    Path(a.out).with_suffix(".json").write_text(json.dumps(res, indent=2))
+    print(json.dumps(res, default=json_default))
+    Path(a.out).with_suffix(".json").write_text(json.dumps(res, indent=2,
+                                                           default=json_default))
 
 
 if __name__ == "__main__":

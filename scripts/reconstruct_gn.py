@@ -68,6 +68,7 @@ from hac26.solvers.operator import CodeOperator                          # noqa:
 from hac26.solvers.output import export_stl, restore_constraints         # noqa: E402
 from reconstruct import answer_path                                      # noqa: E402
 from reconstruct_lpd import (curve_pairs, curve_weight, geometry_mask,   # noqa: E402
+                             json_default,
                              residual_scale, support_from_convex)
 from calibrate import ETA_FLOOR                                          # noqa: E402
 from reconstruct_map import (EXPORT_RES, convex_dice, convexity,     # noqa: E402
@@ -381,7 +382,8 @@ def main() -> None:
             "final_dice": truth_dice(v, f, a.model, a.data_dir),
             "convex_dice": convex_dice(sup_stl, a.model, a.data_dir),
             "final_convexity": convexity(v, f)}
-    Path(a.out).with_suffix(".json").write_text(json.dumps(meta, indent=2))
+    Path(a.out).with_suffix(".json").write_text(json.dumps(meta, indent=2,
+                                                           default=json_default))
     np.savez(Path(a.out).with_suffix(".fit.npz"), c=best["c"], g=best["g"],
              support=support.cpu().numpy())
     print(f"  wrote {a.out} ({rep['faces']} faces, volume {rep['volume']:.3f}); at export "
