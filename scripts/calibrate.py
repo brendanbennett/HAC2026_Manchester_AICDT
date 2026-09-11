@@ -280,11 +280,21 @@ def main():
                          "memory the rendering takes, not the result")
     ap.add_argument("--geom-chunk", type=int, default=render.geom_chunk,
                     help="geometries per rendering batch")
+    ap.add_argument("--radiosity-slack", type=float, default=6.0,
+                    help="a mesh left with more than this many times RenderConfig."
+                         "radiosity_faces patches after decimation is refused. The default "
+                         "of 2 in RenderConfig guards the RECONSTRUCTION against candidate "
+                         "bodies in thousands of pieces, whose n^2 form factors would run to "
+                         "gigabytes. The public shape models are trusted ground truth and "
+                         "some simply do not decimate to the target -- model 2 stops at 2202 "
+                         "patches against a limit of 1200 -- so the guard is relaxed here. "
+                         "The cost is bounded: 3600 patches is a 52 MB form-factor array.")
     a = ap.parse_args()
     dev = "cuda" if torch.cuda.is_available() else "cpu"
 
     inst = Instrument().to(dev)
-    render = RenderConfig(phase_chunk=a.phase_chunk, geom_chunk=a.geom_chunk)
+    render = RenderConfig(phase_chunk=a.phase_chunk, geom_chunk=a.geom_chunk,
+                          radiosity_slack=a.radiosity_slack)
     fwd = ExactForward(inst, psi_grid(a.phases), render, device=dev)
     fit_params = [p for n, p in inst.named_parameters() if n != "raw_eta"]
 

@@ -49,15 +49,24 @@ export UV_CACHE_DIR="$SCRATCH/cache/uv"   # named outright: uv's cache reached 3
                                           # in home on the first run, and it is the
                                           # Makefile's installer whenever uv is on PATH
 export HF_HOME="$SCRATCH/cache/huggingface"
+# Only dataset/raw is symlinked, because `make data` runs fetch_data.py with no arguments
+# and its destination cannot be set from the environment. Everywhere a variable will do, an
+# absolute path is used instead: run_remote_pipeline.sh finds the shape models with
+# `find "$SHAPE_MODELS_DIR" -maxdepth 2 -type f`, and find does not descend into a symlinked
+# directory without -L, so pointing that variable at a symlink silently yields no models and
+# the library is built with the "real" family empty.
 mkdir -p dataset
-for pair in dataset/raw:raw dataset/generated:generated             dataset/shape_models:shape_models runs:runs; do
-  link=${pair%%:*}
-  target="$SCRATCH/${pair##*:}"
-  if [ ! -L "$link" ]; then
-    rm -rf "$link"
-    ln -s "$target" "$link"
-  fi
-done
+if [ ! -L dataset/raw ]; then
+  rm -rf dataset/raw
+  ln -s "$SCRATCH/raw" dataset/raw
+fi
+if [ ! -L runs ]; then
+  rm -rf runs
+  ln -s "$SCRATCH/runs" runs
+fi
+export SHAPE_MODELS_DIR="$SCRATCH/shape_models"
+export LIB_DIR="$SCRATCH/generated/shapes"
+mkdir -p "$SHAPE_MODELS_DIR" "$LIB_DIR"
 echo "scratch: $SCRATCH"; df -h "$SCRATCH" | tail -1
 
 # ---------------------------------------------------------------- sizing
