@@ -291,13 +291,20 @@ def main() -> None:
         c, g, polish = f.run(c, g, stages=POLISH_STAGES, target=TARGET_SIGMA,
                              area_weight=0.0, log=show)
         hist = hist + polish
-        obj, chi = last(hist, "objective"), last(hist, "chi")
-        print(f"  start {s['i']} finished at chi {chi:.4f}, objective {obj:.4f} "
-              f"({f.renders + s['renders']} renders)", flush=True)
+        chi, area = last(hist, "chi"), last(hist, "area")
+        # Two finished starts are compared under the penalty, not under the misfit the polish
+        # was run on. The polish is a refinement inside a start and is minimising the misfit
+        # alone by design; between two bodies, the misfit alone prefers the rougher one, which
+        # is the comparison notes/objective.md says may never be made and the one
+        # select_answers.py is careful to avoid. They are compared on the functional the shape
+        # was fitted under, which is also the one the written body is judged by downstream.
+        obj = float(np.log(max(chi ** 2, 1e-300)) + a.area_weight * area)
+        print(f"  start {s['i']} finished at chi {chi:.4f}, area {area:.3f}, objective "
+              f"{obj:.4f} ({f.renders + s['renders']} renders)", flush=True)
         if best is None or obj < best["objective"]:
             best = {"objective": obj, "chi": chi, "c": c, "g": g, "start": s["i"],
                     "history": hist, "renders": f.renders + s["renders"],
-                    "recipe": recipes[s["i"]]}
+                    "recipe": recipes[s["i"]], "refused_depth": f.refused_depth}
 
     if not a.out:
         return
@@ -367,6 +374,10 @@ def main() -> None:
             "objective_fit_export": fit_x_obj, "objective_held_export": held_x_obj,
             "reshaping": best["c"].tolist(),
             "carve_depth_max": float(np.abs(kernel @ best["g"]).max()),
+            # how often the star-shaped bound refused a trial. A run that never hits it is not
+            # held back by it; one that hits it constantly is a body the correction wants to
+            # carve past its own centre, and that is worth seeing rather than inferring.
+            "depth_refusals": best["refused_depth"],
             "final_dice": truth_dice(v, f, a.model, a.data_dir),
             "convex_dice": convex_dice(sup_stl, a.model, a.data_dir),
             "final_convexity": convexity(v, f)}
