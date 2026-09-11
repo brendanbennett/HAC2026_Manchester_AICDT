@@ -584,8 +584,19 @@ class LPDFlow(nn.Module):
     @classmethod
     def from_state_dict(cls, state: dict, **kw) -> "LPDFlow":
         """A network of the shape a saved state dict describes, loaded with it: the expert
-        count is read off the keys and the edges come with the buffer."""
+        count and the width are read off the keys and the edges come with the buffer.
+
+        The width has to be read, not assumed. It used to fall back to the constructor's
+        default of 96 while only the expert count was inferred, so a checkpoint trained at any
+        other width raised a shape mismatch here -- at RECONSTRUCTION, which is the last stage
+        of a run measured in days, and long after the training that would have to be repeated.
+        The reader's input projection has the width as its output dimension, and every network
+        that has ever been saved has one.
+        """
         n = len({k.split(".")[1] for k in state if k.startswith("experts.")})
+        w = state.get("reader.dual.inp.weight")
+        if w is not None:
+            kw.setdefault("width", int(w.shape[0]))
         net = cls(n_experts=max(n, 1), **kw)
         net.load_state_dict(state)
         return net

@@ -929,6 +929,14 @@ def main():
                     help="apply the endpoint data-fit term to draws with t at or above this "
                          "value; lower values give the curves more direct pull during the "
                          "rollout phase")
+    ap.add_argument("--width", type=int, default=96,
+                    help="width of the flow's data branch: the reader and the per-interval "
+                         "experts. LPDFlow's own default, never plumbed through before, so "
+                         "every run so far has trained the same size of network whatever else "
+                         "it varied. Capacity is close to free here -- a training step is "
+                         "dominated by the operator, which renders one body at a time in a "
+                         "Python loop over the batch, not by the network -- so this is the "
+                         "one axis that can be raised without paying for it in steps.")
     ap.add_argument("--experts", type=int, default=N_EXPERTS,
                     help="experts of the data part, one per interval of t. A run resumed "
                          "from a checkpoint with fewer experts branches: every new expert "
@@ -1031,7 +1039,7 @@ def main():
     if n_experts > a.experts:
         raise SystemExit(f"{ckpt_path} has {n_experts} experts; --experts {a.experts} cannot "
                          f"merge them. Delete it or pass --no-resume.")
-    net = LPDFlow(n_experts=n_experts).to(dev)
+    net = LPDFlow(width=a.width, n_experts=n_experts).to(dev)
     # The prior part and the codec come from scripts/train_prior.py and are frozen here: only
     # the data part trains. The codec is the prior's, so the two parts speak the same
     # whitened code; it travels with every checkpoint to reconstruction.
