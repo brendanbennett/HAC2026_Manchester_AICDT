@@ -837,6 +837,19 @@ def load_prior(net: LPDFlow, path: str, device: str) -> dict:
     return st["meta"]
 
 
+def _metrics_append(path: str, row: dict) -> None:
+    """One JSON object per line, appended and flushed. Append-only so a resumed run adds to
+    the same file, and flushed so a job killed at its wallclock still leaves a usable curve."""
+    if not path:
+        return
+    try:
+        Path(path).parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "a") as fh:
+            fh.write(json.dumps(row) + "\n")
+    except OSError:
+        pass            # a metrics file is never worth losing a training run over
+
+
 def load_instrument(path: str, device: str) -> Instrument:
     """The calibrated instrument, frozen: only the calibration fits it. Training and
     reconstruction refuse to run without one: the curves depend on it, and a default
@@ -937,6 +950,17 @@ def main():
                          "dominated by the operator, which renders one body at a time in a "
                          "Python loop over the batch, not by the network -- so this is the "
                          "one axis that can be raised without paying for it in steps.")
+    ap.add_argument("--metrics", default="runs/train_metrics.jsonl",
+                    help="JSONL file of per-step metrics, appended; \"\" disables it")
+    ap.add_argument("--cond-width", type=int, default=256,
+                    help="width of each expert's conditioning trunk")
+    ap.add_argument("--sphere-width", type=int, default=128,
+                    help="channels of each expert's sphere branch (the dh velocity)")
+    ap.add_argument("--vol-width", type=int, default=64,
+                    help="channels of each expert's volume branch (the g velocity, which is "
+                         "the only part that can make a body non-convex)")
+    ap.add_argument("--branch-blocks", type=int, default=4,
+                    help="residual blocks in each expert branch")
     ap.add_argument("--experts", type=int, default=N_EXPERTS,
                     help="experts of the data part, one per interval of t. A run resumed "
                          "from a checkpoint with fewer experts branches: every new expert "
@@ -1039,7 +1063,9 @@ def main():
     if n_experts > a.experts:
         raise SystemExit(f"{ckpt_path} has {n_experts} experts; --experts {a.experts} cannot "
                          f"merge them. Delete it or pass --no-resume.")
-    net = LPDFlow(width=a.width, n_experts=n_experts).to(dev)
+    net = LPDFlow(width=a.width, n_experts=n_experts, cond_width=a.cond_width,
+                  sphere_width=a.sphere_width, vol_width=a.vol_width,
+                  branch_blocks=a.branch_blocks).to(dev)
     # The prior part and the codec come from scripts/train_prior.py and are frozen here: only
     # the data part trains. The codec is the prior's, so the two parts speak the same
     # whitened code; it travels with every checkpoint to reconstruction.
@@ -1232,6 +1258,15 @@ def main():
         if (a.log_every and s % a.log_every == 0) or s == a.steps - 1:
             rate = (now - t_run) / (s - start_step + 1)
             seen = (s - start_step + 1) * a.batch
+            # A machine-readable copy beside the printed line. The text log is the record a
+            # person reads; this is the one a plot reads, and reconstructing a training curve
+            # by parsing prose is how a run ends up unexamined.
+            _metrics_append(a.metrics, {
+                "step": int(s), "loss": float(loss.detach()), "flow": float(parts.flow),
+                "occupancy": float(parts.occ), "data_fit": float(parts.fit),
+                "dropped": int(dropped), "seen": int(seen), "step_s": float(step_s),
+                "elapsed_s": float(elapsed), "lr": float(opt.param_groups[0]["lr"]),
+                "rolled": int(rolled) if a.rollout_frac > 0 else 0, "phase": "train"})
             print(f"  [{_now()}] step {s:>5}  loss {float(loss.detach()):.5f}  "
                   f"(flow {parts.flow:.5f}, occupancy {parts.occ:.5f}, "
                   f"data fit {parts.fit:.5f})  dropped {dropped}/{seen} bodies"
@@ -1260,6 +1295,12 @@ def main():
                   f"across-draw spread {diag.g_spread:.5f}; val flow {diag.flow:.5f}, "
                   f"occupancy {diag.occ:.5f}, data fit {diag.fit:.5f}, "
                   f"dropped {diag.dropped}/{n_val}", flush=True)
+            _metrics_append(a.metrics, {
+                "step": int(s), "val": float(vl), "val_flow": float(diag.flow),
+                "val_occupancy": float(diag.occ), "val_data_fit": float(diag.fit),
+                "val_dropped": int(diag.dropped), "n_val": int(n_val),
+                "g_mean": float(diag.g_mean), "g_ref": float(g_ref),
+                "g_spread": float(diag.g_spread), "phase": "val"})
             if vl < best - a.min_delta:
                 best, best_step, stale = vl, s, 0
                 best_state = ema.state(net)      # ship the weights that were scored

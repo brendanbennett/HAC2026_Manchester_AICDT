@@ -468,12 +468,13 @@ class PrimalNet(nn.Module):
     zero-initialised too.
     """
 
-    def __init__(self, summary_dim: int, cond_width: int = 256):
+    def __init__(self, summary_dim: int, cond_width: int = 256, sphere_width: int = 128,
+                 vol_width: int = 64, branch_blocks: int = 4):
         super().__init__()
         self.cond = nn.Sequential(nn.Linear(summary_dim + T_DIM + 1, cond_width), nn.SiLU(),
                                   nn.Linear(cond_width, cond_width))
-        self.sphere = SphereBranch(cond_width)
-        self.vol = VolBranch(cond_width)
+        self.sphere = SphereBranch(cond_width, width=sphere_width, blocks=branch_blocks)
+        self.vol = VolBranch(cond_width, width=vol_width, blocks=branch_blocks)
         self.gain = nn.Sequential(nn.Linear(T_DIM, 64), nn.SiLU(), nn.Linear(64, 2))
         nn.init.zeros_(self.gain[-1].weight); nn.init.zeros_(self.gain[-1].bias)
         self.step = nn.Sequential(nn.Linear(T_DIM + 2, 64), nn.SiLU(), nn.Linear(64, 2))
@@ -571,11 +572,16 @@ class LPDFlow(nn.Module):
     """
 
     def __init__(self, width: int = 96, n_modes: int = N_MODES, n_experts: int = N_EXPERTS,
-                 mode_feat: int = 16, edges=None):
+                 mode_feat: int = 16, edges=None, cond_width: int = 256,
+                 sphere_width: int = 128, vol_width: int = 64, branch_blocks: int = 4):
         super().__init__()
         self.prior = PriorNet()
         self.reader = Reader(width, n_modes, mode_feat)
-        self.experts = nn.ModuleList([PrimalNet(self.reader.summary_dim)
+        self.experts = nn.ModuleList([PrimalNet(self.reader.summary_dim,
+                                                cond_width=cond_width,
+                                                sphere_width=sphere_width,
+                                                vol_width=vol_width,
+                                                branch_blocks=branch_blocks)
                                       for _ in range(n_experts)])
         self.register_buffer("edges", self._edges(n_experts, edges))
         self.codec = CodeCodec()
@@ -597,6 +603,19 @@ class LPDFlow(nn.Module):
         w = state.get("reader.dual.inp.weight")
         if w is not None:
             kw.setdefault("width", int(w.shape[0]))
+        # The expert branches are sized independently of `width` and hold most of the
+        # parameters, so each of their sizes has to be read too. Inferring them here is what
+        # lets a run be made bigger without the checkpoint becoming unloadable.
+        for key, name in (("experts.0.cond.0.weight", "cond_width"),
+                          ("experts.0.sphere.inp.b", "sphere_width"),
+                          ("experts.0.vol.inp.bias", "vol_width")):
+            t = state.get(key)
+            if t is not None:
+                kw.setdefault(name, int(t.shape[0]))
+        blocks = {k.split(".")[4] for k in state
+                  if k.startswith("experts.0.vol.conv.") and k.split(".")[4].isdigit()}
+        if blocks:
+            kw.setdefault("branch_blocks", len(blocks))
         net = cls(n_experts=max(n, 1), **kw)
         net.load_state_dict(state)
         return net
