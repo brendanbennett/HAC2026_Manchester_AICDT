@@ -93,6 +93,12 @@ export UV_CACHE_DIR="$SCRATCH/cache/uv"   # named outright: uv's cache reached 3
                                           # in home on the first run, and it is the
                                           # Makefile's installer whenever uv is on PATH
 export HF_HOME="$SCRATCH/cache/huggingface"
+# The CUDA redistributables and the nvdiffrast build tree default to $HOME/.local, which is
+# shared by every checkout on this account. setup_toolchain.sh rebuilds in place whenever its
+# stamp disagrees -- rm -rf "$SRC/build" and a find -delete of the compiled .so -- so a second
+# run with a different TORCH_CUDA_ARCH_LIST would pull the extension out from under a job
+# already using it. Per-run, on scratch, and off the quota'd home.
+export PREFIX="$SCRATCH/local"
 # Only dataset/raw is symlinked, because `make data` runs fetch_data.py with no arguments
 # and its destination cannot be set from the environment. Everywhere a variable will do, an
 # absolute path is used instead: run_remote_pipeline.sh finds the shape models with
