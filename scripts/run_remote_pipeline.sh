@@ -224,8 +224,9 @@ stage_signature() {
       ;;
     decision)
       stage_signature flow-rollout | sed 's/^stage=flow-rollout$/stage=decision/'
-      printf 'RECON_SAMPLES=%s\nRECON_POLISH_STEPS=%s\nRECON_RES=%s\nSWEEP=%s\nSRC=%s\n' \
-        "$RECON_SAMPLES" "$RECON_POLISH_STEPS" "$RECON_RES" "$RECON_GUIDANCE_SWEEP" "$SRC_OUTPUT"
+      printf 'RECON_SAMPLES=%s\nRECON_POLISH_STEPS=%s\nRECON_RES=%s\nSWEEP=%s\nSIDE_POINTS=%s\nSRC=%s\n' \
+        "$RECON_SAMPLES" "$RECON_POLISH_STEPS" "$RECON_RES" "$RECON_GUIDANCE_SWEEP" \
+        "$MEDOID_SIDE_POINTS" "$SRC_OUTPUT"
       ;;
     convex)
       printf 'stage=convex\nDATA_DIR=%s\nCONVEX_CKPT=%s\nSRC=%s\nSRC_FWD=%s\n' \
@@ -570,14 +571,19 @@ fi
 # The flow's answers and the convex starts they came from, side by side: the flow has to
 # beat its start on the non-convex public body without losing on the near-convex ones, since
 # a carved-in dent that is not there costs as much as a missed one.
+# PYTHONPATH: the two scorers are the only entry points outside scripts/, and the scripts are
+# what put the repo root on sys.path -- _venv_setup.sh installs the dependencies by name and
+# not the package itself, so without this `import hac26` fails and the stage cannot start.
+# The two side-view runs need separate --out paths: they share one default, so the flow's run
+# would otherwise overwrite the convex baseline and leave only half the comparison on disk.
 if [ -d "$DATA_DIR" ]; then
-  run_stage score "" bash -c "
+  run_stage score "" env PYTHONPATH="$PWD${PYTHONPATH:+:$PYTHONPATH}" bash -c "
     echo '--- convex starts' &&
     $PY hac26/scoring/voxel.py --stl results/convex/Asteroid0{1,2,3}.stl --models 1 2 3 &&
-    $PY hac26/scoring/side_view.py --models 1 2 3 --recon-dir results/convex &&
+    $PY hac26/scoring/side_view.py --models 1 2 3 --recon-dir results/convex --out runs/side_view_convex.json &&
     echo '--- flow' &&
     $PY hac26/scoring/voxel.py --stl results/lpd/Asteroid0{1,2,3}.stl --models 1 2 3 &&
-    $PY hac26/scoring/side_view.py --models 1 2 3 --recon-dir results/lpd
+    $PY hac26/scoring/side_view.py --models 1 2 3 --recon-dir results/lpd --out runs/side_view_lpd.json
   "
 else
   log "=== score: skipped ($DATA_DIR not present)"
