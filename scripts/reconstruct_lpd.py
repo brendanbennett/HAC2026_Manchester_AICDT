@@ -57,7 +57,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from hac26.conventions import CYLINDER_R, PUBLIC_MODELS, psi_grid   # noqa: E402
 from hac26.data_io import N_CAMS, load_inversion_curves, public_stl    # noqa: E402
 from hac26.field import (CODE_DIM, DESIGN_N, EXTRACT_RES, N_DIR,   # noqa: E402
-                         N_SITES)
+                         N_NODES)
 from hac26.forward.mesh.exact import normalise                         # noqa: E402
 from hac26.forward.mesh.radiosity import RadiosityError                # noqa: E402
 from hac26.data_io import native_sigma                                 # noqa: E402
@@ -153,7 +153,7 @@ def make_resid_fn(net, op: CodeOperator, data, scale, geom_mask, M, cond, suppor
     `support` is the base h the code's dh block corrects. A draw whose body has no curves is
     masked out for this step.
     """
-    sph0, vol0 = cond
+    sph0, node0 = cond
     C = data.shape[0]
     geoms = torch.nonzero(geom_mask[0] > 0).flatten().tolist()
     gsel = torch.tensor(geoms)
@@ -176,7 +176,7 @@ def make_resid_fn(net, op: CodeOperator, data, scale, geom_mask, M, cond, suppor
         m = geom_mask.expand(B, -1) * live[:, None]
         feats = residual_features(data[None].expand(B, -1, -1, -1), pred,
                                   scale[None].expand(B, -1, -1), M, m)
-        return flow_inputs(feats, m, sph0, vol0, net.codec.pullback(z.detach(), adj))
+        return flow_inputs(feats, m, sph0, node0, net.codec.pullback(z.detach(), adj))
     return fn
 
 
@@ -495,7 +495,7 @@ def main():
                  support=np.asarray(support, dtype=np.float32),
                  radius=np.float32(R),
                  meta=json.dumps({"model": int(a.model), "code_dim": int(CODE_DIM),
-                                  "n_dir": int(N_DIR), "n_sites": int(N_SITES),
+                                  "n_dir": int(N_DIR), "n_nodes": int(N_NODES),
                                   "design_n": int(DESIGN_N), "samples": int(a.samples),
                                   "frame": "canonical; apply fit_to_cylinder(v, radius)"},
                                  sort_keys=True))

@@ -11,7 +11,7 @@ to make on a public body is
 
 on the core's normals, where h_true is the support of the released shape's convex hull, both
 in the canonical frame. Its band-limited part is what dh can express; the remainder is what
-no dh can fix and has to be carried by the lattice or accepted as error. Both are reported
+no dh can fix and has to be carried by the depths or accepted as error. Both are reported
 per model, as root mean squares over the normals. The corpus (scripts/build_corpus.py) is
 built the same way on synthetic bodies, so the sizes there should bracket the sizes here; if
 the public bodies need larger corrections than any corpus body, the corpus is too convex.

@@ -5,9 +5,9 @@
         --out results/map/Asteroid03.stl
 
 No flow, no training, no corpus. The convex stage's answer is the base support h; the code,
-the band-limited correction dh of that support and the lattice amplitudes g that carve, starts
-at zero, which is the convex body, and moves by gradient descent on the whitened misfit
-through the exact forward model, with a ridge on the amplitudes as the only prior.
+the band-limited correction dh of that support and the depths that carve, starts at zero,
+which is the convex body, and moves by gradient descent on the whitened misfit through the
+exact forward model, with a ridge on the depths as the only prior.
 
 A lightcurve misfit is not the score, and a body can fit the curves better while resembling
 the truth less, so the run measures both. --hold-out-geoms keeps cameras out of the fit and
@@ -123,9 +123,9 @@ def main() -> None:
                     help="first trial step, in RMS code units per coordinate; the line search "
                          "adapts it, so it is a starting scale and not a schedule")
     ap.add_argument("--l2", type=float, default=3e-3,
-                    help="ridge on the lattice amplitudes, the only prior: many amplitudes "
-                         "against few curves is not obviously determined, and the ridge "
-                         "stops the fit spending them on noise")
+                    help="ridge on the depths, the only prior: many coefficients against "
+                         "few curves is not obviously determined, and the ridge stops the fit "
+                         "spending them on noise")
     ap.add_argument("--phases", type=int, default=96)
     ap.add_argument("--operator-res", type=int, default=EXTRACT_RES,
                     help="extraction resolution of the descent's operator")

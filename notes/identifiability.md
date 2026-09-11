@@ -1,6 +1,6 @@
 # What the curves choose, and what chooses the hull
 
-`notes/representation.md` measures what the correction lattice can hold and `notes/photometry.md`
+`notes/representation.md` measures what the correction can hold and `notes/photometry.md`
 what the rig measures. This note records two questions that were put to the data directly, one
 answered and one answered against the hypothesis that prompted it.
 
@@ -8,7 +8,7 @@ answered and one answered against the hypothesis that prompted it.
 
 Body 3 was written in the fit's own coordinates -- the nine reshaping coefficients that carry
 the convex answer's hull onto the body's own hull, solved on points sampled from that hull,
-and the lattice amplitudes that carve the rest -- and the fit was started there. Curves are
+and the depths that carve the rest -- and the fit was started there. Curves are
 through the stand-in renderer described below, at 24 phases and 96 pixels over the 21 distinct
 geometries and both curve types; `chi` is their root mean square difference from the released
 Blender curves and `dice` the voxel overlap with the released shape at 128 cubed.

@@ -1,22 +1,34 @@
-"""The shape representation: a convex core plus a signed correction on a fixed lattice.
+"""The shape representation: a convex core displaced inward by a depth on the sphere.
 
-    f(y) = max_j (n_j . y - h_j) + q(y/|y|) + Delta(y),
-    Delta(y) = sum_k g_k exp(-||(y-p_k)/sigma||^2/2),   q(u) = sum_lm c_lm Ybar_lm(u)
+    f(y) = max_j (n_j . y - h_j) + q(u) + d(u),   u = (y - o) / |y - o|
+    q(u) = sum_{l <= 2} c_lm Ybar_lm(u),          d(u) = sum_k a_k psi_k(u)
 
 The body is where f < 0. The core is the intersection of half-spaces on fixed normals n_j
 with support values h_j, so on its own it is a convex polytope whose faces lie in the planes
-n_j . y = h_j. Delta is a sum of Gaussian bumps with signed amplitudes g_k on fixed sites p_k;
-it is the only part that can make the body non-convex. The convex stage that supplies h
-cannot see concavities and so gets the hull slightly wrong, and two corrections to it are
-available: dh, a band-limited correction to the support values themselves, and q, a
-degree-two field added to f, whose coefficients are displacements in body units. A caller
-uses one or the other.
+n_j . y = h_j. Everything that makes the body non-convex is a function of direction alone.
+
+Adding a function of direction to the core displaces its level set along the local surface
+normal by that amount, because on a facet the core's gradient has unit norm. So a coefficient
+of q or d is a depth in body units, and the surface the carve leaves is as sharp as the core's
+own facets: the field is smoothed across the surface, where the curves resolve little, and not
+along the normal, where a shadow edge lives.
+
+The direction is measured from a centre o rather than from the pose origin, and it indexes the
+surface point rather than its normal: the Gauss map of a polytope is not injective, since a
+whole facet shares one normal, while the radial map of a body star-shaped about its centre is.
+
+q and d are one function at two angular scales. q carries the degrees up to two -- which is the
+correction a convex inversion's hull needs, since it cannot see a concavity and explains the
+shadowing with shape -- and d carries the rest. A solver moves the single function coarse to
+fine in angular degree, so the hull correction is the first few degrees of the carve and not a
+separate object in a separate space.
 
 The max is a plain max, not a smooth one. Autodiff sends the gradient to the half-space that
 owns the surface at that point; a smooth maximum would pull every face inward.
 
-Delta is signed because a concavity removes material and a lobe adds it, and the same field
-must be able to do both.
+A depth may be negative, which pushes the surface outward. The bound that matters is one-sided
+and is `depth_cap`: below it the body still contains its centre, is star-shaped, and therefore
+extracts as one closed surface.
 
 Everything here lives in the canonical frame (the body's z extent is [-1, 1] and its xy
 radius is 1). Callers restore the published width afterwards with fit_to_cylinder; see
@@ -24,6 +36,7 @@ hac26/shapes.py::canonicalize_r.
 """
 from __future__ import annotations
 
+import hashlib
 from pathlib import Path
 
 import numpy as np
@@ -32,13 +45,13 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 __all__ = ["spherical_design", "design_sha", "DESIGN_N", "DESIGN_T", "DESIGN_ITERS",
-           "ConvexCore", "GaussianLattice", "ImplicitBody", "extract_mesh",
-           "apply_constraints", "LATTICE_SHAPE", "LATTICE_EXTENT", "LATTICE_ALPHA",
-           "EXTRACT_EXTENT", "EXTRACT_RES", "RADIAL_DEGREE", "N_RADIAL", "radial_basis",
-           "radial_field",
-           "lattice_kernel", "searchable_sites", "SEARCH_SHELL",
-           "N_SITES", "N_DIR", "CODE_DIM", "SH_DEGREE", "dir_design", "sh_expand",
-           "support_resample", "support_resample_weights"]
+           "ConvexCore", "DepthSphere", "ImplicitBody", "extract_mesh", "voxel_grid",
+           "apply_constraints", "EXTRACT_EXTENT", "EXTRACT_RES",
+           "RADIAL_DEGREE", "N_RADIAL", "radial_basis", "radial_field",
+           "node_design", "node_turn", "node_kernel", "depth_cap", "core_centre",
+           "N_NODES", "KNN", "NODE_BETA", "DEPTH_CAP_FRAC", "EVAL_CACHE_POINTS",
+           "N_DIR", "CODE_DIM", "SH_DEGREE", "dir_design", "sh_expand",
+           "support_resample", "support_resample_weights", "real_sh"]
 
 DESIGN_N = 4096        # number of core normals. More normals give smaller facets. This size
                        # needs the committed hac26/design4096.npy: building a design this
@@ -48,44 +61,44 @@ DESIGN_T = 10          # spherical design strength
 DESIGN_ITERS = 4000    # the only iteration count whose result is allowed into the cache
 CORE_CHUNK_ELEMS = 6e7 # cap on the (points x normals) intermediate, in float32 elements
 
-# ------------------------------------------------------------------- the correction
-#
-# Delta(y) = sum_k g_k exp(-||(y - p_k)/sigma||^2 / 2)   on a FIXED lattice of sites p_k.
-#
-# The sites are not learned and are not part of the code; the code is g. Amplitudes add where
-# kernels overlap, so several sites together can carve deeper than one.
-LATTICE_SHAPE = (24, 24, 24)      # sites per axis. What decides this is how sharp a surface
-                                  # the lattice can make, because the curves are far more
-                                  # sensitive to the sharpness of a carve than the voxel
-                                  # overlap is: a carve the lattice can only hold blurred
-                                  # fits the curves worse than no carve at all, however well
-                                  # it overlaps the body. notes/representation.md measures
-                                  # what each size can hold.
-N_SITES = 24 * 24 * 24
-LATTICE_EXTENT = 1.1              # half-width of the site box. The canonical pose puts every
-                                  # body inside [-1, 1]^3; the box is a little wider so that
-                                  # cell centres straddle the surface instead of sitting on it.
-LATTICE_ALPHA = 0.75              # sigma = LATTICE_ALPHA * spacing, per axis. Too small and
-                                  # the kernels stop overlapping, and a fit can punch a hole
-                                  # through a thin waist; too large and no combination of
-                                  # amplitudes makes a surface sharp enough to fit the curves.
-EXTRACT_EXTENT = 1.6              # half-width of the grid extract_mesh runs on, in the canonical
-                                  # frame. It has to cover the lattice plus its kernels;
-                                  # extract_mesh checks that.
-EXTRACT_RES = 96                  # side of that grid. It has to resolve the kernels, whose
-                                  # width is LATTICE_ALPHA times the site spacing, or the
-                                  # extraction is a coarser body than the one the amplitudes
-                                  # describe; extract_mesh reports the ratio.
-SEARCH_SHELL = 3.0                # how far outside the body a fit starts from a site may sit
-                                  # and still be worth a render, in kernel widths. Measured on
-                                  # the non-convex public body: at three the representational
-                                  # floor is unchanged and a little under half the lattice is
-                                  # searched, so a secant Jacobian costs a little under half
-                                  # the renders. See searchable_sites.
-LATTICE_CHUNK_ELEMS = 1.2e7       # cap on the (points x sites) intermediate. A small chunk is
-                                  # faster on a CPU and slower on a GPU, so GaussianLattice
-                                  # raises it on CUDA; the raised value is what has to fit
-                                  # beside the rest of a render on an eight-gigabyte card.
+# ------------------------------------------------------------------------ the depth field
+N_NODES = 2560        # directions the depth is carried on. It is where the family stops
+                      # improving faster than the extraction can show: a quarter of this count
+                      # already holds the released non-convex body better than the lattice of
+                      # thirteen thousand amplitudes this replaced, and four times it buys
+                      # little that a grid of EXTRACT_RES cubes can resolve.
+                      # notes/representation.md has the measurement. It is a multiple of four
+                      # because node_design is built to be invariant under a quarter turn about
+                      # the spin axis.
+KNN = 6               # nodes a direction reads. The weights are normalised over them, so they
+                      # are a partition of unity: a constant depth is reproduced exactly, the
+                      # field is bounded by the largest coefficient, and it cannot ring.
+NODE_BETA = 0.75      # kernel width over mean node spacing, sqrt(4 pi / N_NODES) radians.
+DEPTH_CAP_FRAC = 0.90 # deepest carve allowed, as a fraction of the smallest support value
+                      # about the centre. Above that bound the body stops containing its own
+                      # centre and stops being star-shaped, and the extraction then returns
+                      # several components; the margin is a margin and not a measurement.
+
+EXTRACT_EXTENT = 1.30             # half-width of the grid extract_mesh runs on, in the
+                                  # canonical frame. It has to cover the body, which the pose
+                                  # puts inside the unit cylinder, with room for a correction
+                                  # that pushes outward.
+EXTRACT_RES = 128                 # side of that grid. What sets it is that the extraction is
+                                  # what limits the answer once the field is fine enough, so it
+                                  # is raised until the field rather than the grid decides how
+                                  # sharp a carve can be. See notes/representation.md.
+EVAL_CACHE_POINTS = 2 * EXTRACT_RES ** 3
+                      # query points the field keeps work for, counting the same point once per
+                      # cached quantity. It is twice an extraction grid so that a run which
+                      # fits at one resolution and exports at another holds the whole of
+                      # whichever it is using; smaller than one grid and every chunk would
+                      # evict the chunk wanted next. What is held per point is the depth's six
+                      # neighbours and their weights, seventy-two bytes, and the core's own
+                      # value, four -- so the cap is a few hundred megabytes at the extraction
+                      # resolution, against seconds of neighbour search and a thousand million
+                      # comparisons against the core's normals on every render that would
+                      # otherwise be repeated.
+
 
 # ------------------------------------------------------------------- the support correction
 SH_DEGREE = 5                     # dh is band-limited to this spherical-harmonic degree. A
@@ -94,7 +107,7 @@ SH_DEGREE = 5                     # dh is band-limited to this spherical-harmoni
 N_DIR = 128                       # dh is carried as samples on this many design directions,
                                   # which is what SphereConv needs; the band limit is applied
                                   # by sh_expand() when dh is expanded onto the core normals.
-CODE_DIM = N_DIR + N_SITES
+CODE_DIM = N_DIR + N_NODES
 
 
 # ----------------------------------------------------------------- the fixed normals
@@ -237,6 +250,12 @@ class ConvexCore(nn.Module):
         super().__init__()
         self.register_buffer("n", torch.tensor(normals, dtype=torch.float32))
         self.raw_h = nn.Parameter(torch.zeros(len(normals)))
+        # The field of a fixed polytope at a fixed set of points. Through a fit of the carve the
+        # support does not move at all, and the extraction grid is one tensor, so this is the
+        # same array on every one of a fit's thousands of renders -- and recomputing it is the
+        # most expensive thing in a render, a maximum over every normal at every grid point.
+        self._field_cache: dict = {}
+        self._field_points = 0
 
     @property
     def h(self) -> torch.Tensor:
@@ -260,34 +279,93 @@ class ConvexCore(nn.Module):
         """
         n_norm = self.n.shape[0]
         hh = self.h if h is None else h
+        # A cached value is the value, not an approximation of it, but it is not a graph: a
+        # caller differentiating through the support has to have the maxima taken again.
+        live = torch.is_grad_enabled() and (hh.requires_grad or y.requires_grad)
+        key = None
+        if not live:
+            key = (y.data_ptr(), int(y.shape[0]), str(y.device),
+                   hashlib.sha1(hh.detach().cpu().numpy().tobytes()).hexdigest())
+            hit = self._field_cache.get(key)
+            if hit is not None:
+                return hit[1]
         if chunk is None:
             chunk = max(4096, int(CORE_CHUNK_ELEMS // max(n_norm, 1)))
         if y.shape[0] <= chunk:
-            return (y @ self.n.T - hh).amax(dim=-1)             # plain max, not LSE
-        return torch.cat([(y[i:i + chunk] @ self.n.T - hh).amax(dim=-1)
-                          for i in range(0, y.shape[0], chunk)], dim=0)
+            out = (y @ self.n.T - hh).amax(dim=-1)              # plain max, not LSE
+        else:
+            out = torch.cat([(y[i:i + chunk] @ self.n.T - hh).amax(dim=-1)
+                             for i in range(0, y.shape[0], chunk)], dim=0)
+        if key is not None:
+            # the points are kept with the values, so that the tensor cannot be freed while its
+            # address is a key and a later allocation cannot land on that address
+            self._field_cache[key] = (y, out)
+            self._field_points += int(y.shape[0])
+            while self._field_points > EVAL_CACHE_POINTS and len(self._field_cache) > 1:
+                old = next(iter(self._field_cache))
+                self._field_points -= int(self._field_cache.pop(old)[0].shape[0])
+        return out
 
 
-def _grid_lattice(shape=LATTICE_SHAPE, extent: float = LATTICE_EXTENT):
-    """Cell centres of an axis-aligned grid over [-extent, extent]^3, and the spacing per
-    axis."""
-    axes, spacing = [], []
-    for n_ax in shape:
-        step = 2.0 * extent / n_ax
-        axes.append(-extent + (np.arange(n_ax) + 0.5) * step)
-        spacing.append(step)
-    grid = np.stack(np.meshgrid(*axes, indexing="ij"), -1).reshape(-1, 3)
-    return grid.astype(np.float32), np.asarray(spacing, dtype=np.float32)
+def node_design(n: int = N_NODES) -> np.ndarray:
+    """n quasi-uniform directions on the sphere, invariant under a quarter turn about z.
+
+    A quarter turn about the spin axis is an exact symmetry of the problem, and it is what
+    gives the corpus four training pairs per body at no cost in renders. That is only true if
+    turning a body permutes its depths: if the node set is not itself invariant, a turn has to
+    resample the field instead, and resampling smooths it. Measured on the released non-convex
+    body, the resampled code differs from a fit of the turned body by twelve per cent of the
+    depths in the root mean square -- five times the fit's own residual -- so the corpus would
+    be taught codes that no fit of those bodies would produce.
+
+    The set is therefore a quarter of the sphere's worth of directions and its three rotations,
+    so the turn is the block shift node_turn. The quarter carries a Fibonacci spiral of its
+    own: latitudes evenly spaced in cos, azimuths advancing by the golden ratio *of the
+    quadrant*. That last part is what keeps it uniform. Advancing by the whole sphere's golden
+    angle and folding it into the quadrant leaves consecutive latitudes near the poles at
+    nearly the same azimuth, and the closest pair of nodes comes out at half the spacing of a
+    plain spiral; taking the golden ratio inside the quadrant instead gives nearest-neighbour
+    spacings as good as a plain spiral's at every quantile, and a slightly better worst case
+    over six neighbours, which is the number the weights read.
+
+    Quasi-uniform rather than a subdivided icosahedron because the count is then free: the node
+    count is a resolution and wants to be chosen by what the curves resolve, not by whatever a
+    subdivision level happens to give.
+    """
+    n = int(n)
+    if n % 4:
+        raise ValueError(f"{n} directions cannot be invariant under a quarter turn; the count "
+                         f"must be a multiple of four")
+    m = n // 4
+    i = np.arange(m) + 0.5
+    polar = np.arccos(1.0 - 2.0 * i / m)
+    azim = (0.5 * np.pi * (5.0 ** 0.5 - 1.0) / 2.0 * i) % (0.5 * np.pi)
+    return np.concatenate([np.stack([np.cos(azim + q * 0.5 * np.pi) * np.sin(polar),
+                                     np.sin(azim + q * 0.5 * np.pi) * np.sin(polar),
+                                     np.cos(polar)], axis=1) for q in range(4)], axis=0)
 
 
-# ----------------------------------------------------------- the band-limited dh basis
+def node_turn(q: int, n: int = N_NODES) -> np.ndarray:
+    """The permutation of the nodes made by turning a body q quarter turns about the spin axis:
+    index k of the turned field reads index node_turn(q)[k] of the unturned one.
+
+    The value a turned body has in direction u is the value the body has in direction R^T u, so
+    this is the permutation with u[node_turn(q)] = R^T u. It is a shift of whole blocks, because
+    node_design lays the four rotations out one after another. Exact, which is the whole reason
+    the node set is built the way it is: a turned body's depths are the same numbers in a
+    different order, so the symmetry costs nothing and introduces nothing."""
+    n = int(n)
+    if n % 4:
+        raise ValueError(f"{n} directions are not invariant under a quarter turn")
+    return np.roll(np.arange(n), int(q) * (n // 4))
+
 
 def dir_design(n: int = N_DIR) -> np.ndarray:
     """The directions dh is sampled on: a spherical design of n points."""
     return spherical_design(n)
 
 
-def _real_sh(x: np.ndarray, degree: int = SH_DEGREE) -> np.ndarray:
+def real_sh(x: np.ndarray, degree: int = SH_DEGREE) -> np.ndarray:
     """Real spherical harmonics up to `degree` at the unit vectors x, without normalisation.
 
     The basis is only used through a pseudo-inverse, which does not care how the columns are
@@ -337,10 +415,13 @@ def radial_basis(u: torch.Tensor) -> torch.Tensor:
 
 
 def radial_field(y: torch.Tensor, c: torch.Tensor) -> torch.Tensor:
-    """sum_lm c_lm Ybar_lm(y / |y|) at the points y (n, 3).
+    """sum_lm c_lm Ybar_lm(y / |y|) at the points y (n, 3), which the caller has already made
+    relative to the body's centre.
 
-    The direction of a point is undefined at the origin, which is inside every body the
-    challenge poses and never on a level set, so it is guarded and not special-cased.
+    This is the degree-two part of the same depth field DepthSphere carries the rest of, so it
+    is measured from the same centre and in the same units. The direction of a point is
+    undefined at the origin, which is inside every body the challenge poses and never on a
+    level set, so it is guarded and not special-cased.
     """
     return radial_basis(y) @ c
 
@@ -390,102 +471,194 @@ def sh_expand(src: np.ndarray, dst: np.ndarray, degree: int = SH_DEGREE) -> np.n
     limit: whatever is emitted on `src`, only its part of degree <= `degree` reaches h. So
     the band limit is built in rather than encouraged by a penalty.
     """
-    y_src, y_dst = _real_sh(src, degree), _real_sh(dst, degree)
+    y_src, y_dst = real_sh(src, degree), real_sh(dst, degree)
     return (y_dst @ np.linalg.pinv(y_src)).astype(np.float32)
 
 
 # ----------------------------------------------------------------- the correction field
 
-class GaussianLattice(nn.Module):
-    """Delta(y) = sum_k g_k exp(-||(y - p_k)/sigma||^2 / 2), sites fixed, g learned.
+class DepthSphere(nn.Module):
+    """d(u) = sum_k a_k psi_k(u), a depth on the sphere carried on N_NODES directions.
 
-    `g` is the only parameter and is the code: no latent vector, no learned positions, no
-    shared decoder. Amplitudes add where the kernels overlap.
+    psi_k is a Gaussian in the angle to node k, normalised over the KNN nearest nodes of the
+    query direction. The weights of a direction therefore sum to one, which is what makes a
+    coefficient a depth rather than an amplitude: d reproduces a constant exactly, is bounded
+    by the largest coefficient, and cannot overshoot between nodes.
 
-    Delta is signed and is not made zero-mean. Subtracting a mean over the points of one call
-    would make the field depend on how the points are batched; any overall offset belongs
-    to h.
+    `a` is the only parameter and it is the code. The nodes are fixed and are not part of it.
+
+    The weights depend on the query direction alone, so for a fixed set of query points they
+    are a fixed sparse gather with KNN non-zeros per row, built once and reused. A field
+    evaluation is then one sparse product, and it is linear in `a`, so a caller may
+    differentiate through it.
     """
 
-    def __init__(self, shape=LATTICE_SHAPE, extent: float = LATTICE_EXTENT,
-                 alpha: float = LATTICE_ALPHA):
+    def __init__(self, n_nodes: int = N_NODES, knn: int = KNN, beta: float = NODE_BETA,
+                 nodes: np.ndarray | None = None):
         super().__init__()
-        sites, spacing = _grid_lattice(shape, extent)
-        # persistent=False: these follow from the constants above and are the same for every
-        # body, so a checkpoint must not carry its own copy.
-        self.register_buffer("p", torch.from_numpy(sites), persistent=False)
-        self.register_buffer("inv2", torch.from_numpy(
-            (1.0 / (alpha * spacing) ** 2).astype(np.float32)), persistent=False)
-        self.register_buffer("pb", (self.p ** 2 * self.inv2).sum(1), persistent=False)
-        self.g = nn.Parameter(torch.zeros(len(sites)))
+        u = node_design(n_nodes) if nodes is None else np.asarray(nodes, dtype=float)
+        # persistent=False: the nodes follow from the constants above and are the same for
+        # every body, so a checkpoint must not carry its own copy.
+        self.register_buffer("u", torch.tensor(u, dtype=torch.float32), persistent=False)
+        self.knn = int(knn)
+        self.sigma = float(beta) * float(np.sqrt(4.0 * np.pi / len(u)))
+        self.a = nn.Parameter(torch.zeros(len(u)))
+        self._tree = None
+        # The weights of a query direction depend on the direction alone, so for a fixed set
+        # of points they are a fixed gather. The extraction grid is fixed and is the set this
+        # is asked for millions of points at a time, so it is cached on the identity of the
+        # tensor holding those points; a rebuilt search costs seconds and a cached one costs
+        # a hundredth of that.
+        self._gather_cache: dict = {}
+        self._gather_points = 0
 
-    def forward(self, y: torch.Tensor, chunk: int | None = None,
-                g: torch.Tensor | None = None) -> torch.Tensor:
-        """Delta at the points y. `g` may be supplied to override the stored amplitudes, so a
-        caller can differentiate through amplitudes it holds itself.
+    @property
+    def n_nodes(self) -> int:
+        return self.u.shape[0]
 
-        The squared distances are expanded so the cross term is one matrix product:
+    def _kdtree(self):
+        if self._tree is None:
+            from scipy.spatial import cKDTree
+            self._tree = cKDTree(self.u.detach().cpu().numpy())
+        return self._tree
 
-            ||(y - p)/s||^2 = sum_d y_d^2/s_d^2 + sum_d p_d^2/s_d^2 - 2 (y/s^2).p
+    def weights(self, direction: np.ndarray):
+        """(index, weight) of shape (n, KNN): the nodes each direction reads and by how much."""
+        d = np.asarray(direction, dtype=float)
+        d = d / np.maximum(np.linalg.norm(d, axis=1, keepdims=True), 1e-12)
+        chord, idx = self._kdtree().query(d, k=self.knn)
+        if self.knn == 1:
+            chord, idx = chord[:, None], idx[:, None]
+        angle = 2.0 * np.arcsin(np.clip(0.5 * chord, 0.0, 1.0))
+        w = np.exp(-0.5 * (angle / self.sigma) ** 2)
+        w /= np.maximum(w.sum(axis=1, keepdims=True), 1e-30)
+        return idx, w
 
-        which avoids a (points x sites x 3) intermediate.
+    def gather(self, y: torch.Tensor, centre: torch.Tensor | None = None) -> tuple:
+        """(index, weight) as torch tensors for the directions of the points y about `centre`,
+        ready to be applied to the coefficients. The centre has no direction from itself; it
+        is inside every body the challenge poses and never on a level set, so it is guarded
+        rather than special-cased.
+
+        Cached on the identity of the points and the value of the centre, which is what makes
+        an extraction affordable: the grid is the same tensor every call and its neighbour
+        search is built once. The points are keyed *before* the centre is subtracted, because
+        subtracting it allocates a new tensor and a key on that would never hit, and the entry
+        holds the points as well as the weights, so the address a key names stays taken.
         """
-        gg = self.g if g is None else g
-        if chunk is None:
-            elems = LATTICE_CHUNK_ELEMS * (8.0 if y.is_cuda else 1.0)
-            chunk = max(1024, int(elems // max(len(self.p), 1)))
-        out = []
-        for i in range(0, y.shape[0], chunk):
-            q = y[i:i + chunk]
-            d2 = (q ** 2 * self.inv2).sum(1, keepdim=True) \
-                + self.pb[None] - 2.0 * ((q * self.inv2) @ self.p.T)
-            out.append(torch.exp(-0.5 * d2.clamp_min(0.0)) @ gg)
-        return torch.cat(out) if len(out) > 1 else out[0]
+        c = None if centre is None else centre.detach().cpu().numpy().tobytes()
+        key = (y.data_ptr(), int(y.shape[0]), str(y.device), c)
+        hit = self._gather_cache.get(key)
+        if hit is not None:
+            return hit[1:]
+        d = y.detach().cpu().numpy()
+        if centre is not None:
+            d = d - centre.detach().cpu().numpy().reshape(1, 3)
+        idx, w = self.weights(d)
+        dev = y.device
+        out = (torch.as_tensor(idx, dtype=torch.long, device=dev),
+               torch.as_tensor(w, dtype=torch.float32, device=dev))
+        # y itself is kept, so that the tensor cannot be freed while its address is a key and a
+        # later allocation of the same shape cannot land on that address and read this entry
+        self._gather_cache[key] = (y,) + out
+        self._gather_points += int(y.shape[0])
+        # oldest first, so that a run which changes resolution gives up the grid it has
+        # finished with rather than the one it is working on
+        while self._gather_points > EVAL_CACHE_POINTS and len(self._gather_cache) > 1:
+            old = next(iter(self._gather_cache))
+            self._gather_points -= int(self._gather_cache.pop(old)[0].shape[0])
+        return out
+
+    def forward(self, y: torch.Tensor, a: torch.Tensor | None = None,
+                gather: tuple | None = None,
+                centre: torch.Tensor | None = None) -> torch.Tensor:
+        """d at the directions of the points y about `centre`. `a` may be supplied to override
+        the stored coefficients, and `gather` to reuse weights already built for them."""
+        aa = self.a if a is None else a
+        idx, w = self.gather(y, centre) if gather is None else gather
+        return (aa[idx] * w).sum(dim=1)
+
+    def matrix(self, direction: np.ndarray):
+        """The sparse (n, n_nodes) evaluation matrix for a set of directions."""
+        from scipy import sparse
+        idx, w = self.weights(direction)
+        rows = np.repeat(np.arange(len(idx)), self.knn)
+        return sparse.csr_matrix((w.ravel().astype(np.float32), (rows, idx.ravel())),
+                                 shape=(len(idx), self.n_nodes))
 
 
-def lattice_kernel(shape=LATTICE_SHAPE, extent: float = LATTICE_EXTENT,
-                   alpha: float = LATTICE_ALPHA, cut: float = 4.0):
-    """The kernels of one lattice evaluated at the lattice's own sites, sparse.
+def node_kernel(n_nodes: int = N_NODES, knn: int = KNN, beta: float = NODE_BETA):
+    """What the coefficients make at the nodes themselves, as a sparse matrix.
 
-    K[j, k] = phi_k(p_j), so K g is the field the amplitudes g make at the sites. It is what
-    turns a requested carve depth into amplitudes and back, and a solver uses it to say what
-    a coordinate is worth before spending a render on it.
-
-    A kernel is dropped beyond `cut` standard deviations, where it is 3e-4 of its peak. The
-    sites are a regular grid, so the neighbours within that radius are an index box and are
-    found by arithmetic rather than by a search, which is what keeps this affordable when the
-    lattice has more than ten thousand sites.
+    It is nearly the identity, and that is the point: a coefficient is the depth at its own
+    node to within the smoothing over its neighbours. A solver uses it to know what a
+    coordinate is worth without spending a render on it, and because its rows sum to one a
+    bound on the coefficients is a bound on the depth in body units.
     """
-    from scipy import sparse
+    rep = DepthSphere(n_nodes, knn, beta)
+    return rep.matrix(rep.u.numpy())
 
-    sites, spacing = _grid_lattice(shape, extent)
-    sig = alpha * spacing                                       # (3,)
-    n = np.asarray(shape, dtype=np.int64)
-    half = np.ceil(cut * sig / spacing).astype(np.int64)
-    idx = np.stack(np.meshgrid(*[np.arange(s) for s in shape], indexing="ij"), -1)
-    idx = idx.reshape(-1, 3)
-    rows, cols, vals = [], [], []
-    box = np.stack(np.meshgrid(*[np.arange(-h, h + 1) for h in half], indexing="ij"), -1)
-    for d in box.reshape(-1, 3):
-        j = idx + d
-        ok = np.all((j >= 0) & (j < n), axis=1)
-        if not ok.any():
-            continue
-        v = np.exp(-0.5 * (((d * spacing) / sig) ** 2).sum())
-        if v < np.exp(-0.5 * cut ** 2):
-            continue
-        flat = j[ok, 0] * shape[1] * shape[2] + j[ok, 1] * shape[2] + j[ok, 2]
-        rows.append(np.nonzero(ok)[0])
-        cols.append(flat)
-        vals.append(np.full(int(ok.sum()), v))
-    m = int(np.prod(shape))
-    return sparse.csr_matrix((np.concatenate(vals), (np.concatenate(rows),
-                                                     np.concatenate(cols))), shape=(m, m))
+
+def core_centre(support, normals: np.ndarray | None = None) -> np.ndarray:
+    """The Steiner point of the convex core at this support: 3/(4 pi) times the integral of
+    h(u) u over the sphere, taken as the mean over the design directions.
+
+    The depth is a displacement measured along a ray, so it needs a point to measure from, and
+    that point has to be a function of the support alone: the support is what every stage of the
+    pipeline carries beside a code, and a centre stored separately would be a second thing to
+    keep in step. It is not the pose origin. Measured on the library's deeply carved bodies, the
+    best a body star-shaped about the pose origin can do against the truth is three points of
+    overlap below the best about a centre inside the body in the median and twelve points below
+    it in the worst case, because the pose puts the origin where the published constraints put
+    it and not where the body is.
+
+    The Steiner point is the canonical centre of a convex body: it lies in the interior, it
+    moves with the body (for h(u) = h0(u) + o . u with h0 even it returns o exactly), and it
+    costs one product against the normals. Three candidates were compared on the released
+    bodies, on how much of each body a shape star-shaped about the point can cover: this one,
+    the volume centroid, and the Chebyshev centre, which is by construction the point with the
+    most room to carve. On the one released body that is substantially non-convex they span two
+    thousandths and this one is the best of the three; the Chebyshev centre is the worst on both
+    bodies that are not already their own hulls, which is what its own definition predicts, since
+    maximising the room to carve puts the point inside the fattest lobe rather than where it can
+    see the whole body.
+
+    What decides between this and the volume centroid is not the two thousandths but the cost
+    and what happens when it is wrong. The centroid needs the polytope recovered from its four
+    thousand half-spaces, which is a hundred times slower and can be refused outright for a
+    degenerate support -- and a support decoded by a partly trained network in a training loop
+    is sometimes degenerate. This is a product and a mean, and there is no support it cannot
+    take.
+    """
+    h = np.asarray(support, dtype=np.float64).ravel()
+    n = spherical_design(DESIGN_N) if normals is None else np.asarray(normals, dtype=float)
+    return 3.0 * (h[:, None] * n).mean(axis=0)
+
+
+def depth_cap(support, centre=None, fraction: float = DEPTH_CAP_FRAC,
+              normals: np.ndarray | None = None) -> float:
+    """The deepest carve that leaves the body star-shaped about its centre.
+
+    Along a ray from the centre the core is a maximum of affine functions, so it is convex,
+    tends to infinity at both ends, and equals minus the smallest support value at the centre.
+    The set where the field is negative is therefore one interval, and it contains the centre
+    exactly while the depth stays below that smallest support value. Under that one-sided
+    bound the body is star-shaped, hence connected, hence the single closed surface
+    scripts/check_submission.py requires -- by construction rather than by repair.
+
+    The bound is one-sided. A depth may be as negative as it likes; that pushes the surface
+    outward and cannot disconnect it.
+    """
+    h = np.asarray(support, dtype=float).ravel()
+    n = spherical_design(DESIGN_N) if normals is None else np.asarray(normals, dtype=float)
+    o = core_centre(h, n) if centre is None else np.asarray(centre, dtype=float).ravel()
+    return float(fraction) * float((h - n @ o).min())
 
 
 class ImplicitBody(nn.Module):
-    """f(y) = max_j (n_j . y - h_j) + q(y/|y|) + Delta(y), with
-    h = softplus(inv_softplus(h_base) + expand(dh)) and q the radial reshaping term.
+    """f(y) = max_j (n_j . y - h_j) + q(u) + d(u), with u the direction of y from the body's
+    centre, h = softplus(inv_softplus(h_base) + expand(dh)), q the degree-two reshaping and d
+    the depth field.
 
     h_base is the support the body starts from: the hull support of a training body, or the
     convex stage's answer at reconstruction. dh is a band-limited correction to it, sampled on
@@ -496,31 +669,46 @@ class ImplicitBody(nn.Module):
     its own hull because it shadows itself, and a convex inversion explains that darkness with
     shape, so h_base is wrong in a direction that favours a convex answer.
 
-    The band limit is exact on the argument of the softplus and only approximate on h itself,
-    because the slope of softplus varies across normals.
+    q and d are the same object at different angular scales, and writing them that way is what
+    dissolves the problem this repository spent a long time fighting. The correction from a
+    convex inversion's answer to the body used to be two things -- a reshaping of the hull and
+    a carve -- that had to move together and that no search could move together, because they
+    lived in different spaces. They are now one function on the sphere: q carries its degrees
+    up to two and d the rest. A solver moves it coarse to fine in angular degree, and the hull
+    correction is simply the first few degrees of the carve.
 
-    q is the same correction written differently, and a caller uses one or the other. It is
-    the degree-two part alone, added to the field rather than inside the softplus, so a
-    coefficient is a displacement in body units and the reshaping enters linearly. What the
-    convex stage gets wrong about the hull of a non-convex body is almost all of degree two,
-    and a fit that must move the hull and carve it in the same step needs the reshaping in as
-    few coordinates as it can be written in.
+    The centre the direction is measured from is a buffer, not a parameter. It is set beside
+    the support and is never moved by a fit: the star-shaped bound of `depth_cap` is a
+    statement about a fixed centre, and a body carved deeply is much better behaved about its
+    own centroid than about the pose origin.
     """
 
-    def __init__(self, normals: np.ndarray | None = None, lattice_shape=LATTICE_SHAPE):
+    def __init__(self, normals: np.ndarray | None = None, n_nodes: int = N_NODES):
         super().__init__()
         if normals is None:
             normals = spherical_design(DESIGN_N)
         self.core = ConvexCore(normals)
-        self.delta = GaussianLattice(shape=lattice_shape)
+        self.delta = DepthSphere(n_nodes)
         self.dh = nn.Parameter(torch.zeros(N_DIR))
+        self.register_buffer("centre", torch.zeros(3), persistent=False)
         self.register_buffer("dh_expand",
                              torch.from_numpy(sh_expand(dir_design(N_DIR), normals)),
                              persistent=False)
 
-    def set_support(self, h) -> None:
-        """Set the base support h_base, the origin dh is measured from."""
+    def set_support(self, h, centre=None) -> None:
+        """Set the base support h_base, which is the origin dh is measured from, and with it the
+        centre the depth's directions are measured from.
+
+        The centre follows from the support unless one is given, so a caller cannot leave it at
+        the pose origin by forgetting it. core_centre keeps what it derives, and the support is
+        the same through a fit, so the derivation is paid once however many times this is
+        called.
+        """
         self.core.set_support(h)
+        o = core_centre(h.detach().cpu().numpy() if torch.is_tensor(h) else h,
+                        self.core.n.detach().cpu().numpy()) if centre is None else centre
+        with torch.no_grad():
+            self.centre.copy_(torch.as_tensor(np.asarray(o, dtype=np.float32).ravel()))
 
     def support(self, dh: torch.Tensor | None = None) -> torch.Tensor:
         """The support actually used: softplus(raw_h + expand(dh)), with `dh` overriding the
@@ -530,66 +718,64 @@ class ImplicitBody(nn.Module):
         return F.softplus(self.core.raw_h + self.dh_expand @ d)
 
     def forward(self, y: torch.Tensor, dh: torch.Tensor | None = None,
-                g: torch.Tensor | None = None, c: torch.Tensor | None = None) -> torch.Tensor:
-        """f at the points y. `dh`, `g` and `c` override the stored code when given, so a
-        caller can differentiate f through parameters it holds itself. `c` is the radial
-        reshaping term and is absent unless it is passed."""
-        f = self.core(y, h=self.support(dh)) + self.delta(y, g=g)
-        return f if c is None else f + radial_field(y, c)
+                a: torch.Tensor | None = None, c: torch.Tensor | None = None,
+                gather: tuple | None = None) -> torch.Tensor:
+        """f at the points y. `dh`, `a` and `c` override the stored code when given, so a caller
+        can differentiate f through parameters it holds itself. `a` is the depth field's
+        coefficients and `c` the degree-two reshaping, which is absent unless it is passed.
+        `gather` reuses depth weights already built for these points."""
+        f = self.core(y, h=self.support(dh)) + self.delta(y, a=a, gather=gather,
+                                                          centre=self.centre)
+        return f if c is None else f + radial_field(y - self.centre, c)
 
 
 # ----------------------------------------------------------------- extraction
 
 _GRID_CACHE: dict = {}
-_REACH = None
 
 
-def _voxel_grid(res: int, device):
-    """FlexiCubes plus its voxel grid, cached per (res, device). Building the grid is slow and
-    depends on nothing else."""
+def voxel_grid(fc, res: int, device):
+    """The (res+1)^3 grid vertices on [-1/2, 1/2]^3 and the eight vertex indices of each of the
+    res^3 cubes, in FlexiCubes' own ordering.
+
+    The same thing FlexiCubes.construct_voxel_grid returns, built arithmetically instead of by
+    deduplicating the corners of every cube separately. That deduplication sorts eight times as
+    many points as the grid has, which at the extraction resolution is seventeen million rows of
+    three and several gigabytes, and it is the largest allocation anything here makes. The
+    vertices it produces come out in lexicographic order, which is the order a meshgrid gives,
+    so a cube's corner is the grid index of its own corner offset and no sort is needed. The
+    suite checks the two constructions against each other.
+    """
+    a = torch.arange(res + 1, device=device, dtype=torch.float32) / res
+    verts = torch.stack(torch.meshgrid(a, a, a, indexing="ij"), -1).reshape(-1, 3) - 0.5
+    c = fc.cube_corners.to(device).long()
+    off = (c[:, 0] * (res + 1) + c[:, 1]) * (res + 1) + c[:, 2]            # (8,)
+    i = torch.arange(res, device=device)
+    gi, gj, gk = torch.meshgrid(i, i, i, indexing="ij")
+    base = ((gi * (res + 1) + gj) * (res + 1) + gk).reshape(-1, 1)
+    return verts, base + off[None, :]
+
+
+def _voxel_grid(res: int, device, extent: float):
+    """FlexiCubes plus its voxel grid at the extraction's own scale, cached per
+    (res, device, extent).
+
+    The scale is in the key, and the scaled grid is what is cached, because the identity of
+    that tensor is what lets the depth field and the convex core reuse the work they did for it.
+    A grid rescaled on every call is a new tensor every call, and the neighbour search and the
+    core's own field would both be rebuilt two million points at a time.
+    """
     from .vendor.flexicubes import FlexiCubes
 
-    key = (int(res), str(device))
+    key = (int(res), str(device), round(float(extent), 9))
     if key not in _GRID_CACHE:
         fc = FlexiCubes(device=device)
-        _GRID_CACHE[key] = (fc,) + tuple(fc.construct_voxel_grid(res))
+        x, cube = voxel_grid(fc, int(res), device)
+        _GRID_CACHE[key] = (fc, x * (2.0 * float(extent)), cube)
     return _GRID_CACHE[key]
 
 
-def searchable_sites(support, shell: float = SEARCH_SHELL) -> np.ndarray:
-    """Boolean over the lattice sites: those a fit's search may spend a render on.
-
-    A secant Jacobian costs one render per coordinate, so a coordinate that cannot move the
-    surface is a render thrown away. What cannot move it is the outside: a site far beyond the
-    body the fit starts from carries a kernel that is below a hundredth of its peak anywhere
-    the surface can reach, and rather more than half the lattice of a body of this size lies
-    there, in the corners of the box.
-
-    The band is one-sided and that is not a detail. The sites a carve needs run from the
-    starting surface all the way inward -- the non-convex public body's surface lies seven
-    kernel widths inside its convex answer -- so a band *about* the surface throws away the
-    carve itself and costs the representation most of what it can hold. Everything inside the
-    start, plus a shell outside it, keeps the whole of it.
-
-    `support` is the support function of the body the fit starts from, on the core's normals,
-    so the test is the sign of that body's own core field at each site.
-    """
-    n = spherical_design(DESIGN_N)
-    h = np.asarray(support, dtype=np.float64).ravel()
-    sites, spacing = _grid_lattice(LATTICE_SHAPE, LATTICE_EXTENT)
-    core = (sites.astype(np.float64) @ n.T - h[None, :]).max(axis=1)
-    return core < shell * LATTICE_ALPHA * float(spacing.min())
-
-
-def kernel_pitch_ratio(res: int, extent: float = EXTRACT_EXTENT) -> float:
-    """Kernel width over grid pitch of an extraction. Below one the grid does not resolve the
-    correction's own kernels and the extracted body is coarser than the amplitudes describe;
-    the operator's default resolution keeps it at about two."""
-    sigma = LATTICE_ALPHA * 2.0 * LATTICE_EXTENT / max(LATTICE_SHAPE)
-    return sigma / (2.0 * extent / res)
-
-
-def extract_mesh(field, extent: float, res: int = EXTRACT_RES, device: str = "cpu",
+def extract_mesh(field, extent: float = EXTRACT_EXTENT, res: int = EXTRACT_RES, device: str = "cpu",
                  chunk: int = 262144, grad: bool = False):
     """The surface f = 0 as a triangle mesh, by FlexiCubes on a res^3 grid over
     [-extent, extent]^3.
@@ -599,20 +785,12 @@ def extract_mesh(field, extent: float, res: int = EXTRACT_RES, device: str = "cp
     that computes `field` from tensors it holds can differentiate the mesh with respect to
     them; the faces are then a torch long tensor.
 
-    `extent` must cover the lattice and its kernels; otherwise sites near the edge of the box
-    shape a surface the grid never sees.
+    `extent` must cover the body. The pose puts every body inside the unit cylinder, and the
+    correction can push the surface outward, so the default leaves room for that; a caller
+    that passes less gets a body clipped by the grid rather than an error, which is why the
+    default is a constant of the module and not an argument anyone should be choosing.
     """
-    global _REACH
-    if _REACH is None:
-        _REACH = LATTICE_EXTENT + 3.0 / float(GaussianLattice().inv2.min().sqrt())
-    reach = _REACH
-    if extent < reach - 1e-6:
-        raise ValueError(
-            f"extract_mesh extent {extent:.3f} does not cover the correction lattice, which "
-            f"reaches {reach:.3f} (LATTICE_EXTENT {LATTICE_EXTENT} plus 3 sigma). Sites "
-            f"outside the grid shape a surface the extraction cannot see.")
-    fc, x_nx3, cube_fx8 = _voxel_grid(res, device)
-    x_nx3 = x_nx3 * (2.0 * extent)                       # grid spans [-extent, extent]
+    fc, x_nx3, cube_fx8 = _voxel_grid(res, device, extent)
     with torch.set_grad_enabled(grad):
         sdf = torch.cat([field(x_nx3[i:i + chunk]) for i in range(0, len(x_nx3), chunk)])
         verts, faces, _ = fc(x_nx3, sdf, cube_fx8, res, training=False)

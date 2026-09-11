@@ -9,17 +9,20 @@ inversion of a non-convex body returns the convex body whose own shadowing best 
 concavities, which is larger. Of the three public bodies the answer exceeds the body's own
 hull on the one that has concavities and falls short of it on the two that do not, which is
 the mechanism and not a bias of the network. The fit therefore does not treat h as fixed and
-does not treat the hull as something to be corrected before carving. It moves nine
-coefficients that reshape h and the lattice amplitudes that carve it in one step, because
-each half raises the misfit or barely lowers it on its own while the two together lower it by
-more than half.
+does not treat the hull as something to be corrected before carving. The correction is one
+function on the sphere -- a displacement of the core's surface, inward where the body has a
+concavity and outward where the convex answer overshot -- and the reshaping of the hull is
+simply its first three degrees.
 
-The step is damped Gauss-Newton with a secant Jacobian, coarse to fine over the amplitudes
-(hac26.solvers.gauss_newton). Nothing differentiates the renderer. The fit is started several
-times, once from the convex answer itself and otherwise from a shrunken hull carved by a
-single deep waist, because the first linearisation from the convex answer is taken where
-neither half of the correction is yet doing anything and the step there goes into the carve
-alone, which is the convex inversion's own mistake made once more.
+The step is damped Gauss-Newton with a secant Jacobian, coarse to fine in the angular degree of
+that function (hac26.solvers.gauss_newton). Nothing differentiates the renderer. The ladder
+stops well short of the scale at which a displacement stops costing surface area, because there
+the penalty below cannot charge it and the fit would spend its whole budget buying misfit with
+texture. The fit is started several times, once from the convex answer itself and otherwise
+from a shrunken hull carved by a single spherical cap drawn from a grid over where the cap is,
+how wide it is and how deep, because the first linearisation from the convex answer is taken
+where neither half of the correction is yet doing anything and the step there goes into the
+carve alone, which is the convex inversion's own mistake made once more.
 
 What is minimised carries the body's surface area beside its misfit, because the misfit of a
 rendered body reports how finely its surface is resolved almost as strongly as it reports
@@ -54,12 +57,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from hac26.conventions import CYLINDER_R, psi_grid                       # noqa: E402
 from hac26.data_io import N_CAMS, load_inversion_curves                  # noqa: E402
-from hac26.field import (CODE_DIM, EXTRACT_RES, LATTICE_SHAPE, N_RADIAL,  # noqa: E402
-                         N_SITES, lattice_kernel, searchable_sites)
+from hac26.field import (CODE_DIM, EXTRACT_RES, N_NODES, N_RADIAL,       # noqa: E402
+                         DepthSphere, depth_cap, node_kernel)
 from hac26.recon import fit_to_cylinder                                  # noqa: E402
 from hac26.solvers.gauss_newton import (AREA_WEIGHT, AREA_WINDOW,    # noqa: E402
-                                        STEP_C, STEP_G, TARGET_SIGMA, VOLUME_TRUST,
-                                        CarveFit, Stage, conjunction_start)
+                                        DEFAULT_STAGES, N_STARTS, POLISH_STAGES,
+                                        SCREEN_STAGES, STEP_C, STEP_G, TARGET_SIGMA,
+                                        VOLUME_TRUST, CarveFit, conjunction_start)
 from hac26.solvers.operator import CodeOperator                          # noqa: E402
 from hac26.solvers.output import export_stl, restore_constraints         # noqa: E402
 from reconstruct import answer_path                                      # noqa: E402
@@ -70,12 +74,24 @@ from reconstruct_map import (EXPORT_RES, convex_dice, convexity,     # noqa: E40
                              truth_dice)
 from train_lpd import INSTRUMENT, RENDER, _enable_tf32, load_instrument   # noqa: E402
 
-STAGE_SIDES = (6, 12)      # sub-lattices the carve is fitted on before the random subspace
-SUBSPACE_DIRS = 192        # directions per iteration of the last stage
-STAGE_ITERS = (6, 6, 10)
-RESTARTS = 8               # starts of the first stage
-RESTART_SCREEN = 2         # iterations every start is judged on before all but the best stop
-RESTART_KEEP = 2           # starts carried to the end of the first stage
+RESTARTS = 9               # starts screened, the convex answer and eight of the designed
+                           # grid: enough for one sweep of the grid's axes, which is the factor
+                           # the ladder's own first stage cannot correct cheaply. Measured, a
+                           # screening costs about fifty renders against the ladder's four
+                           # thousand, so the sweep is affordable; measured also, the random
+                           # draws this grid replaces were worth nothing at all, so it is the
+                           # spread and not the count that has to earn its place.
+RESTART_KEEP = 2           # starts carried to the end of the ladder
+VOLUME_FLOOR = 0.50        # smallest volume an accepted body may have, as a fraction of the
+                           # convex answer's. The cheapest surface area in this representation
+                           # is a hull shrink and the misfit barely resists one, so without a
+                           # floor the fit walks the volume down past the body and loses more
+                           # overlap than the carve gains; notes/objective.md measures both
+                           # runs. The value is calibrated on the one released non-convex body,
+                           # which sits comfortably above it, and it inherits exactly the
+                           # weakness --min-convex-sigmas has: what would make it principled is
+                           # the distribution of that ratio over the shape library, which is the
+                           # same corpus a learned acceptance gate would need.
 MIN_CONVEX_SIGMAS = 4.0    # how badly the convex answer must fit before a body is worth
                            # correcting, in model errors. A body whose convex answer already
                            # explains its curves has no concavity for the correction to find,
@@ -113,8 +129,8 @@ def main() -> None:
     ap.add_argument("--export-phases", type=int, default=96,
                     help="phases the written body's misfits are measured at")
     ap.add_argument("--operator-res", type=int, default=EXTRACT_RES,
-                    help="extraction resolution of the fit's operator; it has to resolve "
-                         "the correction's kernels")
+                    help="extraction resolution of the fit's operator; it has to resolve the "
+                         "angular scale of the depth field")
     ap.add_argument("--export-res", type=int, default=EXPORT_RES)
     ap.add_argument("--hold-out-geoms", type=int, default=5)
     ap.add_argument("--restarts", type=int, default=RESTARTS)
@@ -124,6 +140,9 @@ def main() -> None:
                          "and zero minimises the misfit alone")
     ap.add_argument("--volume-trust", type=float, default=VOLUME_TRUST,
                     help="largest fractional change of volume an accepted step may make")
+    ap.add_argument("--volume-floor", type=float, default=VOLUME_FLOOR,
+                    help="smallest volume an accepted body may have, as a fraction of the "
+                         "convex answer's; 0 turns the floor off")
     ap.add_argument("--min-convex-sigmas", type=float, default=MIN_CONVEX_SIGMAS,
                     help="leave a body alone whose convex answer already explains its curves "
                          "to fewer than this many model errors")
@@ -153,7 +172,6 @@ def main() -> None:
     weight = curve_weight(d["mask"])                                 # (N_CAMS, 2)
     scale = residual_scale(d, inst.eta).clamp_min(ETA_FLOOR)         # (N_CAMS, 2)
     present = [i for i in range(N_CAMS) if float(geometry_mask(d["mask"])[0, i]) > 0]
-    rng = np.random.default_rng(a.seed)
     held = [present[i] for i in np.unique(np.linspace(0, len(present) - 1, a.hold_out_geoms)
                                           .round().astype(int))] if a.hold_out_geoms else []
     fit_geoms = [g for g in present if g not in held]
@@ -171,39 +189,43 @@ def main() -> None:
     data_fit = flat_curves(data[fit_g], keep_fit)
     scale_fit = np.repeat(scale[fit_g].numpy()[keep_fit.numpy()], data.shape[-1])
     zero_code = torch.zeros(CODE_DIM, device=dev)
+    floor = [0.0]           # set from the convex answer's own volume, once it is rendered
 
     def render(c, g):
         code = zero_code.clone()
-        code[-N_SITES:] = torch.tensor(np.asarray(g), dtype=torch.float32, device=dev)
+        code[-N_NODES:] = torch.tensor(np.asarray(g), dtype=torch.float32, device=dev)
         out = op.curves_with_shape(support, code, R, geoms=fit_g,
                                    c=torch.tensor(np.asarray(c), dtype=torch.float32,
                                                   device=dev))
         if out is None:
             return None
         cur, area, vol = out
+        # A body below the floor is refused here rather than in the solver, because the solver
+        # already has a path for a body the forward model will not render and this is the same
+        # kind of refusal: the line search sees a trial that did not come back and shortens.
+        if vol < floor[0]:
+            return None
         return flat_curves(cur, keep_fit), area, vol
 
-    kernel = lattice_kernel()
-    stages = tuple(Stage(side=s, n_dirs=0, iters=n)
-                   for s, n in zip(STAGE_SIDES, STAGE_ITERS)) \
-        + (Stage(side=0, n_dirs=SUBSPACE_DIRS, iters=STAGE_ITERS[-1]),)
-
-    mask = searchable_sites(support.numpy())
-    print(f"  {int(mask.sum())} of {N_SITES} sites can move the surface of the body the fit "
-          f"starts from; a Jacobian is spent on those", flush=True)
+    nodes = DepthSphere(N_NODES).u.numpy()
+    kernel = node_kernel()
+    cap = depth_cap(support.numpy())
 
     def new_fit(seed):
-        return CarveFit(render, data_fit, scale_fit, kernel, LATTICE_SHAPE,
+        return CarveFit(render, data_fit, scale_fit, kernel, nodes,
                         n_radial=N_RADIAL, area_weight=a.area_weight,
-                        volume_trust=a.volume_trust, step_g=a.step_g, step_c=a.step_c,
-                        seed=seed, site_mask=mask)
+                        volume_trust=a.volume_trust, depth_cap=cap,
+                        step_g=a.step_g, step_c=a.step_c, seed=seed)
 
-    zeros = (np.zeros(N_RADIAL), np.zeros(N_SITES))
+    zeros = (np.zeros(N_RADIAL), np.zeros(N_NODES))
     gate = new_fit(a.seed)
     r0, area0, vol0 = gate._render(*zeros)
     if r0 is None:
         raise SystemExit("the convex answer does not render; nothing to correct")
+    floor[0] = float(a.volume_floor) * vol0
     convex_sigmas = float(np.linalg.norm(r0))
+    print(f"  the depth may reach {cap:.3f} body units before the body stops containing its "
+          f"own centre; below {floor[0]:.3f} of volume a body is refused", flush=True)
     print(f"  the convex answer explains the fitted curves to {convex_sigmas:.2f} model "
           f"errors; area {area0:.3f}, volume {vol0:.3f}", flush=True)
     if convex_sigmas < a.min_convex_sigmas:
@@ -216,14 +238,23 @@ def main() -> None:
     # Every start is judged on the first few iterations of the coarse stage, which tells a
     # start that is descending from one that is not; the best are then carried to the end.
     t0 = time.time()
-    starts, recipes = [(np.zeros(N_RADIAL), np.zeros(N_SITES))], [{"start": "convex answer"}]
-    if a.restarts > 1:
-        from hac26.field import GaussianLattice
-        site_xyz = GaussianLattice().p.numpy()
-        for _ in range(a.restarts - 1):
-            c0, g0, rec = conjunction_start(site_xyz, kernel, rng, n_radial=N_RADIAL)
-            starts.append((c0, g0))
-            recipes.append({"start": "conjunction", **rec})
+    starts, recipes = [(np.zeros(N_RADIAL), np.zeros(N_NODES))], [{"start": "convex answer"}]
+    skipped = 0
+    i = 0
+    while len(starts) < a.restarts and i < N_STARTS:
+        c0, g0, rec = conjunction_start(nodes, i, n_radial=N_RADIAL)
+        i += 1
+        # A cap of a body that has little room to carve is not a body, so it is passed over
+        # rather than shortened: a start clipped to the cap is a different start from the one
+        # the grid means, and the grid would then no longer be a spread.
+        if float(g0.max()) > cap:
+            skipped += 1
+            continue
+        starts.append((c0, g0))
+        recipes.append({"start": "cap", **rec})
+    if skipped:
+        print(f"  {skipped} of the designed starts carve deeper than this body's own centre "
+              f"allows and were passed over", flush=True)
     def last(hist, key):
         rows = [h for h in hist if key in h]
         return rows[-1][key] if rows else float("inf")
@@ -237,13 +268,12 @@ def main() -> None:
     screened = []
     for i, (c0, g0) in enumerate(starts):
         f = new_fit(a.seed + i)
-        c, g, hist = f.run(c0, g0, stages=(Stage(STAGE_SIDES[0], 0, RESTART_SCREEN),),
-                           target=TARGET_SIGMA)
+        c, g, hist = f.run(c0, g0, stages=SCREEN_STAGES, target=TARGET_SIGMA)
         screened.append({"i": i, "objective": last(hist, "objective"),
                          "chi": last(hist, "chi"), "c": c, "g": g, "renders": f.renders})
         print(f"  start {i} ({recipes[i]['start']}): objective "
               f"{screened[-1]['objective']:.4f}, chi {screened[-1]['chi']:.4f} after "
-              f"{RESTART_SCREEN} coarse steps, {f.renders} renders "
+              f"{SCREEN_STAGES[0].iters} coarse steps, {f.renders} renders "
               f"[{time.time()-t0:.0f}s]", flush=True)
     # Starts are compared on what is being minimised. A start that has bought misfit with
     # surface is not ahead of one that has not.
@@ -252,12 +282,13 @@ def main() -> None:
     best = None
     for s in screened[:max(1, RESTART_KEEP)]:
         f = new_fit(a.seed + s["i"] + 100)
-        c, g, hist = f.run(s["c"], s["g"], stages=stages, target=TARGET_SIGMA, log=show)
+        c, g, hist = f.run(s["c"], s["g"], stages=DEFAULT_STAGES, target=TARGET_SIGMA,
+                           log=show)
         # The penalty has put the shape where it goes and left the misfit above where the
         # data alone would put it. Minimising the misfit alone from there, with the trust
         # region still holding the volume, recovers the misfit without giving the shape back.
         print("    polish, on the misfit alone", flush=True)
-        c, g, polish = f.run(c, g, stages=(stages[-1],), target=TARGET_SIGMA,
+        c, g, polish = f.run(c, g, stages=POLISH_STAGES, target=TARGET_SIGMA,
                              area_weight=0.0, log=show)
         hist = hist + polish
         obj, chi = last(hist, "objective"), last(hist, "chi")
@@ -291,7 +322,7 @@ def main() -> None:
             return float("nan"), float("nan")
         gg, keep = curve_index(weight, geoms)
         code = zero_code.clone()
-        code[-N_SITES:] = torch.tensor(np.asarray(g), dtype=torch.float32, device=dev)
+        code[-N_NODES:] = torch.tensor(np.asarray(g), dtype=torch.float32, device=dev)
         out = op_x.curves_with_shape(support, code, R, geoms=gg,
                                      c=torch.tensor(np.asarray(c), dtype=torch.float32,
                                                     device=dev))
@@ -310,7 +341,7 @@ def main() -> None:
     held_x, held_x_obj = measure_at_export(best["c"], best["g"], held)
 
     code = zero_code.clone()
-    code[-N_SITES:] = torch.tensor(best["g"], dtype=torch.float32, device=dev)
+    code[-N_NODES:] = torch.tensor(best["g"], dtype=torch.float32, device=dev)
     m = op_x.mesh(support, code, res=a.export_res,
                   c=torch.tensor(best["c"], dtype=torch.float32, device=dev))
     if m is None:
@@ -324,7 +355,8 @@ def main() -> None:
             "export_phases": a.export_phases, "operator_res": a.operator_res,
             "export_res": a.export_res, "held_out": held, "fit_geoms": fit_g,
             "curves_fitted": int(weight.sum()), "area_weight": a.area_weight,
-            "volume_trust": a.volume_trust, "convex_sigmas": convex_sigmas,
+            "volume_trust": a.volume_trust, "volume_floor": a.volume_floor,
+            "convex_volume": vol0, "depth_cap": cap, "convex_sigmas": convex_sigmas,
             "step_g": a.step_g, "step_c": a.step_c, "restarts": a.restarts,
             "start": best["recipe"], "renders": best["renders"],
             "chi_fit": best["chi"], "objective_fit": best["objective"],

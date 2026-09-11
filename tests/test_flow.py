@@ -3,8 +3,8 @@ the sampler."""
 import torch
 
 from hac26.conventions import cameras
-from hac26.field import CODE_DIM, N_DIR
-from hac26.solvers.lpd_flow import (N_FEAT, N_SPHERE_CH, N_VOL_CH, LATTICE_SHAPE, LPDFlow,
+from hac26.field import CODE_DIM, N_DIR, N_NODES
+from hac26.solvers.lpd_flow import (N_FEAT, N_NODE_CH, N_SPHERE_CH, LPDFlow,
                                     PrimalNet, churn_step, descent_scale, flow_inputs,
                                     geometry_tags, time_embed)
 
@@ -47,10 +47,10 @@ def test_pullback_matches_autograd_through_decode():
 
 def _inputs(B, C):
     sph0 = torch.zeros(1, N_DIR, N_SPHERE_CH)
-    vol0 = torch.zeros(1, N_VOL_CH, *LATTICE_SHAPE)
+    node0 = torch.zeros(1, N_NODES, N_NODE_CH)
     grad = torch.randn(B, CODE_DIM)
     grad[1] = 0.0                                          # a body without an adjoint
-    return flow_inputs(torch.randn(B, C, 40, N_FEAT), torch.ones(B, C), sph0, vol0, grad)
+    return flow_inputs(torch.randn(B, C, 40, N_FEAT), torch.ones(B, C), sph0, node0, grad)
 
 
 def test_inputs_carry_a_unit_direction_and_its_size():
@@ -58,7 +58,7 @@ def test_inputs_carry_a_unit_direction_and_its_size():
     assert inp.adj[:, :N_DIR].pow(2).mean(1)[[0, 2]].allclose(torch.ones(2), atol=1e-5)
     assert inp.adj[1].abs().sum() == 0.0
     assert torch.allclose(inp.sphere[0, :, -1], inp.adj[0, :N_DIR])
-    assert torch.allclose(inp.vol[0, -1].reshape(-1), inp.adj[0, N_DIR:])
+    assert torch.allclose(inp.node[0, :, -1], inp.adj[0, N_DIR:])
     assert inp.adj_log.shape == (3, 2)
 
 
@@ -77,7 +77,7 @@ def test_each_time_goes_to_its_own_expert():
     assert net.expert_of(t).tolist() == [0, 0, 1, 1]
     summary = net.reader(inp.resid, tag, inp.mask)
     for e, sel in ((0, [0, 1]), (1, [2, 3])):
-        direct = (net.prior_velocity(code[sel], t[sel], rad[sel], inp.sphere[sel], inp.vol[sel])
+        direct = (net.prior_velocity(code[sel], t[sel], rad[sel], inp.sphere[sel], inp.node[sel])
                   + net.experts[e](code[sel], t[sel], summary[sel], time_embed(t[sel]),
                                    torch.log(rad[sel]), inp.select(sel)))
         assert torch.allclose(v[sel], direct, atol=1e-6)
@@ -122,7 +122,7 @@ def test_a_fresh_data_part_is_the_closed_form_descent_step():
     code = torch.randn(B, CODE_DIM)
     inp = _inputs(B, C)
     v = net.velocity(code, t, torch.ones(B), geometry_tags().expand(B, -1, -1), inp)
-    prior = net.prior_velocity(code, t, torch.ones(B), inp.sphere, inp.vol)
+    prior = net.prior_velocity(code, t, torch.ones(B), inp.sphere, inp.node)
     size = descent_scale(t)[:, None] * torch.exp(inp.adj_log)
     want = PrimalNet._capped(torch.cat([size[:, :1] * inp.adj[:, :N_DIR],
                                         size[:, 1:] * inp.adj[:, N_DIR:]], -1), code)
@@ -135,17 +135,17 @@ def test_sampler_runs_with_and_without_noise():
     net = _codec().eval()
     C = len(cameras())
     sph0 = torch.zeros(1, N_DIR, N_SPHERE_CH)
-    vol0 = torch.zeros(1, N_VOL_CH, *LATTICE_SHAPE)
+    node0 = torch.zeros(1, N_NODES, N_NODE_CH)
     calls = []
 
     def resid_fn(z, t):
         calls.append(float(t[0]))
-        return flow_inputs(torch.zeros(len(z), C, 40, N_FEAT), torch.ones(len(z), C), sph0, vol0,
+        return flow_inputs(torch.zeros(len(z), C, 40, N_FEAT), torch.ones(len(z), C), sph0, node0,
                            torch.randn(len(z), CODE_DIM))
     tag = geometry_tags().expand(2, -1, -1)
     mask = torch.ones(2, C)
     for churn in (0.0, 0.5):
-        x = net.sample(resid_fn, tag, mask, (sph0, vol0), 1.0, batch=2, n_steps=4, churn=churn)
+        x = net.sample(resid_fn, tag, mask, (sph0, node0), 1.0, batch=2, n_steps=4, churn=churn)
         assert x.shape == (2, CODE_DIM) and torch.isfinite(x).all()
     assert calls[:4] == [0.0, 0.25, 0.5, 0.75]
 
@@ -218,7 +218,7 @@ def test_guidance_weights_the_data_part_and_leaves_the_prior_alone():
     C, B = len(cameras()), 3
     t, code, rad = torch.tensor([0.2, 0.5, 0.8]), torch.randn(3, CODE_DIM), torch.ones(3)
     inp, tag = _inputs(B, C), geometry_tags().expand(B, -1, -1)
-    prior = net.prior_velocity(code, t, rad, inp.sphere, inp.vol)
+    prior = net.prior_velocity(code, t, rad, inp.sphere, inp.node)
     datav = net.data_velocity(code, t, rad, tag, inp)
     assert datav.abs().sum() > 0          # otherwise the weight has nothing to act on
     assert torch.allclose(net.velocity(code, t, rad, tag, inp), prior + datav)
@@ -231,12 +231,12 @@ def test_guidance_weights_the_data_part_and_leaves_the_prior_alone():
         assert torch.allclose(got, prior + ramp * datav, atol=1e-6)
     t0 = torch.zeros(B)
     d0 = net.data_velocity(code, t0, rad, tag, inp)
-    p0 = net.prior_velocity(code, t0, rad, inp.sphere, inp.vol)
+    p0 = net.prior_velocity(code, t0, rad, inp.sphere, inp.node)
     for w in (1.0, 2.0, 5.0):             # at t = 0 every weight is the model as trained
         assert torch.allclose(net.velocity(code, t0, rad, tag, inp, guidance=w), p0 + d0,
                               atol=1e-6)
     t1 = torch.ones(B)
-    p1 = net.prior_velocity(code, t1, rad, inp.sphere, inp.vol)
+    p1 = net.prior_velocity(code, t1, rad, inp.sphere, inp.node)
     assert torch.allclose(net.velocity(code, t1, rad, tag, inp, guidance=0.0), p1, atol=1e-6)
 
 

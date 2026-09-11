@@ -3,16 +3,17 @@
 The gate is the cube: encode it with the support h alone, extract a mesh, and require the
 faces planar to within one grid cell and Dice above 0.99 against the analytic cube. The other
 tests pin what the cube does not touch: the design of normals, that the core is a plain max,
-that the lattice correction is signed and independent of the query batch, that dh is
+that the depth correction is signed, is a partition of unity and is independent of the query
+batch, that the grid the extraction runs on is the one FlexiCubes builds, that dh is
 band-limited, and that the pose constraints allow the published radius its tolerance.
 """
 import numpy as np
 import pytest
 import torch
 
-from hac26.field import (DESIGN_N, DESIGN_T, LATTICE_EXTENT, N_SITES,
-                         ConvexCore, GaussianLattice, ImplicitBody, _design_residual,
-                         apply_constraints, extract_mesh, spherical_design)
+from hac26.field import (DESIGN_N, DESIGN_T, EXTRACT_EXTENT, KNN, N_NODES, ConvexCore,
+                         DepthSphere, ImplicitBody, _design_residual, apply_constraints,
+                         core_centre, depth_cap, extract_mesh, spherical_design, voxel_grid)
 
 A = 1.0            # cube half-side
 RES = 128
@@ -78,45 +79,91 @@ def test_core_h_is_non_negative():
 
 # ------------------------------------------------------------------ the correction
 
-def test_correction_is_signed_and_adds_where_kernels_overlap():
-    """Amplitudes on the fixed lattice add where their kernels overlap (doubling them doubles
-    the field), and the field takes both signs."""
-    gl = GaussianLattice()
+def test_a_coefficient_is_a_depth_and_the_weights_are_a_partition_of_unity():
+    """The weights of a direction sum to one over the nodes it reads, which is what makes a
+    coefficient a depth rather than an amplitude: a constant is reproduced exactly, the field
+    is bounded by the largest coefficient, and it cannot overshoot between nodes. Everything
+    the solver does with a bound on the coefficients rests on this."""
+    rep = DepthSphere()
+    y = torch.randn(512, 3)
+    idx, w = rep.weights(y.numpy())
+    assert idx.shape == (512, KNN)
+    assert np.abs(w.sum(1) - 1.0).max() < 1e-6 and (w >= 0).all()
     with torch.no_grad():
-        gl.g.zero_()
-        near = torch.cdist(gl.p, torch.zeros(1, 3))[:, 0].argsort()[:8]
-        gl.g[near] = 0.1
-    d_one = float(gl(torch.zeros(1, 3)))
+        rep.a.fill_(0.37)
+    assert float((rep(y) - 0.37).abs().max().detach()) < 1e-6
     with torch.no_grad():
-        gl.g[near] = 0.2
-    assert float(gl(torch.zeros(1, 3))) == pytest.approx(2 * d_one, rel=1e-5)
-    with torch.no_grad():
-        gl.g[near[:4]] = -0.2
-    d = gl(torch.randn(256, 3) * 0.5)
-    assert float(d.min()) < 0 < float(d.max())          # signed: it grows as well as carves
+        rep.a.normal_(0, 0.1)
+    d = rep(y)
+    assert float(d.abs().max().detach()) <= float(rep.a.abs().max().detach()) + 1e-6
+    assert float(d.min().detach()) < 0 < float(d.max().detach())          # signed: it grows as well as carves
 
 
 def test_correction_does_not_depend_on_the_query_batch():
     """The correction is a function of the query point alone: evaluating the points in two
-    chunks gives the same values as one call. extract_mesh evaluates its grid in chunks."""
+    chunks gives the same values as one call. extract_mesh evaluates its grid in chunks, and
+    both the depth's neighbour search and the core's own field are cached per chunk."""
     torch.manual_seed(0)
-    gl = GaussianLattice()
+    rep = DepthSphere()
     with torch.no_grad():
-        gl.g.normal_(0, 0.1)
+        rep.a.normal_(0, 0.1)
     y = torch.randn(3000, 3) * 0.5
-    parts = torch.cat([gl(y[:2000]), gl(y[2000:])])
-    assert float((gl(y) - parts).abs().max()) < 1e-6
+    parts = torch.cat([rep(y[:2000]), rep(y[2000:])])
+    assert float((rep(y) - parts).abs().max()) < 1e-6
+
+    n = spherical_design(64)
+    body = ImplicitBody(normals=n)
+    body.set_support(torch.tensor(cube_support(n), dtype=torch.float32))
+    with torch.no_grad():
+        body.delta.a.normal_(0, 0.05)
+    whole = body(y)
+    assert float((torch.cat([body(y[:2000]), body(y[2000:])]) - whole).abs().max()) < 1e-6
+    # and a cached value is the value: asking again for the same points cannot drift
+    assert float((body(y) - whole).abs().max()) == 0.0
 
 
-def test_the_lattice_is_fixed_and_never_travels_with_a_checkpoint():
-    """`g` is the only parameter and the only entry of the state dict; the sites and widths
-    are constants of the representation, so a saved state cannot redefine another body's
-    lattice."""
-    gl = GaussianLattice()
-    assert [n for n, _ in gl.named_parameters()] == ["g"]
-    assert list(gl.state_dict().keys()) == ["g"]
-    assert gl.g.numel() == N_SITES
-    assert float(gl.p.abs().max()) < LATTICE_EXTENT          # cell centres, not corners
+def test_the_node_set_is_fixed_and_never_travels_with_a_checkpoint():
+    """`a` is the only parameter and the only entry of the state dict; the nodes and the kernel
+    width are constants of the representation, so a saved state cannot redefine what another
+    body's depths mean."""
+    rep = DepthSphere()
+    assert [n for n, _ in rep.named_parameters()] == ["a"]
+    assert list(rep.state_dict().keys()) == ["a"]
+    assert rep.a.numel() == N_NODES
+    assert float((rep.u.norm(dim=1) - 1.0).abs().max()) < 1e-6
+
+
+def test_the_centre_follows_from_the_support_and_moves_with_the_body():
+    """The depth is measured from a point that has to be a function of the support alone, or
+    the code would not determine the body without a second thing carried beside it. It has to
+    move with the body, or the same shape mounted differently would be a different code, and it
+    has to be inside, or there is no room to carve at all. The deepest carve the star-shaped
+    bound allows is then a fraction of how far the nearest face is from it."""
+    n = spherical_design(DESIGN_N)
+    h = cube_support(n)
+    o = core_centre(h, n)
+    assert float(np.abs(o).max()) < 1e-4                    # a cube about the origin
+    assert depth_cap(h, o, normals=n) == pytest.approx(0.90 * float((h - n @ o).min()))
+    moved = np.array([0.3, -0.2, 0.1])
+    off = cube_support(n) + n @ moved                       # the same cube, mounted elsewhere
+    assert np.allclose(core_centre(off, n), moved, atol=1e-3)
+    # and the carve is measured from it, so a body mounted off the origin keeps its room
+    assert depth_cap(off, normals=n) == pytest.approx(depth_cap(h, normals=n), rel=1e-3)
+    assert depth_cap(off, normals=n) > depth_cap(off, np.zeros(3), normals=n)
+
+
+def test_the_extraction_grid_is_the_one_flexicubes_builds():
+    """The grid is built arithmetically rather than by deduplicating the corners of every cube,
+    which is the largest allocation anything here makes and does not fit in memory at the
+    extraction resolution. The two constructions have to agree exactly, vertices and cube
+    corners alike, or every extracted body is subtly wrong."""
+    from hac26.vendor.flexicubes import FlexiCubes
+    fc = FlexiCubes(device="cpu")
+    for res in (2, 5, 8, 16):
+        v0, c0 = fc.construct_voxel_grid(res)
+        v1, c1 = voxel_grid(fc, res, "cpu")
+        assert v1.shape == v0.shape and torch.allclose(v0, v1, atol=1e-6)
+        assert c1.shape == c0.shape and bool((c0 == c1).all())
 
 
 def test_dh_is_band_limited_whatever_the_flow_emits():
@@ -128,8 +175,8 @@ def test_dh_is_band_limited_whatever_the_flow_emits():
     n = spherical_design(64)
     body = ImplicitBody(normals=n)
     body.set_support(torch.tensor(cube_support(n), dtype=torch.float32))
-    from hac26.field import _real_sh
-    y5 = torch.tensor(_real_sh(n, 5), dtype=torch.float32)
+    from hac26.field import real_sh
+    y5 = torch.tensor(real_sh(n, 5), dtype=torch.float32)
     torch.manual_seed(0)
     with torch.no_grad():
         body.dh.normal_(0, 0.02)
@@ -143,8 +190,9 @@ def test_dh_is_band_limited_whatever_the_flow_emits():
 
 
 def test_every_parameter_block_receives_gradient():
-    """Every parameter of ImplicitBody (the support, the lattice amplitudes and dh) receives
-    a non-zero gradient from a loss on the field."""
+    """Every parameter of ImplicitBody (the support, the depths and dh) receives a non-zero
+    gradient from a loss on the field. The caches the field keeps must not break that: a caller
+    differentiating through the support has to have the maxima taken again."""
     n = spherical_design(64)
     body = ImplicitBody(normals=n)
     body.set_support(torch.tensor(cube_support(n), dtype=torch.float32))
@@ -181,8 +229,8 @@ def test_cube_extraction_is_planar_and_matches():
     n = spherical_design()
     body = ImplicitBody(normals=n)
     body.set_support(torch.tensor(cube_support(n), dtype=torch.float32))
-    # g and dh are zero, so this is the core alone
-    extent = LATTICE_EXTENT + 0.5
+    # the depths and dh are zero, so this is the core alone
+    extent = EXTRACT_EXTENT + 0.5
     verts, faces = extract_mesh(lambda y: body(y), extent, res=RES)
     assert len(verts) > 0 and len(faces) > 0
 

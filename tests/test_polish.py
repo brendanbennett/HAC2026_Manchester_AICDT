@@ -9,8 +9,8 @@ import torch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 
 from hac26.conventions import psi_grid                                         # noqa: E402
-from hac26.field import (CODE_DIM, N_DIR, GaussianLattice, ImplicitBody,      # noqa: E402
-                         lattice_kernel)
+from hac26.field import (CODE_DIM, N_DIR, N_NODES, DepthSphere,               # noqa: E402
+                         ImplicitBody, node_kernel)
 from hac26.forward.mesh.exact import RenderConfig                              # noqa: E402
 from hac26.forward.mesh.instrument import Instrument                           # noqa: E402
 from hac26.shapes import icosphere, mesh_support                              # noqa: E402
@@ -30,28 +30,52 @@ SMALL = RenderConfig(height=48, width=80, supersample=2, sun_res=128, phase_chun
                      radiosity_faces=48)
 GEOMS = [0, 7]
 
+_NODES = None
 _KERNEL = None
 
 
-def _at_depth(g: torch.Tensor, depth: float) -> torch.Tensor:
-    """Amplitudes rescaled so that the field they make at the sites is `depth` deep.
+def _nodes() -> np.ndarray:
+    global _NODES
+    if _NODES is None:
+        _NODES = DepthSphere(N_NODES).u.numpy()
+    return _NODES
 
-    The bodies here are named by the dents they have, and a dent is a depth. Amplitudes are
-    not: the same amplitude makes a deeper field the more the kernels overlap and a narrower
-    one the finer the lattice, so a body written as a fixed amplitude is a different body on
-    a different lattice, which is how a test comes to check nothing."""
+
+def _smooth(a: torch.Tensor, spacings: float = 3.0) -> torch.Tensor:
+    """`a` smoothed over about `spacings` node spacings, by repeated application of the node
+    kernel.
+
+    The bodies here stand in for what a fit of a real body produces, and that is smooth at the
+    node scale: the depths come from a least-squares solve over surface samples with a ridge,
+    and the search that moves them is capped in angular degree. White noise on the nodes is a
+    body no stage of this pipeline makes, and its rendered misfit is rough at exactly the scale
+    a finite-difference check steps over."""
     global _KERNEL
     if _KERNEL is None:
-        _KERNEL = lattice_kernel()
-    made = float(np.abs(_KERNEL @ g.detach().numpy().astype(np.float64)).max())
-    return g * (depth / made) if made > 1e-9 else g * 0.0
+        _KERNEL = node_kernel()
+    out = a.detach().numpy().astype(np.float64)
+    for _ in range(int(round(spacings ** 2))):
+        out = _KERNEL @ out
+    return torch.tensor(out, dtype=torch.float32)
 
 
-def _blob(centre, width: float) -> torch.Tensor:
-    """A single dent: a Gaussian of the given width in body units, at the given place."""
-    p = GaussianLattice().p.numpy()
-    return torch.tensor(np.exp(-((p - np.asarray(centre)) ** 2).sum(1) / width ** 2),
-                        dtype=torch.float32)
+def _at_depth(a: torch.Tensor, depth: float) -> torch.Tensor:
+    """Depths rescaled so that the deepest of them is `depth`.
+
+    The bodies here are named by the dents they have, and a dent is a depth. The node weights
+    are a partition of unity, so the field is bounded by the largest coefficient and reaches it
+    wherever a few neighbours agree; scaling the largest coefficient therefore names the dent in
+    body units at any node count."""
+    made = float(a.detach().abs().max())
+    return a * (depth / made) if made > 1e-9 else a * 0.0
+
+
+def _blob(direction, width_deg: float) -> torch.Tensor:
+    """A single dent: a smooth cap of the given angular width, in the given direction."""
+    u = _nodes()
+    d = np.asarray(direction, float); d = d / np.linalg.norm(d)
+    ang = np.arccos(np.clip(u @ d, -1.0, 1.0))
+    return torch.tensor(np.exp(-(ang / np.deg2rad(width_deg)) ** 2), dtype=torch.float32)
 
 
 def _setup():
@@ -62,7 +86,7 @@ def _setup():
     h = torch.tensor(mesh_support(v, ImplicitBody().core.n.numpy()), dtype=torch.float32)
     target = torch.zeros(CODE_DIM)
     # the dent the data know about, off both axes so that no symmetry hides it
-    target[N_DIR:] = _at_depth(_blob((0.35, -0.45, 0.0), 0.28), 0.30)
+    target[N_DIR:] = _at_depth(_blob((0.35, -0.45, 0.0), 25.0), 0.30)
     data = op.curves(h, target, 1.2, geoms=GEOMS)       # (2, 2, P) of the geometries used
     full = torch.ones(28, 2, data.shape[-1])
     full[GEOMS] = data
@@ -72,10 +96,10 @@ def _setup():
     codes = torch.zeros(8, CODE_DIM)
     codes[:, :N_DIR] = 0.05 * torch.randn(8, N_DIR, generator=gen)
     for i in range(len(codes)):                         # bodies dented to a tenth of a radius
-        codes[i, N_DIR:] = _at_depth(torch.randn(CODE_DIM - N_DIR, generator=gen), 0.10)
+        codes[i, N_DIR:] = _at_depth(_smooth(torch.randn(N_NODES, generator=gen)), 0.10)
     net.codec.fit(codes)
     start = torch.zeros(CODE_DIM)                       # a generic body without the dent
-    start[N_DIR:] = _at_depth(torch.randn(CODE_DIM - N_DIR, generator=gen), 0.05)
+    start[N_DIR:] = _at_depth(_smooth(torch.randn(N_NODES, generator=gen)), 0.05)
     return op, h, net, full, scale, net.codec.encode(start)
 
 

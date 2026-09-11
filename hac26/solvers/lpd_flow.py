@@ -9,17 +9,17 @@ smoother than both. So the solver is a flow: it starts from noise and moves towa
 that fits, and several runs give several bodies that fit, from which the answer is chosen
 (scripts/reconstruct_lpd.py).
 
-The state is the code x = (dh, g), whitened by CodeCodec. g holds signed amplitudes on a
-fixed lattice and is the only part that can make a body non-convex. dh is a band-limited
+The state is the code x = (dh, a), whitened by CodeCodec. a holds signed depths on a fixed
+set of directions and is the only part that can make a body non-convex. dh is a band-limited
 correction to the support function h, sampled on N_DIR directions. h itself is not in the
 flow: the convex stage recovers the hull well from a linear operator, and sampling all of h
 would make the network rederive that and would let noise move the size of the body. But the
 convex stage assumes convexity, and a non-convex body is darker than its hull because it
 shadows itself, so its h is wrong in the direction of a convex answer. dh corrects that. The
 corpus dh is the correction the convex stage's own reconstruction of each training body needs
-(scripts/build_corpus.py), so the flow learns the errors that stage makes. The two blocks
-live on different domains and have different networks: a 3-D convolution over the lattice
-for g, a convolution on the sphere over the directions for dh.
+(scripts/build_corpus.py), so the flow learns the errors that stage makes. Both blocks live on
+a sphere -- dh on the design directions, the carve on the depth nodes -- so both have the same
+network, a convolution on the sphere, at their own resolutions.
 
 The velocity is a prior part plus a data part, because the posterior is the prior times the
 likelihood: grad log p(x_t | d) = grad log p(x_t) + grad log p(d | x_t), and the velocity of
@@ -52,8 +52,8 @@ residual of one means one standard deviation for every geometry. The state itsel
 noise, so both are taken at the body the prior's velocity says the state is heading for,
 x_t + (1 - t) v_prior (LPDFlow.sample). The network also reads the adjoint of the operator
 there applied to the whitened residual, the direction in code space along which the
-predicted curves move toward the data: its g part as a map over the lattice into the volume
-branch, its dh part into the sphere branch. The same direction enters the velocity directly
+predicted curves move toward the data: each block of it as a field on that block's own
+sphere. The same direction enters the velocity directly
 with a learned step size per block (PrimalNet), so that a step of gradient descent on the
 misfit is available to the network as two numbers.
 
@@ -91,12 +91,12 @@ import torch
 import torch.nn as nn
 
 from hac26.conventions import cameras
-from hac26.field import CODE_DIM, LATTICE_SHAPE, N_DIR, N_SITES, dir_design
+from hac26.field import CODE_DIM, N_DIR, N_NODES, dir_design, node_design
 
-__all__ = ["CODE_DIM", "N_DIR", "N_SITES", "N_MODES", "N_STEPS", "N_EXPERTS", "CHURN",
+__all__ = ["CODE_DIM", "N_DIR", "N_NODES", "N_MODES", "N_STEPS", "N_EXPERTS", "CHURN",
            "OP_GAIN", "DESCENT_CAP", "T_DIM",
-           "T_FREQ", "N_FEAT", "N_SPHERE_CH", "N_VOL_CH", "FlowInputs", "flow_inputs",
-           "DualSetTransformer", "SphereBranch", "VolBranch", "PrimalNet", "PriorNet",
+           "T_FREQ", "N_FEAT", "N_SPHERE_CH", "N_NODE_CH", "FlowInputs", "flow_inputs",
+           "DualSetTransformer", "SphereBranch", "PrimalNet", "PriorNet",
            "Reader", "CodeCodec", "LPDFlow", "fourier_embed", "time_embed", "GUIDANCE",
            "churn_step", "descent_scale", "geometry_tags"]
 
@@ -106,13 +106,17 @@ N_STEPS = 16        # sampling steps by default; the operator runs at each. Trai
 N_EXPERTS = 4       # velocity networks, one per equal interval of t
 CHURN = 0.5         # noise in the sampler, eps(t) = CHURN (1 - t); 0 is the plain flow
 DESCENT_CAP = 0.5   # largest descent step per block, as a share of that block of the state
-OP_GAIN = 300.0     # tr(A' Sigma^-1 A) / CODE_DIM for the operator at the run's geometries and
-                    # phases, in whitened code units: how much whitened misfit a unit whitened
-                    # change of the code makes. It sets descent_scale and nothing else, and
-                    # that profile is flat enough in it that the order of magnitude is what
-                    # matters. Measure it by rendering pairs of corpus bodies and taking the
-                    # ratio of the whitened squared curve difference to the whitened squared
-                    # code difference.
+OP_GAIN = 300.0     # fallback for tr(A' Sigma^-1 A) / CODE_DIM: how much whitened misfit a
+                    # unit whitened change of the code makes, for the operator at the run's
+                    # geometries and phases. It sets descent_scale and nothing else, and that
+                    # profile is flat enough in it that the order of magnitude is what matters.
+                    # It depends on the code's dimension, on the whitening, and therefore on the
+                    # corpus, so a trained model carries its own measured value in a buffer
+                    # (PrimalNet.op_gain) and this constant is only what an untrained one starts
+                    # from. scripts/train_lpd.py measures it from the corpus it is about to
+                    # train on, by rendering pairs of bodies and taking the ratio of the
+                    # whitened squared curve difference to the whitened squared code
+                    # difference.
 GUIDANCE = 1.0      # weight on the data part of the velocity at t = 1, ramped from one at
                     # t = 0. One is the model as trained; above one the draws follow the
                     # curves further from the prior. See LPDFlow.velocity, and
@@ -122,10 +126,14 @@ T_DIM = 32          # width of the TIME embedding, which is not the mode embeddi
 T_FREQ = (0.5, 64.0)  # slowest and fastest time feature, in cycles across [0, 1]
 N_FEAT = 8          # per (geometry, mode) input of the dual: real and imaginary parts of the
                     # whitened residual and of the data, for the intensity and the count
-N_SPHERE_CH = 5     # sphere-branch channels besides dh_t: h on the directions, the direction
+N_SPHERE_CH = 5     # dh-branch channels besides dh_t: h on the directions, the direction
                     # (3), the adjoint's dh part
-N_VOL_CH = 6        # volume-branch channels besides g_t: the core field, the inside
-                    # indicator, the site coordinates (3), the adjoint's g part
+N_NODE_CH = 5       # depth-branch channels besides a_t: how far out the core's surface is
+                    # along that node's ray, which is how much room there is to carve there,
+                    # the direction (3), and the adjoint's depth part. There is no inside
+                    # indicator and no coordinate triple beyond the direction, because in a
+                    # field indexed by direction every coordinate is on the surface -- which is
+                    # the whole reason the lattice's two wasted channels are gone.
 G_LIMIT = 4.0       # the decode saturates at this multiple of the corpus's largest fitted
                     # amplitude: outside anything the flow should emit, well inside where
                     # float32 sinh overflows.
@@ -157,7 +165,7 @@ class FlowInputs(NamedTuple):
     resid: torch.Tensor        # (B, C, N_MODES, N_FEAT)
     mask: torch.Tensor         # (B, C)
     sphere: torch.Tensor       # (B, N_DIR, N_SPHERE_CH)
-    vol: torch.Tensor          # (B, N_VOL_CH, nx, ny, nz)
+    node: torch.Tensor         # (B, N_NODES, N_NODE_CH)
     adj: torch.Tensor          # (B, CODE_DIM)
     adj_log: torch.Tensor      # (B, 2)
 
@@ -165,7 +173,7 @@ class FlowInputs(NamedTuple):
         return FlowInputs(*(f[sel] for f in self))
 
 
-def flow_inputs(resid, mask, sphere0, vol0, grad_z) -> FlowInputs:
+def flow_inputs(resid, mask, sphere0, node0, grad_z) -> FlowInputs:
     """The inputs from the dual's features (B, C, N_MODES, N_FEAT), the geometry mask (B, C),
     the branch channels with empty adjoint slots, and the adjoint of the whitened misfit in
     whitened units (B, CODE_DIM); zeros for a body without curves. Each block of the adjoint
@@ -176,10 +184,10 @@ def flow_inputs(resid, mask, sphere0, vol0, grad_z) -> FlowInputs:
     rms = torch.stack([b.pow(2).mean(1).sqrt() for b in blocks], 1)               # (B, 2)
     unit = torch.cat([b / r[:, None].clamp_min(1e-12) for b, r in zip(blocks, rms.T)], 1)
     sphere = sphere0.expand(B, -1, -1).clone()
-    vol = vol0.expand(B, -1, -1, -1, -1).clone()
+    node = node0.expand(B, -1, -1).clone()
     sphere[..., -1] = unit[:, :N_DIR]
-    vol[:, -1] = unit[:, N_DIR:].reshape(B, *LATTICE_SHAPE)
-    return FlowInputs(resid, mask, sphere, vol, unit, torch.log(rms.clamp_min(1e-6)))
+    node[..., -1] = unit[:, N_DIR:]
+    return FlowInputs(resid, mask, sphere, node, unit, torch.log(rms.clamp_min(1e-6)))
 
 
 def time_embed(t: torch.Tensor, dim: int = T_DIM) -> torch.Tensor:
@@ -266,22 +274,26 @@ class DualSetTransformer(nn.Module):
         return x
 
 
-def _sphere_operators(dirs: np.ndarray, k: int = 8) -> np.ndarray:
-    """Five fixed (N, N) operators for a convolution on the sphere: the identity, the mean over
-    the k nearest directions, two tangential first moments and one second moment.
+N_OPS = 5           # fixed operators a convolution on the sphere is built from
+
+
+def _sphere_operators(dirs: np.ndarray, k: int = 8) -> torch.Tensor:
+    """The five fixed operators of a convolution on the sphere, stacked into one sparse
+    (N_OPS * N, N) matrix: the identity, the mean over the k nearest directions, two tangential
+    first moments and one second moment.
 
     A sphere has no global grid, so a convolution is built from these fixed operators instead
     of a stencil. Together they carry the same information a 3x3 stencil carries on a plane.
+
+    Sparse, because the branches run on direction sets of very different sizes: each operator
+    has k + 1 non-zeros per row wherever it has any, so at the depth nodes the dense form would
+    be a hundred and thirty megabytes of almost entirely zeros and every product would visit all
+    of it. Stacked into one matrix so that applying all five is one product.
     """
     n = len(dirs)
     g = dirs @ dirs.T
     np.fill_diagonal(g, -2.0)
     nb = np.argsort(-g, axis=1)[:, :k]                      # k nearest by cosine
-    ops = np.zeros((5, n, n), dtype=np.float32)
-    ops[0] = np.eye(n, dtype=np.float32)
-    rows = np.repeat(np.arange(n), k)
-    cols = nb.reshape(-1)
-    ops[1][rows, cols] = 1.0 / k
     # a right-handed tangent frame at each direction, seeded from the least-aligned axis
     seed = np.zeros_like(dirs)
     seed[np.arange(n), np.argmin(np.abs(dirs), axis=1)] = 1.0
@@ -290,24 +302,42 @@ def _sphere_operators(dirs: np.ndarray, k: int = 8) -> np.ndarray:
     e2 = np.cross(dirs, e1)
     off = dirs[nb] - dirs[:, None, :]                       # (n, k, 3)
     d = np.linalg.norm(off, axis=2) + 1e-12
-    ops[2][rows, cols] = ((off * e1[:, None, :]).sum(2) / d).reshape(-1) / k
-    ops[3][rows, cols] = ((off * e2[:, None, :]).sum(2) / d).reshape(-1) / k
-    ops[4][rows, cols] = (d ** 2 / (d ** 2).mean()).reshape(-1) / k
-    return ops
+    # column 0 of each row is the direction itself, so the identity needs no separate entry
+    idx = np.concatenate([np.arange(n)[:, None], nb], axis=1)               # (n, k+1)
+    w = np.zeros((N_OPS, n, k + 1), dtype=np.float32)
+    w[0, :, 0] = 1.0
+    w[1, :, 1:] = 1.0 / k
+    w[2, :, 1:] = (off * e1[:, None, :]).sum(2) / d / k
+    w[3, :, 1:] = (off * e2[:, None, :]).sum(2) / d / k
+    w[4, :, 1:] = d ** 2 / (d ** 2).mean() / k
+    rows = (np.arange(N_OPS)[:, None, None] * n
+            + np.arange(n)[None, :, None]).repeat(k + 1, axis=2).ravel()
+    cols = np.broadcast_to(idx[None], (N_OPS, n, k + 1)).ravel()
+    return torch.sparse_coo_tensor(
+        torch.from_numpy(np.stack([rows, cols])).long(),
+        torch.from_numpy(w.reshape(-1)), (N_OPS * n, n),
+        check_invariants=False).coalesce()
 
 
 class SphereConv(nn.Module):
-    """y_c' = sum_k W_k[c, c'] (S_k x)_c + b. Weights shared across directions."""
+    """y_o = sum_{s,c} W[s, c, o] (S_s x)_c + b. Weights shared across directions.
+
+    The operators are a buffer and not a parameter, and they are not persistent: they follow
+    from the direction set alone, which is a constant of the representation, so a checkpoint
+    must not carry a copy of them.
+    """
 
     def __init__(self, ops: torch.Tensor, c_in: int, c_out: int):
         super().__init__()
         self.register_buffer("S", ops, persistent=False)
-        self.w = nn.Parameter(torch.randn(len(ops), c_in, c_out) / np.sqrt(len(ops) * c_in))
+        self.n_dirs = ops.shape[1]
+        self.w = nn.Parameter(torch.randn(N_OPS, c_in, c_out) / np.sqrt(N_OPS * c_in))
         self.b = nn.Parameter(torch.zeros(c_out))
 
     def forward(self, x):                                   # x: (B, N, C_in)
-        y = torch.einsum("kij,bjc->bkic", self.S, x)        # (B, K, N, C_in)
-        return torch.einsum("bkic,kco->bio", y, self.w) + self.b
+        b, n, c = x.shape
+        y = torch.sparse.mm(self.S, x.transpose(0, 1).reshape(n, b * c))
+        return torch.einsum("snbc,sco->bno", y.reshape(N_OPS, n, b, c), self.w) + self.b
 
 
 class _FiLM(nn.Module):
@@ -332,21 +362,26 @@ class _FiLM(nn.Module):
 
 
 class SphereBranch(nn.Module):
-    """Velocity for the dh block: a convolution on the sphere over the N_DIR directions.
+    """Velocity for one block of the code: a convolution on the sphere over the directions that
+    block is carried on.
 
-    Input channels, in order: dh_t, the base support resampled onto the directions, the three
-    components of the direction, and the dh part of the operator's adjoint applied to the
-    whitened residual, scaled per sample. train_lpd.cond_channels builds the middle four and
+    Both blocks of the code live on a sphere, so this is the only branch there is. For dh the
+    directions are `dir_design(N_DIR)` and the channels are, in order: dh_t, the base support
+    resampled onto the directions, the three components of the direction, and the dh part of the
+    operator's adjoint applied to the whitened residual, scaled per sample. For the depth field
+    the directions are the nodes and the second channel is how far out the core's surface lies
+    along that node's ray. train_lpd.cond_channels builds the middle four of each and
     flow_inputs fills the last; the prior part leaves the last one out.
 
     The adjoint channel is an input, never added to the velocity: it says in which direction
     the misfit falls fastest, and the network decides how far to go.
     """
 
-    def __init__(self, cond_dim: int, width: int = 128, blocks: int = 4,
+    def __init__(self, cond_dim: int, dirs: np.ndarray, width: int = 128, blocks: int = 4,
                  in_ch: int = 1 + N_SPHERE_CH):
         super().__init__()
-        ops = torch.from_numpy(_sphere_operators(dir_design(N_DIR)))
+        ops = _sphere_operators(np.asarray(dirs, dtype=float))
+        self.n_dirs = len(dirs)
         self.inp = SphereConv(ops, in_ch, width)
         self.conv = nn.ModuleList([nn.ModuleList([SphereConv(ops, width, width),
                                                   SphereConv(ops, width, width)])
@@ -357,49 +392,12 @@ class SphereBranch(nn.Module):
         nn.init.zeros_(self.head.w); nn.init.zeros_(self.head.b)
         self.act = nn.SiLU()
 
-    def forward(self, x, cond):                             # x: (B, N_DIR, in_ch)
+    def forward(self, x, cond):                             # x: (B, n_dirs, in_ch)
         h = self.inp(x)
         for (c1, c2), film, norm in zip(self.conv, self.film, self.norm):
             y = c2(self.act(c1(norm(h))))
             h = h + film(y, cond, spatial_dims=0)
-        return self.head(h)[..., 0]                         # (B, N_DIR)
-
-
-class VolBranch(nn.Module):
-    """Velocity for the g block: a 3-D convolutional network over the fixed lattice.
-
-    Input channels: g_t, the convex core's field at the sites, the inside indicator, the
-    normalised site coordinates x, y, z, and the g part of the operator's adjoint applied to
-    the whitened residual, scaled per sample. The last one is the only spatially resolved
-    data channel of this branch: it says at which sites a change of amplitude would move the
-    predicted curves toward the data. The curves themselves reach this branch only through
-    the conditioning vector, which is one vector per body.
-
-    Zero padding, not circular: the box is not periodic. Sites are never removed from the
-    code; the core field channel tells the network which sites are deep inside or far
-    outside.
-    """
-
-    def __init__(self, cond_dim: int, width: int = 64, blocks: int = 4,
-                 in_ch: int = 1 + N_VOL_CH):
-        super().__init__()
-        self.shape = LATTICE_SHAPE
-        self.inp = nn.Conv3d(in_ch, width, 3, padding=1)
-        self.conv = nn.ModuleList([nn.ModuleList([nn.Conv3d(width, width, 3, padding=1),
-                                                  nn.Conv3d(width, width, 3, padding=1)])
-                                   for _ in range(blocks)])
-        self.film = nn.ModuleList([_FiLM(cond_dim, width) for _ in range(blocks)])
-        self.norm = nn.ModuleList([nn.GroupNorm(8, width) for _ in range(blocks)])
-        self.head = nn.Conv3d(width, 1, 3, padding=1)
-        nn.init.zeros_(self.head.weight); nn.init.zeros_(self.head.bias)
-        self.act = nn.SiLU()
-
-    def forward(self, x, cond):                             # x: (B, in_ch, nx, ny, nz)
-        h = self.inp(x)
-        for (c1, c2), film, norm in zip(self.conv, self.film, self.norm):
-            y = c2(self.act(c1(norm(h))))
-            h = h + film(y, cond, spatial_dims=3)
-        return self.head(h).reshape(x.shape[0], -1)         # (B, N_SITES)
+        return self.head(h)[..., 0]                         # (B, n_dirs)
 
 
 class CodeCodec(nn.Module):
@@ -408,19 +406,19 @@ class CodeCodec(nn.Module):
     Whitening: x0 is drawn from N(0, I) and the target is x1 - x0, so both endpoints have to
     live on the same scale. Raw dh and g are much narrower than a unit Gaussian.
 
-    asinh on g: the amplitudes are heavy-tailed, and the tail is the deep carves. Clipping it,
+    asinh on the depths: they are heavy-tailed, and the tail is the deep carves. Clipping it,
     or modelling it as Gaussian, would push the flow toward convex answers.
 
-    One scale and one offset per block, not per coordinate: the volume branch is a convolution
-    that reads every site with the same kernel, and a per-site transform would undo that. The
-    scale is a median absolute deviation rather than a standard deviation so the heavy tail
-    does not set it.
+    One scale and one offset per block, not per coordinate: the depth branch is a convolution on
+    the sphere that reads every node with the same weights, and a per-node transform would undo
+    that. The scale is a median absolute deviation rather than a standard deviation so the heavy
+    tail does not set it.
     """
 
     def __init__(self):
         super().__init__()
         self.register_buffer("g_s", torch.ones(1))
-        self.register_buffer("mu", torch.zeros(2))     # [dh, g], one scalar each
+        self.register_buffer("mu", torch.zeros(2))     # [dh, a], one scalar each
         self.register_buffer("sd", torch.ones(2))
         self.register_buffer("u_lim", torch.full((1,), 80.0))
 
@@ -506,8 +504,10 @@ class PrimalNet(nn.Module):
         super().__init__()
         self.cond = nn.Sequential(nn.Linear(summary_dim + T_DIM + 1, cond_width), nn.SiLU(),
                                   nn.Linear(cond_width, cond_width))
-        self.sphere = SphereBranch(cond_width)
-        self.vol = VolBranch(cond_width)
+        self.sphere = SphereBranch(cond_width, dir_design(N_DIR))
+        self.node = SphereBranch(cond_width, node_design(N_NODES), width=64,
+                                 in_ch=1 + N_NODE_CH)
+        self.register_buffer("op_gain", torch.tensor(float(OP_GAIN)))
         self.gain = nn.Sequential(nn.Linear(T_DIM, 64), nn.SiLU(), nn.Linear(64, 2))
         nn.init.zeros_(self.gain[-1].weight); nn.init.zeros_(self.gain[-1].bias)
         self.step = nn.Sequential(nn.Linear(T_DIM + 2, 64), nn.SiLU(), nn.Linear(64, 2))
@@ -516,12 +516,11 @@ class PrimalNet(nn.Module):
     def forward(self, code, t, summary, t_embed, log_radius, inp: FlowInputs):
         c = self.cond(torch.cat([summary, t_embed, log_radius[:, None]], -1))
         v_dh = self.sphere(torch.cat([code[:, None, :N_DIR].transpose(1, 2), inp.sphere], -1), c)
-        g = code[:, N_DIR:].reshape(-1, 1, *LATTICE_SHAPE)
-        v_g = self.vol(torch.cat([g, inp.vol], 1), c)
+        v_g = self.node(torch.cat([code[:, N_DIR:, None], inp.node], -1), c)
         gain = self.gain(t_embed)
         # inp.adj is the unit direction per block and inp.adj_log the log of the size taken
         # out of it, so the two together are the adjoint itself
-        step = descent_scale(t)[:, None] * torch.exp(inp.adj_log) \
+        step = descent_scale(t, float(self.op_gain))[:, None] * torch.exp(inp.adj_log) \
             * (1.0 + self.step(torch.cat([t_embed, inp.adj_log], -1)))
         skip = torch.cat([gain[:, :1] * code[:, :N_DIR], gain[:, 1:] * code[:, N_DIR:]], -1)
         descent = torch.cat([step[:, :1] * inp.adj[:, :N_DIR], step[:, 1:] * inp.adj[:, N_DIR:]], -1)
@@ -553,21 +552,21 @@ class PriorNet(nn.Module):
         super().__init__()
         self.cond = nn.Sequential(nn.Linear(T_DIM + 1, cond_width), nn.SiLU(),
                                   nn.Linear(cond_width, cond_width))
-        self.sphere = SphereBranch(cond_width, in_ch=N_SPHERE_CH)
-        self.vol = VolBranch(cond_width, in_ch=N_VOL_CH)
+        self.sphere = SphereBranch(cond_width, dir_design(N_DIR), in_ch=N_SPHERE_CH)
+        self.node = SphereBranch(cond_width, node_design(N_NODES), width=64,
+                                 in_ch=N_NODE_CH)
         self.gain = nn.Sequential(nn.Linear(T_DIM, 64), nn.SiLU(), nn.Linear(64, 2))
         nn.init.zeros_(self.gain[-1].weight); nn.init.zeros_(self.gain[-1].bias)
 
-    def forward(self, code, t, radius, sphere_ch, vol_ch):
+    def forward(self, code, t, radius, sphere_ch, node_ch):
         """code (B, CODE_DIM), t (B,), radius (B,), and the branch channels with or without
         their adjoint slot, which is dropped here."""
         te = time_embed(t)
         c = self.cond(torch.cat([te, torch.log(radius)[:, None]], -1))
         sph = sphere_ch[..., :N_SPHERE_CH - 1]
-        vol = vol_ch[:, :N_VOL_CH - 1]
+        nod = node_ch[..., :N_NODE_CH - 1]
         v_dh = self.sphere(torch.cat([code[:, None, :N_DIR].transpose(1, 2), sph], -1), c)
-        g = code[:, N_DIR:].reshape(-1, 1, *LATTICE_SHAPE)
-        v_g = self.vol(torch.cat([g, vol], 1), c)
+        v_g = self.node(torch.cat([code[:, N_DIR:, None], nod], -1), c)
         gain = self.gain(te)
         skip = torch.cat([gain[:, :1] * code[:, :N_DIR], gain[:, 1:] * code[:, N_DIR:]], -1)
         return skip + torch.cat([v_dh, v_g], -1)
@@ -631,6 +630,18 @@ class LPDFlow(nn.Module):
         self.codec = CodeCodec()
         self.n_modes = n_modes
 
+    def set_op_gain(self, gain: float) -> None:
+        """Set the operator's gain on every expert, in whitened code units.
+
+        It is a property of the operator, the geometries and the whitening together, so it
+        belongs to a trained model and not to the module: the whitening is fitted to a corpus
+        and the code's dimension is a constant of the representation, and both of them move it.
+        scripts/train_lpd.py measures it on the corpus it is about to train on and calls this,
+        so a checkpoint carries the value its own training used and nothing has to remember a
+        number written down somewhere else."""
+        for e in self.experts:
+            e.op_gain.fill_(float(gain))
+
     @classmethod
     def from_state_dict(cls, state: dict, **kw) -> "LPDFlow":
         """A network of the shape a saved state dict describes, loaded with it: the expert
@@ -667,9 +678,9 @@ class LPDFlow(nn.Module):
         self.experts = nn.ModuleList([copy.deepcopy(self.experts[k]) for k in owners])
         self.edges = new_edges
 
-    def prior_velocity(self, code, t, radius, sphere_ch, vol_ch):
+    def prior_velocity(self, code, t, radius, sphere_ch, node_ch):
         """The prior part alone: the flow over codes without data."""
-        return self.prior(code, t, radius, sphere_ch, vol_ch)
+        return self.prior(code, t, radius, sphere_ch, node_ch)
 
     def data_velocity(self, code, t, radius, geom_tag, inp: FlowInputs):
         """The data part alone: the shared reader's summary, then the expert that owns each
@@ -715,7 +726,7 @@ class LPDFlow(nn.Module):
         it applies less guidance in total than a constant weight of the same size, and at
         guidance one it is the model as trained at every t.
         """
-        v = self.prior_velocity(code, t, radius, inp.sphere, inp.vol)
+        v = self.prior_velocity(code, t, radius, inp.sphere, inp.node)
         d = self.data_velocity(code, t, radius, geom_tag, inp)
         if guidance == 1.0:
             return v + d
@@ -744,14 +755,14 @@ class LPDFlow(nn.Module):
         With churn > 0 each step is churn_step's step of the stochastic equation; the last
         step adds no noise. `guidance` weights the data part of the velocity; see velocity.
         """
-        sph0, vol0 = cond
+        sph0, node0 = cond
         rad = torch.full((batch,), float(radius), device=device)
         x = torch.randn(batch, CODE_DIM, device=device)
         dt = 1.0 / n_steps
         for k in range(n_steps):
             t = torch.full((batch,), k * dt, device=device)
-            x1_hat = x + (1 - t[:, None]) * self.prior_velocity(x, t, rad, sph0.expand(batch, -1, -1),
-                                                                vol0.expand(batch, -1, -1, -1, -1))
+            x1_hat = x + (1 - t[:, None]) * self.prior_velocity(
+                x, t, rad, sph0.expand(batch, -1, -1), node0.expand(batch, -1, -1))
             v = self.velocity(x, t, rad, geom_tag, resid_fn(x1_hat, t), guidance)
             x = churn_step(x, v, k * dt, dt, churn)
         return x

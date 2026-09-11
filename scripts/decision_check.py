@@ -49,18 +49,20 @@ from reconstruct_lpd import (CONSENSUS_LEVELS, OCC_RES, consensus_bodies, decode
                              dice_optimal_level, make_resid_fn, mesh_misfit_by_geom, polish)
 from train_lpd import (CALIBRATION, CORPUS, RENDER, _enable_tf32, cond_channels,   # noqa: E402
                        file_digest, held_out, load_corpus, load_instrument,
-                       model_error_scale, noise_sigma, site_field, smooth_noise_like)
+                       model_error_scale, noise_sigma, probe_centres, probe_field,
+                       smooth_noise_like)
 
 RULES = (("vote", "best_fit", "medoid", "oracle", "consensus_opt")
          + tuple(f"consensus_{lv:g}" for lv in CONSENSUS_LEVELS))
 
 
 def carving(corpus) -> np.ndarray:
-    """How deeply carved each corpus body is: one minus the share of its hull's lattice sites
-    that are inside the body."""
+    """How deeply carved each corpus body is: one minus the share of the probes inside its hull
+    that are also inside the body."""
     g = corpus.codes[:, N_DIR:]
-    body = (site_field(corpus.support_true, g) < 0).float().sum(1)
-    hull = (site_field(corpus.support_true, torch.zeros_like(g)) < 0).float().sum(1)
+    o = probe_centres(corpus.support_true)
+    body = (probe_field(corpus.support_true, g, o) < 0).float().sum((1, 2))
+    hull = (probe_field(corpus.support_true, torch.zeros_like(g), o) < 0).float().sum((1, 2))
     return (1.0 - body / hull.clamp_min(1.0)).clamp_min(0.0).cpu().numpy()
 
 

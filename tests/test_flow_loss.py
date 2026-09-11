@@ -77,14 +77,14 @@ def test_flow_loss_trains_reader_and_expert_with_every_term():
 
 def _carved_body():
     """A unit ball and the same ball with a pocket carved into it: the hull support, the true
-    code, and which lattice sites the carve removes."""
-    from hac26.field import GaussianLattice
-    sites = GaussianLattice().p
-    centre = torch.tensor([0.65, 0.0, 0.0])            # a pocket in the side of the ball
-    carved = (sites - centre).norm(dim=1) < 0.30
+    code, and which of the probe rays the carve reaches."""
+    from hac26.field import DepthSphere, N_NODES
+    nodes = DepthSphere(N_NODES).u
+    axis = torch.tensor([1.0, 0.0, 0.0])               # a pocket in the side of the ball
+    carved = nodes @ axis > np.cos(np.deg2rad(25.0))
     sup = torch.ones(1, DESIGN_N)                      # the support of the unit ball
     code = torch.zeros(1, CODE_DIM)
-    code[0, N_DIR:][carved] = 1.0                      # amplitudes that push the field outside
+    code[0, N_DIR:][carved] = 0.45                     # depths that take the surface inward
     return sup, code, carved
 
 
@@ -98,7 +98,7 @@ def _occ(net, sup, h_base, code_true, z_est):
 
 def test_the_occupancy_term_is_mostly_about_the_carve(monkeypatch):
     """The convex stage already supplies the hull, so the term has to be dominated by the
-    sites the hull gets wrong. Missing the carve entirely costs far more with the weighting
+    probes the hull gets wrong. Missing the carve entirely costs far more with the weighting
     than without it, while a convex body's term is untouched."""
     import train_lpd
     sup, code_true, carved = _carved_body()
@@ -114,12 +114,12 @@ def test_the_occupancy_term_is_mostly_about_the_carve(monkeypatch):
     monkeypatch.setattr(train_lpd, "CARVE_WEIGHT", 0.0)
     plain = gap()
     assert weighted > 5.0 * plain, (weighted, plain)
-    # the carve is a few percent of the sites, and the weighting is what makes it count
+    # the carve is a few percent of the probes, and the weighting is what makes it count
     assert float(carved.float().mean()) < 0.1
 
 
 def test_the_occupancy_term_is_bounded_by_a_wild_field():
-    """A decoded field of many lattice spacings says no more about where the surface is than
+    """A decoded field of many probe spacings says no more about where the surface is than
     one of a single spacing, and unbounded it would swamp the step."""
     sup, code_true, _ = _carved_body()
     net = LPDFlow(n_experts=1)

@@ -1,7 +1,7 @@
 """The operator the flow is trained and run with: a raw code in, the mean-normalised curves
 of every geometry out, and the gradient of a weighted residual back onto the code.
 
-    code (dh, g), reshaping c, base support h --ImplicitBody--> field f
+    code (dh, a), reshaping c, base support h --ImplicitBody--> field f
         --extract_mesh--> mesh
         --xy scaled by the radius--> --ExactForward--> unnormalised curves
         --normalise--> curves
@@ -50,10 +50,13 @@ def mesh_volume(verts: torch.Tensor, faces: torch.Tensor) -> float:
 
 
 def split_code(code: torch.Tensor):
-    """(dh, g) from a raw code (CODE_DIM,). The reshaping coefficients c are not part of the
-    code: the flow's architecture is built around the code's two blocks, one on the sphere
-    and one on the lattice, and c belongs to neither. A solver that fits c passes it beside
-    the code."""
+    """(dh, a) from a raw code (CODE_DIM,): the band-limited correction to the support and the
+    depths on the nodes.
+
+    The reshaping coefficients c are not part of the code. They are the degree-two part of the
+    same depth field the second block carries the rest of, and a network whose blocks are two
+    fixed direction sets has nowhere to put nine numbers that belong to both; a solver that fits
+    c passes it beside the code."""
     if code.numel() != CODE_DIM:
         raise ValueError(f"code has {code.numel()} entries, expected CODE_DIM={CODE_DIM}")
     return code[:N_DIR], code[N_DIR:]
@@ -62,10 +65,10 @@ def split_code(code: torch.Tensor):
 class CodeOperator:
     """A(x) and its adjoint for one phase grid, one instrument and one extraction resolution.
 
-    `res` is the FlexiCubes grid the surface is extracted on. It has to resolve the
-    correction's kernels (field.kernel_pitch_ratio), or the body the operator renders is
-    coarser than the one its amplitudes describe and a fit is scored on something it is not
-    changing. The base support `support` of every call is the origin the code's dh block
+    `res` is the FlexiCubes grid the surface is extracted on. It has to resolve the angular
+    scale of the depth field, which at field.N_NODES nodes is a wavelength of about a tenth of
+    the body, or the body the operator renders is coarser than the one its coefficients describe
+    and a fit is scored on something it is not changing. The base support `support` of every call is the origin the code's dh block
     corrects: the fitted hull of a corpus body in training, the convex stage's answer at
     reconstruction.
     """
@@ -85,10 +88,10 @@ class CodeOperator:
         `grad=True` the vertices are differentiable in `code`. `c` is the radial reshaping
         term (field.radial_field) and is absent unless it is passed."""
         self.body.set_support(support.to(self.device))
-        dh, g = split_code(code.to(self.device))
+        dh, a = split_code(code.to(self.device))
         if c is not None:
             c = c.to(self.device)
-        verts, faces = extract_mesh(lambda y: self.body(y, dh=dh, g=g, c=c), EXTRACT_EXTENT,
+        verts, faces = extract_mesh(lambda y: self.body(y, dh=dh, a=a, c=c), EXTRACT_EXTENT,
                                     res=res or self.res, device=self.device, grad=grad)
         if len(faces) < MIN_FACES:
             return None

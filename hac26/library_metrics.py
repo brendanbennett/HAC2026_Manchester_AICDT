@@ -79,8 +79,8 @@ def descriptor_concavity(verts: np.ndarray, faces: np.ndarray,
     """f_body(y) - f_core(y) at fixed probe points, where f_core is the convex core at the
     hull support and f_body a signed distance from the body's own occupancy.
 
-    This is the part of the field the lattice correction (`hac26.field.GaussianLattice`) has
-    to carry when `scripts/fit_shapes.py` fits a body with the core pinned to its hull.
+    This is the part of the field the depth correction (`hac26.field.DepthSphere`) has to
+    carry when `scripts/fit_shapes.py` fits a body with the core pinned to its hull.
     Computed by a distance transform, so it needs neither torch nor trimesh.
     """
     n = design_normals() if normals is None else np.asarray(normals, float)

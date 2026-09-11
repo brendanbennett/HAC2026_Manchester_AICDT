@@ -11,7 +11,7 @@ applied at the body the prior's velocity says the state is heading for, the read
 whitened residual into a summary, the adjoint carries the residual back onto the code, and
 the expert that owns t predicts the velocity. The velocity is scored against the one that
 would take the state straight to x1 in the time left, with the same weight at every t. The
-endpoint it implies is decoded and its inside-or-outside at the lattice sites is scored
+endpoint it implies is decoded and its inside-or-outside at a cloud of probes is scored
 against the body's, so the loss sees the shape and not only the numbers that encode it. For
 draws late in t, where that endpoint is nearly the answer, it is rendered once more and must
 fit the data to within the noise. See flow_loss.
@@ -66,15 +66,16 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from hac26.conventions import R_z, cameras, psi_grid                            # noqa: E402
 from hac26.data_io import N_CAMS                                                # noqa: E402
-from hac26.field import (CODE_DIM, DESIGN_N, LATTICE_EXTENT, LATTICE_SHAPE, N_DIR,   # noqa: E402
-                         GaussianLattice, ImplicitBody, dir_design, sh_expand,
-                         spherical_design, support_resample, support_resample_weights)
+from hac26.field import (CODE_DIM, DESIGN_N, EXTRACT_EXTENT, N_DIR,               # noqa: E402
+                         N_NODES, DepthSphere, ImplicitBody, dir_design, node_turn,
+                         sh_expand, spherical_design, support_resample,
+                         support_resample_weights)
 from hac26.forward.mesh.exact import RenderConfig                               # noqa: E402
 from hac26.forward.mesh.instrument import Instrument                            # noqa: E402
 from hac26.noise import NOISE_HI, NOISE_LO, NOISE_PROFILE                       # noqa: E402
 from hac26.shapes import canonicalize_r, mesh_support, rescale_touch_z          # noqa: E402
-from hac26.solvers.lpd_flow import (N_EXPERTS, N_FEAT, N_MODES, N_SPHERE_CH,   # noqa: E402
-                                    N_VOL_CH, FlowInputs, LPDFlow, flow_inputs,
+from hac26.solvers.lpd_flow import (N_EXPERTS, N_FEAT, N_MODES, N_NODE_CH,     # noqa: E402
+                                    N_SPHERE_CH, FlowInputs, LPDFlow, flow_inputs,
                                     geometry_tags)
 from hac26.solvers.operator import CodeOperator                                 # noqa: E402
 
@@ -86,15 +87,21 @@ RENDER = RenderConfig()                            # the operator's discretisati
 
 OCC_WEIGHT = 1.0       # weight of the occupancy term against the endpoint term. Both are of
                        # order one at initialisation, so one is the neutral choice.
-OCC_MARGIN = 0.25      # width of the occupancy target's soft edge, as a fraction of the lattice
-                       # spacing. Sites further from the surface than a few of these saturate
-                       # and stop contributing; the field cannot place the surface finer than
-                       # the lattice anyway.
-CARVE_WEIGHT = 20.0    # how much a site the body's hull gets wrong counts against one it gets
+OCC_MARGIN = 0.25      # width of the occupancy target's soft edge, as a fraction of the probe
+                       # spacing along a ray. A probe further from the surface than a few of
+                       # these saturates and stops contributing, and the probes cannot place the
+                       # surface finer than their own spacing anyway.
+PROBE_RADII = 12       # probes along each node's ray, from the centre out to the extraction's
+                       # extent. The probes sit on the nodes' own rays rather than on a grid in
+                       # space, which is what makes the field at them free of any neighbour
+                       # search: the depth at a probe is the depth at its own node, so the whole
+                       # cloud costs one sparse product with the node kernel and one maximum
+                       # over the core's normals per radius.
+CARVE_WEIGHT = 20.0    # how much a probe the body's hull gets wrong counts against one it gets
                        # right, in the occupancy term. A carve touches a few percent of the
-                       # sites, so this puts about half the term on the carve; see step_loss.
+                       # probes, so this puts about half the term on the carve; see step_loss.
 OCC_LOGIT = 12.0       # where the occupancy term saturates, in units of its soft edge, so
-                       # about three lattice spacings from the surface
+                       # about three probe spacings from the surface
 FIT_WEIGHT = 1.0       # weight of the data-fit term (data_fit) against the flow term
 FIT_FROM = 1.0 - 1.0 / N_EXPERTS   # the data-fit term applies at t from here on: the interval
                                    # the last of the N_EXPERTS experts owns, where the endpoint
@@ -183,27 +190,25 @@ _TURN_CACHE: dict = {}
 
 def _quarter_turn_maps(device):
     """What a turn of the body by q quarter turns about the spin axis does to a code, for
-    q = 1, 2, 3, stacked along the first axis: the permutation of the lattice sites (3,
-    N_SITES), the resampling of a support function onto the turned design normals as
+    q = 1, 2, 3, stacked along the first axis: the permutation of the depth nodes
+    (3, N_NODES), the resampling of a support function onto the turned design normals as
     (indices, weights) (3, DESIGN_N, k), and the matrix taking dh on its directions to the
-    turned directions (3, N_DIR, N_DIR). The lattice is a centred cubic grid, so its
-    permutation is exact; dh is band-limited, so its matrix is exact; the support function
-    is resampled the way support_from_mesh's normals resample any support. Built once per
-    device."""
+    turned directions (3, N_DIR, N_DIR).
+
+    All three are exact, each for its own reason: the node set is built to be invariant under a
+    quarter turn (field.node_design), so a turned body's depths are the same numbers in a
+    different order; dh is band-limited, so its matrix is exact on the band; and the support
+    function is resampled the way support_from_mesh's normals resample any support. Built once
+    per device."""
     dev = torch.device(device)
     if dev not in _TURN_CACHE:
-        sites = GaussianLattice().p.double()
         nrm = spherical_design(DESIGN_N)
         dirs = dir_design(N_DIR)
         perms, idxs, ws, es = [], [], [], []
         for q in (1, 2, 3):
             R = R_z(q * np.pi / 2.0)
             # a turned body's value at y is the unturned body's value at R^T y
-            back = sites @ torch.from_numpy(R)                       # rows: R^T y
-            d = torch.cdist(back, sites)
-            perm = d.argmin(1)
-            assert float(d.min(1).values.max()) < 1e-6, "the lattice is not symmetric"
-            perms.append(perm)
+            perms.append(torch.from_numpy(node_turn(q, N_NODES)).long())
             idx, w = support_resample_weights(nrm, nrm @ R)
             idxs.append(torch.from_numpy(idx)); ws.append(torch.from_numpy(w))
             es.append(torch.from_numpy(sh_expand(dirs, dirs @ R)))
@@ -246,8 +251,8 @@ def quarter_turns(corpus: Corpus, idx, q):
 # --------------------------------------------------------------------- the training draws
 
 def occ_eps_default() -> float:
-    """The soft edge in model units: OCC_MARGIN of the finest lattice spacing."""
-    return OCC_MARGIN * min(2.0 * LATTICE_EXTENT / n for n in LATTICE_SHAPE)
+    """The soft edge in model units: OCC_MARGIN of the spacing of the probes along a ray."""
+    return OCC_MARGIN * (EXTRACT_EXTENT / PROBE_RADII)
 
 
 def noise_sigma(n: int, generator=None) -> torch.Tensor:
@@ -317,8 +322,13 @@ def cond_channels(support: torch.Tensor, device=None):
     sh_expand: sh_expand keeps only low harmonic degrees, which is right for dh and would
     throw away part of h on a flat-faced body.
 
-    Volume branch (B, N_VOL_CH, nx, ny, nz): the convex core's field at the lattice sites,
-    the inside indicator, the normalised site coordinates, and the adjoint slot.
+    Depth branch (B, N_NODES, N_NODE_CH): how far out the core's surface lies along each
+    node's ray, the three components of the node direction, and the adjoint slot. That first
+    channel is the room there is to carve at that node -- the quantity field.depth_cap takes the
+    smallest of -- and it is the depth branch's whole view of the body it is correcting. There
+    is no inside indicator and no coordinate triple: on a sphere of directions every coordinate
+    is on the surface, which is the reason this branch has two fewer channels than the lattice
+    branch it replaces and none of them wasted.
     """
     global _DIR_CACHE
     dev = device or support.device
@@ -329,21 +339,21 @@ def cond_channels(support: torch.Tensor, device=None):
         nrm = spherical_design(DESIGN_N)
         _DIR_CACHE = (torch.from_numpy(d.astype(np.float32)),
                       torch.from_numpy(support_resample(nrm, d)),
-                      GaussianLattice().p)
+                      DepthSphere(N_NODES).u)
     if dev not in _DIR_CACHE_DEV:
         _DIR_CACHE_DEV[dev] = tuple(t.to(dev) for t in _DIR_CACHE)
-    dirs, to_dir, sites = _DIR_CACHE_DEV[dev]
+    dirs, to_dir, nodes = _DIR_CACHE_DEV[dev]
     h_dir = sup.to(dev) @ to_dir.T                                    # (B, N_DIR)
     sph = torch.cat([h_dir[..., None],
                      dirs[None].expand(B, -1, -1),
                      torch.zeros(B, N_DIR, 1, device=dev)], -1)       # (B, N_DIR, 5)
 
-    sdf = _site_core(sup.to(dev))
-    xyz = (sites / LATTICE_EXTENT).T[None].expand(B, -1, -1)          # (B, 3, N_SITES)
-    vol = torch.cat([sdf[:, None], (sdf < 0).float()[:, None], xyz,
-                     torch.zeros(B, 1, sdf.shape[1], device=dev)], 1)
-    assert sph.shape[-1] == N_SPHERE_CH and vol.shape[1] == N_VOL_CH
-    return sph, vol.reshape(B, N_VOL_CH, *LATTICE_SHAPE)
+    reach = core_reach(sup.to(dev))                                   # (B, N_NODES)
+    node = torch.cat([reach[..., None],
+                      nodes[None].expand(B, -1, -1),
+                      torch.zeros(B, len(nodes), 1, device=dev)], -1)
+    assert sph.shape[-1] == N_SPHERE_CH and node.shape[-1] == N_NODE_CH
+    return sph, node
 
 
 def spectrum(curves: torch.Tensor, n_modes: int) -> torch.Tensor:
@@ -373,46 +383,74 @@ def residual_features(data: torch.Tensor, pred: torch.Tensor, sigma: torch.Tenso
 
 # ------------------------------------------------------------------- the occupancy target
 
-_SITE_CACHE: dict = {}
+_PROBE_CACHE: dict = {}
 
 
-def _site_geometry(dev):
-    """Two fixed matrices over the lattice sites: the sites projected on every design normal,
-    and the lattice kernel evaluated site-to-site. Neither depends on the body, so both are
-    built once per device."""
-    if dev not in _SITE_CACHE:
-        lat = GaussianLattice()
-        p = lat.p
-        # the same expansion GaussianLattice.forward uses, with the sites as the query points
-        d2 = (p ** 2 * lat.inv2).sum(1, keepdim=True) + lat.pb[None] \
-            - 2.0 * ((p * lat.inv2) @ lat.p.T)
-        kern = torch.exp(-0.5 * d2.clamp_min(0.0))                    # (N_SITES, N_SITES)
-        proj = p @ ImplicitBody().core.n.T                            # (N_SITES, DESIGN_N)
-        _SITE_CACHE[dev] = (proj.to(dev), kern.to(dev))
-    return _SITE_CACHE[dev]
+def _probe_geometry(dev):
+    """Three fixed tensors over the probe cloud: the node directions projected on every design
+    normal (N_NODES, DESIGN_N), the radii the probes sit at (PROBE_RADII,), and the node kernel
+    (N_NODES, N_NODES). None depends on the body, so all three are built once per device.
+
+    The probes are the nodes' own rays, so the projection does not depend on the radius: a probe
+    at radius r in direction u has n . (o + r u) = n . o + r (n . u), and the second factor is
+    this matrix. That is what lets a cloud of PROBE_RADII * N_NODES points cost one maximum per
+    radius rather than one per point.
+    """
+    if dev not in _PROBE_CACHE:
+        rep = DepthSphere(N_NODES)
+        proj = rep.u.double() @ ImplicitBody().core.n.double().T      # (N_NODES, DESIGN_N)
+        r = (torch.arange(PROBE_RADII, dtype=torch.float64) + 0.5) / PROBE_RADII * EXTRACT_EXTENT
+        kern = torch.from_numpy(rep.matrix(rep.u.numpy()).toarray())
+        _PROBE_CACHE[dev] = (proj.float().to(dev), r.float().to(dev), kern.float().to(dev))
+    return _PROBE_CACHE[dev]
 
 
-def _site_core(h: torch.Tensor) -> torch.Tensor:
-    """The convex core's field at the lattice sites, one row per body, for supports h
-    (B, DESIGN_N). The matrix product is shared; per body what is left is a subtract and a
-    max over normals."""
-    proj, _ = _site_geometry(h.device)
-    return torch.stack([(proj - h[b]).amax(-1) for b in range(len(h))])
+def core_reach(h: torch.Tensor) -> torch.Tensor:
+    """How far the core's surface is from the centre along each node's ray, (B, N_NODES), for
+    supports h (B, DESIGN_N).
+
+    Along the ray o + t u the core is the largest of n . o + t (n . u) - h over the normals, so
+    it reaches zero at the smallest of (h - n . o) / (n . u) over the normals that face the ray.
+    This is the depth at which a carve in that direction would take the surface all the way to
+    the centre, so it is exactly the per-node form of field.depth_cap's bound, and it is what
+    the depth branch reads to know how much room it has.
+    """
+    proj, _, _ = _probe_geometry(h.device)                            # (N_NODES, DESIGN_N)
+    off = probe_centres(h) @ ImplicitBody().core.n.to(h.device).T     # (B, DESIGN_N)
+    far = torch.tensor(float("inf"), device=h.device)
+    return torch.stack([torch.where(proj > 1e-6, (h[b] - off[b]) / proj.clamp_min(1e-6),
+                                    far).amin(-1) for b in range(len(h))])
 
 
-def site_field(h: torch.Tensor, g: torch.Tensor) -> torch.Tensor:
-    """f at the lattice sites for a batch of bodies: the core at support h (B, DESIGN_N) plus
-    the lattice sum with amplitudes g (B, N_SITES). This is ImplicitBody.forward evaluated at
-    the sites, with the support supplied rather than stored, so it stays differentiable in
-    both h and g."""
-    _, kern = _site_geometry(h.device)
-    return _site_core(h) + g @ kern.T
+def probe_centres(h: torch.Tensor) -> torch.Tensor:
+    """The centre each body's depths are measured from, (B, 3), for supports h (B, DESIGN_N).
+
+    The Steiner point of field.core_centre, written as one product so that it is batched and so
+    that it carries a gradient: the occupancy term reads the field of a decoded support, the
+    centre of that support is part of where the field is, and a centre taken through numpy would
+    silently cut the loss off from it."""
+    return 3.0 * (h @ ImplicitBody().core.n.to(h.device)) / h.shape[-1]
+
+
+def probe_field(h: torch.Tensor, a: torch.Tensor, centre: torch.Tensor) -> torch.Tensor:
+    """f at the probe cloud for a batch of bodies, (B, PROBE_RADII, N_NODES): the core at
+    support h (B, DESIGN_N) plus the depth field, which on a node's own ray is that node's own
+    depth smoothed over its neighbours. This is ImplicitBody.forward evaluated at the probes,
+    with the support supplied rather than stored, so it stays differentiable in both h and a."""
+    proj, radii, kern = _probe_geometry(h.device)
+    depth = a @ kern.T                                                # (B, N_NODES)
+    off = centre @ ImplicitBody().core.n.to(h.device).T               # (B, DESIGN_N)
+    out = []
+    for r in radii:
+        core = torch.stack([(r * proj + (off[b] - h[b])).amax(-1) for b in range(len(h))])
+        out.append(core + depth)
+    return torch.stack(out, 1)
 
 
 # --------------------------------------------------------------- the operator in the loop
 
 def operator_inputs(net, op: CodeOperator, x1_hat, h, radius, data, sigma, geoms, step_mask,
-                    sph, vol, M):
+                    sph, node, M):
     """Run the operator and its adjoint at the endpoint estimate x1_hat (B, CODE_DIM,
     whitened) of every body and build the network's inputs from the result: the whitened
     residual features and the adjoint of the whitened misfit. A body without curves is
@@ -440,7 +478,7 @@ def operator_inputs(net, op: CodeOperator, x1_hat, h, radius, data, sigma, geoms
     feats = residual_features(data, pred, sigma, M, step_mask)
     # the adjoint is taken with respect to the raw code at x1_hat; the network works in the
     # whitened code, so it is taken back through the codec at that point
-    return flow_inputs(feats, step_mask, sph, vol, net.codec.pullback(x1_hat, adj)), int(B - live.sum())
+    return flow_inputs(feats, step_mask, sph, node, net.codec.pullback(x1_hat, adj)), int(B - live.sum())
 
 
 # ------------------------------------------------------------------------------- the loss
@@ -469,8 +507,8 @@ def step_loss(net, xt, t, v, x1, sup_true, code_true, h_base, occ_weight, occ_ep
     convex body every weight is one and the term is unchanged.
 
     The cross-entropy saturates at OCC_LOGIT rather than growing with the field. A decoded
-    field of several lattice spacings says nothing more about where the surface is than one of
-    a single spacing, and left unbounded a single site with a large field contributes hundreds
+    field of several probe spacings says nothing more about where the surface is than one of a
+    single spacing, and left unbounded a single probe with a large field contributes hundreds
     to the loss and destabilises the step.
 
     Returns (total, flow term, occupancy term, decoded endpoint)."""
@@ -479,12 +517,15 @@ def step_loss(net, xt, t, v, x1, sup_true, code_true, h_base, occ_weight, occ_ep
     x1_hat = xt + (1 - t[:, None]) * v
     with torch.no_grad():
         g_true = code_true[:, N_DIR:]
-        occ_true = torch.sigmoid(-site_field(sup_true, g_true) / occ_eps)
-        occ_hull = torch.sigmoid(-site_field(sup_true, torch.zeros_like(g_true)) / occ_eps)
+        o_true = probe_centres(sup_true)
+        occ_true = torch.sigmoid(-probe_field(sup_true, g_true, o_true) / occ_eps)
+        occ_hull = torch.sigmoid(-probe_field(sup_true, torch.zeros_like(g_true), o_true)
+                                 / occ_eps)
         w = 1.0 + CARVE_WEIGHT * (occ_hull - occ_true).abs()
-        w = w / w.mean(1, keepdim=True).clamp_min(1e-6)
+        w = w / w.mean((1, 2), keepdim=True).clamp_min(1e-6)
     raw = net.codec.decode(x1_hat)
-    f_est = site_field(support_with(h_base, raw[:, :N_DIR]), raw[:, N_DIR:])
+    h_est = support_with(h_base, raw[:, :N_DIR])
+    f_est = probe_field(h_est, raw[:, N_DIR:], probe_centres(h_est))
     logit = OCC_LOGIT * torch.tanh(-f_est / (occ_eps * OCC_LOGIT))
     occ = (torch.nn.functional.binary_cross_entropy_with_logits(logit, occ_true,
                                                                 reduction="none") * w).mean()
@@ -635,15 +676,15 @@ def flow_loss(net, op: CodeOperator, corpus: Corpus, eta, idx, x0, t, M, tag, ma
 
     # h the operator runs at: the convex start of each body
     h_base = sup
-    sph, vol = cond_channels(h_base, device=dev)
+    sph, node = cond_channels(h_base, device=dev)
     tag_b = tag.expand(B, C, 4)
 
     # The state, on the straight line.
     xt = (1 - t[:, None]) * x0 + t[:, None] * x1
     with torch.no_grad():
-        v0 = net.prior_velocity(xt, t, radius, sph, vol)
+        v0 = net.prior_velocity(xt, t, radius, sph, node)
         inp, n_dropped = operator_inputs(net, op, xt + (1 - t[:, None]) * v0, h_base, radius,
-                                         data, scale, geoms, step_mask, sph, vol, M)
+                                         data, scale, geoms, step_mask, sph, node, M)
     step_mask = inp.mask
     u = net.velocity(xt, t, radius, tag_b, inp)
     loss, flow, occ, raw = step_loss(net, xt, t, u, x1, sup_true, codes, h_base, occ_weight,
@@ -825,7 +866,7 @@ def main():
                          "endpoint term; 0 trains the plain flow objective")
     ap.add_argument("--occ-eps", type=float, default=None,
                     help="soft edge of the occupancy target in model units; default is "
-                         "OCC_MARGIN of the lattice spacing")
+                         "OCC_MARGIN of the probe spacing along a ray")
     ap.add_argument("--fit-weight", type=float, default=FIT_WEIGHT,
                     help="weight of the data-fit term on the endpoint estimate for draws in "
                          "the last expert's interval (see flow_loss); 0 turns it off and "
@@ -967,7 +1008,8 @@ def main():
           f"{NOISE_LO:g}-{NOISE_HI:g} of the curve mean", flush=True)
     occ_eps = a.occ_eps if a.occ_eps is not None else occ_eps_default()
     print(f"  occupancy term: weight {a.occ_weight:g}, soft edge {occ_eps:.4f} "
-          f"(lattice spacing {2.0 * LATTICE_EXTENT / max(LATTICE_SHAPE):.4f})", flush=True)
+          f"({PROBE_RADII} probes per ray, spacing "
+          f"{EXTRACT_EXTENT / PROBE_RADII:.4f})", flush=True)
     print(f"  data-fit term: weight {a.fit_weight:g} on draws with t >= {FIT_FROM:g}"
           + ("" if a.fit_weight > 0 else " (off)"), flush=True)
     augment = phases % 4 == 0

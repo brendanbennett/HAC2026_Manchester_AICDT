@@ -25,7 +25,8 @@ SCORED=${SCORED:-"4 5 6 7 8 9 10"}
 HOLD_OUT_GEOMS=${HOLD_OUT_GEOMS:-5}   # cameras kept out of each fit; their misfit is the
                                       # only honest test of the body that was written
 PHASES=${PHASES:-48}
-RESTARTS=${RESTARTS:-8}
+RESTARTS=${RESTARTS:-9}                # the convex answer and one sweep of the designed
+                                      # grid of caps; hac26/solvers/gauss_newton.py says why
 CALIBRATE_STEPS=${CALIBRATE_STEPS:-600}
 CALIBRATE_MODELS=${CALIBRATE_MODELS:-"1 3"}   # public bodies the instrument is fitted on. One
                                               # model error is shared across them, so a body

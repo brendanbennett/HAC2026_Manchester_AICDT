@@ -29,7 +29,7 @@ reduction has it.
 The two directions differ in one measurable way. A corrugation raises the body's surface area
 by 0.55 to 0.71; moving toward the body lowers it by 0.38 to 0.72. The surface area of a
 closed body is the total variation of its indicator, and it is what charges a rough surface
-while leaving a smooth dent of any depth nearly free. A ridge on the amplitudes does not: it
+while leaving a smooth dent of any depth nearly free. A ridge on the coefficients does not: it
 charges by how large a coefficient is, so it prefers a shallow answer to a deep one, and
 measured against the released body it prefers the fit's own answer by eight per cent.
 
@@ -46,16 +46,59 @@ of an area term does not. Making the objective scale free in the misfit,
     G = log chi^2 + mu A,
 
 fixes the balance: stationarity then compares a relative change of misfit with an absolute
-change of area. The window opens to 0.60 <= mu <= 0.99 — below 0.60 the one-cell corrugation is
-still profitable, above 0.99 the body is beaten by itself displaced 0.03 inward, which costs
-0.016 of overlap against the 0.07 the corrugation costs. `AREA_WEIGHT` sits near the top of
-the window and `CarveFit` refuses a value outside it.
+change of area. The window opens, and where it opens to depends on the representation, which is
+the subject of the next section. In the one this repository now uses it is
+0.30 <= mu <= 2.40; `AREA_WEIGHT` sits inside it and `CarveFit` refuses a value outside it.
 
 The penalty does not forbid concavities, and that was tested rather than argued. A hemispherical
 pit of radius 0.15 cut into the released body at 35 places over its surface costs between
 0.004 and 0.073 of objective and is paid between 0.005 and 0.964 by the misfit: 33 of the 35
 are paid for, by a median factor of ten. The two that are not are places where the pit changes
 the curves by less than the model error, which the data do not determine in any case.
+
+## What a displacement changes, and why the ladder has a ceiling
+
+The measurements above were made on a representation that added blobs of material. The body is
+now the convex core displaced inward by a depth, and for a *displacement* the area behaves
+differently in a way that decides the recipe rather than the weight.
+
+The first variation of area under a normal displacement d of a surface is the integral of d
+against twice the mean curvature. At first order the area therefore sees only the
+curvature-weighted average of the displacement, and an oscillation of zero mean is nearly free;
+what a rough displacement raises is the second-order term in its tangential gradient. In a
+lattice of blobs a corrugation is new structure that genuinely adds surface at first order; in a
+depth field it is a wrinkle in a surface that already exists.
+
+Measured from the convex answer of model 3, a displacement at the scale of the node spacing
+lowers the log misfit by 0.15 to 0.57 and changes the area by anything between -0.045 and
++0.112 depending on the seed: one seed in three lowers the area *and* the misfit together, so no
+weight charges it at all, and the others need a weight above 1.9 while the released body stops
+being a minimiser above 2.48. **The window is empty for that direction and no weight closes
+it.** What closes it is taking the direction out of the search: the ladder in
+`hac26/solvers/gauss_newton.py` stops at an angular degree whose wavelength is ten extraction
+pitches at the surface, which is not a corrugation, and the same ladder run without that cap
+ends at an overlap of 0.677 -- below the 0.709 it started from -- while lowering the misfit.
+Inside the capped search the weight is back inside a window it can sit in, and the job it is
+left doing, which it does, is keeping the body a minimiser against a further uniform carve.
+
+The same bound is why a stage that searches random smooth fields on the nodes builds them by
+smoothing over at least two node spacings. One application of the node kernel to white noise is
+exactly the direction above.
+
+## The floor on the volume
+
+The penalty's risk is the hull shrink, and the trust region bounds each step rather than the
+walk. Measured, the remedied ladder on model 3 without a floor takes the volume from the
+convex answer's 2.518 to 0.864 and the overlap from 0.7086 down to 0.6541, lowering the misfit
+throughout; with the volume floored at half the convex answer's the same ladder stops at 1.262
+and ends at 0.7477. The floor is therefore a stop on a walk and not a bound on a step, which is
+why it lives in the render `scripts/reconstruct_gn.py` builds -- a body below it is refused the
+way a body the forward model cannot render is refused -- rather than in `CarveFit`.
+
+It is calibrated on one body. Model 3's own volume is 0.580 of its convex answer's, so the
+floor sits below it with room; what would make the number principled rather than calibrated is
+the distribution of that ratio over the shape library, and that is the same corpus the gate on
+the convex answer's misfit would need.
 
 ## What the penalty exposed
 
@@ -65,7 +108,7 @@ price of the penalty.
 A direction the curves cannot see has no curvature in the Gauss-Newton matrix, so damping
 relative to that curvature does not bound a step into it. While the right-hand side was the
 Jacobian applied to the residual, it lay in the range of the Jacobian and the question did not
-arise. The area's gradient does not lie there, and the amplitudes then grow without limit in
+arise. The area's gradient does not lie there, and the coefficients then grow without limit in
 directions that do not move the surface: measured, a first coarse step reached a carve
 seventeen hundred body radii deep, while rendering a body of overlap 0.748. Flooring the
 damped diagonal at a hundredth of its mean bounds it, and the same step then reaches a carve
@@ -91,7 +134,7 @@ are in the table below; the branch's own previous answer is the row marked as th
 | what was minimised | misfit | overlap | carve depth | hull shift |
 |---|---|---|---|---|
 | nothing: the convex stage's answer | 0.0787 | 0.7080 | 0 | 0 |
-| the misfit, under a ridge on the amplitudes | 0.0376 | 0.7205 | 0.224 | +0.016 |
+| the misfit, under a ridge on the coefficients | 0.0376 | 0.7205 | 0.224 | +0.016 |
 | the misfit and the area, then polished on the misfit | 0.0557 | 0.7533 | 0.226 | +0.042 |
 
 Both fits are from the same start, on the same curves, through the same renderer, at 24 phases

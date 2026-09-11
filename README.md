@@ -129,10 +129,20 @@ the true shape divided by the noise, per geometry, which is the number that says
 the chain matches the channel, and a travel table that names any parameter still moving
 when the step budget ran out.
 
-The fit itself moves the nine reshaping coefficients and the lattice amplitudes in one damped
-Gauss-Newton step with a secant Jacobian, coarse to fine over the amplitudes and restarted
-from several shrunken and carved bodies (`hac26/solvers/gauss_newton.py`). Nothing
-differentiates the renderer.
+The correction from the convex answer to the body is one function on the sphere. A convex
+inversion returns a body larger than the true hull, because enlarging a convex body is how it
+imitates the shadowing of a concavity, so the correction shrinks the hull in some directions and
+carves it in others -- and those are not two separate moves but the low and the high angular
+degrees of the same displacement. The body is the convex core displaced inward by a depth
+indexed by the direction of the surface point, the nine reshaping coefficients carry that
+displacement's degrees up to two, and a depth on the nodes carries the rest
+(`hac26/field.py`). Below a bound the representation states, the body still contains the centre
+the depths are measured from, so it is star-shaped and extracts as one closed surface by
+construction rather than by repair.
+
+The fit moves the whole of that function in one damped Gauss-Newton step with a secant
+Jacobian, coarse to fine in angular degree and restarted from several shrunken and carved
+bodies (`hac26/solvers/gauss_newton.py`). Nothing differentiates the renderer.
 
 What it minimises is not the misfit. Both released reductions are sums over a thresholded
 image, so their error is the quantisation of the boundary of the lit region, and a body with
@@ -142,7 +152,14 @@ the overlap by a thirtieth as much. The objective therefore carries the body's s
 beside its misfit, which is what charges a rough surface and leaves a smooth dent of any depth
 nearly free, and it carries it as a logarithm plus an area so the balance survives the descent.
 `notes/objective.md` measures all of that, gives the window the weight has to lie in, and
-records the three things the penalty exposed that a ridge on the amplitudes had been hiding.
+records the three things the penalty exposed that a ridge on the coefficients had been hiding.
+One more thing decides where the ladder stops. The first variation of area under a normal
+displacement weights the displacement by the surface's mean curvature, so an oscillation of zero
+mean is nearly free of area at first order: a displacement at the scale of the node spacing buys
+misfit almost without paying for it, and no weight charges it while still leaving the body a
+minimum. The ladder therefore stops at an angular degree whose wavelength is many extraction
+pitches, and that bound is load-bearing rather than tuning -- the same ladder without it ends
+below the convex answer it started from.
 Two consequences reach the rest of the pipeline: a body whose convex answer already explains
 its curves is left alone, because there the penalty costs overlap while improving the misfit
 and nothing downstream could catch it; and `select_answers.py` judges a correction by the
@@ -172,11 +189,12 @@ misfit is not evidence of a better body and the convex answers stand.
 `scripts/reconstruct_map.py` is the same problem by gradient descent on the exact misfit,
 without the reshaping, and writes the same fields, so `select_answers.py` reads either.
 
-How fine the lattice has to be is not a free choice. A carve the field can only hold blurred
-fits the curves worse than no carve at all, because a shadow is cast by an edge, so the
-representation has to be able to hold the body before any solver can find it.
-`notes/representation.md` measures what each lattice can hold and why the one in
-`hac26/field.py` was chosen.
+How many directions the depth is carried on is not a free choice. A carve the field can only
+hold blurred fits the curves worse than no carve at all, because a shadow is cast by an edge, so
+the representation has to be able to hold the body before any solver can find it.
+`notes/representation.md` measures what the family can hold, and the answer is that it is not
+the limit: fitted to the released non-convex body's own surface it reaches an overlap of 0.997,
+where every fit of that body from its curves returns about 0.75.
 
 Read the calibration's residual at the released shapes before reading any reconstruction. On
 the rendered channel a model of this kind reaches about 0.004 against curves of a released

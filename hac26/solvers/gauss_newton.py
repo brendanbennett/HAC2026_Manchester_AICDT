@@ -1,70 +1,95 @@
 """Fitting a body to its curves by damped Gauss-Newton, without differentiating the renderer.
 
-The unknown is the pair (c, g): nine coefficients that reshape the convex core and one
-amplitude per lattice site that carves it. Both move in the same step, because the correction
-from a convex inversion's answer to the body is a conjunction of the two and neither half
-lowers the misfit on its own. A method that takes one coordinate direction at a time, or one
-block at a time, walks away from the answer.
+The unknown is the pair (c, a): nine coefficients that reshape the convex core and one depth
+per node of the correction field. Both move in the same step, because the correction from a
+convex inversion's answer to the body is a conjunction of the two and neither half lowers the
+misfit on its own. A method that takes one coordinate direction at a time, or one block at a
+time, walks away from the answer.
+
+c and a are the same function on the sphere at different angular scales -- c carries its
+degrees up to two and a the rest -- so the search over them is one ladder in angular degree,
+from a stage that can only move the hull to a stage that can carve a dent a tenth of the body
+across. Every stage's coordinates are scaled so that one unit of a coordinate is one body unit
+of depth in the field it actually makes, which is what lets one finite-difference step and one
+trust region serve all of them.
+
+The ladder stops at a degree whose angular wavelength is many extraction pitches, and that bound
+is load-bearing rather than tuning. The first variation of area under a normal displacement is
+the integral of the displacement against twice the mean curvature, so an oscillation of zero
+mean is nearly free of area at first order; a displacement at the node scale therefore buys
+misfit almost without paying for it, and no weight on the area charges it while still leaving
+the body a minimiser. Capping the degree takes that direction out of the search instead, which
+is the only thing that removes it.
 
 No derivative of the renderer is used. The chain's derivative with respect to the vertices is
 missing its boundary term on the pure-torch rasteriser and has never been compared against a
 finite difference on the other, and the misfit is in any case a rough function of the code at
 the step sizes a line search takes. A secant Jacobian costs one render per active coordinate
-and removes both risks, and the response of a curve to a carve is superlinear in its depth, so
-a secant over the depth an answer is likely to have is the right linearisation where a tangent
-at zero depth is far too short.
-
-The carve is fitted coarse to fine. A stage's coordinates are combinations of the site
-amplitudes: first the cells of a coarse sub-lattice, then a finer one, then random smooth
-fields, so that the number of renders per iteration stays bounded while the last stage still
-reaches every amplitude. Every coordinate is scaled so that one unit of it is one body unit of
-carve depth at the sites, which is what makes a single finite-difference step size right for
-all of them.
+and removes both risks.
 """
 from __future__ import annotations
 
 from dataclasses import dataclass
 
 import numpy as np
-from scipy import ndimage, sparse
 
-__all__ = ["Stage", "DEFAULT_STAGES", "CarveFit", "block_basis", "subspace_basis",
-           "waist_amplitudes", "conjunction_start", "SHRINK_RANGE", "STEP_G", "STEP_C",
-           "AREA_WEIGHT", "AREA_WINDOW", "VOLUME_TRUST", "DEPTH_TRUST", "TARGET_SIGMA"]
+from ..field import RADIAL_DEGREE, real_sh
+
+__all__ = ["Stage", "DEFAULT_STAGES", "SCREEN_STAGES", "POLISH_STAGES", "CarveFit",
+           "degree_basis", "node_subspace_basis", "cap_depths", "conjunction_start",
+           "start_recipe", "N_STARTS", "SHRINK_RANGE", "STEP_G", "STEP_C",
+           "AREA_WEIGHT", "AREA_WINDOW", "VOLUME_TRUST", "DEPTH_TRUST", "TARGET_SIGMA",
+           "DAMP_FLOOR", "SMOOTHING_LENGTHS", "CAP_RADII_DEG", "CAP_DEPTHS", "CAP_BAND_DEG"]
 
 # The secant steps, in body units of the canonical pose. Each is the size the answer's own
-# correction is likely to have, not a small number: the response of a curve to either half of
-# the correction begins rather than scales, so a probe much shorter than the answer measures
-# the wrong regime. STEP_G is a carve depth and STEP_C a displacement of the hull.
+# correction is likely to have, not a small number. Measured on the released non-convex body:
+# the response of a curve to a carve is concave in its depth, so the direction a column points
+# in has not settled at a probe of 0.05 and has by 0.20, and a Jacobian taken at the shorter
+# probe is a linearisation of the wrong regime. STEP_G is a carve depth and STEP_C a
+# displacement of the hull.
 STEP_G = 0.20
 STEP_C = 0.08
 
-# Weight of the surface area in the objective, in inverse area of the canonical pose. Its
-# admissible window is bounded on both sides and was measured on a span of bodies around the
-# one released non-convex model: below the bottom of it a corrugation one grid cell wide still
-# lowers the objective, and above the top the body stops being the minimiser, beaten by itself
-# displaced slightly inward. The value sits near the top because what it risks there is
-# bounded and small while what it must refuse below is not.
+# Weight of the surface area in the objective, in inverse area of the canonical pose.
+#
+# What the penalty is for depends on the representation, and this one is a displacement of a
+# surface rather than a sum of blobs. The first variation of area under a normal displacement d
+# is the integral of 2Hd over the surface, so at first order the area sees only the
+# mean-curvature-weighted average of the displacement and an oscillation of zero mean is nearly
+# free; what a rough displacement raises is the second-order term in its tangential gradient.
+# Measured on the released non-convex body, a displacement at the node scale is therefore
+# profitable at any weight that leaves the body a minimiser, and in one seed of three it lowers
+# the area as well as the misfit, so no weight charges it at all. The degree cap on the ladder
+# is what removes that direction, not this weight.
+#
+# What the weight is left doing, and does, is keeping the body a minimiser against a further
+# uniform carve; that holds below the top of the window. The bottom is where a smooth dent of
+# the size the correction has stops being profitable.
 AREA_WEIGHT = 0.9
-AREA_WINDOW = (0.60, 0.99)
+AREA_WINDOW = (0.30, 2.40)
 
-# Largest change of volume an accepted step may make, as a fraction. The cheapest area in this
-# representation is a hull shrink, and a penalty on area alone walks down it until the body is
-# gone; refusing a step that moves the volume by more than this removes that and costs nothing,
-# since the extraction has already given the volume. A correction larger than this is reached
-# in several steps, which is why the line search carries lengths short enough to land inside
-# it: a trust region that refuses every trial is a fit that cannot move at all.
+# Largest change of volume an accepted step may make, as a fraction. The cheapest area in any
+# representation of this kind is a hull shrink, and a penalty on area alone walks down it until
+# the body is gone; refusing a step that moves the volume by more than this removes that and
+# costs nothing, since the extraction has already given the volume. A correction larger than
+# this is reached in several steps, which is why the line search carries lengths short enough to
+# land inside it: a trust region that refuses every trial is a fit that cannot move at all.
 VOLUME_TRUST = 0.08
 
-# Deepest carve one accepted step may add or remove, in body units. Nothing else bounds the
-# amplitudes: what the objective charges is the body's surface and its misfit, and both are
-# properties of the level set, so amplitudes may grow without limit in the directions that do
-# not move it. A step is a carve, and a carve deeper than the body is not one.
+# Deepest carve one accepted step may add or remove, in body units. The node kernel's rows sum
+# to one, so the largest depth the field makes is at most the largest coefficient and this
+# region is an exact bound on the step in body units. It is needed because nothing else bounds
+# the coefficients: what the objective charges is the body's surface and its misfit, and both
+# are properties of the level set, so coefficients may grow in the directions that do not move
+# it. A step is a carve, and a carve deeper than the body is not one.
 DEPTH_TRUST = 0.5
 
 # Smallest curvature the damping will believe, as a fraction of the mean over the stage's
-# coordinates. See _normal_equations: it is what bounds a step into a direction the curves do
-# not see, and without it the area term sends the amplitudes there without limit.
+# coordinates. See _normal_equations. A direction the curves cannot see has no curvature, and
+# damping relative to curvature does not bound a step into it once the right-hand side carries
+# the area's gradient, which does not lie in the range of the Jacobian. The floor sits at a
+# hundredth of the mean and binds nothing where the curvature is healthy, which in a field
+# indexed by direction is everywhere: every node has a surface point.
 DAMP_FLOOR = 1e-2
 
 # The misfit, in model errors, at which the fit stops. It is not one: one asks the body to
@@ -73,157 +98,236 @@ DAMP_FLOOR = 1e-2
 # dead and lets the fit spend its budget buying misfit with surface.
 TARGET_SIGMA = 2.6
 
-SHRINK_RANGE = (0.02, 0.14)   # inward displacements of the hull a start draws from, in body
-                              # units of the canonical pose, where a body spans [-1, 1]. The
-                              # range covers a body that is barely non-convex through a
-                              # contact binary; which of them a body is, is what the restarts
-                              # decide.
+# Correlation lengths of the random smooth fields a subspace stage searches, in node spacings.
+# One application of the node kernel smooths by about one spacing, so a field is built by
+# applying it the square of the length times. The shortest length here is two spacings and not
+# one, and that is the same bound the degree cap enforces by another route: a single application
+# of the kernel leaves exactly the node-scale oscillation the area cannot charge.
+SMOOTHING_LENGTHS = (2.0, 4.0, 8.0)
+
+# The designed spread of starts. Measured on the released non-convex body, not one of twelve
+# random draws of a shrunken hull carved by a random slab beat the plain convex answer, and the
+# seven extra draws bought nothing; what a start should be is not a draw but a spread over the
+# shape the correction can have. The carve of a start is therefore one spherical cap written
+# straight into the coefficients, since a coefficient is a depth and needs no rescaling, and the
+# grid below is swept axis first so that the first few starts differ in the one thing the
+# ladder's own first stage cannot fix cheaply, which is where the dent is.
+CAP_BAND_DEG = 30.0                    # half-height of the band of axes, from the equator. A
+                                       # concavity near a pole is seen at grazing incidence from
+                                       # every camera of the rig, so it is the part of a body a
+                                       # convex answer is already closest to right about.
+CAP_AXES = 8                           # axes across that band, quasi-uniformly
+CAP_RADII_DEG = (35.0, 20.0, 50.0)     # angular radius of the cap, middle level first
+CAP_DEPTHS = (0.30, 0.15, 0.45)        # its depth, in body units, middle level first
+SHRINK_RANGE = (0.02, 0.14)            # uniform inward displacements of the hull a start draws
+                                       # from, in body units of the canonical pose, where a body
+                                       # spans [-1, 1]. The range covers a body that is barely
+                                       # non-convex through a contact binary.
+SHRINK_LEVELS = (0.5, 0.0, 1.0)        # positions in that range, middle level first
+N_STARTS = CAP_AXES * len(CAP_RADII_DEG) * len(CAP_DEPTHS) * len(SHRINK_LEVELS)
 
 
 @dataclass(frozen=True)
 class Stage:
-    """One refinement of the carve. `side` is the sub-lattice whose cells are the
-    coordinates, or 0 for a random subspace of `n_dirs` smooth fields."""
-    side: int
+    """One refinement of the correction. `degree` is the largest spherical-harmonic degree the
+    stage's coordinates reach, or 0 for a random subspace of `n_dirs` smooth fields."""
+    degree: int
     n_dirs: int
     iters: int
 
     @property
     def name(self) -> str:
-        return f"blocks {self.side}^3" if self.side else f"subspace {self.n_dirs}"
+        return f"degree {self.degree}" if self.degree else f"subspace {self.n_dirs}"
 
 
-DEFAULT_STAGES = (Stage(side=6, n_dirs=0, iters=6),
-                  Stage(side=12, n_dirs=0, iters=6),
-                  Stage(side=0, n_dirs=192, iters=10))
+# The ladder. A degree-L stage has (L+1)^2 - 9 coordinates, so this is 16, 40, 112, 280 and 616,
+# and a secant Jacobian spends one render on each. It ends at degree 24 because that is where
+# the family already reaches the floor of what any correction of this size can do, and because
+# its angular wavelength is ten extraction pitches at the surface -- far from the node scale the
+# area cannot charge. There is deliberately no node-space stage: measured, the same ladder with
+# one ends below the convex answer it started from.
+DEFAULT_STAGES = (Stage(degree=4, n_dirs=0, iters=4),
+                  Stage(degree=6, n_dirs=0, iters=4),
+                  Stage(degree=10, n_dirs=0, iters=4),
+                  Stage(degree=16, n_dirs=0, iters=3),
+                  Stage(degree=24, n_dirs=0, iters=3))
+
+# What every start is judged on. Measured, two iterations of the coarsest stage take almost the
+# whole of the overlap the full ladder reaches, so this is a screening that sees the answer.
+SCREEN_STAGES = (Stage(degree=4, n_dirs=0, iters=2),)
+
+# Run with the penalty off, after the penalised phase has put the shape where it goes.
+POLISH_STAGES = (Stage(degree=24, n_dirs=0, iters=3),)
 
 
-def block_basis(shape, side: int) -> sparse.csr_matrix:
-    """(n_sites, side^3): one column per cell of a sub-lattice, driving the sites in that
-    cell together. `side` must divide every axis of the lattice."""
-    shape = tuple(int(s) for s in shape)
-    if any(s % side for s in shape):
-        raise ValueError(f"sub-lattice side {side} does not divide the lattice {shape}")
-    idx = np.stack(np.meshgrid(*[np.arange(s) for s in shape], indexing="ij"), -1)
-    idx = idx.reshape(-1, 3)
-    cell = idx // np.array([s // side for s in shape])
-    col = cell[:, 0] * side * side + cell[:, 1] * side + cell[:, 2]
-    row = np.arange(len(idx))
-    return sparse.csr_matrix((np.ones(len(idx)), (row, col)),
-                             shape=(len(idx), side ** 3))
+def degree_basis(nodes: np.ndarray, degree: int, skip: int = RADIAL_DEGREE) -> np.ndarray:
+    """(n_nodes, (degree+1)^2 - (skip+1)^2): the real spherical harmonics of degree skip+1 to
+    `degree`, sampled at the nodes.
 
+    The degrees at or below `skip` are left out because c already carries exactly them: the
+    reshaping adds sum_{l <= RADIAL_DEGREE} c_lm Ybar_lm to the same field from the same centre,
+    so including them here would put identical columns in the Jacobian and spend a render
+    measuring a direction the fit already has.
 
-def subspace_basis(shape, n_dirs: int, rng, correlation: float = 2.0) -> np.ndarray:
-    """(n_sites, n_dirs): smooth random fields on the lattice, orthonormalised.
-
-    Smooth rather than white because neighbouring kernels overlap, so a white direction on
-    the amplitudes is almost entirely in the null space of the field and a render along it
-    sees nothing. The correlation length is in site spacings.
+    The columns are returned unscaled. `CarveFit._basis` scales each to unit peak depth in the
+    field it makes, which is a stronger statement than scaling it at the nodes and is what makes
+    one secant step and one trust region right for every coordinate of every stage.
     """
-    shape = tuple(int(s) for s in shape)
-    q = np.stack([ndimage.gaussian_filter(rng.standard_normal(shape), correlation,
-                                          mode="nearest").reshape(-1)
-                  for _ in range(n_dirs)], 1)
-    return np.linalg.qr(q)[0]
+    degree, skip = int(degree), int(skip)
+    if degree <= skip:
+        raise ValueError(f"a degree-{degree} stage has no coordinates above the degree-{skip} "
+                         f"reshaping the fit already carries")
+    return real_sh(np.asarray(nodes, dtype=float), degree)[:, (skip + 1) ** 2:]
 
 
-def waist_amplitudes(sites: np.ndarray, kernel, rng, equatorial_bias: float = 0.9):
-    """Amplitudes of one Gaussian slab across the body, with its recipe.
+def node_subspace_basis(kernel, n_dirs: int, rng,
+                        lengths=SMOOTHING_LENGTHS) -> np.ndarray:
+    """(n_nodes, n_dirs): smooth random fields on the node set, orthonormalised.
 
-    A waist across the spin axis is the feature a convex inversion cannot see, and a contact
-    binary is one, so a fit that has to cross from the convex answer to a carved body is
-    started from such a feature as well as from the convex answer itself.
-
-    The amplitudes are the requested field at the sites, rescaled so that the field they
-    actually make is as deep as was asked for. Dividing by the kernels' overlap alone is not
-    enough: a slab a fraction of a site spacing wide is covered by far fewer kernels along
-    its normal than a slowly varying field is, and comes out shallower than requested by a
-    factor of two or more. One sparse product measures the depth instead of estimating it.
+    Smooth rather than white because the fit is being asked for a shape and not for a texture: a
+    white field on the nodes is an oscillation at the node scale, which the area penalty cannot
+    charge at any weight that leaves the body a minimiser, and a search that can reach it will
+    spend its budget there. The smoothing is the node kernel itself, applied the square of a
+    correlation length times, since one application averages a node over its nearest neighbours
+    and so smooths by about one node spacing. The shortest length is two spacings for the same
+    reason the ladder's degree is capped, and one application of the kernel must not appear here.
     """
-    if rng.random() < equatorial_bias:
-        a = rng.uniform(0, 2 * np.pi)
-        n = np.array([np.cos(a), np.sin(a), rng.normal(0, 0.25)])
-    else:
-        n = rng.normal(size=3)
-    n = n / np.linalg.norm(n)
-    d = rng.uniform(-0.45, 0.45)
-    w = rng.uniform(0.10, 0.50)
-    depth = rng.uniform(0.10, 0.60)
-    target = np.exp(-(((sites @ n) - d) / w) ** 2)
-    made = float(np.abs(kernel @ target).max())
-    g = target * (depth / made) if made > 1e-9 else target * 0.0
-    return g, {"axis": n.tolist(), "offset": float(d), "width": float(w),
-               "depth": float(depth)}
+    k = int(kernel.shape[0])
+    cols, per = [], max(1, int(n_dirs) // len(lengths))
+    for length in lengths:
+        for _ in range(per):
+            q = rng.standard_normal(k)
+            for _ in range(int(round(float(length) ** 2))):
+                q = kernel @ q
+            cols.append(q)
+    while len(cols) < int(n_dirs):                     # a count the lengths do not divide
+        q = rng.standard_normal(k)
+        for _ in range(int(round(float(lengths[0]) ** 2))):
+            q = kernel @ q
+        cols.append(q)
+    return np.linalg.qr(np.stack(cols[:int(n_dirs)], 1))[0]
 
 
-def conjunction_start(sites: np.ndarray, kernel, rng, n_radial: int = 9) -> tuple:
-    """A start with both halves of the correction present: (c, g, recipe).
+def cap_depths(nodes: np.ndarray, axis, radius_deg: float, depth: float) -> np.ndarray:
+    """The coefficients of a single spherical cap: `depth` on the nodes within `radius_deg` of
+    `axis`, zero elsewhere.
+
+    Written straight into the coefficients with no rescaling, because a coefficient is a depth:
+    the node weights are a partition of unity, so a constant over a region is reproduced exactly
+    inside it and the field falls to zero across about one node spacing at the rim. That rim is
+    the sharp edge of a concavity, which is the feature a convex inversion cannot see at all.
+    """
+    u = np.asarray(nodes, dtype=float)
+    n = np.asarray(axis, dtype=float).ravel()
+    n = n / max(float(np.linalg.norm(n)), 1e-12)
+    return np.where(u @ n >= np.cos(np.deg2rad(float(radius_deg))), float(depth), 0.0)
+
+
+def _cap_axes(n: int = CAP_AXES, band_deg: float = CAP_BAND_DEG) -> np.ndarray:
+    """`n` quasi-uniform axes in the band within `band_deg` of the equator, by the same spiral
+    the nodes use, restricted to that band."""
+    i = np.arange(int(n)) + 0.5
+    z = np.sin(np.deg2rad(float(band_deg))) * (2.0 * i / int(n) - 1.0)
+    azim = np.pi * (1.0 + 5.0 ** 0.5) * i
+    r = np.sqrt(np.maximum(1.0 - z ** 2, 0.0))
+    return np.stack([r * np.cos(azim), r * np.sin(azim), z], axis=1)
+
+
+def start_recipe(index: int) -> dict:
+    """The `index`-th start of the designed grid, as its four numbers.
+
+    The grid is swept with the axis varying fastest and every other factor at its middle level
+    first, so that a run which can afford only a few starts spends them on where the dent is
+    rather than on how deep it is. The depth and the radius are what the ladder's own first
+    stage corrects most cheaply; the axis is not.
+    """
+    i = int(index)
+    axes = _cap_axes()
+    axis = axes[i % len(axes)]
+    i //= len(axes)
+    radius = CAP_RADII_DEG[i % len(CAP_RADII_DEG)]
+    i //= len(CAP_RADII_DEG)
+    depth = CAP_DEPTHS[i % len(CAP_DEPTHS)]
+    i //= len(CAP_DEPTHS)
+    level = SHRINK_LEVELS[i % len(SHRINK_LEVELS)]
+    shrink = SHRINK_RANGE[0] + level * (SHRINK_RANGE[1] - SHRINK_RANGE[0])
+    return {"axis": axis.tolist(), "radius_deg": float(radius), "depth": float(depth),
+            "shrink": float(shrink)}
+
+
+def conjunction_start(nodes: np.ndarray, index: int, n_radial: int = 9) -> tuple:
+    """A start with both halves of the correction present: (c, a, recipe).
 
     A convex inversion of a non-convex body does not return that body's hull. It returns a
     larger one, because enlarging the hull is how a convex body imitates the shadowing of a
-    concavity, so the correction from that answer to the body shrinks the hull and carves it
-    at the same time. A start that leaves the hull where the convex inversion put it asks the
-    fit to find both from a linearisation taken where neither is active, and there a hull
-    shrink alone raises the misfit; the fit then spends the step on the carve, which is the
-    convex inversion's own mistake made once more one level down. Drawing the shrink with the
-    waist puts the first linearisation somewhere both are already doing something.
+    concavity, so the correction from that answer to the body shrinks the hull and carves it at
+    the same time. A start that leaves the hull where the convex inversion put it asks the fit to
+    find both from a linearisation taken where neither is active, and there a hull shrink alone
+    raises the misfit; the fit then spends the step on the carve, which is the convex inversion's
+    own mistake made once more one level down. Pairing the shrink with the cap puts the first
+    linearisation somewhere both are already doing something.
 
     The shrink is uniform, the degree-zero coefficient alone, because that is the part of the
     excess that does not depend on which way a body is turned; the rest is left to the fit.
     """
-    g, rec = waist_amplitudes(sites, kernel, rng)
+    rec = start_recipe(index)
+    a = cap_depths(nodes, rec["axis"], rec["radius_deg"], rec["depth"])
     c = np.zeros(int(n_radial))
-    c[0] = rng.uniform(*SHRINK_RANGE)
-    return c, g, {**rec, "shrink": float(c[0])}
+    c[0] = rec["shrink"]
+    return c, a, rec
 
 
 class CarveFit:
-    """Damped Gauss-Newton on (c, g) against one body's curves.
+    """Damped Gauss-Newton on (c, a) against one body's curves.
 
-    `render(c, g)` returns the kept curves as a flat array in the same order as `data`, or
-    None for a body the forward model cannot render. `scale` is the per-entry model error the
-    residual is divided by, so the reported misfit is in standard deviations of it.
+    `render(c, a)` returns the kept curves as a flat array in the same order as `data` together
+    with the surface area and the volume of the canonically posed body, or None for a body the
+    forward model refuses. `scale` is the per-entry model error the residual is divided by, so
+    the reported misfit is in standard deviations of it.
+
+    `kernel` is what the coefficients make at the nodes themselves, and `nodes` are the
+    directions they are carried on. The kernel is used for three things that all follow from its
+    rows summing to one: scaling a coordinate to unit peak depth, bounding a step's depth
+    exactly, and smoothing the random fields of a subspace stage.
 
     Both secant steps are taken over the size the answer's own correction is likely to have
     rather than at zero, because the response of the curves to either half of the correction
-    begins rather than scales: a dent shadows itself only once it is deep enough to, and a
-    hull shrink lowers the misfit only once there is a carve for it to uncover. A probe much
-    shorter than the answer therefore returns a column of the Jacobian whose sign is that of
-    the wrong regime.
+    begins rather than scales: a dent shadows itself only once it is deep enough to, and a hull
+    shrink lowers the misfit only once there is a carve for it to uncover.
     """
 
     def __init__(self, render, data: np.ndarray, scale: np.ndarray, kernel,
-                 lattice_shape, n_radial: int = 9,
+                 nodes: np.ndarray, n_radial: int = 9,
                  area_weight: float = AREA_WEIGHT, volume_trust: float = VOLUME_TRUST,
-                 depth_trust: float = DEPTH_TRUST,
+                 depth_trust: float = DEPTH_TRUST, depth_cap: float | None = None,
                  step_g: float = STEP_G, step_c: float = STEP_C,
                  damping=(1e-1, 1e-2, 1e-3, 1.0, 10.0),
                  lengths=(1.0, 0.5, 0.25, 0.1, 0.04),
-                 subspace_tries: int = 3, seed: int = 0, site_mask=None):
+                 subspace_tries: int = 3, seed: int = 0):
         if area_weight and not AREA_WINDOW[0] <= area_weight <= AREA_WINDOW[1]:
             raise ValueError(f"area weight {area_weight} is outside the measured window "
-                             f"{AREA_WINDOW}; below it a corrugation one cell wide is still "
-                             f"profitable and above it the body stops being the minimum")
+                             f"{AREA_WINDOW}; below it a smooth dent of the size the correction "
+                             f"has is not charged and above it the body stops being the minimum")
         self.render = render
         self.data = np.asarray(data, dtype=np.float64).ravel()
         self.iscale = 1.0 / np.asarray(scale, dtype=np.float64).ravel()
         self.n_obs = len(self.data)
         self.kernel = kernel
-        self.shape = tuple(int(s) for s in lattice_shape)
-        self.n_sites = int(np.prod(self.shape))
-        self.site_mask = None if site_mask is None else np.asarray(site_mask, bool).ravel()
-        if self.site_mask is not None and len(self.site_mask) != self.n_sites:
-            raise ValueError(f"the site mask has {len(self.site_mask)} entries for "
-                             f"{self.n_sites} sites")
+        self.nodes = np.asarray(nodes, dtype=float)
+        self.n_nodes = len(self.nodes)
+        if kernel.shape[0] != self.n_nodes or kernel.shape[1] != self.n_nodes:
+            raise ValueError(f"the kernel is {kernel.shape} for {self.n_nodes} nodes")
         self.n_radial = int(n_radial)
         self.area_weight = float(area_weight)
         self.volume_trust = float(volume_trust)
         self.depth_trust = float(depth_trust)
+        self.depth_cap = None if depth_cap is None else float(depth_cap)
         self.step_g, self.step_c = float(step_g), float(step_c)
         self.damping, self.lengths = tuple(damping), tuple(lengths)
         self.subspace_tries = int(subspace_tries)
         self.rng = np.random.default_rng(seed)
         self.renders = 0
+        self.refused_depth = 0
 
     # ------------------------------------------------------------------ the objective
     def residual(self, y) -> np.ndarray | None:
@@ -234,15 +338,15 @@ class CarveFit:
         r = (np.asarray(y, dtype=np.float64).ravel() - self.data) * self.iscale
         return r / np.sqrt(self.n_obs)
 
-    def _render(self, c, g):
-        """(residual, area, volume) of the body at (c, g), or (None, nan, nan).
+    def _render(self, c, a):
+        """(residual, area, volume) of the body at (c, a), or (None, nan, nan).
 
         `render` returns the kept curves together with the surface area and the volume of the
         canonically posed body. Both come from the mesh the extraction has already built, so
         they cost a per cent of the render, and every Jacobian column therefore carries the
         secant derivative of the area for nothing."""
         self.renders += 1
-        out = self.render(c, g)
+        out = self.render(c, a)
         if out is None:
             return None, float("nan"), float("nan")
         y, area, vol = out
@@ -251,90 +355,95 @@ class CarveFit:
     def objective(self, r, area: float) -> float:
         """log chi^2 plus the area of the body, which is the total variation of its indicator.
 
-        Area rather than a ridge on the amplitudes because the two charge different things. A
-        ridge charges by how large a coefficient is, so it prefers a shallow answer to a deep
-        one and prefers the fit's own answer to the body. Area charges by how much surface a
-        shape has, so a smooth dent of any depth passes nearly free while a corrugation of the
-        same amplitude does not, and a corrugation is what a fit buys misfit with when the
-        misfit is mostly reporting how finely the surface is resolved.
+        Area rather than a ridge on the coefficients because the two charge different things. A
+        ridge charges by how large a coefficient is, so it prefers a shallow answer to a deep one
+        and prefers the fit's own answer to the body. Area charges by how much surface a shape
+        has, so a smooth dent of any depth passes nearly free while what it refuses is a body
+        that has grown surface it does not need -- above all a further uniform carve into a body
+        that already explains its curves.
 
-        The logarithm rather than a plain weight because the two terms have to stay in balance
-        as the fit descends. The gradient of chi^2 falls with chi while the gradient of an area
-        term does not, so no fixed weight both charges a corrugation at the start and leaves
-        the body a minimum at the end: the window for one is empty by a factor of five, and the
-        scale-free form opens it. Stationarity then compares a relative change of misfit with
-        an absolute change of area.
+        The logarithm rather than a plain weight because the two terms have to stay in balance as
+        the fit descends. The gradient of chi^2 falls with chi while the gradient of an area term
+        does not, so no fixed weight both charges at the start and leaves the body a minimum at
+        the end. Stationarity then compares a relative change of misfit with an absolute change
+        of area.
         """
         rr = float(r @ r)
         return float(np.log(max(rr, 1e-300)) + self.area_weight * float(area))
 
-    def _basis(self, stage: Stage):
-        """The stage's coordinates as columns over the site amplitudes, scaled so that one
-        unit of a coordinate is one body unit of carve depth at the sites.
+    def _basis(self, stage: Stage) -> np.ndarray:
+        """The stage's coordinates as columns over the node depths, scaled so that one unit of a
+        coordinate is one body unit of depth in the field the column actually makes.
 
-        Where a site mask is given, the coordinates are confined to it and any column left
-        with nothing to drive is dropped. A secant Jacobian spends one render per column, so a
-        column over sites that cannot move the surface is a render thrown away; field
-        .searchable_sites says which those are and why the band is one-sided.
+        Scaled through the kernel rather than at the nodes because the two differ: the node
+        weights smooth a column over its neighbours, and a column whose angular wavelength is a
+        few node spacings comes out of that smoothing shallower than it went in. Scaling by what
+        the field reaches is what makes one finite-difference step and one depth trust region
+        right for a degree-4 coordinate and a degree-24 one alike.
         """
-        if stage.side:
-            b = block_basis(self.shape, stage.side)
+        if stage.degree:
+            b = degree_basis(self.nodes, stage.degree, self.n_radial_degree)
         else:
-            b = sparse.csc_matrix(subspace_basis(self.shape, stage.n_dirs, self.rng))
-        if self.site_mask is not None:
-            b = sparse.csc_matrix(sparse.diags(self.site_mask.astype(float)) @ b)
-            b.eliminate_zeros()
-            alive = np.diff(b.indptr) > 0
-            if alive.any():
-                b = b[:, np.flatnonzero(alive)]
+            b = node_subspace_basis(self.kernel, stage.n_dirs, self.rng)
         peak = np.zeros(b.shape[1])
-        for i in range(0, b.shape[1], 256):                    # a block at a time, dense
+        for i in range(0, b.shape[1], 256):                    # a block at a time
             sl = slice(i, min(i + 256, b.shape[1]))
-            peak[sl] = np.abs(self.kernel @ b[:, sl].toarray()).max(axis=0)
-        b = sparse.csc_matrix(b.multiply(1.0 / np.maximum(peak, 1e-12)[None, :]))
-        return b, (b.T @ b).toarray()
+            peak[sl] = np.abs(self.kernel @ b[:, sl]).max(axis=0)
+        return b / np.maximum(peak, 1e-12)[None, :]
+
+    @property
+    def n_radial_degree(self) -> int:
+        """The largest spherical-harmonic degree c carries, which is what a degree stage skips.
+
+        Read from the number of reshaping coefficients rather than imported, so that a caller
+        which passes a different n_radial gets a basis that skips exactly what its own c covers.
+        """
+        d = int(round(np.sqrt(self.n_radial))) - 1
+        if (d + 1) ** 2 != self.n_radial:
+            raise ValueError(f"{self.n_radial} reshaping coefficients are not the harmonics of "
+                             f"a whole degree, so a degree stage cannot know what to skip")
+        return d
 
     # ------------------------------------------------------------------ one iteration
-    def _jacobian(self, c, g, basis, r0, area0, vol0):
-        """(J, a, v): the secant derivatives of the residual, the area and the volume, in the
+    def _jacobian(self, c, a, basis, r0, area0, vol0):
+        """(J, da, dv): the secant derivatives of the residual, the area and the volume, in the
         stage's coordinates. The last two cost no render of their own, since the body whose
         residual a column measures is the body whose area and volume it measures."""
         m = basis.shape[1]
         J = np.zeros((len(r0), self.n_radial + m))
-        a = np.zeros(self.n_radial + m)
-        v = np.zeros(self.n_radial + m)
+        da = np.zeros(self.n_radial + m)
+        dv = np.zeros(self.n_radial + m)
         for j in range(self.n_radial):
             cc = c.copy()
             cc[j] += self.step_c
-            r, ar, vr = self._render(cc, g)
+            r, ar, vr = self._render(cc, a)
             if r is not None:
                 J[:, j] = (r - r0) / self.step_c
-                a[j] = (ar - area0) / self.step_c
-                v[j] = (vr - vol0) / self.step_c
+                da[j] = (ar - area0) / self.step_c
+                dv[j] = (vr - vol0) / self.step_c
         for j in range(m):
-            col = np.asarray(basis[:, j].todense()).ravel()
-            r, ar, vr = self._render(c, g + self.step_g * col)
+            r, ar, vr = self._render(c, a + self.step_g * basis[:, j])
             if r is not None:
                 J[:, self.n_radial + j] = (r - r0) / self.step_g
-                a[self.n_radial + j] = (ar - area0) / self.step_g
-                v[self.n_radial + j] = (vr - vol0) / self.step_g
-        return J, a, v
+                da[self.n_radial + j] = (ar - area0) / self.step_g
+                dv[self.n_radial + j] = (vr - vol0) / self.step_g
+        return J, da, dv
 
     def _trust_length(self, step, basis, vprime, vol) -> float:
         """The longest step length that keeps both the change of volume and the depth of the
         carve it adds inside their trust regions, capped at one.
 
-        A region has to shorten the step rather than merely refuse it. The cheapest area in
-        this representation is a hull shrink, so the linear term of a penalised step points
-        down it and can be enormous: unconstrained, the first step of a coarse stage collapses
-        the body altogether, and a line search over a fixed ladder of lengths then finds every
-        one of them outside the region and takes no step at all.
+        A region has to shorten the step rather than merely refuse it. The cheapest area in this
+        representation is a hull shrink, so the linear term of a penalised step points down it
+        and can be enormous: unconstrained, the first step of a coarse stage collapses the body
+        altogether, and a line search over a fixed ladder of lengths then finds every one of them
+        outside the region and takes no step at all.
 
-        The two regions bound different things and both are needed. Volume alone does not
-        bound the amplitudes, because a step that carves deeply in one place and fills deeply
-        in another leaves the volume where it was; the objective does not bound them either,
-        since it charges the surface and the misfit and both are properties of the level set.
-        The depth of the carve a step makes is what says whether it is a step between bodies.
+        The two regions bound different things and both are needed. Volume alone does not bound
+        the depths, because a step that carves deeply in one place and fills deeply in another
+        leaves the volume where it was; the objective does not bound them either, since it
+        charges the surface and the misfit and both are properties of the level set. The depth of
+        the carve a step makes is what says whether it is a step between bodies.
         """
         rate = abs(float(vprime @ step))
         lv = 1.0 if rate <= 1e-12 else self.volume_trust * max(abs(vol), 1e-9) / rate
@@ -342,26 +451,24 @@ class CarveFit:
         ld = 1.0 if depth <= 1e-12 else self.depth_trust / depth
         return float(min(1.0, lv, ld))
 
-    def _normal_equations(self, J, r0, a):
+    def _normal_equations(self, J, r0, da):
         """(A, b, diagonal) of the penalised Gauss-Newton system, before the damping.
 
         Differentiating log(r.r) + mu A gives the ordinary Gauss-Newton system with one extra
         linear term. The matrix is unchanged, so the penalty costs nothing in conditioning:
 
-            (J^T J) d = -J^T r - (mu/2)(r^T r) a.
+            (J^T J) d = -J^T r - (mu/2)(r^T r) a'.
         """
         A = J.T @ J
-        b = -(J.T @ r0) - 0.5 * self.area_weight * float(r0 @ r0) * a
+        b = -(J.T @ r0) - 0.5 * self.area_weight * float(r0 @ r0) * da
         d = np.diag(A).copy()
         pos = d[d > 0]
         mean = float(pos.mean()) if pos.size else 1.0
-        # A direction the curves cannot see has no curvature, and the damping, being relative
-        # to the curvature, does not bound the step there. That is harmless while the right
-        # side is J^T r, which lies in the range of J; it is not harmless once the right side
-        # carries the area's gradient, which does not, and the step in such a direction then
-        # grows without bound as the damping is loosened. Flooring the diagonal gives those
-        # directions the damping of an average one, so a step into them is bounded by the same
-        # trust as a step into a direction the curves do determine.
+        # A direction the curves cannot see has no curvature, and the damping, being relative to
+        # the curvature, does not bound the step there. That is harmless while the right side is
+        # J^T r, which lies in the range of J; it is not harmless once the right side carries the
+        # area's gradient, which does not, and the step in such a direction then grows without
+        # bound as the damping is loosened.
         d = np.maximum(d, DAMP_FLOOR * mean)
         return A, b, d
 
@@ -372,61 +479,66 @@ class CarveFit:
         except np.linalg.LinAlgError:
             return np.zeros(len(b))
 
-    def run(self, c0, g0, stages=DEFAULT_STAGES, target: float = TARGET_SIGMA, log=None,
+    def run(self, c0, a0, stages=DEFAULT_STAGES, target: float = TARGET_SIGMA, log=None,
             area_weight: float | None = None):
-        """Fit from (c0, g0). Returns (c, g, history); the history has one row per accepted
-        or refused iteration.
+        """Fit from (c0, a0). Returns (c, a, history); the history has one row per accepted or
+        refused iteration.
 
-        `area_weight` overrides the penalty for this run alone, and zero turns it off, which
-        is what the polish uses: once the shape is where the penalty puts it, minimising the
-        misfit alone with the trust region still on recovers the misfit without giving the
-        shape back.
+        `area_weight` overrides the penalty for this run alone, and zero turns it off, which is
+        what the polish uses: once the shape is where the penalty puts it, minimising the misfit
+        alone with the trust regions still on recovers the misfit without giving the shape back.
         """
         was, self.area_weight = self.area_weight, (self.area_weight if area_weight is None
                                                    else float(area_weight))
         try:
-            return self._run(c0, g0, stages, target, log)
+            return self._run(c0, a0, stages, target, log)
         finally:
             self.area_weight = was
 
-    def _run(self, c0, g0, stages, target, log):
-        c, g = np.asarray(c0, float).copy(), np.asarray(g0, float).copy()
+    def _run(self, c0, a0, stages, target, log):
+        c, a = np.asarray(c0, float).copy(), np.asarray(a0, float).copy()
         history = []
-        r, area, vol = self._render(c, g)
+        r, area, vol = self._render(c, a)
         if r is None:
-            return c, g, [{"stage": "start", "chi": float("inf"), "note": "no curves"}]
+            return c, a, [{"stage": "start", "chi": float("inf"), "note": "no curves"}]
         chi = float(np.linalg.norm(r))
         for stage in stages:
-            basis, _ = self._basis(stage)
+            basis = self._basis(stage)
             tries = 0
             it = 0
             while it < stage.iters:
                 if chi <= target:
                     break
-                J, a, vprime = self._jacobian(c, g, basis, r, area, vol)
-                A, rhs, diag = self._normal_equations(J, r, a)
+                J, da, vprime = self._jacobian(c, a, basis, r, area, vol)
+                A, rhs, diag = self._normal_equations(J, r, da)
                 obj = self.objective(r, area)
                 # The best of the trials rather than the first that descends. A damping and a
-                # step length that happen to be tried early are not the best step available,
-                # and the trials cost fifteen renders against the Jacobian's own hundreds.
+                # step length that happen to be tried early are not the best step available, and
+                # the trials cost fifteen renders against the Jacobian's own hundreds.
                 best = None
                 for mu in self.damping:
                     step = self._solve(A, rhs, diag, mu)
                     cap = self._trust_length(step, basis, vprime, vol)
                     for length in (cap * np.asarray(self.lengths)):
                         cc = c + length * step[:self.n_radial]
-                        gg = g + length * (basis @ step[self.n_radial:])
-                        rr, aa, vv = self._render(cc, gg)
+                        aa = a + length * (basis @ step[self.n_radial:])
+                        # The star-shaped bound is a refusal and not a clip: a clipped step is a
+                        # different step, and the line search would then be choosing among
+                        # lengths that no longer mean what it thinks they mean.
+                        if self.depth_cap is not None and float(aa.max()) > self.depth_cap:
+                            self.refused_depth += 1
+                            continue
+                        rr, aar, vv = self._render(cc, aa)
                         if rr is None:
                             continue
                         if abs(vv - vol) > self.volume_trust * max(abs(vol), 1e-9):
                             continue          # outside the trust region on volume
-                        o = self.objective(rr, aa)
+                        o = self.objective(rr, aar)
                         if o < obj and (best is None or o < best[0]):
-                            best = (o, cc, gg, rr, aa, vv)
+                            best = (o, cc, aa, rr, aar, vv)
                 moved = best is not None
                 if moved:
-                    _, c, g, r, area, vol = best
+                    _, c, a, r, area, vol = best
                     chi = float(np.linalg.norm(r))
                 row = {"stage": stage.name, "iteration": it, "chi": chi, "area": area,
                        "volume": vol, "objective": self.objective(r, area),
@@ -436,14 +548,14 @@ class CarveFit:
                 if log is not None:
                     log(row)
                 if not moved:
-                    # a subspace that finds no step is redrawn; a fixed block basis that
-                    # finds none has converged for this stage
+                    # a subspace that finds no step is redrawn; a fixed degree basis that finds
+                    # none has converged for this stage
                     tries += 1
-                    if stage.side or tries >= self.subspace_tries:
+                    if stage.degree or tries >= self.subspace_tries:
                         break
-                    basis, _ = self._basis(stage)
+                    basis = self._basis(stage)
                     continue
                 it += 1
             if chi <= target:
                 break
-        return c, g, history
+        return c, a, history

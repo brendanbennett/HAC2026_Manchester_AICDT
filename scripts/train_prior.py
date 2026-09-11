@@ -51,8 +51,8 @@ def prior_loss(net, corpus: Corpus, idx, x0, t, occ_weight, occ_eps, turns=None)
         codes, _, sup, sup_true = quarter_turns(corpus, idx, turns)
     x1 = net.codec.encode(codes)
     xt = (1 - t[:, None]) * x0 + t[:, None] * x1
-    sph, vol = cond_channels(sup, device=codes.device)
-    v = net.prior_velocity(xt, t, corpus.radius[idx], sph, vol)
+    sph, node = cond_channels(sup, device=codes.device)
+    v = net.prior_velocity(xt, t, corpus.radius[idx], sph, node)
     total, flow, occ, _ = step_loss(net, xt, t, v, x1, sup_true, codes, sup, occ_weight, occ_eps)
     return total, flow, occ
 

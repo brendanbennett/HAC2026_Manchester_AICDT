@@ -45,9 +45,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from eval_exact import decode, predict_h                                          # noqa: E402
 from hac26.conventions import CYLINDER_R, cameras, psi_grid                       # noqa: E402
 from hac26.data_io import resample_curves                                         # noqa: E402
-from hac26.field import (CODE_DIM, DESIGN_N, EXTRACT_RES, LATTICE_ALPHA,          # noqa: E402
-                         LATTICE_EXTENT, LATTICE_SHAPE, N_DIR, SH_DEGREE, _real_sh,
-                         design_sha, dir_design, spherical_design)
+from hac26.field import (CODE_DIM, DESIGN_N, EXTRACT_RES, KNN, N_DIR,             # noqa: E402
+                         N_NODES, NODE_BETA, SH_DEGREE, DepthSphere, design_sha, real_sh,
+                         dir_design, spherical_design)
 from hac26.forward.convex_egi import normalize_np                                 # noqa: E402
 from hac26.solvers.operator import CodeOperator                                   # noqa: E402
 from hac26.train import load_net                                                  # noqa: E402
@@ -118,11 +118,13 @@ def corpus_meta(n, phases, op_res, calibration, convex) -> dict:
         "operator_res": int(op_res),
         "design_n": int(DESIGN_N),
         "code_dim": int(CODE_DIM),
-        # The lattice, because g is amplitudes on it. CODE_DIM pins only the site count;
-        # changing the kernel width or the box changes what every g means.
-        "lattice_shape": list(LATTICE_SHAPE),
-        "lattice_extent": float(LATTICE_EXTENT),
-        "lattice_alpha": float(LATTICE_ALPHA),
+        # The node set, because the second block of the code is depths on it. CODE_DIM pins
+        # only how many there are; changing which directions they are, or the width of their
+        # kernels, changes what every depth means.
+        "n_nodes": int(N_NODES),
+        "node_sha": design_sha(DepthSphere(N_NODES).u.numpy()),
+        "knn": int(KNN),
+        "node_beta": float(NODE_BETA),
         "calibration": file_digest(calibration),
         "convex": file_digest(convex),
         "render": asdict(RENDER),
@@ -157,8 +159,8 @@ def correction_matrix() -> torch.Tensor:
     """(N_DIR, DESIGN_N): the least-squares fit of harmonics up to SH_DEGREE to a difference
     on the core's normals, evaluated on the dh directions. dh_expand takes the result back to
     the band-limited difference."""
-    y_dir = _real_sh(dir_design(N_DIR), SH_DEGREE)
-    y_nrm = _real_sh(spherical_design(DESIGN_N), SH_DEGREE)
+    y_dir = real_sh(dir_design(N_DIR), SH_DEGREE)
+    y_nrm = real_sh(spherical_design(DESIGN_N), SH_DEGREE)
     return torch.from_numpy(y_dir @ np.linalg.pinv(y_nrm))
 
 
