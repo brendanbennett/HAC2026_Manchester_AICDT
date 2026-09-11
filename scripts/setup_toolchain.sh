@@ -36,7 +36,17 @@ $PYBIN -c 'import torch' >/dev/null 2>&1 || {
   echo "ERROR: torch is not importable with $PYBIN. Run \`make venv CUDA=12\` (or 13) first," >&2
   echo "       then \`make toolchain\`." >&2; exit 1; }
 
-mkdir -p "$CUDA" /tmp/cudadl && cd /tmp/cudadl
+# Staging goes in a private directory, not a fixed path in /tmp. These nodes are shared, and
+# a fixed /tmp/cudadl is extracted over whatever is already there: another user's copy, or
+# another job of your own. tar then fails with "Cannot utime: Operation not permitted" or
+# "File exists" and the toolchain build dies in its first seconds, which is how two runs of
+# this pipeline died before the cause was found. Slurm gives every job its own $TMPDIR on
+# node-local NVMe and deletes it at job end, which is exactly right; outside a job the uid
+# keeps it from colliding with other users.
+STAGE="${TMPDIR:-/tmp}/hac26-toolchain-$(id -u)"
+rm -rf "$STAGE"; mkdir -p "$STAGE"
+trap 'rm -rf "$STAGE"' EXIT
+mkdir -p "$CUDA" "$STAGE/cudadl" && cd "$STAGE/cudadl"
 for c in cuda_nvcc cuda_cudart cuda_cccl; do
   p=$(curl -s "$REDIST/redistrib_$CUDA_VER.json" | $PYBIN -c "import json,sys;print(json.load(sys.stdin)['$c']['linux-x86_64']['relative_path'])")
   [ -f "$(basename "$p")" ] || curl -sL "$REDIST/$p" -o "$(basename "$p")"
@@ -57,7 +67,7 @@ for d in cuda_*-archive; do cp -rn "$d"/* "$CUDA"/; done
 #
 # The directory is rebuilt on every run. It used to be filled with cp -n and never cleared, so
 # the first torch a machine ever had decided its contents for good.
-MATHINC=/tmp/mathinc
+MATHINC="$STAGE/mathinc"
 rm -rf "$MATHINC"; mkdir -p "$MATHINC"
 INC_DIRS=$($PYBIN - "$CUDA_MAJOR" <<'PY'
 import glob, os, re, sys, torch
@@ -143,7 +153,7 @@ echo "[toolchain] building against $BUILT_FOR" >&2
 command -v ninja >/dev/null 2>&1 || echo \
   "[toolchain] no ninja on PATH: this build will be serial. make venv EXTRAS=test,toolchain" >&2
 
-cat > /tmp/build_nvdr.py <<'PY'
+cat > "$STAGE/build_nvdr.py" <<'PY'
 import sys, torch.utils.cpp_extension as ce
 ce._check_cuda_version = lambda *a, **k: None      # the version guard; see the header comment
 sys.argv = ["setup.py", "build_ext", "--inplace"]
@@ -151,7 +161,7 @@ exec(open("setup.py").read())
 PY
 cd "$SRC"
 CUDA_HOME=$CUDA PATH=$CUDA/bin:$PATH CPATH=$MATHINC:$CUDA/include \
-  CPLUS_INCLUDE_PATH=$MATHINC:$CUDA/include $PYBIN /tmp/build_nvdr.py
+  CPLUS_INCLUDE_PATH=$MATHINC:$CUDA/include $PYBIN "$STAGE/build_nvdr.py"
 # The .dist-info below is not bookkeeping: since 0.4.0 nvdiffrast/__init__.py reads its own
 # version through importlib.metadata, so `import nvdiffrast` raises PackageNotFoundError
 # without it. That release also moved the number into pyproject.toml; older checkouts keep a
