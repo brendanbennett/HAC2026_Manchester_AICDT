@@ -208,6 +208,7 @@ def candidate_diagnostic(kind: str, label: str, verts, faces, misfit_sigma: floa
         report.update({
             "watertight": bool(m.is_watertight),
             "winding_consistent": bool(m.is_winding_consistent),
+            "components": int(len(m.split(only_watertight=False))),
             "volume": volume,
             "faces": int(len(m.faces)),
             "convexity": float(convexity),
@@ -216,11 +217,13 @@ def candidate_diagnostic(kind: str, label: str, verts, faces, misfit_sigma: floa
         })
     except Exception as exc:                         # noqa: BLE001  diagnostic path
         report.update({"watertight": False, "winding_consistent": False,
-                       "volume": float("nan"), "faces": 0, "convexity": float("nan"),
+                       "components": 0, "volume": float("nan"), "faces": 0,
+                       "convexity": float("nan"),
                        "carved_volume_fraction": float("nan"), "error": str(exc)})
-    report["eligible"] = (
+    report["eligible"] = bool(
         np.isfinite(report["misfit_sigma"])
         and bool(report["watertight"])
+        and int(report["components"]) == 1
         and np.isfinite(report["volume"])
         and report["volume"] > 0.0
         and int(report["faces"]) >= 8
@@ -230,12 +233,23 @@ def candidate_diagnostic(kind: str, label: str, verts, faces, misfit_sigma: floa
         reasons.append("nonfinite_misfit")
     if not report["watertight"]:
         reasons.append("not_watertight")
+    if int(report["components"]) != 1:
+        reasons.append("not_single_component")
     if not np.isfinite(report["volume"]) or report["volume"] <= 0.0:
         reasons.append("bad_volume")
     if int(report["faces"]) < 8:
         reasons.append("too_few_faces")
     report["ineligible_reasons"] = reasons
     return report
+
+
+def json_default(obj):
+    """Convert NumPy scalar diagnostics to plain JSON values."""
+    if isinstance(obj, np.generic):
+        return obj.item()
+    if isinstance(obj, np.ndarray):
+        return obj.tolist()
+    raise TypeError(f"Object of type {obj.__class__.__name__} is not JSON serializable")
 
 
 def polish(net, op: CodeOperator, z, support, radius, data, scale, geoms, steps: int):
@@ -283,10 +297,6 @@ def polish(net, op: CodeOperator, z, support, radius, data, scale, geoms, steps:
     return z, chi0, chi, it
 
 
-CONSENSUS_SHRINK_TOL = 0.015   # see consensus_bodies: below this a short radius is a
-                               # contour offset, above it the draws disagreed
-
-
 def dice_optimal_level(occs: list, extent: float, radius: float, iters: int = 3,
                        lo: float = 0.2, hi: float = 0.7) -> float:
     """The level whose body is the best single answer under the voxel measure, derived rather
@@ -308,10 +318,14 @@ def dice_optimal_level(occs: list, extent: float, radius: float, iters: int = 3,
     the upper clamp only guards against a degenerate estimate.
     """
     t = 0.5
+    good = None                  # the last level that actually produced a body
     for _ in range(iters):
         made = consensus_bodies(occs, extent, radius, levels=(t,))
         if not made:
-            break
+            # t is outside the range of the draw fraction, so it would produce nothing
+            # downstream either; fall back to the last level that did produce a body.
+            return good if good is not None else 0.5
+        good = t
         _, v, f = made[0]
         occ = mesh_occupancy(v, f, occs[0].shape[0], extent)
         d = float(np.mean([dice(occ, o) for o in occs]))
@@ -319,47 +333,72 @@ def dice_optimal_level(occs: list, extent: float, radius: float, iters: int = 3,
     return t
 
 
+def off_lattice_level(level: float, n_draws: int) -> float:
+    """A level strictly between two attainable draw fractions.
+
+    The fraction of draws occupying a voxel takes only the values k / n_draws, so a level
+    equal to one of them puts the isosurface exactly through the sampled values. Marching
+    cubes then places vertices on grid points and emits zero-area triangles and pinch
+    points: the body comes back with a fifth of its faces degenerate and its winding
+    inverted, which `export_stl` cannot repair and no voxel measure that relies on
+    orientation can read. CONSENSUS_LEVELS holds 0.5 and the default draw count is 8, so
+    the majority level landed on the lattice on every run.
+
+    The level is moved down to the middle of the cell below it, (k - 0.5) / n_draws. That
+    keeps exactly the voxels the requested level meant -- those where at least k of the
+    n_draws agree -- while passing strictly between attainable values, so every triangle
+    has area. A level that is not on the lattice is returned unchanged.
+    """
+    if n_draws < 1:
+        return float(level)
+    k = float(level) * n_draws
+    kr = round(k)
+    return (kr - 0.5) / n_draws if abs(k - kr) < 1e-9 else float(level)
+
+
+CONSENSUS_SHRINK_TOL = 0.015   # see consensus_bodies: below this a short radius is a
+                               # contour offset, above it the draws disagreed
+
+
 def consensus_bodies(occs: list, extent: float, radius: float, levels=CONSENSUS_LEVELS,
                      set_radius: bool = True):
     """Meshes of the level sets of the fraction of draws containing each voxel, for boolean
     grids `occs` on [-extent, extent]^3, posed like the draws. Returns [(level, verts,
-    faces)]; a level with no closed surface is left out."""
+    faces)]; a level with no closed surface is left out.
+
+    Each requested level is nudged off the k / len(occs) lattice before the isosurface is
+    extracted (see off_lattice_level); the level reported back is the one that was asked
+    for, since that is what names the candidate."""
     from skimage import measure
     prob = np.mean([o.astype(np.float32) for o in occs], axis=0)
     n = prob.shape[0]
     spacing = 2.0 * extent / n
     out = []
     for level in levels:
-        if not (prob.min() < level < prob.max()):
+        lv = off_lattice_level(float(level), len(occs))
+        if not (prob.min() < lv < prob.max()):
             continue
-        v, f, _, _ = measure.marching_cubes(prob, level=level, spacing=(spacing,) * 3)
+        v, f, _, _ = measure.marching_cubes(prob, level=lv, spacing=(spacing,) * 3)
         v = v - extent + spacing / 2.0                  # cell centres, not cell corners
-        # The radius is SET here, as it is for the draws, not capped. It used to be capped, on
-        # the argument that a level set is a contour of a probability rather than a body, sits
-        # about half a voxel off the draws' own surface, and that scaling to the published
-        # radius would correct that half-voxel offset at the widest point while over-correcting
-        # nearer the axis -- the offset being a distance and the correction a proportion, both
-        # of them about half a per cent.
+        # The radius was capped here rather than set, on the argument that a level set is a
+        # contour of a probability rather than a body, sits about half a voxel off the draws'
+        # own surface, and that scaling to the published radius would fix the widest point
+        # while over-correcting nearer the axis -- both effects being about half a per cent.
         #
-        # The half-a-per-cent premise is what fails. It holds when the draws agree, and a
-        # consensus body is only ever selected when they do not: averaging eight disagreeing
-        # draws and cutting at 0.5 erodes the body by far more than half a voxel. Model 2's
+        # The half-a-per-cent premise is what fails, and only where it matters. It holds when
+        # the draws agree, and a consensus body is only ever selected when they do not:
+        # averaging eight disagreeing draws erodes the body far past half a voxel. Model 2's
         # shipped consensus answer came out at r_xy 1.353 against a published 1.420 -- 4.7%
-        # short, ten times the offset the cap was reasoning about -- and setting the radius
-        # instead of capping it moves its official voxel score 0.8109 -> 0.8516 and its
-        # projection score 0.9711 -> 0.9846. Models 4, 7 and 10 are short by 1.0%, 1.0% and
-        # 0.5% and gain correspondingly less.
+        # short -- and setting the radius instead of capping it moves its voxel score under
+        # the organisers' own measure from 0.8109 to 0.8516 and its projection score from
+        # 0.9711 to 0.9846. Models 4, 7 and 10 were short by 1.0%, 1.0% and 0.5%.
         #
-        # The information is free and exact: the challenge publishes the minimal radius of a
-        # cylinder containing the body, so the true body's widest point touches it by
-        # construction. A reconstruction narrower than R is known to be too narrow.
-        #
-        # Both readings are right in their own regime, so the shortfall decides which applies.
-        # Within CONSENSUS_SHRINK_TOL the contour-offset argument holds and the radius is
-        # capped, as before -- the proportional correction really would do more harm than the
-        # half-voxel it repaired, and test_consensus_levels_keep_or_fill_a_dent measures that
-        # harm on a dent sitting at the widest point. Past it the body has been eroded by
-        # disagreement, not displaced by a contour, and it is set.
+        # The information is exact: the challenge publishes the minimal radius of a cylinder
+        # containing the body, so the true body's widest point touches it by construction, and
+        # a reconstruction narrower than R is known to be too narrow. Both readings are right
+        # in their own regime, so the shortfall picks between them -- within
+        # CONSENSUS_SHRINK_TOL the contour-offset argument holds and the radius is capped as
+        # before, past it the body has been eroded by disagreement and is set.
         v = restore_constraints(v, radius)
         r = float(np.hypot(v[:, 0], v[:, 1]).max())
         if set_radius and r < radius * (1.0 - CONSENSUS_SHRINK_TOL):
@@ -570,8 +609,13 @@ def main():
     n_draws = len(meshes)
     # the consensus bodies join the draws as candidates; the draws alone are the reference
     # the derived level joins the fixed two; see dice_optimal_level
-    levels_used = (CONSENSUS_LEVELS + (dice_optimal_level(occs, occ_extent, R),)
-                   if n_draws > 1 else ())
+    if n_draws > 1:
+        asked = CONSENSUS_LEVELS + (dice_optimal_level(occs, occ_extent, R),)
+        # the derived level can land on one of the fixed ones; asking for it twice builds,
+        # samples and scores the same body twice and reports it as two candidates
+        levels_used = tuple(dict.fromkeys(round(float(x), 9) for x in asked))
+    else:
+        levels_used = ()
     extra = consensus_bodies(occs, occ_extent, R, levels=levels_used) if n_draws > 1 else []
     levels = [lv for lv, _, _ in extra]
     candidates = meshes + [(mv, mf) for _, mv, mf in extra]
@@ -658,6 +702,10 @@ def main():
     info = export_stl(a.out, v, f)
     res = {"model": a.model, "radius": R, "draws": n_draws, "answer": chosen,
            "candidate": int(k), "consensus_levels": [float(x) for x in levels_used],
+           # the levels asked for above, and the ones that actually produced a body: a
+           # level outside the range of the draw fraction makes none, and it is the second
+           # list that indexes the candidates the answer was chosen from
+           "consensus_levels_built": [float(x) for x in levels],
            "spread": spread, "spread_off_medoid": spread_off,
            "collapsed": bool(collapsed),
            "medoid_metric": medoid_metric,
@@ -690,8 +738,9 @@ def main():
                                  mesh_occupancy(rv, f, 128, e)))
         print(f"  DICE vs truth: {res['dice']:.4f}", flush=True)
 
-    print(json.dumps(res))
-    Path(a.out).with_suffix(".json").write_text(json.dumps(res, indent=2))
+    print(json.dumps(res, default=json_default))
+    Path(a.out).with_suffix(".json").write_text(json.dumps(res, indent=2,
+                                                           default=json_default))
 
 
 if __name__ == "__main__":

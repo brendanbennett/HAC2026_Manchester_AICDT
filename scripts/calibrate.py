@@ -100,12 +100,12 @@ def load_data(data_dir: str, model: int, phases: int, device: str,
             torch.tensor(mismatch, dtype=torch.float32, device=device))
 
 
-def initial_psi0(fwd: ExactForward, verts, faces, real, present, sigma) -> float:
+def initial_psi0(fwd: ExactForward, verts, faces, real, present, sigma, mesh=None) -> float:
     """The whole-frame shift of the rendered curves that fits the data best, as a start
     phase. Shifting psi0 by one grid step moves every curve by one frame, so one rendering
     serves every candidate."""
     P = real.shape[-1]
-    pred = normalise(fwd.raw_curves(verts, faces, psi0=0.0))
+    pred = normalise(fwd.raw_curves(verts, faces, psi0=0.0, mesh=mesh))
     best, best_j = float("inf"), 0
     for j in range(-int(P * PSI0_SEARCH), int(P * PSI0_SEARCH) + 1):
         r = (torch.roll(pred, -j, dims=-1) - real) / sigma[..., None]
@@ -275,19 +275,20 @@ def main():
     ap.add_argument("--data-dir", default="dataset/raw")
     ap.add_argument("--blender", action="store_true",
                     help="fit the instrument to the BLENDER curves rather than the lab ones. "
-                         "They are a render of the true shape by a known camera with no "
-                         "photographic sensor in front of it, so the chain has a different "
-                         "and much smaller mismatch to explain -- and they exist for all ten "
-                         "models, so an instrument fitted here applies to every secret body.")
+                         "Measured: it converges far faster (-logL 383 -> -10.7 against "
+                         "1587 -> 1.2) and lands at eta 0.0372 against the lab fit's 0.0378, "
+                         "moving the residual at the true shape from 0.0681 to 0.0667 on "
+                         "model 3. Two per cent. The mismatch is the chain's, not the "
+                         "curves'.")
     ap.add_argument("--models", nargs="+", type=int, default=list(PUBLIC_MODELS),
-                    help="public bodies to fit the instrument on. One eta is shared across "
-                         "all of them, so a body the model cannot reproduce raises the noise "
-                         "floor for every other body and for every secret model fitted "
-                         "against the result. Model 2, the sawed-off cube, misses by 4.2x "
-                         "the combined noise where models 1 and 3 sit at 0.2-0.7x: its flat "
-                         "faces put Otsu in a regime the chain does not reproduce. Every "
-                         "secret model is round-regime like 1 and 3, so fitting on the cube "
-                         "buys nothing and costs the noise floor.")
+                    help="public bodies to fit on. One eta is shared across all of them, so a "
+                         "body the model cannot reproduce raises the noise floor for every "
+                         "other body and for every secret model fitted against the result. "
+                         "Per-model residual medians in units of the combined noise: model 1 "
+                         "0.23/0.26, model 3 0.66/0.43, model 2 4.17/2.53. The cube's flat "
+                         "faces put Otsu in a regime the chain does not reproduce, and every "
+                         "secret model is round-regime like 1 and 3, so fitting on it costs "
+                         "the seven that are scored a noise floor three times too high.")
     ap.add_argument("--out", default=OUT_INSTRUMENT)
     ap.add_argument("--report", default=OUT_REPORT)
     render = RenderConfig()
@@ -296,11 +297,21 @@ def main():
                          "memory the rendering takes, not the result")
     ap.add_argument("--geom-chunk", type=int, default=render.geom_chunk,
                     help="geometries per rendering batch")
+    ap.add_argument("--radiosity-slack", type=float, default=6.0,
+                    help="a mesh left with more than this many times RenderConfig."
+                         "radiosity_faces patches after decimation is refused. The default "
+                         "of 2 in RenderConfig guards the RECONSTRUCTION against candidate "
+                         "bodies in thousands of pieces, whose n^2 form factors would run to "
+                         "gigabytes. The public shape models are trusted ground truth and "
+                         "some simply do not decimate to the target -- model 2 stops at 2202 "
+                         "patches against a limit of 1200 -- so the guard is relaxed here. "
+                         "The cost is bounded: 3600 patches is a 52 MB form-factor array.")
     a = ap.parse_args()
     dev = "cuda" if torch.cuda.is_available() else "cpu"
 
     inst = Instrument().to(dev)
-    render = RenderConfig(phase_chunk=a.phase_chunk, geom_chunk=a.geom_chunk)
+    render = RenderConfig(phase_chunk=a.phase_chunk, geom_chunk=a.geom_chunk,
+                          radiosity_slack=a.radiosity_slack)
     fwd = ExactForward(inst, psi_grid(a.phases), render, device=dev)
     fit_params = [p for n, p in inst.named_parameters() if n != "raw_eta"]
 
@@ -308,11 +319,16 @@ def main():
     for M in a.models:
         t0 = time.time()
         verts, faces = load_truth(a.data_dir, M, dev)
+        # The form factors belong to the mesh, and only the instrument moves during the fit,
+        # so they are made once here. Remade every step they were most of it: the visibility
+        # ray test on model 2's 2202 patches runs on the CPU for over a minute.
+        mesh = fwd.mesh_constants(verts, faces)
         real, present, sigma, mismatch = load_data(a.data_dir, M, a.phases, dev,
                                                    use_blender=a.blender)
         with torch.no_grad():
-            psi0 = initial_psi0(fwd, verts, faces, real, present, sigma)
-        bodies[M] = dict(verts=verts, faces=faces, real=real, present=present, sigma=sigma,
+            psi0 = initial_psi0(fwd, verts, faces, real, present, sigma, mesh)
+        bodies[M] = dict(verts=verts, faces=faces, mesh=mesh, real=real, present=present,
+                         sigma=sigma,
                          psi0=torch.tensor(psi0, device=dev, requires_grad=True))
         print(f"  model {M}: {len(faces)} faces, {int(present.sum())}/{N_CAMS} geometries, "
               f"noise median {float(sigma.median()):.4f} (A/B mismatch "
@@ -341,7 +357,7 @@ def main():
             # parameter and this body's start phase, through the rendering
             raw, _, grads = fwd.vjp(
                 b["verts"], b["faces"], lambda r: likelihood_cotangent(r, b, eta.detach()),
-                psi0=b["psi0"], params=fit_params + [b["psi0"]])
+                psi0=b["psi0"], params=fit_params + [b["psi0"]], mesh=b["mesh"])
             for p, g in zip(fit_params + [b["psi0"]], grads):
                 p.grad = g if p.grad is None else p.grad + g
             # eta enters only through the likelihood, so its gradient is direct
@@ -373,7 +389,8 @@ def main():
     with torch.no_grad():
         eta = inst.eta.reshape(2, N_CAMS).T
         for M, b in bodies.items():
-            pred = normalise(fwd.raw_curves(b["verts"], b["faces"], psi0=float(b["psi0"])))
+            pred = normalise(fwd.raw_curves(b["verts"], b["faces"], psi0=float(b["psi0"]),
+                                            mesh=b["mesh"]))
             rep = residual_report(pred, b["real"], b["present"], b["sigma"], eta)
             print_report(M, rep)
             report["residual"][M] = rep

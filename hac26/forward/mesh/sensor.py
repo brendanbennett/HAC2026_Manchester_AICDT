@@ -111,14 +111,24 @@ class SensorModel(nn.Module):
         return torch.cat([torch.zeros(1, device=c.device, dtype=c.dtype), c / c[-1]])
 
     def oetf(self, x: torch.Tensor) -> torch.Tensor:
-        """Piecewise-linear monotone spline through the knots, evaluated on x in [0, 1]."""
+        """Piecewise-linear monotone spline through the knots, evaluated on x in [0, 1].
+
+        Each pixel's two knot values are picked by one torch.where per segment, not by
+        indexing the knots with the segment index. The values are the same, but the backward
+        of the index accumulates millions of pixels onto nine knots, which the indexing kernel
+        does nearly serially: 0.94 s of a 0.99 s image backward for a block of 56 images,
+        against a masked sum per segment here."""
         k = self.oetf_knots()
         n = len(k) - 1
         u = x.clamp(0.0, 1.0) * n
         i = u.floor().clamp(max=n - 1)
         t = u - i
-        i = i.int()                                 # the index is kept for the backward pass
-        return torch.lerp(k[i], k[i + 1], t)
+        lo, hi = k[0].expand_as(u), k[1].expand_as(u)
+        for m in range(1, n):
+            seg = i == m
+            lo = torch.where(seg, k[m], lo)
+            hi = torch.where(seg, k[m + 1], hi)
+        return torch.lerp(lo, hi, t)
 
     def vignette(self, r: torch.Tensor) -> torch.Tensor:
         a = self.raw_vignette

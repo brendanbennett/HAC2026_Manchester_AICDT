@@ -70,7 +70,7 @@ def save_submission_stl(path: str, verts: np.ndarray, faces: np.ndarray,
     # Through the same repair-and-check gate the flow's answers go through, so a submission
     # file cannot be written non-watertight or inside out whichever solver produced it.
     from .solvers.output import export_stl
-    info.update(export_stl(path, verts, faces))
+    info.update(export_stl(path, verts, faces))   # raises rather than write a non-solid
     return info
 
 

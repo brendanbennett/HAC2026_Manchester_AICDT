@@ -104,6 +104,29 @@ def test_vjp_returns_the_same_curves_and_finite_gradients():
     assert torch.isfinite(g_tau) and torch.isfinite(g_ped).all()
 
 
+def test_a_cached_mesh_gives_the_same_curves_and_gradients():
+    """mesh_constants made once and passed back as `mesh` gives the curves and instrument
+    gradients of a call that makes its own, which is what lets the calibration make them once
+    per body; a cached mesh cannot carry a gradient to the vertices, so asking is refused."""
+    v, f = _two_spheres()
+    vt = torch.tensor(v, dtype=torch.float32)
+    ft = torch.tensor(f)
+    inst = Instrument(quantise=False)
+    op = ExactForward(inst, psi_grid(6), SMALL, device="cpu", backend="software")
+    mesh = op.mesh_constants(vt, ft)
+    params = [inst.raw_rho, inst.raw_tau_i, inst.raw_pedestal, inst.sensor.raw_oetf]
+    cot = lambda raw: torch.ones_like(raw)                                    # noqa: E731
+    raw, _, grads = op.vjp(vt, ft, cot, geoms=[0, 5], params=params)
+    raw_c, _, grads_c = op.vjp(vt, ft, cot, geoms=[0, 5], params=params, mesh=mesh)
+    assert torch.allclose(raw, raw_c)
+    for g, g_c in zip(grads, grads_c):
+        assert torch.allclose(g, g_c)
+    assert torch.allclose(op.raw_curves(vt, ft, geoms=[0, 5]),
+                          op.raw_curves(vt, ft, geoms=[0, 5], mesh=mesh))
+    with pytest.raises(ValueError):
+        op.vjp(vt.clone().requires_grad_(True), ft, cot, geoms=[0, 5], mesh=mesh)
+
+
 def test_normalise_vjp_matches_autograd():
     """The hand-written adjoint of the per-curve mean normalisation equals autograd's."""
     raw = (torch.rand(3, 2, 7, dtype=torch.float64) + 0.5).requires_grad_(True)
@@ -133,3 +156,20 @@ def test_a_distant_camera_still_sees_the_body():
                       device="cpu", backend="software")
     raw = op.raw_curves(vt, ft, geoms=[0, 9])
     assert torch.isfinite(raw).all() and (raw > 0).all()
+
+
+def test_a_mesh_that_does_not_decimate_is_refused():
+    """A surface in many pieces keeps faces in every piece and stops far above the patch
+    target, and the form factors of that many patches would cost the square of it: the mesh
+    is refused with the error every caller already handles, before anything is built."""
+    from scipy.ndimage import gaussian_filter
+    from skimage import measure
+
+    from hac26.forward.mesh.radiosity import RadiosityError
+    field = gaussian_filter(np.random.default_rng(0).random((20, 20, 20)), 0.8)
+    v, f, _, _ = measure.marching_cubes(field, level=float(np.median(field)))
+    op = ExactForward(Instrument(quantise=False), psi_grid(4), SMALL, device="cpu",
+                      backend="software")
+    with pytest.raises(RadiosityError, match="above the limit"):
+        op.raw_curves(torch.tensor(v / 10.0 - 1.0, dtype=torch.float32),
+                      torch.tensor(f.astype(np.int64)))

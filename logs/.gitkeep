@@ -1,0 +1,2 @@
+# Slurm opens -o/-e before the job body runs and will not create this directory,
+# so it has to exist at submit time. mkdir -p inside the script is too late.
