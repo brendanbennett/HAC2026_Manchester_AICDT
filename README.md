@@ -240,8 +240,15 @@ it. `scripts/run_smoke_test.sh` runs the same stages small, as a wiring check. E
 is a variable at the top of the pipeline script and can be overridden from the environment.
 Training states lie on the straight line between noise and body only, and `train_lpd.py`
 says why states from the sampler's own trajectory are not scored. The flow's answers are
-scored beside the convex ones by the pipeline's last stage and reach the submission by the
-same gate as any other correction.
+scored beside the convex ones and reach the submission by the same gate as any other
+correction. The pipeline's last stage is the non-convex track above, which is what writes
+`results/submission`.
+
+`submit_csf3.sh` is that pipeline as a batch job, with the partitions, the modules and the
+GPU architectures of one cluster settled in it. `CSF_STAGE=nonconvex ./submit_csf3.sh` runs
+the correction and the submission alone: those read no corpus and no flow, only the
+calibration and the committed convex answers, so they need none of the training and are
+hours rather than days.
 
 ## Tests
 

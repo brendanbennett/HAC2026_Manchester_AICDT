@@ -4,6 +4,7 @@
 # from, and a name written here goes stale the moment the work moves.
 #
 #   ./submit_csf3.sh                            # gpuA (A100 80GB), 4-day limit
+#   CSF_STAGE=nonconvex ./submit_csf3.sh        # the correction and the submission only
 #   CSF_PARTITION=gpuH_short ./submit_csf3.sh   # H200, 1-day limit
 #   CSF_PARTITION=gpuH ./submit_csf3.sh         # H200, 4-day limit
 #   CSF_PARTITION=gpuL ./submit_csf3.sh         # L40S 48GB, 4-day limit
@@ -11,6 +12,12 @@
 #   sbatch submit_csf3.sh                       # gpuA only; ignores CSF_PARTITION
 #
 # CSF_TIME overrides the wallclock and CSF_ACCOUNT the H200 account code.
+#
+# CSF_STAGE=nonconvex runs scripts/run_nonconvex.sh alone: it calibrates the rendered
+# channel, corrects every body from the committed convex answers with both solvers, and
+# writes a submission. It reads no corpus and no flow, so it needs neither the library nor
+# any training, and it is hours rather than days. The default runs the whole pipeline, which
+# ends with the same stage.
 #
 # =============================================================================
 # Partition, modules and the torch build are all confirmed against this cluster:
@@ -164,5 +171,11 @@ make data 2>&1 | tee logs/csf3_data.log || \
 
 # ---------------------------------------------------------------- run
 # Each stage writes a marker under runs/.done/ and is skipped if already
-# complete, so a job that hits the wall clock can be resubmitted as is.
-./scripts/run_remote_pipeline.sh
+# complete, so a job that hits the wall clock can be resubmitted as is. The
+# non-convex track keeps its state per body instead, so it too carries on
+# where a killed job stopped.
+case "${CSF_STAGE:-pipeline}" in
+  pipeline)  ./scripts/run_remote_pipeline.sh ;;
+  nonconvex) ./scripts/run_nonconvex.sh ;;
+  *) echo "CSF_STAGE=$CSF_STAGE: expected pipeline or nonconvex" >&2; exit 1 ;;
+esac
