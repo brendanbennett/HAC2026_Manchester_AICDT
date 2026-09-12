@@ -80,6 +80,18 @@ class RenderConfig:
     bad_rows: str = "raise"    # what RadiositySolver does with a broken form-factor row
 
 
+class MeshConstants(NamedTuple):
+    """The part of Prepared that depends on the mesh alone (ExactForward.mesh_constants).
+    `F` and `patch` are None for an instrument without interreflection, which is the only part
+    of it that depends on the instrument at all -- whether the patches are built."""
+    F: torch.Tensor | None     # (patches, patches) form factors
+    patch: torch.Tensor | None
+    fv: torch.Tensor
+    ff: torch.Tensor
+    area: torch.Tensor
+    extent: float
+
+
 class Prepared(NamedTuple):
     """Everything about one mesh that does not depend on the phase. `solver` and `patch` are
     None for an instrument without interreflection."""
@@ -212,12 +224,16 @@ class ExactForward:
         self.ras_sun = Rasteriser(config.sun_res, config.sun_res, 1, device, backend)
 
     # ------------------------------------------------------------------ per-body setup
-    def _prepare(self, verts: torch.Tensor, faces: torch.Tensor) -> Prepared:
-        """The form factors of the patches and their factorisation (constants of the mesh),
-        the face-to-patch map, and the per-face vertices and areas, which stay
-        differentiable. Raises RadiosityError when the patches cannot be built or their form
-        factors are unusable."""
-        solver, patch = None, None
+    def mesh_constants(self, verts: torch.Tensor, faces: torch.Tensor) -> MeshConstants:
+        """The form factors of the patches, the face-to-patch map, and the per-face vertices
+        and areas, which stay differentiable.
+
+        None of it depends on the instrument's fitted parameters, and on a carved mesh it is
+        most of the cost of a call, because the visibility ray test of the form factors runs on
+        the CPU. A caller that renders one fixed mesh many times, as the calibration does,
+        builds it once and passes it back as `mesh`. Raises RadiosityError when the patches
+        cannot be built."""
+        F, patch = None, None
         if bool(self.inst.interreflection):
             v_np = verts.detach().cpu().double().numpy()
             f_np = faces.detach().cpu().numpy()
@@ -229,8 +245,7 @@ class ExactForward:
                 raise RadiosityError("the mesh decimates to fewer than four patches")
             F, _, _, pc = form_factors(pv, pf, n_samples=self.cfg.form_factor_samples,
                                        device=self.device)
-            solver = RadiositySolver(F.to(torch.float32), self.inst.rho,
-                                     bad_rows=self.cfg.bad_rows)
+            F = F.to(torch.float32)
             from scipy.spatial import cKDTree
             patch = torch.as_tensor(cKDTree(pc).query(v_np[f_np].mean(1))[1],
                                     device=self.device)
@@ -238,7 +253,21 @@ class ExactForward:
         tv = verts[faces.long()]
         area = 0.5 * torch.linalg.cross(tv[:, 1] - tv[:, 0], tv[:, 2] - tv[:, 0]).norm(dim=1)
         extent = float(verts.detach().norm(dim=1).max()) * 1.05
-        return Prepared(solver, patch, fv, ff, area.clamp_min(1e-12), extent)
+        return MeshConstants(F, patch, fv, ff, area.clamp_min(1e-12), extent)
+
+    def _prepare(self, verts: torch.Tensor, faces: torch.Tensor,
+                 mesh: MeshConstants | None = None) -> Prepared:
+        """The mesh constants, from `mesh` when given, and the factorisation of the radiosity
+        system at the current albedo, which is fitted and so is rebuilt every call. Raises
+        RadiosityError when the patches cannot be built or their form factors are unusable."""
+        if mesh is None:
+            mesh = self.mesh_constants(verts, faces)
+        elif verts.requires_grad:
+            raise ValueError("a cached `mesh` holds the per-face vertices of the call that "
+                             "made it, so it cannot carry a gradient to `verts`")
+        solver = (None if mesh.F is None else
+                  RadiositySolver(mesh.F, self.inst.rho, bad_rows=self.cfg.bad_rows))
+        return Prepared(solver, mesh.patch, mesh.fv, mesh.ff, mesh.area, mesh.extent)
 
     def _radiance(self, prep: Prepared, cov: torch.Tensor, k: int) -> torch.Tensor:
         """Per-face radiance (P, F) from the lit coverage (P K, F) of K source samples: the
@@ -355,19 +384,20 @@ class ExactForward:
         return [(i, self.psi[i:i + step]) for i in range(0, len(self.psi), step)]
 
     def raw_curves(self, verts: torch.Tensor, faces: torch.Tensor, geoms=None,
-                   psi0=0.0) -> torch.Tensor:
+                   psi0=0.0, mesh: MeshConstants | None = None) -> torch.Tensor:
         """Unnormalised curves (G, 2, P): intensity then count, for the requested geometries.
-        No gradient. Raises RadiosityError when the mesh cannot be used."""
+        No gradient. `mesh` is mesh_constants(verts, faces), when the caller has
+        it. Raises RadiosityError when the mesh cannot be used."""
         geoms = self._geoms(geoms)
         with torch.no_grad():
-            prep = self._prepare(verts.detach(), faces)
+            prep = self._prepare(verts.detach(), faces, mesh)
             tau_b = self._binary_thresholds(prep, psi0, geoms)
             out = [self._chunk(prep, phases, psi0, geoms, tau_b) for _, phases in
                    self._phase_chunks()]
         return torch.cat(out, -1)
 
     def raw_curves_turned(self, verts: torch.Tensor, faces: torch.Tensor, geoms=None,
-                          psi0=0.0):
+                          psi0=0.0, mesh: MeshConstants | None = None):
         """raw_curves, and beside it the count curves (3, G, P) the body would have if its
         first frame were frame P/4, P/2 or 3P/4: the counts above Otsu's threshold of that
         frame. A body turned by a quarter turn about its spin axis has the intensity curves of
@@ -380,7 +410,7 @@ class ExactForward:
         if P % 4:
             raise ValueError(f"turned counts need a phase count divisible by four, not {P}")
         with torch.no_grad():
-            prep = self._prepare(verts.detach(), faces)
+            prep = self._prepare(verts.detach(), faces, mesh)
             taus = [self._binary_thresholds(prep, psi0, geoms, frame=j * P // 4)
                     for j in range(4)]
             out, extra = [], []
@@ -391,20 +421,21 @@ class ExactForward:
         return torch.cat(out, -1), torch.cat(extra, -1)
 
     def vjp(self, verts: torch.Tensor, faces: torch.Tensor, cot, geoms=None, psi0=0.0,
-            params: list | None = None):
+            params: list | None = None, mesh: MeshConstants | None = None):
         """The unnormalised curves and the vector-Jacobian product with `cot` (G, 2, P), with
         respect to `verts` (when it requires grad) and to the tensors in `params`. `cot` may
         also be a function of the full unnormalised curves, for cotangents that depend on
         every phase at once, such as the adjoint of the mean normalisation; the curves are
         then computed once without gradient first. Returns (curves, grad_verts,
         [grad_param, ...]); a gradient is None for an input that does not require grad. Runs
-        in blocks of phases and geometries, so the memory is that of one block. Raises
+        in blocks of phases and geometries, so the memory is that of one block. `mesh` is
+        mesh_constants(verts, faces), for a mesh that is not differentiated. Raises
         RadiosityError when the mesh cannot be used."""
         geoms = self._geoms(geoms)
         params = list(params or [])
         wrt = ([verts] if verts.requires_grad else []) + params
         with torch.enable_grad():          # the caller may be inside no_grad
-            prep = self._prepare(verts, faces)
+            prep = self._prepare(verts, faces, mesh)
             tau_b = self._binary_thresholds(prep, psi0, geoms)
             if callable(cot):
                 with torch.no_grad():

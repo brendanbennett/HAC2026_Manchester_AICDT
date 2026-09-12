@@ -118,12 +118,12 @@ def load_data(data_dir: str, model: int, phases: int, device: str, channel: str 
             torch.tensor(mismatch, dtype=torch.float32, device=device))
 
 
-def initial_psi0(fwd: ExactForward, verts, faces, real, present, sigma) -> float:
+def initial_psi0(fwd: ExactForward, verts, faces, real, present, sigma, mesh=None) -> float:
     """The whole-frame shift of the rendered curves that fits the data best, as a start
     phase. Shifting psi0 by one grid step moves every curve by one frame, so one rendering
     serves every candidate."""
     P = real.shape[-1]
-    pred = normalise(fwd.raw_curves(verts, faces, psi0=0.0))
+    pred = normalise(fwd.raw_curves(verts, faces, psi0=0.0, mesh=mesh))
     best, best_j = float("inf"), 0
     for j in range(-int(P * PSI0_SEARCH), int(P * PSI0_SEARCH) + 1):
         r = (torch.roll(pred, -j, dims=-1) - real) / sigma[..., None]
@@ -343,9 +343,14 @@ def main():
         t0 = time.time()
         verts, faces = load_truth(a.data_dir, M, dev, a.truth_faces)
         real, present, sigma, mismatch = load_data(a.data_dir, M, a.phases, dev, a.channel)
+        # The form factors of the patches belong to the mesh, and only the instrument moves
+        # during the fit, so they are built once here. Rebuilt every step they were most of the
+        # cost of a step: the visibility ray test of a decimated public body runs on the CPU.
+        mesh = fwd.mesh_constants(verts, faces)
         with torch.no_grad():
-            psi0 = initial_psi0(fwd, verts, faces, real, present, sigma)
-        bodies[M] = dict(verts=verts, faces=faces, real=real, present=present, sigma=sigma,
+            psi0 = initial_psi0(fwd, verts, faces, real, present, sigma, mesh)
+        bodies[M] = dict(verts=verts, faces=faces, mesh=mesh, real=real, present=present,
+                         sigma=sigma,
                          psi0=torch.tensor(psi0, device=dev, requires_grad=True))
         print(f"  model {M}: {len(faces)} faces, {int(present.sum())}/{N_CAMS} geometries, "
               f"noise median {float(sigma.median()):.4f} (A/B mismatch "
@@ -375,7 +380,7 @@ def main():
             # parameter and this body's start phase, through the rendering
             raw, _, grads = fwd.vjp(
                 b["verts"], b["faces"], lambda r: likelihood_cotangent(r, b, eta.detach()),
-                psi0=b["psi0"], params=fit_params + [b["psi0"]])
+                psi0=b["psi0"], params=fit_params + [b["psi0"]], mesh=b["mesh"])
             for p, g in zip(fit_params + [b["psi0"]], grads):
                 p.grad = g if p.grad is None else p.grad + g
             # eta enters only through the likelihood, so its gradient is direct
@@ -409,7 +414,8 @@ def main():
         eta = inst.eta.reshape(2, N_CAMS).T
         worst_eta = torch.zeros_like(eta)
         for M, b in bodies.items():
-            pred = normalise(fwd.raw_curves(b["verts"], b["faces"], psi0=float(b["psi0"])))
+            pred = normalise(fwd.raw_curves(b["verts"], b["faces"], psi0=float(b["psi0"]),
+                                            mesh=b["mesh"]))
             rep = residual_report(pred, b["real"], b["present"], b["sigma"], eta)
             print_report(M, rep)
             report["residual"][M] = rep
