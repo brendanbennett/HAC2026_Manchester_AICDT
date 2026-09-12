@@ -91,6 +91,19 @@ FIT_WEIGHT = 1.0       # weight of the data-fit term (data_fit) against the flow
 FIT_FROM = 1.0 - 1.0 / N_EXPERTS   # the data-fit term applies at t from here on: the interval
                                    # the last of the N_EXPERTS experts owns, where the endpoint
                                    # estimate is nearly the answer
+FLOW_GAP_MIN = 1.0 / N_EXPERTS   # floor on the 1 - t the flow term divides by, so its weight
+                       # is capped at 1 / FLOW_GAP_MIN^2 instead of diverging as t -> 1. See
+                       # step_loss: past this point the term is a plain endpoint regression.
+                       # The floor is the last expert's interval, the band where the data-fit
+                       # term is already what pulls the endpoint onto the curves.
+GRAD_CLIP = 1.0        # cap on the gradient's global norm at each step. The batch is small
+                       # enough that one unusual draw is a large share of it, and a step taken
+                       # on such a draw otherwise moves the weights far enough that the draws
+                       # after it are worse, which is how this training diverges. Clipping
+                       # leaves the step's direction alone and bounds only its length, so an
+                       # ordinary step, whose norm is well under the cap, is unaffected. It is
+                       # the backstop under FLOW_GAP_MIN, not a substitute for it: the cap on
+                       # the flow term's weight is what stops the large steps arising.
 FIT_KNEE = 1.0         # excess misfit, in noise standard deviations, beyond which the data-fit
                        # term stops growing as a square and grows in proportion instead. It
                        # bounds the pull the term can exert at the pull a body two standard
@@ -445,16 +458,17 @@ def rollout(net, op, x0, k, h, radius, data, sigma, geoms, step_mask, sph, vol, 
     network on the states it will actually meet."""
     x = x0.clone()
     dt = 1.0 / N_STEPS
-    dropped = 0
+    dropped = calls = 0
     for s in range(int(k)):
         t = torch.full((len(x),), s * dt, device=x.device)
         x1_hat = x + (1 - t[:, None]) * net.prior_velocity(x, t, radius, sph, vol)
         inp, n_bad = operator_inputs(net, op, x1_hat, h, radius, data, sigma, geoms,
                                      step_mask, sph, vol, M)
         dropped += n_bad
+        calls += len(x)
         v = net.velocity(x, t, radius, tag, inp)
         x = churn_step(x, v, s * dt, dt, CHURN)
-    return x, dropped
+    return x, dropped, calls
 
 
 # ------------------------------------------------------------------------------- the loss
@@ -465,8 +479,37 @@ def step_loss(net, xt, t, v, x1, sup_true, code_true, h_base, occ_weight, occ_ep
     The flow term is the squared error of v against the velocity that takes the state
     straight to x1 in the time left, (x1 - xt) / (1 - t), averaged per block so the many g
     coordinates do not swamp the few dh coordinates. On the straight line that target is
-    x1 - x0. Every t weighs the same: a velocity error moves the sampler's answer by the same
-    amount whenever it happens, and the late ones are never corrected.
+    x1 - x0.
+
+    It is written here in the equivalent endpoint form, because the two differ off the line.
+    Since x1_hat = xt + (1 - t) v,
+
+        || v - (x1 - xt) / (1 - t) ||^2  ==  || x1_hat - x1 ||^2 / (1 - t)^2
+
+    exactly: the term is a regression of the endpoint estimate on the true endpoint, carrying
+    the weight 1 / (1 - t)^2. The residual is of ordinary size wherever the state is, but that
+    weight diverges as t -> 1, and on the straight line the divergence is invisible because
+    the target cancels it -- (x1 - xt) / (1 - t) is identically x1 - x0 there, whatever t is.
+    Off the line it does not cancel. Writing the deviation from the line as d = xt - x_line(t),
+
+        (x1 - xt) / (1 - t)  =  (x1 - x0)  -  d / (1 - t)
+
+    so a rollout state, which has d != 0 by construction and by CHURN, meets a target and a
+    loss inflated by up to 1 / (1 - t)^2. At the last state the sampler can reach that is a
+    factor of 256, which is enough on its own to take the step past anything the weights can
+    absorb.
+
+    So the weight is capped: 1 - t is floored at FLOW_GAP_MIN. Below the floor nothing changes
+    and the term is what it always was; above it the term is a plain endpoint regression.
+    Reweighting cannot move where the term is minimised -- for any positive weight that is
+    still the conditional mean of the target -- so this changes only how the emphasis is spread
+    over t, never what the network is being asked to learn. Bounding the target itself, or
+    softening the square, would both have moved it.
+
+    The floor is where the one-shot target stops being a fair request. It asks the network to
+    erase the whole accumulated deviation in the time remaining, which is reasonable while
+    several sampler steps are left and not once one is: past the floor the velocity it demands
+    is larger than any the sampler meets in the states it actually visits.
 
     The occupancy term scores the endpoint the velocity implies, x1_hat = xt + (1 - t) v,
     decoded: the cross-entropy of its inside-or-outside at the lattice sites against the
@@ -488,9 +531,11 @@ def step_loss(net, xt, t, v, x1, sup_true, code_true, h_base, occ_weight, occ_ep
     to the loss and destabilises the step.
 
     Returns (total, flow term, occupancy term, decoded endpoint)."""
-    err = (v - (x1 - xt) / (1 - t[:, None])) ** 2
-    flow = 0.5 * (err[:, :N_DIR].mean() + err[:, N_DIR:].mean())
     x1_hat = xt + (1 - t[:, None]) * v
+    # the endpoint form of the term, so the large intermediate is never formed at all
+    gap = (1 - t[:, None]).clamp_min(FLOW_GAP_MIN)
+    err = ((x1_hat - x1) / gap) ** 2
+    flow = 0.5 * (err[:, :N_DIR].mean() + err[:, N_DIR:].mean())
     with torch.no_grad():
         g_true = code_true[:, N_DIR:]
         occ_true = torch.sigmoid(-site_field(sup_true, g_true) / occ_eps)
@@ -556,13 +601,17 @@ def with_gradient(value: torch.Tensor, x: torch.Tensor, grad: torch.Tensor) -> t
 class Diag(NamedTuple):
     """Numbers flow_loss reports beside the loss: the mean |g| of the endpoint estimate and
     its spread across the batch (what a collapse to the conditional mean would move first),
-    the flow, occupancy and data-fit terms, and the bodies dropped for having no curves."""
+    the flow, occupancy and data-fit terms, and the operator calls made and how many of them
+    were dropped for the body having no curves. The two are counted together because a draw
+    does not make a fixed number of calls: a rolled-out draw makes one per sampler step it
+    replays, so drops are only readable against the calls that produced them."""
     g_mean: float
     g_spread: float
     flow: float
     occ: float
     fit: float
     dropped: int
+    calls: int
 
 
 def flow_loss(net, op: CodeOperator, corpus: Corpus, eta, idx, x0, t, M, tag, mask,
@@ -658,7 +707,7 @@ def flow_loss(net, op: CodeOperator, corpus: Corpus, eta, idx, x0, t, M, tag, ma
     tag_b = tag.expand(B, C, 4)
 
     # The state: on the straight line, or where the sampler gets to.
-    n_dropped = 0
+    n_dropped = n_calls = 0
     if rollout_steps is None:
         xt = (1 - t[:, None]) * x0 + t[:, None] * x1
     else:
@@ -666,16 +715,18 @@ def flow_loss(net, op: CodeOperator, corpus: Corpus, eta, idx, x0, t, M, tag, ma
         xt = torch.empty_like(x0)
         for b in range(B):
             sl = slice(b, b + 1)
-            xt[sl], n_bad = rollout(net, op, x0[sl], int(rollout_steps[b]), h_base[sl],
-                                    radius[sl], data[sl], scale[sl], geoms, step_mask[sl],
-                                    sph[sl], vol[sl], tag_b[sl], M)
+            xt[sl], n_bad, n_op = rollout(net, op, x0[sl], int(rollout_steps[b]), h_base[sl],
+                                          radius[sl], data[sl], scale[sl], geoms,
+                                          step_mask[sl], sph[sl], vol[sl], tag_b[sl], M)
             n_dropped += n_bad
+            n_calls += n_op
 
     with torch.no_grad():
         v0 = net.prior_velocity(xt, t, radius, sph, vol)
         inp, n_bad = operator_inputs(net, op, xt + (1 - t[:, None]) * v0, h_base, radius,
                                      data, scale, geoms, step_mask, sph, vol, M)
     n_dropped += n_bad
+    n_calls += B
     step_mask = inp.mask
     u = net.velocity(xt, t, radius, tag_b, inp)
     loss, flow, occ, raw = step_loss(net, xt, t, u, x1, sup_true, codes, h_base, occ_weight,
@@ -692,6 +743,7 @@ def flow_loss(net, op: CodeOperator, corpus: Corpus, eta, idx, x0, t, M, tag, ma
             val, g_fit, n_bad = data_fit(net, op, x1_hat, h_base[sel], radius[sel], data[sel],
                                          scale[sel], geoms, step_mask[sel])
             n_dropped += n_bad
+            n_calls += int(sel.sum())
             fit = with_gradient(val, x1_hat, g_fit)
     loss = loss + fit_weight * fit
     if not return_diag:
@@ -700,7 +752,7 @@ def flow_loss(net, op: CodeOperator, corpus: Corpus, eta, idx, x0, t, M, tag, ma
         g_hat = raw[:, N_DIR:]
         diag = Diag(float(g_hat.abs().mean()),
                     float(g_hat.std(0).mean()) if len(g_hat) > 1 else float("nan"),
-                    float(flow), float(occ), float(fit), n_dropped)
+                    float(flow), float(occ), float(fit), n_dropped, n_calls)
     return loss, diag
 
 
@@ -711,7 +763,8 @@ def validate(net, op, corpus, eta, val_idx, val_x0, val_t, val_sigma, val_xi, va
     memory. The bodies are not turned, so every evaluation scores the same draws."""
     was_training = net.training
     net.eval()
-    tot, n, acc, dropped = 0.0, 0, np.zeros(len(Diag._fields) - 1), 0
+    n_float = len(Diag._fields) - 2          # the trailing two are counts, summed not averaged
+    tot, n, acc, dropped, calls = 0.0, 0, np.zeros(n_float), 0, 0
     with torch.no_grad():
         for i in range(0, len(val_idx), chunk):
             sl = slice(i, i + chunk)
@@ -721,12 +774,14 @@ def validate(net, op, corpus, eta, val_idx, val_x0, val_t, val_sigma, val_xi, va
                              zeta=val_zeta[sl], return_diag=True, occ_weight=occ_weight,
                              occ_eps=occ_eps, fit_weight=fit_weight, fit_from=fit_from)
             tot += b * float(l)
-            acc += b * np.array([0.0 if v != v else v for v in d[:-1]])   # a nan spread is 0
+            acc += b * np.array([0.0 if v != v else v            # a nan spread is 0
+                                 for v in d[:n_float]])
             dropped += d.dropped
+            calls += d.calls
             n += b
     net.train(was_training)
     m = max(n, 1)
-    return tot / m, Diag(*(acc / m), dropped)
+    return tot / m, Diag(*(acc / m), dropped, calls)
 
 
 # --------------------------------------------------------------------------- the training
@@ -738,7 +793,10 @@ def _hms(sec: float) -> str:
 
 
 def _now() -> str:
-    return time.strftime("%H:%M:%S")
+    # UTC, as run_remote_pipeline.sh's `log` uses `date -u`: the two interleave in the same
+    # job log, and in local summer time a stage banner otherwise reads an hour before the
+    # lines it brackets.
+    return time.strftime("%H:%M:%S", time.gmtime())
 
 
 class EMA:
@@ -1145,7 +1203,24 @@ def main():
             raise SystemExit(
                 f"{ckpt_path} was written for different flow settings "
                 f"({'; '.join(bad)}). Delete it or pass --no-resume.")
-        net.load_state_dict(st["net"])
+        # A resume is either a continuation or a new phase. A continuation picks up an
+        # interrupted run and must behave as the uninterrupted one would have: last iterate,
+        # last optimiser and average, record intact. A new phase -- a different expert count
+        # or a different rollout fraction -- is a different network or a different training
+        # distribution, so the record cannot carry over, and the weights it starts from are
+        # the ones the last phase selected rather than its last iterate. The last iterate is
+        # the one early stopping rejected; starting a harder phase there begins it from a
+        # model already known to be worse than the one the phase before it shipped.
+        branching = n_experts != a.experts
+        rolling = float(st.get("rollout_frac", 0.0)) != float(a.rollout_frac)
+        new_phase = branching or rolling
+        if new_phase and st.get("best_state") is not None:
+            net.load_state_dict(st["best_state"])
+            from_weights = (f"the weights it selected at step {st['best_step']} "
+                            f"(val {st['best']:.5f})")
+        else:
+            net.load_state_dict(st["net"])
+            from_weights = f"its weights at step {st['step']}"
         torch.set_rng_state(st["rng"])
         start_step = st["step"] + 1
         best, best_step, stale = st["best"], st["best_step"], st["stale"]
@@ -1155,22 +1230,28 @@ def main():
               f"({_hms(elapsed_before)} trained so far; best val "
               f"{best:.5f} from step {best_step}, {stale}/{a.patience} without "
               f"improvement)", flush=True)
+        print(f"  continuing from {from_weights}", flush=True)
         reset = []
-        if n_experts != a.experts:
+        if branching:
             # the best weights so far belong to the network before the split; the record
-            # starts again for the branched one, with a fresh optimiser and average
+            # starts again for the branched one
             net.branch(a.experts)
-            opt, ema = fresh_optimiser_and_ema()
             reset.append(f"branched from {n_experts} to {a.experts} experts at "
                          f"{net.edges.tolist()}")
+        if rolling:
+            # a new training distribution: the weights carry over, the record does not
+            reset.append(f"rollout fraction changed from {st.get('rollout_frac', 0.0)} to "
+                         f"{a.rollout_frac}")
+        if new_phase:
+            # A fresh optimiser and average for a new phase. Adam's moments and the EMA
+            # shadow describe the trajectory that produced the last iterate; against
+            # rewound weights, a branched network or a different loss scale they describe
+            # nothing this phase is doing.
+            opt, ema = fresh_optimiser_and_ema()
         else:
             opt.load_state_dict(st["opt"])
             if st.get("ema") is not None:
                 ema.load(st["ema"], st.get("ema_n", 0))
-        if float(st.get("rollout_frac", 0.0)) != float(a.rollout_frac):
-            # a new training distribution: the weights carry over, the record does not
-            reset.append(f"rollout fraction changed from {st.get('rollout_frac', 0.0)} to "
-                         f"{a.rollout_frac}")
         if reset:
             best, best_state, best_step, stale = float("inf"), None, -1, 0
             print(f"  {'; '.join(reset)}: early-stopping record reset", flush=True)
@@ -1183,8 +1264,11 @@ def main():
               f"to train -- raise --steps to continue", flush=True)
     stopped_at = a.steps
 
+    # the trained parameters, read after any branch: the optimiser's, and the ones clipped
+    clipped = list(net.reader.parameters()) + list(net.experts.parameters())
+
     t_run = t_step = time.time()
-    dropped = rolled = 0
+    dropped = calls = rolled = clip_hits = 0
     for s in range(start_step, a.steps):
         idx = train_idx[torch.randint(0, len(train_idx), (a.batch,)).to(dev)]
         x0 = torch.randn(a.batch, codes.shape[1], dtype=codes.dtype).to(dev)
@@ -1202,7 +1286,12 @@ def main():
                                 return_diag=True, occ_weight=a.occ_weight, occ_eps=occ_eps,
                                 fit_weight=a.fit_weight, fit_from=a.fit_from)
         dropped += parts.dropped
-        opt.zero_grad(); loss.backward(); opt.step(); ema.update(net)
+        calls += parts.calls
+        opt.zero_grad()
+        loss.backward()
+        gnorm = torch.nn.utils.clip_grad_norm_(clipped, GRAD_CLIP)
+        opt.step(); ema.update(net)
+        clip_hits += int(float(gnorm) > GRAD_CLIP)
         now = time.time()
         step_s = now - t_step
         elapsed = elapsed_before + (now - t_run)
@@ -1223,17 +1312,18 @@ def main():
                       f"finish inside one window.", flush=True)
         if (a.log_every and s % a.log_every == 0) or s == a.steps - 1:
             rate = (now - t_run) / (s - start_step + 1)
-            seen = (s - start_step + 1) * a.batch
+            done = s - start_step + 1
             print(f"  [{_now()}] step {s:>5}  loss {float(loss.detach()):.5f}  "
                   f"(flow {parts.flow:.5f}, occupancy {parts.occ:.5f}, "
-                  f"data fit {parts.fit:.5f})  dropped {dropped}/{seen} bodies"
+                  f"data fit {parts.fit:.5f})  dropped {dropped}/{calls} operator calls"
                   + (f"  rolled out {rolled} batches" if a.rollout_frac > 0 else "")
+                  + f"  clipped {clip_hits}/{done}"
                   + f"  {step_s:.1f}s/step  elapsed {_hms(elapsed)}  "
                   f"eta {_hms(rate * (a.steps - s - 1))}", flush=True)
-            if dropped > 0.5 * seen:
-                # a step that drops most of its batch is not training; say so every time
-                print(f"  WARNING: {dropped} of {seen} bodies had no curves so far -- the "
-                      f"operator is failing on most endpoint estimates", flush=True)
+            if dropped > 0.5 * max(calls, 1):
+                # most endpoint estimates yielding no curves is not training; say so
+                print(f"  WARNING: {dropped} of {calls} operator calls found no curves -- "
+                      f"the operator is failing on most endpoint estimates", flush=True)
 
         stop = False
         if n_val and ((s + 1) % a.val_every == 0 or s == a.steps - 1):
@@ -1251,7 +1341,7 @@ def main():
                   f"{g_ref:.5f} ({100*diag.g_mean/max(g_ref,1e-12):.0f}%), "
                   f"across-draw spread {diag.g_spread:.5f}; val flow {diag.flow:.5f}, "
                   f"occupancy {diag.occ:.5f}, data fit {diag.fit:.5f}, "
-                  f"dropped {diag.dropped}/{n_val}", flush=True)
+                  f"dropped {diag.dropped}/{diag.calls} operator calls", flush=True)
             if vl < best - a.min_delta:
                 best, best_step, stale = vl, s, 0
                 best_state = ema.state(net)      # ship the weights that were scored

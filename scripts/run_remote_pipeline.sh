@@ -94,7 +94,13 @@ PRIOR_BATCH=${PRIOR_BATCH:-64}
 
 FLOW_STEPS=${FLOW_STEPS:-1000}   # a cap: training stops early once the held-out loss plateaus
 FLOW_PHASES=${FLOW_PHASES:-96}
-FLOW_BATCH=${FLOW_BATCH:-2}
+FLOW_BATCH=${FLOW_BATCH:-8}     # two draws per expert per step: t is stratified across the
+                                # batch, so a batch of 2 * N_EXPERTS gives each of the four
+                                # experts two draws, and gives the data-fit band (t >= 0.75)
+                                # two draws every step rather than one draw in four steps.
+                                # A step costs about a batch's worth of operator calls, so
+                                # this is roughly 4x the step time of a batch of 2; lower
+                                # FLOW_STEPS to match if the budget is tight.
 FLOW_VAL_BODIES=${FLOW_VAL_BODIES:-16}  # held out of training: early stopping scores them and
                                         # the decision check reconstructs them; 0 turns both off
 FLOW_VAL_EVERY=${FLOW_VAL_EVERY:-200}
