@@ -73,8 +73,16 @@ N_OBJECTS=${N_OBJECTS:-600}
 DESIGN_N=${DESIGN_N:-4096}
 DESIGN_DEVICE=${DESIGN_DEVICE:-}
 
-FIT_WORKERS=${FIT_WORKERS:-$LIB_WORKERS}
-FIT_POINTS=${FIT_POINTS:-60000}
+# How far a body's code is a property of the body rather than of the sampling it was fitted
+# from improves as the square root of FIT_POINTS and never plateaus, so this is a trade against
+# time rather than a setting with a right value. Measured over the library's most carved bodies,
+# two independent samplings of one body give codes 16.8% apart at 60000 and 8.7% at 240000. The
+# fitted Dice is flat across that whole range -- it is limited by what the lattice can express
+# and not by the sampling -- so Dice is no guide here and the reproducibility of the codes is
+# the whole of the argument. The four times the signed distances that costs is minutes on
+# fit_shapes.py's GPU path and would have been hours on the CPU one.
+FIT_WORKERS=${FIT_WORKERS:-$LIB_WORKERS}   # --sdf cpu only; the GPU path is serial by design
+FIT_POINTS=${FIT_POINTS:-240000}
 CODES_FILE=runs/corpus_codes.npz
 
 CONVEX_CKPT=${CONVEX_CKPT:-models/lpd_convex.pt}   # the convex stage, whose starts the flow corrects
