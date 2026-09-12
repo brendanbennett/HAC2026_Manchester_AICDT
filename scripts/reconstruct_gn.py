@@ -48,6 +48,7 @@ import json
 import sys
 import time
 from collections import Counter
+from dataclasses import replace
 from pathlib import Path
 
 import numpy as np
@@ -184,16 +185,30 @@ def main() -> None:
                          "and not by the curves, which the written body records as "
                          "budget_limited; the point of the flag is a check that the whole path "
                          "executes, or an answer by a fixed time")
+    ap.add_argument("--height", type=int, default=RENDER.height,
+                    help="sensor image height; with --width and --sun-res, a lower value "
+                         "checks the wiring at a fraction of the cost and is not a "
+                         "reconstruction")
+    ap.add_argument("--width", type=int, default=RENDER.width)
+    ap.add_argument("--sun-res", type=int, default=RENDER.sun_res)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--device", default="cuda")
     a = ap.parse_args()
+    # The image size is a flag so that a wiring check costs a fraction of a reconstruction.
+    # A run at a reduced size is not a reconstruction and says so in its metadata.
+    render = RENDER if (a.height, a.width, a.sun_res) == (RENDER.height, RENDER.width,
+                                                          RENDER.sun_res) \
+        else replace(RENDER, height=a.height, width=a.width, sun_res=a.sun_res)
+    if render is not RENDER:
+        print(f"  NOTE: rendering at {a.height}x{a.width}, sun view {a.sun_res}; a run at a "
+              f"reduced size checks the wiring and is not a reconstruction", flush=True)
 
     torch.manual_seed(a.seed)
     _enable_tf32()
     dev = a.device if torch.cuda.is_available() else "cpu"
     R = CYLINDER_R[a.model]
     inst = load_instrument(a.calibration or INSTRUMENT[a.channel], device=dev)
-    op = CodeOperator(inst, psi_grid(a.phases), res=a.operator_res, config=RENDER, device=dev)
+    op = CodeOperator(inst, psi_grid(a.phases), res=a.operator_res, config=render, device=dev)
 
     sup_stl = a.support_from or str(answer_path(a.model))
     support = support_from_convex(sup_stl)
@@ -420,7 +435,7 @@ def main() -> None:
 
     # the body as it would be submitted, and its misfits, measured at the export resolution
     # and the export phase count, which is what a scored body is
-    op_x = CodeOperator(inst, psi_grid(a.export_phases), res=a.export_res, config=RENDER,
+    op_x = CodeOperator(inst, psi_grid(a.export_phases), res=a.export_res, config=render,
                         device=dev)
     d_x = load_inversion_curves(a.data_dir, a.model, m=a.export_phases, channel=a.channel)
     data_x = curve_pairs(d_x["curves"])

@@ -229,12 +229,15 @@ if [ -d dataset/raw ]; then
       --phases 8 --height 48 --width 80 --sun-res 32 \
       --out "$OUT/instrument_smoke.pt" --report "$OUT/instrument_smoke.json"
 
-  log "=== 12/14 reconstruct_gn: model 3, one iteration a stage"
+  # 80 designed starts rather than a handful: the grid is caps first and waists from index
+  # 72, so anything under that never exercises the family added for multi-lobed bodies.
+  log "=== 12/14 reconstruct_gn: model 3, one iteration a stage, both start families"
   run "reconstruct_gn" logs/smoke_gn.log \
     "$PY" scripts/reconstruct_gn.py --model 3 --channel blender \
       --calibration "$OUT/instrument_smoke.pt" \
-      --max-stage-iters 1 --restarts 2 --restart-keep 1 --screen-starts 8 \
+      --max-stage-iters 1 --restarts 2 --restart-keep 1 --screen-starts 80 \
       --phases 8 --operator-res 24 --export-res 32 --export-phases 8 \
+      --height 64 --width 112 --sun-res 64 \
       --hold-out-geoms 2 --out results/smoke/gn/Asteroid03.stl
   tail -8 logs/smoke_gn.log
 
@@ -244,6 +247,7 @@ if [ -d dataset/raw ]; then
       --calibration "$OUT/instrument_smoke.pt" \
       --steps 4 --every 2 --ckpt-every 2 \
       --phases 8 --operator-res 24 --hold-out-geoms 2 \
+      --height 64 --width 112 --sun-res 64 \
       --out results/smoke/map/Asteroid03.stl
   tail -8 logs/smoke_map.log
 
