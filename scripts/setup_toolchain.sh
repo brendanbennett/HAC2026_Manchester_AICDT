@@ -36,13 +36,25 @@ $PYBIN -c 'import torch' >/dev/null 2>&1 || {
   echo "ERROR: torch is not importable with $PYBIN. Run \`make venv CUDA=12\` (or 13) first," >&2
   echo "       then \`make toolchain\`." >&2; exit 1; }
 
-mkdir -p "$CUDA" /tmp/cudadl && cd /tmp/cudadl
+# Not /tmp, for the download and the unpacking either: /tmp is shared between users on a
+# batch node, and a co-user's run of this script leaves a cuda_*-archive tree there that is
+# neither writable nor, /tmp being sticky, removable by anyone else. tar then fails on every
+# entry with "Cannot open: File exists" and the build never starts. These sit beside the
+# toolkit they are unpacked into instead, which is per-user by construction.
+DL=${CUDA_DL_DIR:-$PREFIX/src/cudadl}
+UNPACK=$DL/unpacked
+mkdir -p "$CUDA" "$DL"
+# Unpacked fresh each run: a tree left by an interrupted extraction is otherwise copied on
+# as though it were complete, and cp -n below would keep the truncated files for good.
+rm -rf "$UNPACK"; mkdir -p "$UNPACK"
+cd "$DL"
 for c in cuda_nvcc cuda_cudart cuda_cccl; do
   p=$(curl -s "$REDIST/redistrib_$CUDA_VER.json" | $PYBIN -c "import json,sys;print(json.load(sys.stdin)['$c']['linux-x86_64']['relative_path'])")
   [ -f "$(basename "$p")" ] || curl -sL "$REDIST/$p" -o "$(basename "$p")"
-  tar -xf "$(basename "$p")"
+  tar -xf "$(basename "$p")" -C "$UNPACK"
 done
-for d in cuda_*-archive; do cp -rn "$d"/* "$CUDA"/; done
+for d in "$UNPACK"/cuda_*-archive; do cp -rn "$d"/* "$CUDA"/; done
+rm -rf "$UNPACK"          # the tarballs stay, so a rerun does not download again
 
 # The math-library headers come from torch's own CUDA bundle, wherever it keeps them: a cu13
 # torch has one nvidia/cu13/include tree, a cu12 torch has one include directory per library
@@ -57,7 +69,7 @@ for d in cuda_*-archive; do cp -rn "$d"/* "$CUDA"/; done
 #
 # The directory is rebuilt on every run. It used to be filled with cp -n and never cleared, so
 # the first torch a machine ever had decided its contents for good.
-MATHINC=/tmp/mathinc
+MATHINC=$PREFIX/src/mathinc          # not /tmp, for the reason given further up
 rm -rf "$MATHINC"; mkdir -p "$MATHINC"
 INC_DIRS=$($PYBIN - "$CUDA_MAJOR" <<'PY'
 import glob, os, re, sys, torch
@@ -143,7 +155,8 @@ echo "[toolchain] building against $BUILT_FOR" >&2
 command -v ninja >/dev/null 2>&1 || echo \
   "[toolchain] no ninja on PATH: this build will be serial. make venv EXTRAS=test,toolchain" >&2
 
-cat > /tmp/build_nvdr.py <<'PY'
+BUILD_PY=$PREFIX/src/build_nvdr.py    # not /tmp, for the reason given further up
+cat > "$BUILD_PY" <<'PY'
 import sys, torch.utils.cpp_extension as ce
 ce._check_cuda_version = lambda *a, **k: None      # the version guard; see the header comment
 sys.argv = ["setup.py", "build_ext", "--inplace"]
@@ -151,7 +164,7 @@ exec(open("setup.py").read())
 PY
 cd "$SRC"
 CUDA_HOME=$CUDA PATH=$CUDA/bin:$PATH CPATH=$MATHINC:$CUDA/include \
-  CPLUS_INCLUDE_PATH=$MATHINC:$CUDA/include $PYBIN /tmp/build_nvdr.py
+  CPLUS_INCLUDE_PATH=$MATHINC:$CUDA/include $PYBIN "$BUILD_PY"
 # The .dist-info below is not bookkeeping: since 0.4.0 nvdiffrast/__init__.py reads its own
 # version through importlib.metadata, so `import nvdiffrast` raises PackageNotFoundError
 # without it. That release also moved the number into pyproject.toml; older checkouts keep a
