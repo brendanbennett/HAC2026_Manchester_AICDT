@@ -156,3 +156,18 @@ def source_directions(delta_rad: float, k: int = 8) -> np.ndarray:
 def psi_grid(frames: int = FRAMES, sense: float = SENSE) -> np.ndarray:
     """psi_k = sense * 2 pi k / frames, with sense = -1 measured (see module docstring)."""
     return sense * 2.0 * np.pi * np.arange(frames) / frames
+
+def geometry_digest() -> str:
+    """Short digest of everything an instrument is fitted against but does not itself hold.
+
+    A calibration is a fit of the sensor chain against curves rendered through the cameras and
+    the transfer in this module. Change a camera's elevation or the transfer's exponent and
+    every fitted parameter is the answer to a different question, while the saved file still
+    loads. The pipeline skips the calibration when an instrument file is present, so an
+    instrument that outlived the geometry it was fitted under would be used in silence; this is
+    what Instrument.save records and Instrument.load checks.
+    """
+    import hashlib
+    parts = [repr(sorted(TOP_ELEVATION_DEG.items())), repr(AZIMUTHS_DEG), repr(CAM_KINDS),
+             repr(S_LAB.tolist()), repr(SENSE), repr(FRAMES), repr(TRANSFER_EXPONENT)]
+    return hashlib.sha256("|".join(parts).encode()).hexdigest()[:16]

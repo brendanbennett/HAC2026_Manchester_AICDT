@@ -190,14 +190,33 @@ class Instrument(nn.Module):
                 f"eta median {f(self.eta.median()):.4f}")
 
     def save(self, path) -> None:
-        torch.save(self.state_dict(), path)
+        """Write the fitted parameters, and with them the geometry they were fitted against.
+
+        See conventions.geometry_digest: the cameras and the transfer are not part of the
+        instrument, so a file fitted under one set of them loads happily under another and is
+        then the answer to a different question."""
+        from ...conventions import geometry_digest
+        state = dict(self.state_dict())
+        state["_geometry"] = torch.tensor(
+            list(bytes.fromhex(geometry_digest())), dtype=torch.uint8)
+        torch.save(state, path)
 
     @classmethod
     def load(cls, path, device="cpu") -> "Instrument":
         """A saved instrument, with the sensor chain it was saved with. Which chain that is
         follows from the keys: a rendered channel's PowerTransfer has a gamma where the
         laboratory camera's SensorModel has spline knots."""
+        from ...conventions import geometry_digest
         state = torch.load(path, map_location="cpu", weights_only=True)
+        saved = state.pop("_geometry", None)
+        if saved is not None:
+            was = bytes(saved.tolist()).hex()
+            if was != geometry_digest():
+                raise RuntimeError(
+                    f"{path} was fitted against different cameras or a different transfer "
+                    f"({was} against {geometry_digest()}). Every parameter in it is the answer "
+                    f"to a different question, so rerun scripts/calibrate.py rather than using "
+                    f"it; the pipeline skips the calibration when this file is present.")
         inst = cls(sensor=PowerTransfer() if "sensor.raw_gamma" in state else None)
         try:
             inst.load_state_dict(state)
