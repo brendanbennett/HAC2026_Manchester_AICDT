@@ -108,6 +108,14 @@ DAMP_FLOOR = 1e-2
 # explain the curves to the noise, and the representation cannot, its own floor at the
 # released non-convex body being about this. A target below the floor makes the stopping rule
 # dead and lets the fit spend its budget buying misfit with surface.
+#
+# The unit is the calibrated model error and it moves with the calibration, exactly as the
+# threshold in scripts/reconstruct_gn.py does; the floor above was read before the sawed-off
+# cube left the calibration. The direction it moved is the safe one, since a smaller model
+# error puts the floor further above this number and the rule simply never fires, which
+# spends the whole budget rather than stopping early. It is still a number to read again
+# alongside the other, and a later calibration that raises the model error would make it stop
+# short without saying so.
 TARGET_SIGMA = 2.6
 
 # Correlation lengths of the random smooth fields a subspace stage searches, in node spacings.

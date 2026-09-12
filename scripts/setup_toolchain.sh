@@ -31,12 +31,19 @@ CUDA=$PREFIX/cuda129
 SRC=${NVDIFFRAST_SRC:-$PREFIX/src/nvdiffrast}
 PYBIN=${PYTHON:-python3}
 VENV=${VIRTUAL_ENV:-}
+# Scratch for the downloads and the build, which do not have to survive the run. A fixed name
+# under /tmp is not usable on a shared node: /tmp is one directory for every user, so the
+# first job to create it owns it and every later one fails on permissions. A batch scheduler
+# sets TMPDIR to a directory private to the job; the fallback keeps the same property off a
+# cluster by putting the user's name in the path.
+SCRATCH_TMP=${TMPDIR:-/tmp/${USER:-build}}
+mkdir -p "$SCRATCH_TMP"
 
 $PYBIN -c 'import torch' >/dev/null 2>&1 || {
   echo "ERROR: torch is not importable with $PYBIN. Run \`make venv CUDA=12\` (or 13) first," >&2
   echo "       then \`make toolchain\`." >&2; exit 1; }
 
-mkdir -p "$CUDA" /tmp/cudadl && cd /tmp/cudadl
+mkdir -p "$CUDA" "$SCRATCH_TMP/cudadl" && cd "$SCRATCH_TMP/cudadl"
 for c in cuda_nvcc cuda_cudart cuda_cccl; do
   p=$(curl -s "$REDIST/redistrib_$CUDA_VER.json" | $PYBIN -c "import json,sys;print(json.load(sys.stdin)['$c']['linux-x86_64']['relative_path'])")
   [ -f "$(basename "$p")" ] || curl -sL "$REDIST/$p" -o "$(basename "$p")"
@@ -57,7 +64,7 @@ for d in cuda_*-archive; do cp -rn "$d"/* "$CUDA"/; done
 #
 # The directory is rebuilt on every run. It used to be filled with cp -n and never cleared, so
 # the first torch a machine ever had decided its contents for good.
-MATHINC=/tmp/mathinc
+MATHINC=$SCRATCH_TMP/mathinc
 rm -rf "$MATHINC"; mkdir -p "$MATHINC"
 INC_DIRS=$($PYBIN - "$CUDA_MAJOR" <<'PY'
 import glob, os, re, sys, torch
@@ -143,7 +150,7 @@ echo "[toolchain] building against $BUILT_FOR" >&2
 command -v ninja >/dev/null 2>&1 || echo \
   "[toolchain] no ninja on PATH: this build will be serial. make venv EXTRAS=test,toolchain" >&2
 
-cat > /tmp/build_nvdr.py <<'PY'
+cat > "$SCRATCH_TMP/build_nvdr.py" <<'PY'
 import sys, torch.utils.cpp_extension as ce
 ce._check_cuda_version = lambda *a, **k: None      # the version guard; see the header comment
 sys.argv = ["setup.py", "build_ext", "--inplace"]
@@ -151,7 +158,7 @@ exec(open("setup.py").read())
 PY
 cd "$SRC"
 CUDA_HOME=$CUDA PATH=$CUDA/bin:$PATH CPATH=$MATHINC:$CUDA/include \
-  CPLUS_INCLUDE_PATH=$MATHINC:$CUDA/include $PYBIN /tmp/build_nvdr.py
+  CPLUS_INCLUDE_PATH=$MATHINC:$CUDA/include $PYBIN "$SCRATCH_TMP/build_nvdr.py"
 # The .dist-info below is not bookkeeping: since 0.4.0 nvdiffrast/__init__.py reads its own
 # version through importlib.metadata, so `import nvdiffrast` raises PackageNotFoundError
 # without it. That release also moved the number into pyproject.toml; older checkouts keep a

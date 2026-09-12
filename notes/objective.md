@@ -250,7 +250,10 @@ body needs, the body's own being +0.087.
 It reaches that at a *worse* misfit, which is the whole point and the thing to watch. A
 selection that reads the misfit alone prefers the second row to the third and would throw the
 better body away, so `scripts/select_answers.py` reads the functional the correction was
-fitted under. Nothing that compares two corrections may read the misfit on its own.
+fitted under. Nothing that compares two corrections may read the misfit on its own, and that
+includes the polish: it minimises the misfit alone by design, so the body it starts from is
+kept and the two are scored under the penalty, the better one being the one written. A polish
+that buys its misfit with surface is then visible instead of exported.
 
 That selection asks a scored body to beat its convex answer by the ratio model 3's refinement
 reached, and the table above says why that is a demanding test rather than a neutral one: model

@@ -148,6 +148,10 @@ def main() -> None:
     ap.add_argument("--export-res", type=int, default=EXPORT_RES)
     ap.add_argument("--hold-out-geoms", type=int, default=5)
     ap.add_argument("--restarts", type=int, default=RESTARTS)
+    ap.add_argument("--restart-keep", type=int, default=RESTART_KEEP,
+                    help="screened starts carried to the end of the ladder. This is what a "
+                         "run costs, the ladder being far more renders than the screening, "
+                         "so it is the dial for a run against a deadline")
     ap.add_argument("--area-weight", type=float, default=AREA_WEIGHT,
                     help="weight of the posed body's surface area in the objective, in "
                          f"inverse area of the canonical pose; measured window {AREA_WINDOW}, "
@@ -207,6 +211,9 @@ def main() -> None:
     scale_fit = np.repeat(scale[fit_g].numpy()[keep_fit.numpy()], data.shape[-1])
     zero_code = torch.zeros(CODE_DIM, device=dev)
     floor = [0.0]           # set from the convex answer's own volume, once it is rendered
+    refused_volume = [0]    # trials the floor turned away, counted here because this is where
+                            # the reason is known: inside the solver a body under the floor is
+                            # indistinguishable from one the forward model will not render
 
     def render(c, g):
         code = zero_code.clone()
@@ -221,6 +228,7 @@ def main() -> None:
         # already has a path for a body the forward model will not render and this is the same
         # kind of refusal: the line search sees a trial that did not come back and shortens.
         if vol < floor[0]:
+            refused_volume[0] += 1
             return None
         return flat_curves(cur, keep_fit), area, vol
 
@@ -283,6 +291,19 @@ def main() -> None:
         rows = [h for h in hist if key in h]
         return rows[-1][key] if rows else float("inf")
 
+    def penalised(chi, area) -> float:
+        """The functional a finished body is compared under, here and downstream. It is not
+        the one the polish minimises, which is why both sides of the polish are scored with
+        it."""
+        return float(np.log(max(chi ** 2, 1e-300)) + a.area_weight * area)
+
+    def still_descending(hist) -> bool:
+        """True when the ladder's last iteration still took a step, so the fit stopped on its
+        iteration count rather than on the data. A capped result is not a converged one and
+        the written body has to say which it is."""
+        rows = [h for h in hist if "accepted" in h]
+        return bool(rows) and bool(rows[-1]["accepted"])
+
     def show(row):
         print(f"    {row['stage']:>14}  it {row['iteration']}  chi {row['chi']:.4f}"
               f"  area {row['area']:.3f}  volume {row['volume']:.3f}"
@@ -304,31 +325,52 @@ def main() -> None:
     screened.sort(key=lambda s: s["objective"])
 
     best = None
-    for s in screened[:max(1, RESTART_KEEP)]:
+    for s in screened[:max(1, a.restart_keep)]:
         f = new_fit(a.seed + s["i"] + 100)
-        c, g, hist = f.run(s["c"], s["g"], stages=DEFAULT_STAGES, target=TARGET_SIGMA,
-                           log=show)
-        # The penalty has put the shape where it goes and left the misfit above where the
-        # data alone would put it. Minimising the misfit alone from there, with the trust
-        # region still holding the volume, recovers the misfit without giving the shape back.
+        floor_before = refused_volume[0]
+        cu, gu, hist = f.run(s["c"], s["g"], stages=DEFAULT_STAGES, target=TARGET_SIGMA,
+                             log=show)
+        chi_u, area_u = last(hist, "chi"), last(hist, "area")
+        obj_u = penalised(chi_u, area_u)
+        # The penalty has put the shape where it goes and left the misfit above where the data
+        # alone would put it. Minimising the misfit alone from there, with the trust regions
+        # still on, is meant to recover the misfit without giving the shape back. It is
+        # minimising a functional that is not the one this body is judged by, here or in
+        # select_answers.py, so the body it starts from is kept and the two are compared under
+        # the penalty. Without that, a polish that buys misfit with surface is written out and
+        # nothing downstream can see that it happened.
         print("    polish, on the misfit alone", flush=True)
-        c, g, polish = f.run(c, g, stages=POLISH_STAGES, target=TARGET_SIGMA,
-                             area_weight=0.0, log=show)
+        cp, gp, polish = f.run(cu, gu, stages=POLISH_STAGES, target=TARGET_SIGMA,
+                               area_weight=0.0, log=show)
+        chi_p, area_p = last(hist + polish, "chi"), last(hist + polish, "area")
+        obj_p = penalised(chi_p, area_p)
+        keep_polish = obj_p <= obj_u
+        c, g, chi, area, obj = ((cp, gp, chi_p, area_p, obj_p) if keep_polish else
+                                (cu, gu, chi_u, area_u, obj_u))
+        if not keep_polish:
+            print(f"    the polish raised the objective from {obj_u:.4f} to {obj_p:.4f}; "
+                  f"the body it started from is kept", flush=True)
         hist = hist + polish
-        chi, area = last(hist, "chi"), last(hist, "area")
         # Two finished starts are compared under the penalty, not under the misfit the polish
-        # was run on. The polish is a refinement inside a start and is minimising the misfit
-        # alone by design; between two bodies, the misfit alone prefers the rougher one, which
-        # is the comparison notes/objective.md says may never be made and the one
-        # select_answers.py is careful to avoid. They are compared on the functional the shape
-        # was fitted under, which is also the one the written body is judged by downstream.
-        obj = float(np.log(max(chi ** 2, 1e-300)) + a.area_weight * area)
+        # was run on. Between two bodies the misfit alone prefers the rougher one, which is the
+        # comparison notes/objective.md says may never be made and the one select_answers.py is
+        # careful to avoid. They are compared on the functional the shape was fitted under,
+        # which is also the one the written body is judged by downstream.
         print(f"  start {s['i']} finished at chi {chi:.4f}, area {area:.3f}, objective "
               f"{obj:.4f} ({f.renders + s['renders']} renders)", flush=True)
         if best is None or obj < best["objective"]:
             best = {"objective": obj, "chi": chi, "c": c, "g": g, "start": s["i"],
                     "history": hist, "renders": f.renders + s["renders"],
-                    "recipe": recipes[s["i"]], "refused_depth": f.refused_depth}
+                    "recipe": recipes[s["i"]], "refused_depth": f.refused_depth,
+                    "refused_volume": refused_volume[0] - floor_before,
+                    "polished": keep_polish, "budget_limited": still_descending(hist)}
+    if best["budget_limited"]:
+        print(f"  !!! the ladder was still taking steps at its last iteration, so this body "
+              f"is bounded by the iteration counts and not by the curves", flush=True)
+    if best["refused_volume"]:
+        print(f"  the volume floor turned away {best['refused_volume']} trials of the kept "
+              f"start; a large count is a fit pressed against it rather than one stopped by "
+              f"it once", flush=True)
 
     if not a.out:
         return
@@ -391,6 +433,9 @@ def main() -> None:
             "convex_explains_curves": convex_explains,
             "step_g": a.step_g, "step_c": a.step_c, "restarts": a.restarts,
             "start": best["recipe"], "renders": best["renders"],
+            "restart_keep": a.restart_keep, "polished": best["polished"],
+            "budget_limited": best["budget_limited"],
+            "refused_volume": best["refused_volume"],
             "chi_fit": best["chi"], "objective_fit": best["objective"],
             "history": best["history"], "export": rep,
             "chi_fit_convex": convex_fit, "chi_held_convex": convex_held,
