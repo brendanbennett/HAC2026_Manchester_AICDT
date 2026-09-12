@@ -24,6 +24,9 @@ ones are at the physical scale of the printed model, z spanning 6–8 rather tha
 | 09-12 | flow retrained on CSF3, 800 bodies, 11M, polish 30 (`results/flow_all`, all ten built) | 0.9552 | 0.9914 | 0.8598 | 0.9824 | 0.7330 | 0.9576 | **5.480** |
 | 09-12 | the same, polish 0 | 0.9530 | 0.9902 | 0.8736 | 0.9764 | 0.7249 | 0.9566 | **5.475** |
 | 09-12 | flow retrained, 2500 bodies, **304M** parameters | 0.529\* | — | 0.356\* | — | 0.422\* | — | **far worse** |
+| 09-12 | flow retrained, 2500 bodies, 11M (`results/final_p30`) | 0.9696 | 0.9929 | 0.9342 | 0.9833 | 0.6934 | 0.9454 | **5.519** |
+| 09-12 | the same with the carving zeroed — `dh` only | 0.9706 | 0.9946 | 0.9335 | 0.9785 | 0.6942 | 0.9449 | **5.516** |
+| **09-12** | **referee-selected convex-or-carved (`results/referee_all`) — the submission** | **0.9786** | **0.9929** | **0.9106** | **0.9905** | **0.7330** | **0.9576** | **5.563** |
 
 \* Dice against truth, not the full measure; the run was abandoned once these were seen.
 
@@ -53,6 +56,74 @@ least squares with `h` pinned to the true hull — the best the parametrisation 
 reproduces Mithra to Dice **0.991**, a torus to **0.995** and a limbed lego-like figure to
 **0.860** (parity-scan Dice at res 96; the official voxeliser reads ~0.02 higher on model 3).
 Whatever is losing 0.28 of score, it is not the shape parametrisation.
+
+
+## The referee: an independent renderer, and the first thing to beat convex
+
+The pipeline's own misfit cannot choose between candidate shapes. Measured against truth it is
+anti-correlated with Dice, and it rates the **sawed-off cube at 3.05 sigma** — the worst fit of
+any public body — while fitting **Mithra, a contact binary, at 0.89 sigma**. It is not
+measuring concavity; it is measuring our renderer failing on flat faces and sharp edges.
+
+So the choice is made with a second opinion. `DAMIT/scripts/referee.py` scores a candidate with
+DAMIT's independent pure-torch renderer against the **Blender** lightcurves, which ship with
+all ten models, are rendered from the true shapes, and which nothing in this repo has ever read
+(`data_io.use_blender` defaults False and is never set True). On a truth mesh that renderer
+reproduces them to 0.0077/0.0270 RMSE for model 3, reproducing `validate_forward.py` exactly.
+
+Agreement with the official score, on the public models:
+
+| comparison | referee picks the higher-scoring body |
+|---|---|
+| **convex vs carved** | **3 / 3** |
+| convex vs the 2500-body flow | 2 / 3 |
+| carved vs the 2500-body flow | 1 / 3 |
+
+The referee is reliable at the one question that matters — *does this body need a concavity?* —
+and unreliable at ranking two flows, so only two candidates are ever compared
+(`scripts/select_by_referee.py`). The rule is truth-free: it reads only challenge data.
+
+Per-model picks, mean RMSE against the Blender curves (convex / carved):
+
+| model | convex | carved | pick | margin |
+|---|---|---|---|---|
+| 1 | **0.0355** | 0.0356 | convex | 0.3% |
+| 2 | **0.2776** | 0.3200 | convex | 15.3% |
+| 3 | 0.0674 | **0.0579** | carved | 14.1% |
+| 4 | 0.0791 | **0.0737** | carved | 6.8% |
+| 5 | 0.0882 | **0.0747** | carved | 15.3% |
+| 6 | 0.1466 | **0.1106** | carved | 24.6% |
+| 7 | 0.2232 | **0.1733** | carved | 22.4% |
+| 8 | **0.0381** | 0.0467 | convex | 22.6% |
+| 9 | 0.0927 | **0.0828** | carved | 10.7% |
+| 10 | 0.2461 | **0.2129** | carved | 13.5% |
+
+**Caveat, stated plainly: the rule is validated on three bodies.** It recovers the right answer
+on all three and gains 0.019 over convex, but three is three. It is preferred to shipping
+convex because the alternative rule — our own misfit — is measurably worse than chance, and
+because the referee's forward model is the one validated against an independent reference.
+
+### Model 2's data does not match its own truth
+
+Under the referee, model 2's **released truth mesh** scores 0.1822 against 0.0095 for Vesta and
+0.0172 for Mithra: twenty times worse, on the ground truth, under a renderer validated to
+0.008. No shape we produce can fix that. Our own renderer independently rates model 2 the worst
+fit of the three, and DAMIT's convention identification was done on "models 1 and 3" — model 2
+was excluded there too. Two renderers built on different principles fail on model 2 and only
+model 2. Its spin convention, phase or printed geometry differs from the released STL. Model 2
+is a third of the public set, so its misfit has been read as evidence about our method when it
+is evidence about its data.
+
+### The 2500-body flow stopped carving
+
+The 11M flow trained overnight on 2388 bodies emits **convexity 0.982-1.000 on all ten models**.
+Zeroing its carving block `g` entirely and rebuilding from the saved codes changes the public
+score by **0.0025 out of 6** (5.5188 -> 5.5163). Six hours on an H200 with a stable optimiser
+taught it to stop carving — which, given that every carve it made was net harmful on the public
+models, is the loss surface reporting honestly. It is a convex refiner, and a good one: it is
+the only pipeline that beats the convex stage on the sawed-off cube (0.9342 vs 0.9106 voxel),
+through `dh` rather than through concavity. The carved bodies in the submission come from the
+earlier 800-body checkpoint, which is the only one that still carves.
 
 ## What has been tried against the convex answer, and has failed
 

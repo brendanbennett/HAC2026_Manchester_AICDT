@@ -1,0 +1,308 @@
+{
+  "model": 6,
+  "radius": 0.925,
+  "draws": 8,
+  "answer": "draw 6",
+  "candidate": 6,
+  "consensus_levels": [
+    0.35,
+    0.5,
+    0.457114831
+  ],
+  "consensus_levels_built": [
+    0.35,
+    0.5,
+    0.457114831
+  ],
+  "spread": 0.9405424086043834,
+  "spread_off_medoid": 0.9320484669764383,
+  "collapsed": false,
+  "medoid_metric": "volume+side_view",
+  "candidate_diagnostics": [
+    {
+      "kind": "draw",
+      "label": "draw 0",
+      "misfit_sigma": 1.8187835216522217,
+      "watertight": true,
+      "winding_consistent": true,
+      "components": 1,
+      "volume": 1.663193795514189,
+      "faces": 8708,
+      "convexity": 0.9848741126512545,
+      "carved_volume_fraction": 0.015125887348745537,
+      "eligible": true,
+      "ineligible_reasons": []
+    },
+    {
+      "kind": "draw",
+      "label": "draw 1",
+      "misfit_sigma": 1.858174443244934,
+      "watertight": true,
+      "winding_consistent": true,
+      "components": 1,
+      "volume": 2.1373987121369593,
+      "faces": 9624,
+      "convexity": 0.9983408361013919,
+      "carved_volume_fraction": 0.0016591638986080959,
+      "eligible": true,
+      "ineligible_reasons": []
+    },
+    {
+      "kind": "draw",
+      "label": "draw 2",
+      "misfit_sigma": 1.7341539859771729,
+      "watertight": true,
+      "winding_consistent": true,
+      "components": 1,
+      "volume": 2.0857543669409173,
+      "faces": 8876,
+      "convexity": 0.9977919307510869,
+      "carved_volume_fraction": 0.002208069248913147,
+      "eligible": true,
+      "ineligible_reasons": []
+    },
+    {
+      "kind": "draw",
+      "label": "draw 3",
+      "misfit_sigma": 1.7914432287216187,
+      "watertight": true,
+      "winding_consistent": true,
+      "components": 1,
+      "volume": 1.9613217297611234,
+      "faces": 9272,
+      "convexity": 0.997947357747244,
+      "carved_volume_fraction": 0.0020526422527560317,
+      "eligible": true,
+      "ineligible_reasons": []
+    },
+    {
+      "kind": "draw",
+      "label": "draw 4",
+      "misfit_sigma": 1.6146306991577148,
+      "watertight": true,
+      "winding_consistent": true,
+      "components": 1,
+      "volume": 1.8601966162417884,
+      "faces": 8688,
+      "convexity": 0.9741698484612424,
+      "carved_volume_fraction": 0.025830151538757562,
+      "eligible": true,
+      "ineligible_reasons": []
+    },
+    {
+      "kind": "draw",
+      "label": "draw 5",
+      "misfit_sigma": 1.761816143989563,
+      "watertight": true,
+      "winding_consistent": true,
+      "components": 1,
+      "volume": 2.0459147857258553,
+      "faces": 8688,
+      "convexity": 0.9967502829278505,
+      "carved_volume_fraction": 0.003249717072149494,
+      "eligible": true,
+      "ineligible_reasons": []
+    },
+    {
+      "kind": "draw",
+      "label": "draw 6",
+      "misfit_sigma": 1.7153687477111816,
+      "watertight": true,
+      "winding_consistent": true,
+      "components": 1,
+      "volume": 2.0299086863335245,
+      "faces": 8960,
+      "convexity": 0.9972094969975348,
+      "carved_volume_fraction": 0.0027905030024651944,
+      "eligible": true,
+      "ineligible_reasons": []
+    },
+    {
+      "kind": "draw",
+      "label": "draw 7",
+      "misfit_sigma": 1.8130676746368408,
+      "watertight": true,
+      "winding_consistent": true,
+      "components": 1,
+      "volume": 1.9658899061693245,
+      "faces": 8988,
+      "convexity": 0.9953948753802524,
+      "carved_volume_fraction": 0.0046051246197476026,
+      "eligible": true,
+      "ineligible_reasons": []
+    },
+    {
+      "kind": "consensus",
+      "label": "consensus at level 0.35",
+      "misfit_sigma": Infinity,
+      "watertight": true,
+      "winding_consistent": true,
+      "components": 1,
+      "volume": 2.0917643779208186,
+      "faces": 90240,
+      "convexity": 0.9800311524362018,
+      "carved_volume_fraction": 0.019968847563798242,
+      "eligible": false,
+      "ineligible_reasons": [
+        "nonfinite_misfit"
+      ]
+    },
+    {
+      "kind": "consensus",
+      "label": "consensus at level 0.5",
+      "misfit_sigma": Infinity,
+      "watertight": true,
+      "winding_consistent": true,
+      "components": 1,
+      "volume": 2.012929048609159,
+      "faces": 87496,
+      "convexity": 0.9803870464585017,
+      "carved_volume_fraction": 0.01961295354149828,
+      "eligible": false,
+      "ineligible_reasons": [
+        "nonfinite_misfit"
+      ]
+    },
+    {
+      "kind": "consensus",
+      "label": "consensus at level 0.457115",
+      "misfit_sigma": Infinity,
+      "watertight": true,
+      "winding_consistent": true,
+      "components": 1,
+      "volume": 2.0025572396194975,
+      "faces": 87496,
+      "convexity": 0.9801312587489108,
+      "carved_volume_fraction": 0.019868741251089173,
+      "eligible": false,
+      "ineligible_reasons": [
+        "nonfinite_misfit"
+      ]
+    }
+  ],
+  "eligible_candidates": [
+    0,
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7
+  ],
+  "medoid_volume_only": false,
+  "medoid_side_points": 200000,
+  "medoid_side_dirs": 36,
+  "medoid_side_res": 512,
+  "medoid_side_mode": "side",
+  "residual_scale_median": 0.11880271881818771,
+  "steps": 16,
+  "churn": 0.5,
+  "polish_steps": 30,
+  "polish_target": 1.0,
+  "polish_misfit_sigma": [
+    [
+      2.2229597568511963,
+      1.69106125831604,
+      10
+    ],
+    [
+      2.0207931995391846,
+      1.711646556854248,
+      11
+    ],
+    [
+      2.1651856899261475,
+      1.6585323810577393,
+      15
+    ],
+    [
+      2.164696216583252,
+      1.717841386795044,
+      17
+    ],
+    [
+      2.297891616821289,
+      1.5456573963165283,
+      21
+    ],
+    [
+      2.1094374656677246,
+      1.6984671354293823,
+      16
+    ],
+    [
+      1.9942212104797363,
+      1.638327717781067,
+      27
+    ],
+    [
+      2.0485918521881104,
+      1.7124290466308594,
+      15
+    ]
+  ],
+  "misfit_sigma": [
+    1.8187835216522217,
+    1.858174443244934,
+    1.7341539859771729,
+    1.7914432287216187,
+    1.6146306991577148,
+    1.761816143989563,
+    1.7153687477111816,
+    1.8130676746368408
+  ],
+  "answer_misfit_sigma": 1.7153687477111816,
+  "held_out_geoms": [],
+  "seen_geoms": [
+    0,
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
+    10,
+    11,
+    12,
+    13,
+    14,
+    15,
+    16,
+    17,
+    18,
+    19,
+    20,
+    21,
+    22,
+    23,
+    24,
+    25,
+    26,
+    27
+  ],
+  "held_out_misfit_sigma": null,
+  "snap_enabled": false,
+  "snap_max_rise": 0.05,
+  "snap_planes": 12,
+  "snap_tol": 0.02,
+  "snap_min_frac": 0.02,
+  "planes_accepted": [
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0
+  ],
+  "codes_file": "results/final_p30/Asteroid06.codes.npz",
+  "watertight_as_built": true,
+  "watertight": true,
+  "volume": 2.0299086863335245,
+  "faces": 8960
+}
