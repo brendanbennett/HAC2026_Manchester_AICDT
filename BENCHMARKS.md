@@ -107,7 +107,25 @@ because the referee's forward model is the one validated against an independent 
 
 Under the referee, model 2's **released truth mesh** scores 0.1822 against 0.0095 for Vesta and
 0.0172 for Mithra: twenty times worse, on the ground truth, under a renderer validated to
-0.008. No shape we produce can fix that. Our own renderer independently rates model 2 the worst
+0.008. No shape we produce can fix that.
+
+Eight explanations have been tested against it and none survives: a Blinn-Phong specular term
+(makes it worse, 0.109 -> 0.116 -> 0.123), an ambient floor, reversed spin, flipped azimuth, a
+full-rotation lag search, mesh resolution (0.1090 at 4662 faces, 0.1085 at 6000), phase
+sampling (180 vs 360 frames), and all 24 axis-aligned re-orientations -- the body as supplied
+ranks 23 of 24, and the best of them improves the fit by 13%, not the 20x that would be needed.
+The published conventions (rot_sign -1, az_sign +1) are already optimal for model 2, the same
+as for models 1 and 3.
+
+One incidental finding from that sweep: **model 2 is far more sensitive to mesh decimation than
+the other two.** It goes 0.109 at 4662 faces to 0.714 at 1868, where model 3 only goes 0.0045
+to 0.0230. A body whose curves are dominated by a few large flat faces is hurt
+disproportionately by any decimation that perturbs a face normal, which is worth remembering
+before reading too much into any model-2 number computed on a decimated mesh -- ours included.
+
+The two files also agree with each other: models 2 and 3 each ship a 7 May `.msh` and a 19 May
+`.stl` with identical face counts, extents and volumes, so the shape data is not stale and the
+two releases are the same geometry in two formats. Our own renderer independently rates model 2 the worst
 fit of the three, and DAMIT's convention identification was done on "models 1 and 3" — model 2
 was excluded there too. Two renderers built on different principles fail on model 2 and only
 model 2. Its spin convention, phase or printed geometry differs from the released STL. Model 2
