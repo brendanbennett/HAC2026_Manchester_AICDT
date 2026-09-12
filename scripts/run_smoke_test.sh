@@ -35,14 +35,22 @@ N_BODIES=${N_BODIES:-4}
 LIB_RES=${LIB_RES:-32}
 LIB_WORKERS=${LIB_WORKERS:-$(nproc 2>/dev/null || echo 2)}
 FIT_WORKERS=${FIT_WORKERS:-$LIB_WORKERS}
-# Above the fit's own floor of a few sample points per amplitude (fit_shapes.main), which
-# is a property of the code and not of how short this run is: below it the solve is
-# decided by the ridge and the smoke test would be exercising something the real run
-# never does.
-FIT_POINTS=${FIT_POINTS:-14000}
+# Not set here. The fit refuses fewer than a dozen sample points per depth, because below
+# that the solve is decided by the ridge rather than by the body and the smoke test would be
+# exercising something no real run does. That floor is a property of how many directions the
+# field carries, so it moves whenever the representation does -- a number written here went
+# stale the moment the field grew from a lattice to 2560 depths. fit_shapes derives its own
+# default from the same constant as the floor, so leaving it unset cannot go stale. Set
+# FIT_POINTS to override, and the fit will refuse anything under its floor.
+FIT_POINTS=${FIT_POINTS:-}
 FLOW_STEPS=${FLOW_STEPS:-8}
 FLOW_PHASES=${FLOW_PHASES:-16}     # few phases keep the run short
-FLOW_OPERATOR_RES=${FLOW_OPERATOR_RES:-16}
+# The extraction has to resolve the angular scale of the depth field, or the body the
+# operator renders is coarser than the one its coefficients describe and the run exercises a
+# regime no real one is in. At 2560 directions that scale is about a tenth of the body, and
+# the grid pitch is twice the extraction extent over this number, so sixteen -- chosen when
+# the field was a coarse lattice -- no longer reaches it and twenty-four does.
+FLOW_OPERATOR_RES=${FLOW_OPERATOR_RES:-24}
 DESIGN_N=${DESIGN_N:-4096}
 CONVEX_CKPT=${CONVEX_CKPT:-models/lpd_convex.pt}
 
@@ -103,7 +111,7 @@ log "=== 3/14 fit_shapes: per-body fit over the smoke library"
 run "fit_shapes" logs/smoke_fit.log \
   "$PY" scripts/fit_shapes.py \
     --bodies "$N_BODIES" --shapes-dir "$LIB_DIR" \
-    --workers "$FIT_WORKERS" --points "$FIT_POINTS" \
+    --workers "$FIT_WORKERS" ${FIT_POINTS:+--points "$FIT_POINTS"} \
     --out "$OUT/corpus_codes.npz"
 tail -20 logs/smoke_fit.log
 
