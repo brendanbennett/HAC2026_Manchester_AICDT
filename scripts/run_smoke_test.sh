@@ -27,7 +27,11 @@
 set -uo pipefail
 cd "$(dirname "$0")/.."
 
-N_BODIES=${N_BODIES:-16}
+# Four, not two. train_lpd holds one body out, train_prior needs at least one to train on,
+# and fit_shapes refuses a corpus whose median fitted Dice is below its floor -- over two
+# bodies that median is one awkward body away from tripping, and a smoke test that fails at
+# random proves nothing. Four is the smallest count that exercises every stage reliably.
+N_BODIES=${N_BODIES:-4}
 LIB_RES=${LIB_RES:-32}
 LIB_WORKERS=${LIB_WORKERS:-$(nproc 2>/dev/null || echo 2)}
 FIT_WORKERS=${FIT_WORKERS:-$LIB_WORKERS}
@@ -36,7 +40,7 @@ FIT_WORKERS=${FIT_WORKERS:-$LIB_WORKERS}
 # decided by the ridge and the smoke test would be exercising something the real run
 # never does.
 FIT_POINTS=${FIT_POINTS:-14000}
-FLOW_STEPS=${FLOW_STEPS:-25}
+FLOW_STEPS=${FLOW_STEPS:-8}
 FLOW_PHASES=${FLOW_PHASES:-16}     # few phases keep the run short
 FLOW_OPERATOR_RES=${FLOW_OPERATOR_RES:-16}
 DESIGN_N=${DESIGN_N:-4096}
@@ -67,6 +71,12 @@ run() {
 
 log "using interpreter: $($PY --version 2>&1) at $(command -v "$PY")"
 
+# The same check the long runs make. Here it is worth it for a different reason: a smoke test
+# that fails five stages in because a package is missing has told you about the package and
+# nothing about the algorithm.
+run "preflight" logs/smoke_preflight.log \
+  "$PY" scripts/preflight.py --data-dir "${DATA_DIR:-dataset/raw}" --skip-render
+
 if [ -z "${HAC26_SOFTWARE_RASTER:-}" ] && ! "$PY" -c "import nvdiffrast" >/dev/null 2>&1; then
   log "nvdiffrast is not importable, so the exact forward model cannot render here."
   log "Run scripts/setup_toolchain.sh on a GPU machine, or run 'pytest tests' for a wiring"
@@ -74,14 +84,14 @@ if [ -z "${HAC26_SOFTWARE_RASTER:-}" ] && ! "$PY" -c "import nvdiffrast" >/dev/n
   exit 1
 fi
 
-log "=== 1/10 shape library: $N_BODIES bodies at res=$LIB_RES"
+log "=== 1/14 shape library: $N_BODIES bodies at res=$LIB_RES"
 run "shape library" logs/smoke_library.log \
   "$PY" scripts/build_shape_library.py \
     --n "$N_BODIES" --out "$LIB_DIR" --workers "$LIB_WORKERS" --res "$LIB_RES" \
     --report-sample "$N_BODIES"
 tail -20 logs/smoke_library.log
 
-log "=== 2/10 spherical design (no-op if hac26/design${DESIGN_N}.npy is already checked in)"
+log "=== 2/14 spherical design (no-op if hac26/design${DESIGN_N}.npy is already checked in)"
 if [ -f "hac26/design${DESIGN_N}.npy" ]; then
   log "    hac26/design${DESIGN_N}.npy already exists" | tee logs/smoke_design.log
 else
@@ -89,7 +99,7 @@ else
 fi
 tail -5 logs/smoke_design.log
 
-log "=== 3/10 fit_shapes: per-body fit over the smoke library"
+log "=== 3/14 fit_shapes: per-body fit over the smoke library"
 run "fit_shapes" logs/smoke_fit.log \
   "$PY" scripts/fit_shapes.py \
     --bodies "$N_BODIES" --shapes-dir "$LIB_DIR" \
@@ -137,7 +147,7 @@ torch.save({'preset': asdict(pr), 'model': build_model(pr, 'cpu')[0].state_dict(
   log "    wiring test; the starts it makes are meaningless."
 fi
 
-log "=== 4/10 build_corpus: curves and convex starts of the smoke bodies"
+log "=== 4/14 build_corpus: curves and convex starts of the smoke bodies"
 rm -rf "$OUT/corpus.npz" "$OUT/corpus.npz.parts"
 run "build_corpus" logs/smoke_corpus.log \
   "$PY" scripts/build_corpus.py \
@@ -146,14 +156,14 @@ run "build_corpus" logs/smoke_corpus.log \
     --out "$OUT/corpus.npz"
 tail -5 logs/smoke_corpus.log
 
-log "=== 5/10 train_prior: the prior part over the smoke corpus"
+log "=== 5/14 train_prior: the prior part over the smoke corpus"
 run "train_prior" logs/smoke_prior.log \
   "$PY" scripts/train_prior.py \
     --steps 200 --batch 8 --val-bodies 2 --val-every 50 \
     --log-every 50 --corpus "$OUT/corpus.npz" --out "$OUT/prior_flow.pt"
 tail -5 logs/smoke_prior.log
 
-log "=== 6/10 train_lpd: the data part over the smoke corpus, one expert"
+log "=== 6/14 train_lpd: the data part over the smoke corpus, one expert"
 run "train_lpd" logs/smoke_flow.log \
   "$PY" scripts/train_lpd.py \
     --steps "$FLOW_STEPS" --batch 1 --experts 1 \
@@ -164,7 +174,7 @@ run "train_lpd" logs/smoke_flow.log \
     --out "$OUT/lpd_flow.pt"
 tail -20 logs/smoke_flow.log
 
-log "=== 7/10 train_lpd: the same run continued, branched into its experts"
+log "=== 7/14 train_lpd: the same run continued, branched into its experts"
 run "train_lpd (experts)" logs/smoke_flow_experts.log \
   "$PY" scripts/train_lpd.py \
     --steps "$FLOW_STEPS" --extra-steps 4 --batch 1 \
@@ -176,7 +186,7 @@ run "train_lpd (experts)" logs/smoke_flow_experts.log \
 tail -12 logs/smoke_flow_experts.log
 grep -q "branched from 1 to" logs/smoke_flow_experts.log || { log "FAILED: the second run did not branch"; exit 1; }
 
-log "=== 8/10 decision_check: a held-out smoke body, two draws"
+log "=== 8/14 decision_check: a held-out smoke body, two draws"
 run "decision_check" logs/smoke_decision.log \
   "$PY" scripts/decision_check.py --bodies 1 --samples 2 --polish-steps 2 --res 24 \
     --val-bodies 2 --side-points 20000 \
@@ -185,12 +195,12 @@ run "decision_check" logs/smoke_decision.log \
 tail -12 logs/smoke_decision.log
 
 if [ -d dataset/raw ]; then
-  log "=== 9/10 convex: dataset/raw is present, the convex start of model 1"
+  log "=== 9/14 convex: dataset/raw is present, the convex start of model 1"
   mkdir -p results/smoke
   run "reconstruct (convex)" logs/smoke_convex.log \
     "$PY" scripts/reconstruct.py --ckpt "$CONVEX" --model 1 --fit-cylinder \
       --out results/smoke/convex_Asteroid01.stl
-  log "=== 10/10 reconstruct: model 1 from that start"
+  log "=== 10/14 reconstruct: model 1 from that start"
   run "reconstruct_lpd" logs/smoke_reconstruct.log \
     "$PY" scripts/reconstruct_lpd.py --model 1 --samples 2 --res 24 --polish-steps 2 \
       --hold-out-geoms 2 \
@@ -200,8 +210,49 @@ if [ -d dataset/raw ]; then
       --medoid-volume-only --out results/smoke/Asteroid01.stl
   tail -20 logs/smoke_reconstruct.log
   log "    wrote results/smoke/Asteroid01.stl"
+
+  # The non-convex track, which the stages above never touch: it needs a calibrated
+  # instrument and nothing else the flow produced. Model 3 rather than 1, because it is the
+  # only released body with a concavity to find, so it is the one where a correction that
+  # does nothing is visible.
+  log "=== 11/14 calibrate: two steps on the blender channel, models 1 and 3"
+  run "calibrate" logs/smoke_calibrate.log \
+    "$PY" scripts/calibrate.py --channel blender --models 1 3 --steps 2 \
+      --phases 8 --height 48 --width 80 --sun-res 32 \
+      --out "$OUT/instrument_smoke.pt" --report "$OUT/instrument_smoke.json"
+
+  log "=== 12/14 reconstruct_gn: model 3, one iteration a stage"
+  run "reconstruct_gn" logs/smoke_gn.log \
+    "$PY" scripts/reconstruct_gn.py --model 3 --channel blender \
+      --calibration "$OUT/instrument_smoke.pt" \
+      --max-stage-iters 1 --restarts 2 --restart-keep 1 --screen-starts 8 \
+      --phases 8 --operator-res 24 --export-res 32 --export-phases 8 \
+      --hold-out-geoms 2 --out results/smoke/gn/Asteroid03.stl
+  tail -8 logs/smoke_gn.log
+
+  log "=== 13/14 reconstruct_map: model 3, a few descent steps on the same objective"
+  run "reconstruct_map" logs/smoke_map.log \
+    "$PY" scripts/reconstruct_map.py --model 3 --channel blender \
+      --calibration "$OUT/instrument_smoke.pt" \
+      --steps 4 --every 2 --ckpt-every 2 \
+      --phases 8 --operator-res 24 --hold-out-geoms 2 \
+      --out results/smoke/map/Asteroid03.stl
+  tail -8 logs/smoke_map.log
+
+  # Both tracks select into their own directory, which is the arrangement that keeps one from
+  # overwriting the other's submission. Model 3 is public, so this also checks the path that
+  # reads a released truth.
+  log "=== 14/14 select_answers: each track into its own tree, then the submission check"
+  for track in gn map; do
+    run "select_answers ($track)" "logs/smoke_select_$track.log" \
+      "$PY" scripts/select_answers.py --refined "results/smoke/$track" --models 3 \
+        --into "results/smoke/submission-$track"
+    run "check_submission ($track)" "logs/smoke_check_$track.log" \
+      "$PY" scripts/check_submission.py "results/smoke/submission-$track"
+  done
+  log "    two independent submissions under results/smoke/submission-{gn,map}/"
 else
-  log "=== 9/10 convex, 10/10 reconstruct: skipped (dataset/raw not present)"
+  log "=== 9/14 onwards: skipped (dataset/raw not present)"
   log "    Both need the real measured curves, so they can't run offline. Everything up to"
   log "    here (library, fit, corpus, prior, flow, decision check) is proven wired; download"
   log "    dataset/raw to also exercise the last two stages."
@@ -214,6 +265,10 @@ log "    codes:    $OUT/corpus_codes.npz"
 log "    corpus:   $OUT/corpus.npz"
 log "    prior:    $OUT/prior_flow.pt"
 log "    flow:     $OUT/lpd_flow.pt"
+log "    the non-convex track, when dataset/raw was present:"
+log "    instrument: $OUT/instrument_smoke.pt"
+log "    bodies:     results/smoke/{gn,map}/Asteroid03.stl"
+log "    submissions: results/smoke/submission-{gn,map}/"
 log ""
 log "If this all ran without error, scripts/run_remote_pipeline.sh should too. Nothing"
 log "here touched runs/corpus_codes.npz, runs/corpus.npz, runs/lpd_flow.pt, models/ or"
