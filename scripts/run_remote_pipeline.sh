@@ -42,15 +42,15 @@
 #   4c. prior       scripts/train_prior.py           -- the prior part of the flow; no operator
 #   5. flow         scripts/train_lpd.py             -- the data part with one expert, on the
 #                   straight line between noise and body; needs nvdiffrast on a GPU
-#   5b. flow-experts the same run continued from its best weights, branched into one expert
-#                   per interval of t (see train_lpd.py)
+#   5b. flow-rollout the same run continued: branched into its experts and trained on the
+#                   sampler's own states; the main training phase (see train_lpd.py)
 #   5c. decision    scripts/decision_check.py         -- reconstructs held-out corpus bodies
 #                   and scores every rule for picking the answer against their truth
-#   6. convex       scripts/make_submission.py, all ten models -- the submission, and the
-#                   starts the flow corrects; needs dataset/raw
+#   6. convex       scripts/reconstruct.py, all ten models -- the starts the flow corrects;
+#                   needs dataset/raw
 #   6b. reconstruct scripts/reconstruct_lpd.py, all ten models -- needs nvdiffrast
-#   7. score        scripts/benchmark.py on the public models with the organisers'
-#                   measures -- needs dataset/raw
+#   7. score        hac26/scoring/voxel.py and side_view.py on the public models --
+#                   needs dataset/raw
 #
 # The exact forward model renders with nvdiffrast, which scripts/setup_toolchain.sh builds;
 # the pipeline stops before the calibration if it cannot be imported.
@@ -74,12 +74,12 @@ DESIGN_N=${DESIGN_N:-4096}
 DESIGN_DEVICE=${DESIGN_DEVICE:-}
 
 FIT_WORKERS=${FIT_WORKERS:-$LIB_WORKERS}
-FIT_POINTS=${FIT_POINTS:-120000}   # sample points per body of the lattice fit; the solve
-                                   # refuses fewer than twelve per amplitude
+FIT_POINTS=${FIT_POINTS:-60000}
 CODES_FILE=runs/corpus_codes.npz
 
 CONVEX_CKPT=${CONVEX_CKPT:-models/lpd_convex.pt}   # the convex stage, whose starts the flow corrects
 CORPUS_FILE=runs/corpus.npz
+CORPUS_WORKERS=${CORPUS_WORKERS:-8}
 
 PRIOR_STEPS=${PRIOR_STEPS:-20000}   # a cap: the prior stops early once the held-out loss plateaus
 PRIOR_BATCH=${PRIOR_BATCH:-64}
@@ -95,32 +95,25 @@ FLOW_CKPT_EVERY=${FLOW_CKPT_EVERY:-100}   # steps between resumable checkpoints;
 FLOW_CKPT=${FLOW_CKPT:-runs/lpd_flow.pt.ckpt}   # under runs/, not /tmp: it has to outlive
                                                 # the job that wrote it
 FLOW_LOG_EVERY=${FLOW_LOG_EVERY:-10}
-FLOW_OPERATOR_RES=${FLOW_OPERATOR_RES:-96}   # extraction resolution of the operator; it has
-                                   # to resolve the correction's kernels, whose width is a
-                                   # fraction of the site spacing
+FLOW_OPERATOR_RES=${FLOW_OPERATOR_RES:-32}
 FLOW_TRAIN_GEOMS=${FLOW_TRAIN_GEOMS:-28}   # geometries the operator renders per step; all of them
-FLOW_EXPERT_STEPS=${FLOW_EXPERT_STEPS:-1000}   # cap on the second run's extra steps, branched
-                                                # into one expert per interval of t; 0 skips it
+FLOW_FIT_WEIGHT=${FLOW_FIT_WEIGHT:-1.0}
+FLOW_FIT_FROM=${FLOW_FIT_FROM:-0.75}
+FLOW_ROLLOUT_STEPS=${FLOW_ROLLOUT_STEPS:-1000}  # cap on the second run's extra steps: branched into
+                                                # experts, rolled out, the main phase; 0 skips it
+FLOW_ROLLOUT_FRAC=${FLOW_ROLLOUT_FRAC:-0.5}     # share of its draws that come from the sampler
 
 RECON_SAMPLES=${RECON_SAMPLES:-8}
 RECON_POLISH_STEPS=${RECON_POLISH_STEPS:-30}   # most gradient steps of the polish per draw; 0 skips it
-RECON_RES=${RECON_RES:-96}      # extraction resolution of the written body. It is the
-                                # operator's, so the body that is written is the body whose
-                                # misfit was accepted
+RECON_RES=${RECON_RES:-96}
 RECON_SNAP=${RECON_SNAP:-0}
 # Weight on the data part of the velocity when sampling (lpd_flow.LPDFlow.velocity).
 # One is the model as trained. The decision stage reconstructs held-out bodies at each
-# of RECON_GUIDANCE_SWEEP and names the weight that scores best; set this to it and
-# rerun the reconstruct stage, which is cheap beside the training.
-RECON_GUIDANCE=${RECON_GUIDANCE:-1.0}
-RECON_GUIDANCE_SWEEP=${RECON_GUIDANCE_SWEEP:-1.0 1.5 2.0}
-# Noise in the sampler (lpd_flow.churn_step). It corrects a velocity the network gets wrong
-# and costs variance where it gets it right, so the level that scores best depends on the
-# trained network. The decision stage reconstructs held-out bodies at each of
-# RECON_CHURN_SWEEP and names the level that scores best; set this to it and rerun the
-# reconstruct stage.
-RECON_CHURN=${RECON_CHURN:-0.5}
-RECON_CHURN_SWEEP=${RECON_CHURN_SWEEP:-0.0 0.25 0.5}
+# of RECON_GUIDANCE_SWEEP and names the weight that scores best. When RECON_GUIDANCE is
+# not set by the caller, the pipeline reads that value before reconstruction.
+RECON_GUIDANCE_WAS_SET=${RECON_GUIDANCE+x}
+RECON_GUIDANCE=${RECON_GUIDANCE:-}
+RECON_GUIDANCE_SWEEP=${RECON_GUIDANCE_SWEEP:-1.0 1.5 2.0 3.0}
 MEDOID_VOLUME_ONLY=${MEDOID_VOLUME_ONLY:-0}
 MEDOID_SIDE_POINTS=${MEDOID_SIDE_POINTS:-200000}
 MEDOID_SIDE_DIRS=${MEDOID_SIDE_DIRS:-36}
@@ -180,10 +173,6 @@ SRC_FLOW=$(src_digest hac26/solvers/lpd_flow.py scripts/train_lpd.py scripts/tra
 SRC_OUTPUT=$(src_digest scripts/reconstruct_lpd.py scripts/decision_check.py \
                         hac26/solvers/output.py hac26/scoring/side_view.py \
                         hac26/scoring/voxel.py hac26/recon.py)
-SRC_CONVEX=$(src_digest scripts/make_submission.py scripts/reconstruct.py scripts/eval_exact.py \
-                        scripts/check_submission.py hac26/data_io.py hac26/recon.py \
-                        hac26/solvers/lpd_convex.py hac26/train.py hac26/solvers/output.py)
-SRC_SCORE=$(src_digest scripts/benchmark.py hac26/scoring/official.py)
 
 stage_signature() {
   case "$1" in
@@ -223,37 +212,42 @@ stage_signature() {
       ;;
     flow)
       stage_signature prior | sed 's/^stage=prior$/stage=flow/'
-      printf 'FLOW_STEPS=%s\nFLOW_BATCH=%s\nFLOW_VAL_EVERY=%s\nFLOW_PATIENCE=%s\nFLOW_CKPT_EVERY=%s\nFLOW_CKPT=%s\nFLOW_LOG_EVERY=%s\nFLOW_TRAIN_GEOMS=%s\n' \
+      printf 'FLOW_STEPS=%s\nFLOW_BATCH=%s\nFLOW_VAL_EVERY=%s\nFLOW_PATIENCE=%s\nFLOW_CKPT_EVERY=%s\nFLOW_CKPT=%s\nFLOW_LOG_EVERY=%s\nFLOW_TRAIN_GEOMS=%s\nFLOW_FIT_WEIGHT=%s\nFLOW_FIT_FROM=%s\n' \
         "$FLOW_STEPS" "$FLOW_BATCH" "$FLOW_VAL_EVERY" "$FLOW_PATIENCE" \
-        "$FLOW_CKPT_EVERY" "$FLOW_CKPT" "$FLOW_LOG_EVERY" "$FLOW_TRAIN_GEOMS"
+        "$FLOW_CKPT_EVERY" "$FLOW_CKPT" "$FLOW_LOG_EVERY" "$FLOW_TRAIN_GEOMS" \
+        "$FLOW_FIT_WEIGHT" "$FLOW_FIT_FROM"
       ;;
-    flow-experts)
-      stage_signature flow | sed 's/^stage=flow$/stage=flow-experts/'
-      printf 'FLOW_EXPERT_STEPS=%s\n' "$FLOW_EXPERT_STEPS"
+    flow-rollout)
+      stage_signature flow | sed 's/^stage=flow$/stage=flow-rollout/'
+      printf 'FLOW_ROLLOUT_STEPS=%s\nFLOW_ROLLOUT_FRAC=%s\n' \
+        "$FLOW_ROLLOUT_STEPS" "$FLOW_ROLLOUT_FRAC"
       ;;
     decision)
-      stage_signature flow-experts | sed 's/^stage=flow-experts$/stage=decision/'
-      printf 'RECON_SAMPLES=%s\nRECON_POLISH_STEPS=%s\nRECON_RES=%s\nSWEEP=%s\nSRC=%s\n' \
-        "$RECON_SAMPLES" "$RECON_POLISH_STEPS" "$RECON_RES" \
-        "$RECON_GUIDANCE_SWEEP $RECON_CHURN_SWEEP" "$SRC_OUTPUT"
+      stage_signature flow-rollout | sed 's/^stage=flow-rollout$/stage=decision/'
+      printf 'RECON_SAMPLES=%s\nRECON_POLISH_STEPS=%s\nRECON_RES=%s\nSWEEP=%s\nSIDE_POINTS=%s\nSRC=%s\n' \
+        "$RECON_SAMPLES" "$RECON_POLISH_STEPS" "$RECON_RES" "$RECON_GUIDANCE_SWEEP" \
+        "$MEDOID_SIDE_POINTS" "$SRC_OUTPUT"
       ;;
     convex)
-      printf 'stage=convex\nDATA_DIR=%s\nCONVEX_CKPT=%s\nSRC=%s\n' \
-        "$DATA_DIR" "$CONVEX_CKPT" "$SRC_CONVEX"
+      printf 'stage=convex\nDATA_DIR=%s\nCONVEX_CKPT=%s\nSRC=%s\nSRC_FWD=%s\n' \
+        "$DATA_DIR" "$CONVEX_CKPT" "$SRC_CORPUS" "$SRC_FORWARD"
       ;;
     reconstruct)
-      printf 'stage=reconstruct\nDESIGN_N=%s\nFLOW_STEPS=%s\nFLOW_PHASES=%s\nFLOW_BATCH=%s\nFLOW_OPERATOR_RES=%s\nFLOW_TRAIN_GEOMS=%s\nFLOW_EXPERT_STEPS=%s\nCONVEX_CKPT=%s\nRECON_SAMPLES=%s\nRECON_POLISH_STEPS=%s\nRECON_RES=%s\nRECON_SNAP=%s\nMEDOID_VOLUME_ONLY=%s\nMEDOID_SIDE_POINTS=%s\nMEDOID_SIDE_DIRS=%s\nMEDOID_SIDE_RES=%s\nMEDOID_SIDE_MODE=%s\n' \
+      printf 'stage=reconstruct\nDESIGN_N=%s\nFLOW_STEPS=%s\nFLOW_PHASES=%s\nFLOW_BATCH=%s\nFLOW_OPERATOR_RES=%s\nFLOW_TRAIN_GEOMS=%s\nFLOW_ROLLOUT_STEPS=%s\nFLOW_ROLLOUT_FRAC=%s\nCONVEX_CKPT=%s\nRECON_SAMPLES=%s\nRECON_POLISH_STEPS=%s\nRECON_RES=%s\nRECON_SNAP=%s\nMEDOID_VOLUME_ONLY=%s\nMEDOID_SIDE_POINTS=%s\nMEDOID_SIDE_DIRS=%s\nMEDOID_SIDE_RES=%s\nMEDOID_SIDE_MODE=%s\n' \
         "$DESIGN_N" "$FLOW_STEPS" "$FLOW_PHASES" "$FLOW_BATCH" "$FLOW_OPERATOR_RES" \
-        "$FLOW_TRAIN_GEOMS" "$FLOW_EXPERT_STEPS" "$CONVEX_CKPT" \
+        "$FLOW_TRAIN_GEOMS" "$FLOW_ROLLOUT_STEPS" "$FLOW_ROLLOUT_FRAC" "$CONVEX_CKPT" \
         "$RECON_SAMPLES" "$RECON_POLISH_STEPS" "$RECON_RES" "$RECON_SNAP" \
         "$MEDOID_VOLUME_ONLY" "$MEDOID_SIDE_POINTS" "$MEDOID_SIDE_DIRS" \
         "$MEDOID_SIDE_RES" "$MEDOID_SIDE_MODE"
-      printf 'RECON_GUIDANCE=%s\nRECON_CHURN=%s\nSRC=%s\nSRC_FLOW=%s\nSRC_FWD=%s\n' \
-        "$RECON_GUIDANCE" "$RECON_CHURN" "$SRC_OUTPUT" "$SRC_FLOW" "$SRC_FORWARD"
+      printf 'RECON_GUIDANCE=%s\nSRC=%s\nSRC_FLOW=%s\nSRC_FWD=%s\n' \
+        "$RECON_GUIDANCE" "$SRC_OUTPUT" "$SRC_FLOW" "$SRC_FORWARD"
       ;;
     score)
-      stage_signature reconstruct | sed 's/^stage=reconstruct$/stage=score/'
-      printf 'SRC_SCORE=%s\n' "$SRC_SCORE"
+      printf 'stage=score\nDATA_DIR=%s\nRECON_DIR=results/lpd\nRECON_SAMPLES=%s\nRECON_RES=%s\nRECON_SNAP=%s\nMEDOID_VOLUME_ONLY=%s\nMEDOID_SIDE_POINTS=%s\nMEDOID_SIDE_DIRS=%s\nMEDOID_SIDE_RES=%s\nMEDOID_SIDE_MODE=%s\n' \
+        "$DATA_DIR" "$RECON_SAMPLES" "$RECON_RES" "$RECON_SNAP" \
+        "$MEDOID_VOLUME_ONLY" "$MEDOID_SIDE_POINTS" "$MEDOID_SIDE_DIRS" \
+        "$MEDOID_SIDE_RES" "$MEDOID_SIDE_MODE"
+      printf 'SRC=%s\n' "$SRC_OUTPUT"
       ;;
     *)
       printf 'stage=%s\n' "$1"
@@ -390,6 +384,10 @@ if [ "$STAGES_AFTER_FORCE" != "1" ] && [ "$FORCE_STAGE" != "calibrate" ] \
   log "=== calibrate: skipped (models/instrument_calibration.pt already present)"
   mark_done calibrate
 elif [ -d "$DATA_DIR" ]; then
+  if [ -f models/instrument_calibration.pt ] && ! valid_instrument; then
+    log "=== calibrate: models/instrument_calibration.pt does not load into the current"
+    log "    Instrument, so it is refitted. Commit the new one so later runs skip this stage."
+  fi
   run_stage calibrate models/instrument_calibration.pt \
     $PY scripts/calibrate.py --data-dir "$DATA_DIR"
 else
@@ -418,7 +416,8 @@ fi
 run_stage corpus "$CORPUS_FILE" \
   $PY scripts/build_corpus.py \
     --bodies "$N_BODIES" --phases "$FLOW_PHASES" --operator-res "$FLOW_OPERATOR_RES" \
-    --codes-file "$CODES_FILE" --convex "$CONVEX_CKPT" --out "$CORPUS_FILE"
+    --codes-file "$CODES_FILE" --convex "$CONVEX_CKPT" --out "$CORPUS_FILE" \
+    --workers "$CORPUS_WORKERS"
 
 # ---------------------------------------------------------------- 4c. the prior part
 run_stage prior runs/prior_flow.pt \
@@ -436,24 +435,28 @@ run_stage flow runs/lpd_flow.pt \
     --patience "$FLOW_PATIENCE" \
     --ckpt-every "$FLOW_CKPT_EVERY" --ckpt-file "$FLOW_CKPT" \
     --log-every "$FLOW_LOG_EVERY" \
+    --fit-weight "$FLOW_FIT_WEIGHT" --fit-from "$FLOW_FIT_FROM" \
     --corpus "$CORPUS_FILE"
 
-# ---------------------------------------------------------------- 5b. flow, branched
-# The same run continued from its best-scoring weights, branched into the default number of
-# experts, for up to FLOW_EXPERT_STEPS more steps on the same straight-line objective.
-if [ "$FLOW_EXPERT_STEPS" -gt 0 ]; then
-  run_stage flow-experts runs/lpd_flow.pt \
+# ---------------------------------------------------------------- 5b. flow, rolled out
+# The same run continued from its checkpoint, branched into the default number of experts:
+# part of the draws now take their state from the sampler itself, for up to
+# FLOW_ROLLOUT_STEPS more steps. This is the main phase; the first run only prepares it.
+if [ "$FLOW_ROLLOUT_STEPS" -gt 0 ]; then
+  run_stage flow-rollout runs/lpd_flow.pt \
     $PY scripts/train_lpd.py \
-      --steps "$FLOW_STEPS" --extra-steps "$FLOW_EXPERT_STEPS" \
+      --steps "$FLOW_STEPS" --extra-steps "$FLOW_ROLLOUT_STEPS" \
       --batch "$FLOW_BATCH" \
       --train-geoms "$FLOW_TRAIN_GEOMS" --out runs/lpd_flow.pt \
       --val-bodies "$FLOW_VAL_BODIES" --val-every "$FLOW_VAL_EVERY" \
       --patience "$FLOW_PATIENCE" \
       --ckpt-every "$FLOW_CKPT_EVERY" --ckpt-file "$FLOW_CKPT" \
       --log-every "$FLOW_LOG_EVERY" \
+      --fit-weight "$FLOW_FIT_WEIGHT" --fit-from "$FLOW_FIT_FROM" \
+      --rollout-frac "$FLOW_ROLLOUT_FRAC" \
       --corpus "$CORPUS_FILE"
 else
-  log "=== flow-experts: skipped (FLOW_EXPERT_STEPS=0)"
+  log "=== flow-rollout: skipped (FLOW_ROLLOUT_STEPS=0)"
 fi
 
 # ---------------------------------------------------------------- 5c. the decision rule
@@ -466,22 +469,60 @@ if [ "$FLOW_VAL_BODIES" -gt 0 ]; then
       --ckpt runs/lpd_flow.pt --corpus "$CORPUS_FILE" --val-bodies "$FLOW_VAL_BODIES" \
       --bodies "$FLOW_VAL_BODIES" --samples "$RECON_SAMPLES" \
       --polish-steps "$RECON_POLISH_STEPS" --res "$RECON_RES" \
-      --guidance $RECON_GUIDANCE_SWEEP --churn $RECON_CHURN_SWEEP \
+      --guidance $RECON_GUIDANCE_SWEEP \
       --side-points "$MEDOID_SIDE_POINTS" --out runs/decision_check.json
 else
   log "=== decision: skipped (FLOW_VAL_BODIES=0)"
 fi
 
-# ---------------------------------------------------------------- 6. the convex answers
-# The submission: the convex stage's reconstruction of every model by the recipe fixed in
-# scripts/make_submission.py, checked, and scored on the public models with the organisers'
-# measures. The flow starts from these bodies.
+if [ -f runs/decision_check.json ]; then
+  BEST_GUIDANCE=$($PY -c "import json, sys; p=sys.argv[1]; d=json.load(open(p)); v=d.get('best_guidance'); print('' if v is None else v)" runs/decision_check.json)
+  if [ -z "${RECON_GUIDANCE:-}" ] && [ -n "$BEST_GUIDANCE" ]; then
+    RECON_GUIDANCE="$BEST_GUIDANCE"
+    log "=== reconstruct: using best guidance from runs/decision_check.json: $RECON_GUIDANCE"
+  elif [ -n "${RECON_GUIDANCE_WAS_SET:-}" ] && [ -n "$BEST_GUIDANCE" ] \
+       && [ "$RECON_GUIDANCE" != "$BEST_GUIDANCE" ]; then
+    log "!!! reconstruct: RECON_GUIDANCE=$RECON_GUIDANCE overrides decision best $BEST_GUIDANCE"
+  fi
+fi
+if [ -z "${RECON_GUIDANCE:-}" ]; then
+  RECON_GUIDANCE=1.0
+  log "!!! reconstruct: no decision best guidance available; falling back to RECON_GUIDANCE=1.0"
+fi
+
+# ---------------------------------------------------------------- 6. the convex starts
+# The convex stage's reconstruction of every model, made the way the corpus starts were: the
+# same checkpoint and the same decode, so the flow meets at reconstruction what it trained
+# on. A model is redone when its STL is missing or older than its curves or the checkpoint,
+# so re-downloaded data is picked up.
 if [ ! -d "$DATA_DIR" ]; then
   log "!!! convex: $DATA_DIR not present; the measured curves are needed from here on."
   exit 1
 fi
-run_stage convex results/public_scores.json \
-  $PY scripts/make_submission.py --data-dir "$DATA_DIR" --ckpt "$CONVEX_CKPT"
+if should_run convex; then
+  log "=== convex: starting (10 models)"
+  mkdir -p results/convex
+  ok=1
+  for M in 1 2 3 4 5 6 7 8 9 10; do
+    P=$(printf "%02d" "$M")
+    OUT="results/convex/Asteroid$P.stl"
+    if [ -s "$OUT" ] && [ ! "$CONVEX_CKPT" -nt "$OUT" ] && [ "$STAGES_AFTER_FORCE" != "1" ] \
+       && [ -z "$(find "$DATA_DIR" -name "Asteroid*${P}_lightcurve_*" -newer "$OUT" 2>/dev/null)" ]; then
+      log "  --- model $M: $OUT is current"
+      continue
+    fi
+    log "  --- model $M -> $OUT"
+    if ! $PY scripts/reconstruct.py --ckpt "$CONVEX_CKPT" --model "$M" --data-dir "$DATA_DIR" \
+        --out "$OUT" 2>&1 | tee -a logs/convex.log; then
+      log "  --- model $M FAILED"
+      ok=0
+    fi
+  done
+  [ "$ok" = "1" ] && mark_done convex || { log "=== convex: FAILED"; exit 1; }
+  log "=== convex: done"
+else
+  log "=== convex: skipped (already done)"
+fi
 
 # ---------------------------------------------------------------- 6b. reconstruct all ten
 if should_run reconstruct; then
@@ -493,10 +534,8 @@ if should_run reconstruct; then
     # Each model is its own unit of work, so a job that dies on one model costs only that
     # model. The .json is written last, so a model counts as done only when both files exist
     # and are newer than the flow and the convex start they came from.
-    START=results/submission/Asteroid$P.stl
-    [ -f "results/public/Asteroid$P.stl" ] && START=results/public/Asteroid$P.stl
     if [ -s "$OUT" ] && [ -s "results/lpd/Asteroid$P.json" ] \
-       && [ ! runs/lpd_flow.pt -nt "$OUT" ] && [ ! "$START" -nt "$OUT" ] \
+       && [ ! runs/lpd_flow.pt -nt "$OUT" ] && [ ! "results/convex/Asteroid$P.stl" -nt "$OUT" ] \
        && [ "$STAGES_AFTER_FORCE" != "1" ]; then
       log "  --- model $M: skipped ($OUT already written -- rm it to redo just this one)"
       continue
@@ -504,8 +543,7 @@ if should_run reconstruct; then
     log "  --- model $M -> $OUT (started $(date -u +%H:%M:%S))"
     RECON_ARGS=(--model "$M" --samples "$RECON_SAMPLES" --res "$RECON_RES"
       --phases "$FLOW_PHASES" --operator-res "$FLOW_OPERATOR_RES"
-      --polish-steps "$RECON_POLISH_STEPS" --guidance "$RECON_GUIDANCE" \
-      --churn "$RECON_CHURN"
+      --polish-steps "$RECON_POLISH_STEPS" --guidance "$RECON_GUIDANCE"
       --ckpt runs/lpd_flow.pt --data-dir "$DATA_DIR" --out "$OUT"
       --medoid-side-points "$MEDOID_SIDE_POINTS"
       --medoid-side-dirs "$MEDOID_SIDE_DIRS"
@@ -530,12 +568,23 @@ else
 fi
 
 # ---------------------------------------------------------------- 7. score the public models
-# The flow's answers beside the convex answers they started from, under the organisers' two
-# measures: the flow has to beat its start on the non-convex public body without losing on
-# the near-convex ones, since a carved-in dent that is not there costs as much as a missed one.
+# The flow's answers and the convex starts they came from, side by side: the flow has to
+# beat its start on the non-convex public body without losing on the near-convex ones, since
+# a carved-in dent that is not there costs as much as a missed one.
+# PYTHONPATH: the two scorers are the only entry points outside scripts/, and the scripts are
+# what put the repo root on sys.path -- _venv_setup.sh installs the dependencies by name and
+# not the package itself, so without this `import hac26` fails and the stage cannot start.
+# The two side-view runs need separate --out paths: they share one default, so the flow's run
+# would otherwise overwrite the convex baseline and leave only half the comparison on disk.
 if [ -d "$DATA_DIR" ]; then
-  run_stage score "" \
-    $PY scripts/benchmark.py results/public results/lpd --data-dir "$DATA_DIR"
+  run_stage score "" env PYTHONPATH="$PWD${PYTHONPATH:+:$PYTHONPATH}" bash -c "
+    echo '--- convex starts' &&
+    $PY hac26/scoring/voxel.py --stl results/convex/Asteroid0{1,2,3}.stl --models 1 2 3 &&
+    $PY hac26/scoring/side_view.py --models 1 2 3 --recon-dir results/convex --out runs/side_view_convex.json &&
+    echo '--- flow' &&
+    $PY hac26/scoring/voxel.py --stl results/lpd/Asteroid0{1,2,3}.stl --models 1 2 3 &&
+    $PY hac26/scoring/side_view.py --models 1 2 3 --recon-dir results/lpd --out runs/side_view_lpd.json
+  "
 else
   log "=== score: skipped ($DATA_DIR not present)"
 fi
@@ -545,4 +594,4 @@ log "    library:  $LIB_DIR ($N_BODIES bodies; see $LIB_DIR/report.md)"
 log "    normals:  $DESIGN_N"
 log "    corpus:   $CORPUS_FILE"
 log "    flow ckpt: runs/lpd_flow.pt"
-log "    submission: results/submission/Asteroid*.stl (convex); flow answers: results/lpd/"
+log "    reconstructions: results/lpd/Asteroid*.stl"

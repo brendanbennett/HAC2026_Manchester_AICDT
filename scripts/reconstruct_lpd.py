@@ -55,9 +55,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from hac26.conventions import CYLINDER_R, PUBLIC_MODELS, psi_grid   # noqa: E402
-from hac26.data_io import N_CAMS, load_inversion_curves, public_stl    # noqa: E402
-from hac26.field import (CODE_DIM, DESIGN_N, EXTRACT_RES, N_DIR,   # noqa: E402
-                         N_NODES)
+from hac26.data_io import N_CAMS, load_model_curves, public_stl        # noqa: E402
+from hac26.field import CODE_DIM, DESIGN_N, N_DIR, N_NODES   # noqa: E402
 from hac26.forward.mesh.exact import normalise                         # noqa: E402
 from hac26.forward.mesh.radiosity import RadiosityError                # noqa: E402
 from hac26.data_io import native_sigma                                 # noqa: E402
@@ -68,9 +67,9 @@ from hac26.solvers.output import (export_stl, metric_medoid, planar_snap,      #
                                   ransac_planes, restore_constraints)
 from hac26.recon import dice, fit_to_cylinder, mesh_occupancy          # noqa: E402
 from hac26.shapes import rescale_touch_z                              # noqa: E402
-from reconstruct import answer_path                                    # noqa: E402
-from train_lpd import (INSTRUMENT, RENDER, _enable_tf32, cond_channels,   # noqa: E402
-                       load_instrument, residual_features, support_from_mesh)
+from train_lpd import (CALIBRATION, RENDER, _enable_tf32, cond_channels,   # noqa: E402
+                       check_flow_metadata, load_flow_file, load_instrument, residual_features,
+                       support_from_mesh)
 
 SPREAD_MAX = 0.95    # mean Dice of the other draws against the medoid above which the draws
                      # are reported as one body rather than a spread of answers
@@ -107,15 +106,8 @@ def curve_pairs(curves56: np.ndarray) -> torch.Tensor:
 
 
 def geometry_mask(mask56: np.ndarray) -> torch.Tensor:
-    """(1, N_CAMS): a geometry counts as present when either of its curves is.
-
-    Either rather than both, because a single curve can be dropped on its own. A missing file
-    takes a whole block of twenty-eight, and then neither curve of any geometry is present;
-    but the released count curve of one body is a step function of the transfer curve rather
-    than of the shape and is refused by itself (data_io.count_curve_is_usable), and that
-    geometry still has an intensity curve to be fitted on. Which of the two a geometry
-    carries is `curve_weight`."""
-    return torch.tensor((mask56[:N_CAMS] > 0) | (mask56[N_CAMS:] > 0),
+    """(1, N_CAMS): a geometry counts as present only if BOTH its curves are."""
+    return torch.tensor((mask56[:N_CAMS] > 0) & (mask56[N_CAMS:] > 0),
                         dtype=torch.float32)[None]
 
 
@@ -180,33 +172,15 @@ def make_resid_fn(net, op: CodeOperator, data, scale, geom_mask, M, cond, suppor
     return fn
 
 
-def json_default(obj):
-    """Plain JSON values for the numpy scalars and arrays a diagnostic collects.
-
-    Every number in a report passes through numpy somewhere, and json refuses a numpy scalar.
-    A run that has done its work and cannot write its report has lost the work, so the encoder
-    is told how to spell them rather than every producer being asked to cast."""
-    if isinstance(obj, np.generic):
-        return obj.item()
-    if isinstance(obj, np.ndarray):
-        return obj.tolist()
-    raise TypeError(f"Object of type {obj.__class__.__name__} is not JSON serializable")
-
-
-def whitened_misfit(pred, data, scale, geoms, weight=None) -> float:
+def whitened_misfit(pred, data, scale, geoms) -> float:
     """RMS of (data - pred) / scale over the geometries `geoms`, in standard deviations.
-    `pred` holds those geometries only, in that order, as the operator returns them; `data`,
-    `scale` and `weight` hold every geometry. `weight` is (N_CAMS, 2) and zeroes the curves
-    that carry no shape, and the mean is taken over the curves that are left."""
+    `pred` holds those geometries only, in that order, as the operator returns them; `data`
+    and `scale` hold every geometry."""
     r = (data[geoms] - pred) / scale[geoms][..., None]
-    if weight is None:
-        return float(r.pow(2).mean().sqrt())
-    w = weight[geoms][..., None].to(r.device)
-    return float((r.pow(2) * w).sum().div(w.sum().clamp_min(1e-9) * r.shape[-1]).sqrt())
+    return float(r.pow(2).mean().sqrt())
 
 
-def mesh_misfit_by_geom(op: CodeOperator, verts, faces, radius, data, scale,
-                        weight=None) -> torch.Tensor:
+def mesh_misfit_by_geom(op: CodeOperator, verts, faces, radius, data, scale) -> torch.Tensor:
     """Whitened RMS misfit of a mesh in the canonical frame against the curves, per geometry
     (N_CAMS,), in standard deviations; inf everywhere for a mesh that cannot be rendered, so
     that it is never accepted."""
@@ -217,15 +191,74 @@ def mesh_misfit_by_geom(op: CodeOperator, verts, faces, radius, data, scale,
         pred = normalise(op.forward.raw_curves(v_t, f_t)).cpu()
     except RadiosityError:
         return torch.full((N_CAMS,), float("inf"))
-    r = ((pred - data) / scale[..., None]).pow(2)
-    if weight is None:
-        return r.mean((1, 2)).sqrt()
-    w = weight[..., None].to(r.device)
-    return (r * w).sum((1, 2)).div((w.sum((1, 2)) * r.shape[-1]).clamp_min(1e-9)).sqrt()
+    return ((pred - data) / scale[..., None]).pow(2).mean((1, 2)).sqrt()
 
 
-def polish(net, op: CodeOperator, z, support, radius, data, scale, geoms, steps: int,
-           weight=None):
+def candidate_diagnostic(kind: str, label: str, verts, faces, misfit_sigma: float) -> dict:
+    """Validity and geometry diagnostics for one selectable reconstruction candidate."""
+    import trimesh
+    from scipy.spatial import ConvexHull
+
+    report = {"kind": kind, "label": label,
+              "misfit_sigma": float(misfit_sigma) if np.isfinite(misfit_sigma) else float("inf")}
+    try:
+        m = trimesh.Trimesh(np.asarray(verts), np.asarray(faces), process=True)
+        m.remove_unreferenced_vertices()
+        m.merge_vertices()
+        m.fix_normals()
+        v = np.asarray(m.vertices, dtype=float)
+        hull_volume = float(ConvexHull(v).volume) if len(v) >= 4 else float("nan")
+        volume = float(m.volume)
+        convexity = (abs(volume) / hull_volume
+                     if np.isfinite(hull_volume) and hull_volume > 0 else float("nan"))
+        report.update({
+            "watertight": bool(m.is_watertight),
+            "winding_consistent": bool(m.is_winding_consistent),
+            "components": int(len(m.split(only_watertight=False))),
+            "volume": volume,
+            "faces": int(len(m.faces)),
+            "convexity": float(convexity),
+            "carved_volume_fraction": float(max(0.0, 1.0 - convexity))
+                                      if np.isfinite(convexity) else float("nan"),
+        })
+    except Exception as exc:                         # noqa: BLE001  diagnostic path
+        report.update({"watertight": False, "winding_consistent": False,
+                       "components": 0, "volume": float("nan"), "faces": 0,
+                       "convexity": float("nan"),
+                       "carved_volume_fraction": float("nan"), "error": str(exc)})
+    report["eligible"] = bool(
+        np.isfinite(report["misfit_sigma"])
+        and bool(report["watertight"])
+        and int(report["components"]) == 1
+        and np.isfinite(report["volume"])
+        and report["volume"] > 0.0
+        and int(report["faces"]) >= 8
+    )
+    reasons = []
+    if not np.isfinite(report["misfit_sigma"]):
+        reasons.append("nonfinite_misfit")
+    if not report["watertight"]:
+        reasons.append("not_watertight")
+    if int(report["components"]) != 1:
+        reasons.append("not_single_component")
+    if not np.isfinite(report["volume"]) or report["volume"] <= 0.0:
+        reasons.append("bad_volume")
+    if int(report["faces"]) < 8:
+        reasons.append("too_few_faces")
+    report["ineligible_reasons"] = reasons
+    return report
+
+
+def json_default(obj):
+    """Convert NumPy scalar diagnostics to plain JSON values."""
+    if isinstance(obj, np.generic):
+        return obj.item()
+    if isinstance(obj, np.ndarray):
+        return obj.tolist()
+    raise TypeError(f"Object of type {obj.__class__.__name__} is not JSON serializable")
+
+
+def polish(net, op: CodeOperator, z, support, radius, data, scale, geoms, steps: int):
     """Gradient descent on the whitened misfit of one draw, in the whitened code, from where
     the flow left it. Each iteration renders once with the adjoint, steps against the
     gradient by POLISH_STEP per coordinate at first, and halves the step until the misfit
@@ -236,20 +269,17 @@ def polish(net, op: CodeOperator, z, support, radius, data, scale, geoms, steps:
     iterations taken)."""
     def misfit_of(zz):
         cur = op.curves(support, net.codec.decode(zz), radius, geoms=geoms)
-        return float("inf") if cur is None else whitened_misfit(cur.cpu(), data, scale,
-                                                                geoms, weight)
+        return float("inf") if cur is None else whitened_misfit(cur.cpu(), data, scale, geoms)
 
     d_sel, s_sel = data[geoms].to(op.device), scale[geoms].to(op.device)
-    w_sel = None if weight is None else weight[geoms].to(op.device)[..., None]
     z = z.detach().clone()
     alpha, chi0, chi, it = POLISH_STEP, None, None, 0
     while it < steps:
         cur, g = op.adjoint(support, net.codec.decode(z), radius,
-                            lambda c: (d_sel - c) / s_sel[..., None] ** 2
-                            * (1.0 if w_sel is None else w_sel), geoms=geoms)
+                            lambda c: (d_sel - c) / s_sel[..., None] ** 2, geoms=geoms)
         if cur is None:
             break
-        chi = whitened_misfit(cur.cpu(), data, scale, geoms, weight)
+        chi = whitened_misfit(cur.cpu(), data, scale, geoms)
         chi0 = chi if chi0 is None else chi0
         if chi <= POLISH_TARGET:
             break
@@ -294,10 +324,14 @@ def dice_optimal_level(occs: list, extent: float, radius: float, iters: int = 3,
     the upper clamp only guards against a degenerate estimate.
     """
     t = 0.5
+    good = None                  # the last level that actually produced a body
     for _ in range(iters):
         made = consensus_bodies(occs, extent, radius, levels=(t,))
         if not made:
-            break
+            # t is outside the range of the draw fraction, so it would produce nothing
+            # downstream either; fall back to the last level that did produce a body.
+            return good if good is not None else 0.5
+        good = t
         _, v, f = made[0]
         occ = mesh_occupancy(v, f, occs[0].shape[0], extent)
         d = float(np.mean([dice(occ, o) for o in occs]))
@@ -305,19 +339,47 @@ def dice_optimal_level(occs: list, extent: float, radius: float, iters: int = 3,
     return t
 
 
+def off_lattice_level(level: float, n_draws: int) -> float:
+    """A level strictly between two attainable draw fractions.
+
+    The fraction of draws occupying a voxel takes only the values k / n_draws, so a level
+    equal to one of them puts the isosurface exactly through the sampled values. Marching
+    cubes then places vertices on grid points and emits zero-area triangles and pinch
+    points: the body comes back with a fifth of its faces degenerate and its winding
+    inverted, which `export_stl` cannot repair and no voxel measure that relies on
+    orientation can read. CONSENSUS_LEVELS holds 0.5 and the default draw count is 8, so
+    the majority level landed on the lattice on every run.
+
+    The level is moved down to the middle of the cell below it, (k - 0.5) / n_draws. That
+    keeps exactly the voxels the requested level meant -- those where at least k of the
+    n_draws agree -- while passing strictly between attainable values, so every triangle
+    has area. A level that is not on the lattice is returned unchanged.
+    """
+    if n_draws < 1:
+        return float(level)
+    k = float(level) * n_draws
+    kr = round(k)
+    return (kr - 0.5) / n_draws if abs(k - kr) < 1e-9 else float(level)
+
+
 def consensus_bodies(occs: list, extent: float, radius: float, levels=CONSENSUS_LEVELS):
     """Meshes of the level sets of the fraction of draws containing each voxel, for boolean
     grids `occs` on [-extent, extent]^3, posed like the draws. Returns [(level, verts,
-    faces)]; a level with no closed surface is left out."""
+    faces)]; a level with no closed surface is left out.
+
+    Each requested level is nudged off the k / len(occs) lattice before the isosurface is
+    extracted (see off_lattice_level); the level reported back is the one that was asked
+    for, since that is what names the candidate."""
     from skimage import measure
     prob = np.mean([o.astype(np.float32) for o in occs], axis=0)
     n = prob.shape[0]
     spacing = 2.0 * extent / n
     out = []
     for level in levels:
-        if not (prob.min() < level < prob.max()):
+        lv = off_lattice_level(float(level), len(occs))
+        if not (prob.min() < lv < prob.max()):
             continue
-        v, f, _, _ = measure.marching_cubes(prob, level=level, spacing=(spacing,) * 3)
+        v, f, _, _ = measure.marching_cubes(prob, level=lv, spacing=(spacing,) * 3)
         v = v - extent + spacing / 2.0                  # cell centres, not cell corners
         # The radius is capped here rather than set, unlike the draws', which are put at the
         # published radius exactly. A level set is a contour of a probability, not a body: it
@@ -365,12 +427,9 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", type=int, required=True)
     ap.add_argument("--ckpt", default="runs/lpd_flow.pt")
-    ap.add_argument("--channel", choices=("real", "blender"), default="real",
-                    help="the released curves to invert, and with them the instrument "
-                         "fitted to that channel")
-    ap.add_argument("--calibration", default=None,
-                    help="the Instrument written by scripts/calibrate.py for the channel; "
-                         "must be the one the flow was trained with")
+    ap.add_argument("--calibration", default=CALIBRATION,
+                    help="the Instrument written by scripts/calibrate.py; must be the one "
+                         "the flow was trained with")
     ap.add_argument("--data-dir", default="dataset/raw")
     ap.add_argument("--samples", type=int, default=8)
     ap.add_argument("--steps", type=int, default=N_STEPS,
@@ -385,10 +444,10 @@ def main():
                          "scripts/decision_check.py measures which weight scores best on "
                          "bodies whose truth is known")
     ap.add_argument("--phases", type=int, default=96)
-    ap.add_argument("--operator-res", type=int, default=EXTRACT_RES,
+    ap.add_argument("--operator-res", type=int, default=32,
                     help="FlexiCubes resolution of the operator inside the flow; must match "
                          "the training run")
-    ap.add_argument("--res", type=int, default=EXTRACT_RES,
+    ap.add_argument("--res", type=int, default=64,
                     help="FlexiCubes resolution the final mesh is extracted at")
     ap.add_argument("--out", required=True)
     ap.add_argument("--seed", type=int, default=0)
@@ -426,36 +485,33 @@ def main():
     M = min(N_MODES, a.phases // 2)
     dev = "cuda" if torch.cuda.is_available() else "cpu"
 
-    inst = load_instrument(a.calibration or INSTRUMENT[a.channel], dev)
+    inst = load_instrument(a.calibration, dev)
     op = CodeOperator(inst, psi, res=a.operator_res, config=RENDER, device=dev)
 
-    sd = torch.load(a.ckpt, map_location="cpu", weights_only=False)
-    if "net" in sd and isinstance(sd.get("step"), int):
-        # a train_lpd.py resume checkpoint rather than a finished run's weights: use its
-        # best held-out state if it has one
-        print(f"  {a.ckpt} is a training checkpoint at step {sd['step']}"
-              + (f", using its best weights from step {sd['best_step']} "
-                 f"(val {sd['best']:.5f})" if sd.get("best_state") else ", using its "
-                 "current weights (no held-out evaluation in it yet)"), flush=True)
-        sd = sd["best_state"] or sd["net"]
+    sd, flow_meta = load_flow_file(a.ckpt, map_location="cpu")
+    if "checkpoint_step" in flow_meta:
+        print(f"  {a.ckpt} is a training checkpoint at step {flow_meta['checkpoint_step']}, "
+              f"using {'best' if flow_meta.get('loaded_best_state') else 'current'} weights "
+              f"from step {flow_meta['loaded_step']}", flush=True)
+    check_flow_metadata(flow_meta, calibration=a.calibration, phases=a.phases,
+                        operator_res=a.operator_res, context=a.ckpt)
     net = LPDFlow.from_state_dict(sd)
     net.eval()
 
-    sup_stl = a.support_from or str(answer_path(a.model))
+    sup_stl = a.support_from or f"results/convex/Asteroid{a.model:02d}.stl"
     support = support_from_convex(sup_stl)
     print(f"  h from {sup_stl}: {float(support.min()):.3f}-{float(support.max()):.3f}",
           flush=True)
 
-    d = load_inversion_curves(a.data_dir, a.model, m=a.phases, channel=a.channel)
+    d = load_model_curves(a.data_dir, a.model, m=a.phases)
     # A curve file that is absent leaves its block at zero and masked out, which the solver
     # would accept and reconstruct around. An answer built from half the measurement, or none
     # of it, is worse than no answer, so say so instead.
     if set(d["files"]) != {"intensity", "binary"}:
-        raise SystemExit(f"model {a.model} needs both {a.channel} curve files under "
+        raise SystemExit(f"model {a.model} needs both measured curve files under "
                          f"{a.data_dir}; found {sorted(d['files'])}")
     data = curve_pairs(d["curves"])                              # (N_CAMS, 2, P)
     mask = geometry_mask(d["mask"])
-    weight = curve_weight(d["mask"])                             # (N_CAMS, 2)
     scale = residual_scale(d, inst.eta)                          # (N_CAMS, 2)
     tag = geometry_tags()
     present = torch.nonzero(mask[0] > 0).flatten()
@@ -482,14 +538,14 @@ def main():
         t0 = time.time()
         for i in range(a.samples):
             codes[i], before, after, n_it = polish(net, op, codes[i], support, R, data, scale,
-                                                    seen.tolist(), a.polish_steps, weight)
+                                                    seen.tolist(), a.polish_steps)
             polished.append([before, after, n_it])
             print(f"  draw {i}: polished from {before:.2f} to {after:.2f} sigma in {n_it} "
                   f"steps", flush=True)
         print(f"  polish in {time.time()-t0:.0f}s", flush=True)
 
     def misfit_by_geom(w, faces):
-        return mesh_misfit_by_geom(op, w, faces, R, data, scale, weight)
+        return mesh_misfit_by_geom(op, w, faces, R, data, scale)
 
     def misfit(w, faces):
         """Whitened RMS misfit of a candidate mesh over the geometries the inversion saw."""
@@ -517,7 +573,7 @@ def main():
         print(f"  WARNING: could not save the codes to {codes_path}: {exc}", flush=True)
         codes_path = None
 
-    meshes, snaps, fits = [], [], []
+    meshes, snaps, fits, sources = [], [], [], []
     for i in range(a.samples):
         v, f, kept = decode(op, raw_codes[i], support, res=a.res, misfit_fn=misfit,
                             snap=a.snap, snap_planes=a.snap_planes,
@@ -528,6 +584,7 @@ def main():
         print(f"  draw {i}: misfit {chi:.2f} sigma", flush=True)
         v = fit_to_cylinder(v, R)            # canonical -> physical: xy only
         meshes.append((v, f)); snaps.append(kept); fits.append(chi)
+        sources.append({"kind": "draw", "label": f"draw {i}", "draw": int(i)})
     if not meshes:
         raise SystemExit("every draw was degenerate")
     # one grid for every draw, sized to the widest of them, so the pairwise Dice below
@@ -537,17 +594,47 @@ def main():
     n_draws = len(meshes)
     # the consensus bodies join the draws as candidates; the draws alone are the reference
     # the derived level joins the fixed two; see dice_optimal_level
-    levels_used = (CONSENSUS_LEVELS + (dice_optimal_level(occs, occ_extent, R),)
-                   if n_draws > 1 else ())
+    if n_draws > 1:
+        asked = CONSENSUS_LEVELS + (dice_optimal_level(occs, occ_extent, R),)
+        # the derived level can land on one of the fixed ones; asking for it twice builds,
+        # samples and scores the same body twice and reports it as two candidates
+        levels_used = tuple(dict.fromkeys(round(float(x), 9) for x in asked))
+    else:
+        levels_used = ()
     extra = consensus_bodies(occs, occ_extent, R, levels=levels_used) if n_draws > 1 else []
     levels = [lv for lv, _, _ in extra]
     candidates = meshes + [(mv, mf) for _, mv, mf in extra]
+    sources += [{"kind": "consensus", "label": f"consensus at level {lv:g}",
+                 "level": float(lv)} for lv, _, _ in extra]
     occs = occs + [mesh_occupancy(mv, mf, OCC_RES, occ_extent)
                    for _, mv, mf in extra]
 
+    candidate_fits = list(fits)
+    for _, mv, mf in extra:
+        candidate_fits.append(misfit(mv / np.array([R, R, 1.0]), mf))
+    candidate_diagnostics = [
+        candidate_diagnostic(src["kind"], src["label"], candidates[i][0], candidates[i][1],
+                             candidate_fits[i])
+        for i, src in enumerate(sources)
+    ]
+    eligible = [i for i, row in enumerate(candidate_diagnostics) if row["eligible"]]
+    eligible_draws = [i for i in eligible if i < n_draws]
+    if not eligible_draws:
+        raise SystemExit("no valid draw candidate has finite misfit; refusing to choose an "
+                         "answer from consensus bodies alone")
+    if not eligible:
+        raise SystemExit("no valid LPD candidate has finite misfit")
+    invalid = len(candidate_diagnostics) - len(eligible)
+    if invalid:
+        print(f"  candidate gate: {invalid}/{len(candidate_diagnostics)} candidates ineligible; "
+              f"selecting among {len(eligible)} valid candidates", flush=True)
+    eligible_occs = [occs[i] for i in eligible]
+    eligible_candidates = [candidates[i] for i in eligible]
+    n_ref = len(eligible_draws)
+
     medoid_metric = "volume"
     if a.medoid_volume_only:
-        k = metric_medoid(occs, n_ref=n_draws)
+        k_local = metric_medoid(eligible_occs, n_ref=n_ref)
     else:
         try:
             from hac26.scoring.side_view import surface_points
@@ -558,15 +645,16 @@ def main():
         print(f"  side-view medoid: {a.medoid_side_points} surface points/draw, "
               f"{a.medoid_side_dirs} dirs, res {a.medoid_side_res}", flush=True)
         outlines = [surface_points(v, f, n=a.medoid_side_points, seed=a.seed + i)
-                    for i, (v, f) in enumerate(candidates)]
-        k = metric_medoid(occs, outlines, side_n_dirs=a.medoid_side_dirs,
-                          side_res=a.medoid_side_res, side_mode=a.medoid_side_mode,
-                          n_ref=n_draws)
+                    for i, (v, f) in enumerate(eligible_candidates)]
+        k_local = metric_medoid(eligible_occs, outlines, side_n_dirs=a.medoid_side_dirs,
+                                side_res=a.medoid_side_res, side_mode=a.medoid_side_mode,
+                                n_ref=n_ref)
         medoid_metric = "volume+side_view"
         del outlines            # large, and nothing reads it after the medoid
+    k = eligible[k_local]
 
     v, f = candidates[k]
-    chosen = f"draw {k}" if k < n_draws else f"consensus at level {levels[k - n_draws]:g}"
+    chosen = sources[k]["label"]
     if a.snap:
         print(f"  planes accepted per draw (allowed rise {SNAP_MAX_RISE}): {snaps}", flush=True)
     else:
@@ -575,8 +663,7 @@ def main():
     off = ([dice(occs[k], o) for j, o in enumerate(occs[:n_draws]) if j != k] or [0.0])
     spread_off = float(np.mean(off))
     # a consensus body is in the physical frame; the misfit takes canonical vertices
-    chosen_fit = (fits[k] if k < n_draws
-                  else misfit(candidates[k][0] / np.array([R, R, 1.0]), candidates[k][1]))
+    chosen_fit = float(candidate_diagnostics[k]["misfit_sigma"])
     print(f"  answer = {chosen} of {n_draws} draws and {len(extra)} consensus bodies by "
           f"{medoid_metric}; mean Dice to the draws {spread_off:.4f}; misfit "
           f"{chosen_fit:.2f} sigma (draws {min(fits):.2f}-{max(fits):.2f})", flush=True)
@@ -600,9 +687,15 @@ def main():
     info = export_stl(a.out, v, f)
     res = {"model": a.model, "radius": R, "draws": n_draws, "answer": chosen,
            "candidate": int(k), "consensus_levels": [float(x) for x in levels_used],
+           # the levels asked for above, and the ones that actually produced a body: a
+           # level outside the range of the draw fraction makes none, and it is the second
+           # list that indexes the candidates the answer was chosen from
+           "consensus_levels_built": [float(x) for x in levels],
            "spread": spread, "spread_off_medoid": spread_off,
            "collapsed": bool(collapsed),
            "medoid_metric": medoid_metric,
+           "candidate_diagnostics": candidate_diagnostics,
+           "eligible_candidates": [int(i) for i in eligible],
            "medoid_volume_only": bool(a.medoid_volume_only),
            "medoid_side_points": 0 if a.medoid_volume_only else int(a.medoid_side_points),
            "medoid_side_dirs": int(a.medoid_side_dirs),

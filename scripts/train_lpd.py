@@ -844,6 +844,67 @@ def load_prior(net: LPDFlow, path: str, device: str) -> dict:
     return st["meta"]
 
 
+def load_flow_file(path: str, map_location="cpu") -> tuple:
+    """Load a finished flow file or a resumable training checkpoint.
+
+    New finished files are {"state_dict", "meta"}. Older finished files are bare state dicts.
+    Resumable checkpoints are accepted for diagnostics and reconstruction by taking their best
+    held-out state when available, as reconstruct_lpd.py already did before metadata was added.
+    Returns (state_dict, metadata).
+    """
+    st = torch.load(path, map_location=map_location, weights_only=False)
+    if isinstance(st, dict) and "state_dict" in st and "meta" in st:
+        return st["state_dict"], dict(st.get("meta") or {})
+    if isinstance(st, dict) and "net" in st and isinstance(st.get("step"), int):
+        meta = {k: v for k, v in st.items()
+                if k not in {"net", "opt", "best_state", "rng", "ema"}}
+        meta["checkpoint_step"] = int(st["step"])
+        meta["loaded_step"] = int(st.get("best_step", st["step"])) if st.get("best_state") else int(st["step"])
+        meta["loaded_best_state"] = bool(st.get("best_state") is not None)
+        return st.get("best_state") or st["net"], meta
+    return st, {}
+
+
+def check_flow_metadata(meta: dict, *, corpus: str | None = None, calibration: str | None = None,
+                        phases: int | None = None, operator_res: int | None = None,
+                        context: str = "flow checkpoint") -> None:
+    """Refuse known mismatches between a flow file and the run trying to use it."""
+    if not meta:
+        print(f"  WARNING: {context} has no metadata; cannot verify corpus/calibration/operator "
+              f"settings", flush=True)
+        return
+    problems, missing = [], []
+
+    def expect_digest(key, path):
+        if path is None:
+            return
+        if key not in meta:
+            missing.append(key)
+            return
+        live = file_digest(path)
+        if meta[key] != live:
+            problems.append(f"{key}: checkpoint={meta[key]!r}, current={live!r}")
+
+    def expect_int(key, value):
+        if value is None:
+            return
+        if key not in meta:
+            missing.append(key)
+            return
+        if int(meta[key]) != int(value):
+            problems.append(f"{key}: checkpoint={meta[key]!r}, current={int(value)!r}")
+
+    expect_digest("corpus", corpus)
+    expect_digest("calibration", calibration)
+    expect_int("phases", phases)
+    expect_int("operator_res", operator_res)
+    if problems:
+        raise SystemExit(f"{context} was written for different settings ({'; '.join(problems)})")
+    if missing:
+        print(f"  WARNING: {context} metadata is missing {', '.join(sorted(set(missing)))}; "
+              f"verified the fields it did carry", flush=True)
+
+
 def load_instrument(path: str, device: str) -> Instrument:
     """The calibrated instrument, frozen: only the calibration fits it. Training and
     reconstruction refuse to run without one: the curves depend on it, and a default
