@@ -52,7 +52,13 @@ MAX_DEGREE=${MAX_DEGREE:-0}            # ceiling on the Gauss-Newton ladder's sp
                                       # lowering this is the answer to a run that will not
                                       # finish, and it lowers a bound that is an upper one
 MAP_STEPS=${MAP_STEPS:-300}            # descent steps of the gradient solver
-TIME_BUDGET=${TIME_BUDGET:-0}          # seconds one body of one track may take; 0 is no cap
+TIME_BUDGET=${TIME_BUDGET:-0}          # seconds one body of one track may take; 0 is no
+                                      # cap. A floor rather than a cap: the solvers check it
+                                      # between units of work, and the longest unit is one
+                                      # iteration of the Gauss-Newton ladder's top stage, at
+                                      # (L+1)^2 - 9 renders. Budget the wallclock as bodies x
+                                      # (TIME_BUDGET + one such iteration), or lower
+                                      # MAX_DEGREE, which is what shortens that iteration
 REDO=${REDO:-0}                        # 1 refits bodies that are already written
 CALIBRATE_STEPS=${CALIBRATE_STEPS:-600}
 CALIBRATE_MODELS=${CALIBRATE_MODELS:-"1 3"}   # public bodies the instrument is fitted on. One

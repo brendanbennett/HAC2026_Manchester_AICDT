@@ -1330,7 +1330,15 @@ def main():
         print(f"  no best checkpoint was selected; keeping the EMA weights over {ema.n} "
               f"steps", flush=True)
     Path(a.out).parent.mkdir(parents=True, exist_ok=True)
-    torch.save(net.state_dict(), a.out)
+    # With the metadata, not as a bare state dict: load_flow_file reads it and
+    # check_flow_metadata refuses a flow used against a corpus, a calibration, a phase grid,
+    # an extraction resolution or a sensor it was not trained under. Written without it, the
+    # finished file was the one link in the chain with no digest -- the instrument carries a
+    # rig digest and the corpus records the calibration it was rendered with, and the flow
+    # between them carried nothing.
+    torch.save({"state_dict": net.state_dict(),
+                "meta": {**meta, "steps_trained": int(stopped_at),
+                         "best_step": int(best_step), "val": float(best)}}, a.out)
     print(f"[{_now()}] wrote {a.out} after {_hms(elapsed_before + (time.time() - t_run))} "
           f"of training", flush=True)
 

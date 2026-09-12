@@ -260,6 +260,12 @@ def main() -> None:
                          f"has is not charged and above it the body stops being the minimum")
     cap = depth_cap(support.numpy() if hasattr(support, "numpy") else np.asarray(support))
     floor = [0.0]          # set from the convex answer's own volume, once it is rendered
+    # Why a trial was turned away, counted where the reason is known. A line search that ends
+    # with no step is the one outcome that says nothing on its own: a body refused by the
+    # volume floor, one that carves past its own centre, one the renderer will not render and
+    # one that simply does not lower the objective are four different situations wanting four
+    # different things done about them, and they all look like "no step" from outside.
+    refused = {"depth cap": 0, "volume floor": 0, "no curves": 0, "objective": 0}
 
     def objective(z):
         """(log chi^2 + weight x area, chi) of the body `z` makes, or (inf, None) when it is
@@ -276,12 +282,15 @@ def main() -> None:
         be halving a step that no longer means what it takes it to mean.
         """
         if float(z[N_DIR:].max()) > cap:
+            refused["depth cap"] += 1
             return float("inf"), None
         out = op.curves_with_shape(support, z, R, geoms=fit_geoms)
         if out is None:
+            refused["no curves"] += 1
             return float("inf"), None
         cur, area, vol = out
         if vol < floor[0]:
+            refused["volume floor"] += 1
             return float("inf"), None
         chi = whitened_misfit(cur.cpu(), data, scale, fit_geoms, weight)
         ridge = a.l2 * float((z[N_DIR:] ** 2).sum())
@@ -436,6 +445,7 @@ def main() -> None:
             break
 
         moved = False
+        before = dict(refused)
         for _ in range(MAX_HALVINGS):
             trial = code + step * direction
             J_t, chi_t = objective(trial)
@@ -444,12 +454,23 @@ def main() -> None:
                 step *= STEP_GROW
                 moved = True
                 break
+            if np.isfinite(J_t):
+                refused["objective"] += 1
             step *= 0.5
         if a.ckpt_every and (it + 1) % a.ckpt_every == 0:
             save_ckpt(it, step)
         if not moved:
-            print(f"  no step of size >= {step:.2e} lowers the objective; converged at "
-                  f"step {it}", flush=True)
+            here = {k: refused[k] - before[k] for k in refused}
+            why = ", ".join(f"{n} by the {k}" for k, n in here.items() if n) or "none"
+            print(f"  no step down to {step:.2e} lowers the objective; converged at step "
+                  f"{it}. Of the {MAX_HALVINGS} trials: {why} refused.", flush=True)
+            if it == start_it:
+                # Nothing was ever accepted, so the body about to be written is the convex
+                # answer unchanged. Said plainly, because a run that wrote its input and
+                # exited zero otherwise reads as a run that worked.
+                print("  !!! no trial was accepted at all, so the body written is the convex "
+                      "answer itself and this run found no correction. The refusals above "
+                      "say which bound the first step met.", flush=True)
             break
 
     if a.out:
@@ -488,6 +509,7 @@ def main() -> None:
                 "final_convexity": convexity(v, f),
                 "area_weight": a.area_weight, "volume_floor": a.volume_floor,
                 "time_limited": time_limited, "steps_taken": len(hist),
+                "trials_refused": refused,
                 "export_refused": export_error}
         Path(a.out).with_suffix(".json").write_text(json.dumps(meta, indent=2,
                                                                default=json_default))

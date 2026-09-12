@@ -203,7 +203,11 @@ def main() -> None:
                     help="seconds after which the fit stops between units of work and writes "
                          "the best finished body; 0 is no budget. A run that stops this way "
                          "records time_limited and leaves its checkpoint, so rerunning it "
-                         "continues rather than starting over")
+                         "continues rather than starting over. It is a floor and not a cap: "
+                         "the check falls between units, and the longest unit is one "
+                         "iteration of the ladder's top stage, which is (L+1)^2 - 9 renders, "
+                         "so the worst case is the budget plus that. --max-degree is what "
+                         "bounds it")
     ap.add_argument("--ckpt-file", default=None,
                     help="resumable checkpoint; by default <--out>.gn.ckpt. The fit is a "
                          "sweep of independent starts, so what is checkpointed is the "
@@ -455,11 +459,25 @@ def main() -> None:
         rows = [h for h in hist if "accepted" in h]
         return bool(rows) and bool(rows[-1]["accepted"])
 
+    seen_floor = [0]
+
     def show(row):
+        """One line per iteration, and on an iteration that took no step, how many of its
+        trials the volume floor turned away.
+
+        A stage that finds no step says nothing on its own about why, and the two cases want
+        different things done about them: a fit that has run out of shape to find is
+        finished, while one whose every trial is refused by the floor is pinned against a
+        bound and will be refused at every degree above this one too, at a Jacobian each.
+        """
+        turned = refused_volume[0] - seen_floor[0]
+        seen_floor[0] = refused_volume[0]
         print(f"    {row['stage']:>14}  it {row['iteration']}  chi {row['chi']:.4f}"
               f"  area {row['area']:.3f}  volume {row['volume']:.3f}"
-              f"  {'step' if row['accepted'] else 'no step'}  [{time.time()-t0:.0f}s]",
-              flush=True)
+              f"  {'step' if row['accepted'] else 'no step'}"
+              + ("" if row["accepted"] or not turned else
+                 f" ({turned} trials refused by the volume floor)")
+              + f"  [{time.time()-t0:.0f}s]", flush=True)
 
     screened = st["screened"]
     for i in range(st["next_screen"], len(starts)):

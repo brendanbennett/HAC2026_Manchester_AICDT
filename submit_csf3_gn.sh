@@ -20,9 +20,12 @@
 # calling this script; nothing here overrides them.
 #
 # TIME_BUDGET is the one to reach for if the wallclock below turns out to be too short. It
-# caps a single body of a single solver, and both solvers checkpoint inside a body, so a run
-# that spends it writes the best body it reached and the next job continues from there
-# rather than starting that body again.
+# bounds a single body of a single solver from below rather than above: the check falls
+# between units of work, and the Gauss-Newton ladder's longest unit is one iteration of its
+# top stage, at (L+1)^2 - 9 renders. Size the wallclock as bodies x (TIME_BUDGET + one such
+# iteration), and lower MAX_DEGREE to shorten it. Both solvers checkpoint inside a body, so a
+# run that spends its budget writes the best body it reached and the next job continues from
+# there rather than starting that body again.
 #
 # gpuL rather than submit_csf3.sh's gpuA: reconstruct_gn.py's cost is dominated by rendering
 # one candidate mesh at a time (no batching across restarts or the ladder's own coordinates --

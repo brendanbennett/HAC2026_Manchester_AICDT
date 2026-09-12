@@ -57,7 +57,15 @@ def main():
     try:
         import thingi10k
     except ImportError:
-        raise SystemExit("pip install thingi10k first")
+        # Not "pip install": the Makefile builds the venv with uv when uv is on PATH, and
+        # such a venv has no pip in it, so the obvious remedy cannot be followed from inside
+        # the thing that needs it.
+        raise SystemExit(
+            "thingi10k is not installed. It is the `objects` extra:\n"
+            "  make venv EXTRAS=test,toolchain,objects\n"
+            "or, into an existing venv,\n"
+            "  uv pip install --python ./.venv/bin/python thingi10k\n"
+            "  ./.venv/bin/python -m pip install thingi10k   # a venv built without uv")
 
     thingi10k.init(cache_dir=a.cache_dir)
     ds = thingi10k.dataset(closed=True, solid=True, manifold=True, num_components=1,
@@ -68,11 +76,16 @@ def main():
     out.mkdir(parents=True, exist_ok=True)
     n_ok = 0
     seen_things = set()
+    n_repeat, n_refused, n_unreadable, n_not_tri = 0, 0, 0, 0
     for k in order:
         if n_ok >= a.n:
             break
         e = ds[int(k)]
-        if not _allowed(e) or e["thing_id"] in seen_things:
+        if e["thing_id"] in seen_things:
+            n_repeat += 1
+            continue
+        if not _allowed(e):
+            n_refused += 1
             continue
         seen_things.add(e["thing_id"])
         dst = out / f"thingi_{int(e['file_id']):06d}.obj"
@@ -82,10 +95,12 @@ def main():
         try:
             v, f = thingi10k.load_file(e["file_path"])
         except Exception as exc:                              # noqa: BLE001
+            n_unreadable += 1
             print(f"  skipped {e['file_id']}: {exc}", flush=True)
             continue
         v = np.asarray(v, float); f = np.asarray(f, np.int64)
         if f.shape[1] != 3:
+            n_not_tri += 1
             continue
         with open(dst, "w") as fh:
             fh.write(f"# Thingi10K file {e['file_id']}, thing {e['thing_id']}, "
@@ -94,6 +109,16 @@ def main():
             fh.writelines(f"f {i + 1} {j + 1} {k + 1}\n" for i, j, k in f)
         n_ok += 1
     print(f"  {n_ok} objects in {out}", flush=True)
+    # An exit status of zero with a third of what was asked for says nothing about why, and
+    # the count is what anyone sizing N_OBJECTS reads. The filters are the whole dataset's
+    # and cannot be met by asking for more.
+    if n_ok < a.n:
+        print(f"  NOTE: {a.n} were asked for and {n_ok} written. The pool was {len(ds)} files "
+              f"passing the geometry filters, of which {n_repeat} repeated a thing already "
+              f"taken, {n_refused} were refused by the licence and size rules, "
+              f"{n_unreadable} would not load and {n_not_tri} were not triangle meshes. "
+              f"Raising --n cannot pass this number; widening --genus, --min-vertices or "
+              f"--max-vertices can.", flush=True)
 
 
 if __name__ == "__main__":

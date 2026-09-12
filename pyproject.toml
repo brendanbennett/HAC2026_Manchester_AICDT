@@ -29,6 +29,10 @@ pipeline = ["torch>=2.1"]
 # does not, which is the difference between a build of a minute and a build of many; the
 # Makefile installs this extra by default and the script prints what to do when it is absent.
 toolchain = ["ninja"]
+# The everyday-object family of the shape library (scripts/fetch_objects.py). An addition to
+# the library rather than a requirement, which is why it is its own extra and not a
+# dependency: a run without it loses that family and goes on.
+objects = ["thingi10k"]
 
 [tool.setuptools]
 packages = ["hac26"]
