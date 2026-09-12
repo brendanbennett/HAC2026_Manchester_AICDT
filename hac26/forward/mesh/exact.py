@@ -239,6 +239,15 @@ class ExactForward:
             f_np = faces.detach().cpu().numpy()
             try:
                 pv, pf = decimate(v_np, f_np, self.cfg.radiosity_faces)
+            except ImportError as exc:
+                # Not a property of this mesh, so not a RadiosityError: callers treat one of
+                # those as a body that has no curves and go on to the next. A missing package
+                # would then turn every body into a skipped one and write an empty corpus
+                # after rendering the whole library, which is a failure worth having at once.
+                raise RuntimeError(
+                    f"the radiosity patches need a package that is not installed ({exc}). "
+                    f"Every body would be skipped as having no curves. Install it, or run "
+                    f"with an instrument whose interreflection is off.") from exc
             except Exception as exc:                    # noqa: BLE001  decimation failed
                 raise RadiosityError(f"could not build the radiosity patches: {exc}") from exc
             if len(pf) < 4:

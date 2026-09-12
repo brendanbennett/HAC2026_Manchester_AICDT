@@ -125,6 +125,13 @@ def main() -> None:
                          "convex answer's")
     ap.add_argument("--models", nargs="+", type=int,
                     default=[M for M in range(1, 11) if M not in PUBLIC_MODELS])
+    ap.add_argument("--into", default=None,
+                    help="directory the chosen bodies are written to; by default the one "
+                         "answer_path names, which is the submission itself. Two tracks that "
+                         "both select into it overwrite each other, so give each its own "
+                         "directory and let a person choose between them. A directory other "
+                         "than the default is seeded with the convex answer for every model "
+                         "first, so what it holds is a complete submission either way")
     a = ap.parse_args()
     if a.calibrate is not None and a.ratio is not None:
         raise SystemExit("give either --calibrate, to measure the ratio on a public model, "
@@ -150,10 +157,21 @@ def main() -> None:
               "least as well as the convex answer. Pass --calibrate to require a public "
               "model's own margin as well.", flush=True)
 
-    selection = {"ratio": ratio, "refined_dir": a.refined,
+    into = Path(a.into) if a.into else None
+    if into is not None:
+        into.mkdir(parents=True, exist_ok=True)
+        for M in a.models:
+            src = answer_path(M)
+            dst = into / Path(src).name
+            if not dst.exists():
+                shutil.copyfile(src, dst)
+        print(f"seeded {into} with the convex answer for {len(a.models)} models; what it "
+              f"holds is a complete submission whatever is accepted below", flush=True)
+    selection_file = str(into / "selection.json") if into else SELECTION_FILE
+    selection = {"ratio": ratio, "refined_dir": a.refined, "into": str(into) if into else None,
                  "calibrated_on": a.calibrate, "models": {}}
     for M in a.models:
-        target = answer_path(M)
+        target = str(into / Path(answer_path(M)).name) if into else answer_path(M)
         stl = Path(a.refined) / f"Asteroid{M:02d}.stl"
         js = stl.with_suffix(".json")
         entry = {"answer": "convex"}
@@ -176,8 +194,8 @@ def main() -> None:
                 entry["answer"] = "refined"
         selection["models"][M] = entry
         print(f"model {M:>2}: {entry['answer']:8s} {entry['reason']}", flush=True)
-    Path(SELECTION_FILE).write_text(json.dumps(selection, indent=2))
-    print(f"wrote {SELECTION_FILE}")
+    Path(selection_file).write_text(json.dumps(selection, indent=2))
+    print(f"wrote {selection_file}")
 
 
 if __name__ == "__main__":

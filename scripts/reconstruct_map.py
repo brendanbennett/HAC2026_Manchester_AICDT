@@ -40,7 +40,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from hac26.conventions import CYLINDER_R, PUBLIC_MODELS, psi_grid        # noqa: E402
 from hac26.data_io import N_CAMS, load_inversion_curves, public_stl      # noqa: E402
-from hac26.field import CODE_DIM, EXTRACT_RES, N_DIR                     # noqa: E402
+from hac26.field import (CODE_DIM, EXTRACT_EXTENT, EXTRACT_RES, N_DIR,   # noqa: E402
+                         depth_cap, extract_mesh)
 from hac26.recon import dice, fit_to_cylinder, mesh_occupancy            # noqa: E402
 from hac26.shapes import rescale_touch_z                                 # noqa: E402
 from hac26.solvers.operator import CodeOperator                          # noqa: E402
@@ -49,6 +50,7 @@ from reconstruct import answer_path                                      # noqa:
 from reconstruct_lpd import (curve_pairs, curve_weight, geometry_mask,   # noqa: E402
                              json_default,
                              residual_scale, support_from_convex, whitened_misfit)
+from hac26.solvers.gauss_newton import AREA_WEIGHT, AREA_WINDOW           # noqa: E402
 from train_lpd import INSTRUMENT, RENDER, _enable_tf32, load_instrument   # noqa: E402
 
 OCC_RES = 128         # grid of the Dice reported at the checkpoints
@@ -123,10 +125,22 @@ def main() -> None:
     ap.add_argument("--lr", type=float, default=0.05,
                     help="first trial step, in RMS code units per coordinate; the line search "
                          "adapts it, so it is a starting scale and not a schedule")
-    ap.add_argument("--l2", type=float, default=3e-3,
-                    help="ridge on the depths, the only prior: many coefficients against "
-                         "few curves is not obviously determined, and the ridge stops the fit "
-                         "spending them on noise")
+    ap.add_argument("--l2", type=float, default=0.0,
+                    help="ridge on the depths. Zero by default, and deliberately: a ridge "
+                         "charges a coefficient by how large it is, so it prefers a shallow "
+                         "answer to a deep one and therefore prefers this fit's own answer to "
+                         "the body. The surface area does the work instead, and charges the "
+                         "thing that is actually wrong with a bad answer")
+    ap.add_argument("--area-weight", type=float, default=AREA_WEIGHT,
+                    help="weight of the posed body's surface area in the objective, in "
+                         f"inverse area of the canonical pose; measured window {AREA_WINDOW}")
+    ap.add_argument("--volume-floor", type=float, default=0.50,
+                    help="smallest volume an accepted body may have, as a fraction of the "
+                         "convex answer's; 0 turns the floor off")
+    ap.add_argument("--ckpt-every", type=int, default=25,
+                    help="steps between checkpoints; 0 writes none")
+    ap.add_argument("--no-resume", action="store_true",
+                    help="start from the convex answer even when a checkpoint is there")
     ap.add_argument("--phases", type=int, default=96)
     ap.add_argument("--operator-res", type=int, default=EXTRACT_RES,
                     help="extraction resolution of the descent's operator")
@@ -182,13 +196,62 @@ def main() -> None:
     def cot_fn(cur):
         return 2.0 * w_fit[..., None] * (cur - d_fit) / (s_fit[..., None] ** 2) / n_obs
 
+    if not (a.area_weight == 0.0 or AREA_WINDOW[0] <= a.area_weight <= AREA_WINDOW[1]):
+        raise SystemExit(f"area weight {a.area_weight} is outside the measured window "
+                         f"{AREA_WINDOW}; below it a smooth dent of the size the correction "
+                         f"has is not charged and above it the body stops being the minimum")
+    cap = depth_cap(support.numpy() if hasattr(support, "numpy") else np.asarray(support))
+    floor = [0.0]          # set from the convex answer's own volume, once it is rendered
+
     def objective(z):
-        cur = op.curves(support, z, R, geoms=fit_geoms)
-        if cur is None:
+        """(log chi^2 + weight x area, chi) of the body `z` makes, or (inf, None) when it is
+        not a body.
+
+        The same functional CarveFit minimises, and for the same reason: a ridge on the
+        coefficients charges how large they are, which prefers a shallow answer to a deep one,
+        while the area charges the surface the body actually has. The volume and the area come
+        from the mesh the extraction has already built, so they cost a per cent of the render
+        rather than one of their own.
+
+        The floor on the volume and the star-shaped bound on the depths are refusals here and
+        not clips, because a clipped trial is a different trial and the line search would then
+        be halving a step that no longer means what it takes it to mean.
+        """
+        if float(z[N_DIR:].max()) > cap:
+            return float("inf"), None
+        out = op.curves_with_shape(support, z, R, geoms=fit_geoms)
+        if out is None:
+            return float("inf"), None
+        cur, area, vol = out
+        if vol < floor[0]:
             return float("inf"), None
         chi = whitened_misfit(cur.cpu(), data, scale, fit_geoms, weight)
         ridge = a.l2 * float((z[N_DIR:] ** 2).sum())
-        return chi ** 2 + ridge, chi
+        return float(np.log(max(chi ** 2, 1e-300)) + a.area_weight * area + ridge), chi
+
+    def area_gradient(z):
+        """(area, d area / d z) of the canonically posed body, by autograd through the
+        extraction.
+
+        The extraction's vertices are differentiable in the code, so the area is too. The
+        derivative holds the triangulation fixed while a real step also re-triangulates, so it
+        is a direction rather than an exact derivative -- which is enough, because every trial
+        step is accepted or rejected on the true objective above and not on this."""
+        zz = z.detach().clone().requires_grad_(True)
+        dh, g = zz[:N_DIR], zz[N_DIR:]
+        # op.mesh sets the support on every call; this path builds the mesh itself, so it has
+        # to do the same or the body is whatever the last call left behind
+        op.body.set_support(support.to(dev))
+        m = extract_mesh(lambda y: op.body(y, dh=dh, a=g), EXTRACT_EXTENT,
+                         res=a.operator_res, device=dev, grad=True)
+        if m is None:
+            return None, None
+        vv, ff = m
+        vc = CodeOperator.canonical(vv, ff)
+        p0, p1, p2 = (vc[ff[:, i]] for i in range(3))
+        A = 0.5 * torch.cross(p1 - p0, p2 - p0, dim=1).norm(dim=1).sum()
+        gz, = torch.autograd.grad(A, zz)
+        return float(A), gz.detach()
 
     def held_misfit(operator, z):
         if not held:
@@ -208,11 +271,54 @@ def main() -> None:
     hist, best = [], None
     t0 = time.time()
     step = a.lr
+    start_it, elapsed_before = 0, 0.0
+
+    # The floor is a fraction of the convex answer's own volume, so it is set from the answer
+    # rather than named: the cheapest surface in this representation is a hull shrink and the
+    # misfit barely resists one, so without it the descent walks the volume past the body.
+    out0 = op.curves_with_shape(support, torch.zeros(CODE_DIM, device=dev), R, geoms=fit_geoms)
+    if out0 is None:
+        raise SystemExit("the convex answer does not render; nothing to correct")
+    vol0, area0 = float(out0[2]), float(out0[1])
+    floor[0] = float(a.volume_floor) * vol0
+    print(f"  convex answer: area {area0:.3f}, volume {vol0:.3f}; below {floor[0]:.3f} of "
+          f"volume a body is refused, and the depth may reach {cap:.3f} before the body stops "
+          f"containing its own centre", flush=True)
+
+    ckpt_path = Path(f"{a.out}.map.ckpt") if a.out else None
+    if ckpt_path is not None and ckpt_path.exists() and not a.no_resume:
+        st = torch.load(ckpt_path, map_location=dev, weights_only=False)
+        if st.get("keys") != {"model": a.model, "channel": a.channel,
+                              "operator_res": a.operator_res, "phases": a.phases,
+                              "area_weight": float(a.area_weight)}:
+            print(f"  {ckpt_path} was written under other settings, so it is ignored",
+                  flush=True)
+        else:
+            code = st["code"].to(dev)
+            start_it, step, elapsed_before = int(st["step"]) + 1, float(st["lr"]), float(st["elapsed"])
+            best, hist = st["best"], list(st["hist"])
+            print(f"  resumed {ckpt_path} at step {start_it}", flush=True)
+
+    def save_ckpt(it, lr_now):
+        """Written under a temporary name and renamed, so a kill mid-write leaves the previous
+        checkpoint rather than a truncated one. The descent is hundreds of steps and a body is
+        worth an hour, so losing it to a wallclock is the failure this prevents."""
+        if ckpt_path is None or not a.ckpt_every:
+            return
+        ckpt_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = ckpt_path.with_name(ckpt_path.name + ".part")
+        torch.save({"code": code.detach().cpu(), "step": it, "lr": lr_now, "best": best,
+                    "hist": hist, "elapsed": elapsed_before + (time.time() - t0),
+                    "keys": {"model": a.model, "channel": a.channel,
+                             "operator_res": a.operator_res, "phases": a.phases,
+                             "area_weight": float(a.area_weight)}}, tmp)
+        tmp.replace(ckpt_path)
+
     J, chi = objective(code)
     convex_fit, convex_held = export_misfits(code)
     print(f"  convex answer at export resolution: chi_fit {convex_fit:.3f}"
           + (f"  chi_held {convex_held:.3f}" if held else ""), flush=True)
-    for it in range(a.steps + 1):
+    for it in range(start_it, a.steps + 1):
         if it % a.every == 0 or it == a.steps:
             row = {"step": it, "chi_fit": chi, "objective": J, "step_size": step,
                    "seconds": round(time.time() - t0, 1)}
@@ -222,7 +328,10 @@ def main() -> None:
                 row["convexity"] = convexity(m[0], m[1])
             if held:
                 row["chi_held"] = held_misfit(op, code)
-            if best is None or chi < best["chi_fit"]:
+            # Compared on the functional being minimised and never on the misfit alone.
+            # Between two bodies the misfit prefers the rougher one, which is the comparison
+            # notes/objective.md says may never be made.
+            if best is None or J < best["objective"]:
                 best = {**row, "code": code.detach().clone()}
             hist.append(row)
             print(f"  step {it:>4}  chi_fit {chi:7.3f}"
@@ -237,7 +346,15 @@ def main() -> None:
         if grad is None:
             print("  the body has no curves; stopping", flush=True)
             break
-        grad = grad.detach()
+        # d(log chi^2)/dz is the misfit gradient over chi^2: the adjoint returns the
+        # derivative of chi^2 itself, and the log is what makes the balance against the area
+        # scale free, so that a body whose misfit is ten times smaller is not thereby allowed
+        # ten times the surface.
+        grad = grad.detach() / max(chi ** 2, 1e-12)
+        if a.area_weight:
+            _, g_area = area_gradient(code)
+            if g_area is not None:
+                grad = grad + a.area_weight * g_area
         grad[N_DIR:] += 2.0 * a.l2 * code[N_DIR:]
         # one unit-RMS direction per block, so that neither the few dh coordinates nor the
         # many amplitudes set the step for the other
@@ -260,6 +377,8 @@ def main() -> None:
                 moved = True
                 break
             step *= 0.5
+        if a.ckpt_every and (it + 1) % a.ckpt_every == 0:
+            save_ckpt(it, step)
         if not moved:
             print(f"  no step of size >= {step:.2e} lowers the objective; converged at "
                   f"step {it}", flush=True)
@@ -267,13 +386,24 @@ def main() -> None:
 
     if a.out:
         z = best["code"] if best is not None else code.detach()
+        # The code is written before anything is asked of the mesh. A deeply carved body can
+        # pinch and be refused at the export guard, and losing the coefficients with it means
+        # descending again rather than extracting again.
+        Path(a.out).parent.mkdir(parents=True, exist_ok=True)
+        np.savez(Path(a.out).with_suffix(".code.npz"), code=z.cpu().numpy(),
+                 support=support.cpu().numpy())
         m = posed_mesh(op, support, z, R, EXPORT_RES)
         if m is None:
-            raise SystemExit("the final body is degenerate; nothing written")
+            raise SystemExit("the final body is degenerate; the code is in the .code.npz "
+                             "beside it")
         v, f = m
         fit_x, held_x = export_misfits(z)
-        Path(a.out).parent.mkdir(parents=True, exist_ok=True)
-        rep = export_stl(a.out, v, f)
+        export_error = None
+        try:
+            rep = export_stl(a.out, v, f)
+        except ValueError as exc:
+            export_error, rep = str(exc), {"refused": str(exc)}
+            print(f"  !!! {exc}", flush=True)
         meta = {"model": a.model, "channel": d["channel"], "radius": R, "steps": a.steps,
                 "lr": a.lr, "l2": a.l2, "phases": a.phases, "operator_res": a.operator_res,
                 "export_res": EXPORT_RES, "held_out": held, "history": hist, "export": rep,
@@ -281,11 +411,16 @@ def main() -> None:
                 "chi_fit_export": fit_x, "chi_held_export": held_x,
                 "final_dice": truth_dice(v, f, a.model, a.data_dir),
                 "convex_dice": convex_dice(sup_stl, a.model, a.data_dir),
-                "final_convexity": convexity(v, f)}
+                "final_convexity": convexity(v, f),
+                "area_weight": a.area_weight, "volume_floor": a.volume_floor,
+                "export_refused": export_error}
         Path(a.out).with_suffix(".json").write_text(json.dumps(meta, indent=2,
                                                                default=json_default))
-        np.savez(Path(a.out).with_suffix(".code.npz"), code=z.cpu().numpy(),
-                 support=support.cpu().numpy())
+        if export_error is not None:
+            raise SystemExit(
+                f"model {a.model}: the descent finished and its code is written beside this, "
+                f"but the extracted mesh is not a closed solid and was refused. Re-extract "
+                f"from {Path(a.out).with_suffix('.code.npz')} rather than descending again.")
         print(f"  wrote {a.out}  ({rep['faces']} faces, volume {rep['volume']:.3f}); "
               f"at export resolution chi_fit {fit_x:.3f}"
               + (f", chi_held {held_x:.3f} against the convex answer's {convex_held:.3f}"
