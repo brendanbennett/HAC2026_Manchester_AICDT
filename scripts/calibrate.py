@@ -282,6 +282,16 @@ def print_movement(rep: dict, limit: float = 0.5) -> list:
               f"travel the step budget allows: {', '.join(limited)}.")
         print("  !!! The fit is bounded by --steps, not by the data. Rerun with more steps "
               "(or a larger --lr) until this list is empty before trusting the residuals.")
+        if "raw_eta" in limited:
+            # Said here because the advice above does not apply to this one and would be
+            # followed. eta runs downhill until the likelihood's log term stops it, and on a
+            # channel the chain reproduces closely it wants a smaller value than the floor
+            # the saved instrument will clamp it to. Travel toward a bound is not an
+            # unconverged fit, and no number of steps clears it.
+            print(f"  !!! raw_eta is the exception: the saved instrument floors the model "
+                  f"error at {ETA_FLOOR}, so on a channel whose residual is below that, eta "
+                  f"travels its whole budget toward a bound it cannot pass. Read the eta line "
+                  f"below rather than adding steps for this one.")
     else:
         print("  every parameter settled well inside its budget")
     return limited
