@@ -207,6 +207,18 @@ def main() -> None:
               "model's own margin as well.", flush=True)
 
     into = Path(a.into) if a.into else None
+    # A public model's convex answer is the support every fit of that body starts from and the
+    # baseline every comparison of it is made against (reconstruct.answer_path). Writing a
+    # refinement over it would move the start of the next run and leave the numbers labelled
+    # convex describing a body that is not, so a public model is only ever selected into a
+    # directory named here.
+    public = [M for M in a.models if M in PUBLIC_MODELS]
+    if public and into is None:
+        raise SystemExit(
+            f"model(s) {public} are public, and their answers under results/public are the "
+            f"support every fit starts from and the baseline it is compared with. Give "
+            f"--into to write a chosen body somewhere else; the submission itself is the "
+            f"scored models.")
     if into is not None:
         into.mkdir(parents=True, exist_ok=True)
         for M in a.models:
