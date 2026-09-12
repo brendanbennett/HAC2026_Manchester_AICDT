@@ -603,11 +603,25 @@ def main():
         )
 
         # --------------------------------------------------------
-        # Save solver
+        # Save solver (a resume-from-checkpoint convenience only -- everything else this
+        # checkpoint writes above, STL/curves/Dice/results.json, has already been saved by
+        # this point, so a failure here should not cost any of that)
         # --------------------------------------------------------
 
-        with open(output_dir / "solver.pkl", "wb") as f:
-            cloudpickle.dump(solver, f)
+        try:
+            with open(output_dir / "solver.pkl", "wb") as f:
+                cloudpickle.dump(solver, f)
+        except TypeError as exc:
+            # solver.fitness_fn closes over `forward`, which for --forward-model exact holds
+            # nvdiffrast's live CUDA context (RasterizeCRStateWrapper, a C extension object
+            # with no __reduce__) -- unpicklable by construction, not a bug in this specific
+            # run. Uncaught, this used to kill the whole GA at generation 0's checkpoint,
+            # every time, for every exact-model run: confirmed on 8/10 models of a real
+            # 10-model production run, all stopped dead here.
+            print(f"warning: could not save solver.pkl (the resume-from-checkpoint file) at "
+                 f"generation {generation}: {exc}. Continuing without it -- this run just "
+                 f"cannot be resumed from this checkpoint if interrupted; the STL, curves "
+                 f"and results.json already written above are unaffected.", flush=True)
 
     # ------------------------------------------------------------
     # Genetic optimiser
