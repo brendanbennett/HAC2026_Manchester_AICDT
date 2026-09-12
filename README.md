@@ -75,6 +75,16 @@ calibration, the flow training and the non-convex reconstructions render with it
 submission and the tests do not, since the tests run the same code on a slow pure-torch
 rasteriser.
 
+Both x86 and ARM hosts are handled. The toolchain reads the machine and fetches the CUDA
+redistributable NVIDIA publishes for it, which for an ARM server such as a Grace-Hopper node
+is the one named `linux-sbsa` rather than the `linux-aarch64` that means Jetson. Set
+`TORCH_CUDA_ARCH_LIST` to cover every card the build may land on -- `8.0;8.9;9.0+PTX` spans
+A100, L40S and Hopper -- since an extension built for one card fails at the first kernel
+launch on an older one. The venv and the compiled extension each record the machine they were
+made on and are rebuilt rather than reused when a tree is reached from the other, which a
+shared filesystem makes easy to do by accident. `make check` prints the machine beside the
+torch build.
+
 ## Data
 
 The challenge data is not stored in the repo. Fetch it with

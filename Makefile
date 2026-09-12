@@ -48,8 +48,14 @@ UV   := $(shell command -v uv 2>/dev/null)
 # command line or in the environment, including CUDA=auto) overrides the record and rewrites
 # it; so does deleting the venv.
 # ---------------------------------------------------------------------------
+# The record carries the machine beside the wheel line, so a venv built on one instruction set
+# and reached from another -- which a shared filesystem makes easy -- is rebuilt rather than
+# reused. Only the wheel line is read back as the CUDA choice.
 ifeq ($(origin CUDA),file)
-CUDA_RECORDED := $(shell cat $(TORCH_MARK) 2>/dev/null)
+TORCH_RECORDED := $(shell cat $(TORCH_MARK) 2>/dev/null)
+ifeq ($(word 2,$(TORCH_RECORDED)),$(shell uname -m))
+CUDA_RECORDED := $(word 1,$(TORCH_RECORDED))
+endif
 endif
 
 ifneq ($(CUDA_RECORDED),)
@@ -194,7 +200,7 @@ venv: $(MARK)
 	    fi; \
 	  fi; \
 	fi; \
-	printf '%s\n' "$(TORCH_TAG)" > $(TORCH_MARK)
+	printf '%s\n' "$(TORCH_TAG) $(shell uname -m)" > $(TORCH_MARK)
 	@echo "==> $(VENV) ready: $$($(PY) --version), torch $(TORCH_TAG), extras [$(EXTRAS)]"
 
 $(MARK): pyproject.toml | $(PY)
@@ -231,7 +237,8 @@ check: $(PY)
 	print('torch      ', torch.__version__, '(cuda', torch.version.cuda or 'none', ')'); \
 	print('cuda avail ', torch.cuda.is_available(), \
 	      torch.cuda.get_device_name(0) if torch.cuda.is_available() else ''); \
-	print('mps avail  ', getattr(torch.backends,'mps',None) and torch.backends.mps.is_available())"
+	print('mps avail  ', getattr(torch.backends,'mps',None) and torch.backends.mps.is_available()); \
+	import platform; print('machine    ', platform.machine())"
 	@$(PY) -c "import nvdiffrast; print('nvdiffrast  ok', nvdiffrast.__file__)" 2>/dev/null \
 	  || echo "nvdiffrast  not importable (make toolchain, or run with HAC26_SOFTWARE_RASTER=1)"
 

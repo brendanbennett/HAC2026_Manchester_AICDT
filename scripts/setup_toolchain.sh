@@ -39,13 +39,25 @@ VENV=${VIRTUAL_ENV:-}
 SCRATCH_TMP=${TMPDIR:-/tmp/${USER:-build}}
 mkdir -p "$SCRATCH_TMP"
 
+# NVIDIA publishes a redistributable per platform and names them by its own convention rather
+# than by uname's: an x86 server is linux-x86_64, and an ARM server -- a Grace-Hopper node, say
+# -- is linux-sbsa, which is Server Base System Architecture and not the linux-aarch64 that
+# means Jetson. Reading the key from the machine is what lets one script serve both, and an
+# unknown machine is told so here rather than failing later on a manifest lookup.
+case "$(uname -m)" in
+  x86_64)  CUDA_PLATFORM=linux-x86_64 ;;
+  aarch64) CUDA_PLATFORM=linux-sbsa ;;
+  *) echo "ERROR: no CUDA redistributable is known for $(uname -m). The platforms this" >&2
+     echo "       script handles are x86_64 and aarch64." >&2; exit 1 ;;
+esac
+
 $PYBIN -c 'import torch' >/dev/null 2>&1 || {
   echo "ERROR: torch is not importable with $PYBIN. Run \`make venv CUDA=12\` (or 13) first," >&2
   echo "       then \`make toolchain\`." >&2; exit 1; }
 
 mkdir -p "$CUDA" "$SCRATCH_TMP/cudadl" && cd "$SCRATCH_TMP/cudadl"
 for c in cuda_nvcc cuda_cudart cuda_cccl; do
-  p=$(curl -s "$REDIST/redistrib_$CUDA_VER.json" | $PYBIN -c "import json,sys;print(json.load(sys.stdin)['$c']['linux-x86_64']['relative_path'])")
+  p=$(curl -s "$REDIST/redistrib_$CUDA_VER.json" | $PYBIN -c "import json,sys;print(json.load(sys.stdin)['$c']['$CUDA_PLATFORM']['relative_path'])")
   [ -f "$(basename "$p")" ] || curl -sL "$REDIST/$p" -o "$(basename "$p")"
   tar -xf "$(basename "$p")"
 done
@@ -134,7 +146,11 @@ printf '%s' "$USED" | sed 's/^/  /' >&2
 # made on one card and run on an older one fails at the first kernel launch.
 BUILT_FOR=$($PYBIN -c 'import sys, torch; print("torch", torch.__version__, "cuda", \
     torch.version.cuda, "python", "%d.%d" % sys.version_info[:2])')
-BUILT_FOR="$BUILT_FOR arch ${TORCH_CUDA_ARCH_LIST:-visible}"
+# The machine belongs in the record for the same reason the torch build does. A tree shared
+# between an x86 cluster and an ARM one -- over a filesystem, or by copying a checkout -- would
+# otherwise reuse an extension built for the other instruction set, and the failure is an
+# import error naming a symbol rather than the machine.
+BUILT_FOR="$BUILT_FOR arch ${TORCH_CUDA_ARCH_LIST:-visible} machine $(uname -m)"
 STAMP=$SRC/.hac26-build
 rm -f "$SRC/.hac26-mathinc"                # the record before torch was part of it
 if [ "$(cat "$STAMP" 2>/dev/null)" != "$BUILT_FOR
