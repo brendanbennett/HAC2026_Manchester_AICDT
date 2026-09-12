@@ -97,3 +97,51 @@ def test_a_common_offset_is_reported_on_every_azimuth():
                                         torch.ones(28, dtype=torch.bool),
                                         torch.full((28, 2), 0.01))
     assert len(set(off.values())) == 1 and abs(list(off.values())[0] - 3.75) < 0.5, off
+
+
+def test_the_worst_residual_masks_geometries_and_not_columns():
+    """A curve carries a geometry, a column and a phase, and `present` is one flag per
+    geometry, so the mask belongs on the first axis. Broadcast from the right it meets the
+    column axis instead, which raises on this rig and would silently mask the wrong thing on
+    one where the two counts happened to agree.
+
+    The result has to be shaped like the model error it is compared against, one number per
+    geometry and column, and a geometry that was never recorded has to contribute nothing.
+    """
+    from hac26.data_io import N_CAMS
+    P = 48
+    g = torch.Generator().manual_seed(0)
+    pred = torch.randn(N_CAMS, 2, P, generator=g)
+    real = torch.randn(N_CAMS, 2, P, generator=g)
+    present = torch.zeros(N_CAMS, dtype=torch.bool)
+    present[:21] = True                    # what the Blender channel leaves on model 1
+
+    out = calibrate.curve_residual(pred, real, present)
+    assert out.shape == (N_CAMS, 2)
+    assert bool((out[21:] == 0).all()), "an unrecorded geometry contributed a residual"
+    assert bool((out[:21] > 0).all())
+
+    ref = torch.zeros(N_CAMS, 2)
+    for i in range(N_CAMS):
+        if present[i]:
+            ref[i] = (pred[i] - real[i]).pow(2).mean(-1).sqrt()
+    assert torch.allclose(out, ref, atol=1e-6)
+    # zeroing is what lets the caller take a maximum over bodies: a geometry with no data can
+    # never win one, so it never raises the model error a curve is given
+    assert float(out.max()) == float(out[:21].max())
+
+
+def test_a_channel_with_no_independent_pair_still_calibrates():
+    """The A/B mismatch is the disagreement between two independent recordings of the body in
+    its two mountings. A deterministic render has no second recording -- the duplicated column
+    comes back identical and the duplicate drop then leaves no pair with both columns -- so
+    the quantity is undefined rather than small. It is a diagnostic, printed beside the noise
+    and entering neither the fit nor the model error, so measuring it is what may fail and the
+    calibration is what must not."""
+    import numpy as np
+    from hac26.data_io import N_CAMS
+    from hac26.noise import ab_mismatch
+    curves = np.random.default_rng(0).normal(size=(2 * N_CAMS, 48))
+    with pytest.raises(ValueError):
+        ab_mismatch(curves, np.zeros(2 * N_CAMS))
+    assert np.isfinite(ab_mismatch(curves, np.ones(2 * N_CAMS))).all()

@@ -111,7 +111,16 @@ def load_data(data_dir: str, model: int, phases: int, device: str, channel: str 
     pairs = np.stack([d["curves"][:N_CAMS], d["curves"][N_CAMS:]], axis=1)
     present = (d["mask"][:N_CAMS] > 0) & (d["mask"][N_CAMS:] > 0)
     sigma = native_sigma(d).reshape(2, N_CAMS).T
-    mismatch = ab_mismatch(d["curves"], d["mask"]).reshape(2, N_CAMS).T
+    # The mismatch is a diagnostic and is printed beside sigma; it enters neither the fit nor
+    # eta. It is the disagreement between two independent recordings of the body in its two
+    # mountings, and a deterministic render has no second recording: the organisers' Blender
+    # files reproduce the duplicated column exactly, so the duplicate drop leaves no pair with
+    # both columns and there is nothing to measure. That is a property of a synthetic channel,
+    # not a fault in the data, so it is reported as unavailable and the fit goes on.
+    try:
+        mismatch = ab_mismatch(d["curves"], d["mask"]).reshape(2, N_CAMS).T
+    except ValueError:
+        mismatch = np.full((N_CAMS, 2), np.nan, dtype=np.float32)
     return (torch.tensor(pairs, dtype=torch.float32, device=device),
             torch.tensor(present, device=device),
             torch.tensor(sigma, dtype=torch.float32, device=device),
@@ -149,6 +158,20 @@ def likelihood_cotangent(raw, body, eta):
     the normalised curves, taken back through the normalisation."""
     _, cot = nll(normalise(raw), body["real"], body["present"], body["sigma"], eta)
     return normalise_vjp(raw, cot)
+
+
+def curve_residual(pred, real, present) -> torch.Tensor:
+    """RMS residual of every curve over the phases, in curve units, as (N_CAMS, 2), with the
+    geometries that were not measured contributing zero.
+
+    `present` says which geometry was recorded, one flag per geometry, while the curves carry
+    a geometry, a column and a phase. The mask therefore belongs on the first axis; broadcast
+    from the right it would meet the column axis instead, which is the shape this function
+    exists to keep in one place. Zero rather than dropped because the caller takes a maximum
+    over bodies, and a geometry with no data can never win one.
+    """
+    r = (pred - real) * present[:, None, None]
+    return r.pow(2).mean(-1).sqrt()
 
 
 def residual_report(pred, real, present, sigma, eta) -> dict:
@@ -353,8 +376,11 @@ def main():
                          sigma=sigma,
                          psi0=torch.tensor(psi0, device=dev, requires_grad=True))
         print(f"  model {M}: {len(faces)} faces, {int(present.sum())}/{N_CAMS} geometries, "
-              f"noise median {float(sigma.median()):.4f} (A/B mismatch "
-              f"{float(mismatch.median()):.4f}, {float(mismatch.median()/sigma.median()):.0f}x), "
+              f"noise median {float(sigma.median()):.4f} ("
+              + ("A/B mismatch not measurable: no geometry has two independent recordings"
+                 if bool(torch.isnan(mismatch).all()) else
+                 f"A/B mismatch {float(mismatch.median()):.4f}, "
+                 f"{float(mismatch.median()/sigma.median()):.0f}x") + "), "
               f"start phase {np.degrees(psi0):+.1f} deg ({time.time()-t0:.0f}s)", flush=True)
 
     opt = torch.optim.Adam([{"params": fit_params + [inst.raw_eta]},
@@ -422,8 +448,8 @@ def main():
             report["psi0_deg"][M] = float(np.degrees(float(b["psi0"])))
             report["phase_offset_deg"][M] = phase_offset_report(
                 pred, b["real"], b["present"], b["sigma"])
-            r = (pred - b["real"]) * b["present"][..., None]
-            worst_eta = torch.maximum(worst_eta, r.pow(2).mean(-1).sqrt())
+            worst_eta = torch.maximum(worst_eta,
+                                      curve_residual(pred, b["real"], b["present"]))
         # The likelihood fits one eta per curve across the bodies, which is near the pooled
         # residual and therefore under-covers the worst of them. What a curve's model error
         # has to cover is the worst body the method will meet, and three public bodies are
