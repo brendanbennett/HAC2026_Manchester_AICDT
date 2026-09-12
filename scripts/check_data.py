@@ -18,7 +18,10 @@ The manifest records paths under `data/raw/`; the README puts the data in `datas
     python scripts/check_data.py --write               # regenerate the manifest from what is
                                                        # on disk, after a deliberate refresh
 
-Exits non-zero if anything is missing or has changed.
+Exits non-zero when a file the repository reads is missing or has changed. The download also
+carries videos and prose that nothing here opens, and a mismatch in those is printed and
+passed over: a reworded Readme is not a data change, and a run that stopped for one would be
+stopping on something it never reads.
 """
 from __future__ import annotations
 
@@ -29,6 +32,23 @@ from pathlib import Path
 
 MANIFEST = Path("dataset/MANIFEST.sha256")
 PREFIX = "data/raw/"          # the path prefix the manifest was written with
+
+
+def is_read(rel: str) -> bool:
+    """Whether anything in this repository opens the file, which is what decides whether a
+    mismatch against the manifest is fatal.
+
+    The curves are what every fit is measured against and the released meshes are what the
+    public scores are measured against, so a changed or missing one of those invalidates a
+    run: `data_io.load_model_curves` reads the first and `data_io.public_stl` the second.
+    Nothing here opens the rest of the download -- the videos, the prose -- so a mismatch in
+    it is worth printing and cannot invalidate anything. The distinction is made here rather
+    than by editing the manifest, because a prose file the organisers reword is not a data
+    change and refreshing the manifest each time would train the operator to adopt whatever
+    is on disk.
+    """
+    name = Path(rel).name.lower()
+    return "_lightcurve_" in name or name.endswith((".stl", ".msh"))
 
 
 def sha256(path: Path, chunk: int = 1 << 20) -> str:
@@ -92,18 +112,25 @@ def main() -> int:
     print(f"{ok} of {ok + len(missing) + len(changed)} files match {a.manifest}")
     for label, items in (("missing", missing), ("changed", changed), ("not in the manifest", extra)):
         if items:
-            print(f"\n{len(items)} {label}:")
-            for s in items[:20]:
-                print(f"   {s}")
+            read = [q for q in items if is_read(q)]
+            print(f"\n{len(items)} {label}"
+                  + (f", {len(read)} of them read by this repository" if read and
+                     len(read) != len(items) else "") + ":")
+            for q in items[:20]:
+                print(f"   {q}" + ("" if is_read(q) else "   (not read here)"))
             if len(items) > 20:
                 print(f"   ... and {len(items) - 20} more")
+    fatal = [q for q in missing + changed if is_read(q)]
     if changed:
         print("\nA changed file is either a download the organisers have since replaced or a\n"
               "manifest entry that was never refreshed. Check the challenge page's News &\n"
               "Updates before assuming the manifest is right, then rerun with --write.")
-    if missing or changed:
-        print("\nThe calibration and everything downstream of it read these files.")
+    if fatal:
+        print(f"\n{len(fatal)} of these {'is' if len(fatal) == 1 else 'are'} read by the "
+              f"calibration and everything downstream of it.")
         return 1
+    if missing or changed:
+        print("\nNone of these is read by anything here, so nothing downstream is affected.")
     return 0
 
 

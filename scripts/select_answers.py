@@ -125,6 +125,17 @@ def decide(meta: dict, ratio: float) -> tuple:
         return False, "the written body has no held-out misfit"
     if not base:
         return False, "the convex answer has no held-out number to compare with"
+    # Where the truth is released, it decides, and no misfit argues with it. A refinement
+    # that fit the curves better while moving away from the shape is the failure this gate
+    # exists to catch -- the same failure calibrated_ratio refuses to take a ratio from --
+    # and on a body whose convex answer is already close to its hull there is no concavity to
+    # find, so the objective buys its misfit with overlap. Both numbers are nan for a scored
+    # model, where there is no truth to appeal to, and the check is then silent.
+    dice, base_dice = meta.get("final_dice"), meta.get("convex_dice")
+    if dice is not None and base_dice is not None and dice == dice and base_dice == base_dice:
+        if dice <= base_dice:
+            return False, (f"the released truth says otherwise: the refinement took the "
+                           f"overlap from {base_dice:.4f} to {dice:.4f}")
     got = held / base
     if held > ratio * base:
         return False, (f"held out {got:.3f} of the convex answer's number, above the "

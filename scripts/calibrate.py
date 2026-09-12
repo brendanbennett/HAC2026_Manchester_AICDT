@@ -40,6 +40,12 @@ prints how far every parameter travelled against its budget, naming the ones tha
 moving. Read that table before the residuals: while it names anything, the residuals are
 those of a truncated fit.
 
+The fit is hours and everything downstream needs the instrument it writes, so it checkpoints
+every --ckpt-every steps to --ckpt-file (default <--out>.ckpt) and resumes from it by default,
+carrying the optimiser, the start phases and the likelihood history, so a resumed run stops on
+the same plateau an uninterrupted one would. --time-budget stops it between steps and then
+writes the instrument it had reached, which a run killed by a wallclock does not.
+
 Writes the Instrument to models/instrument_calibration.pt, and the fitted psi0 per body with
 the per-geometry residual report and the movement table to
 models/instrument_calibration.json. The residual at the true shape divided by the noise, per
@@ -338,6 +344,19 @@ def main():
                     help="geometries per rendering batch")
     ap.add_argument("--truth-faces", type=int, default=TRUTH_FACES,
                     help="faces the released meshes are decimated to before rendering")
+    ap.add_argument("--time-budget", type=float, default=0.0,
+                    help="seconds after which the fit stops between steps and writes the "
+                         "instrument it has reached; 0 is no budget. A fit killed by a "
+                         "wallclock instead writes nothing at all, and everything downstream "
+                         "needs an instrument to load")
+    ap.add_argument("--ckpt-every", type=int, default=25,
+                    help="steps between checkpoints; 0 writes none, which loses the fit to a "
+                         "wallclock")
+    ap.add_argument("--ckpt-file", default=None,
+                    help="resumable checkpoint; by default <--out>.ckpt")
+    ap.add_argument("--no-resume", action="store_true",
+                    help="start from the channel's own starting instrument even when a "
+                         "checkpoint for these settings is there")
     ap.add_argument("--height", type=int, default=render.height,
                     help="sensor image height; with --width and --sun-res, a lower value "
                          "checks the wiring on a CPU and is not a calibration")
@@ -406,19 +425,67 @@ def main():
     if render_fitted:
         groups.append({"params": [b["psi0"] for b in bodies.values()], "lr": a.lr / 10})
     opt = torch.optim.Adam(groups, lr=a.lr)
+
+    # The fit is hours and everything downstream needs the instrument it writes, so a run
+    # killed by a wallclock must not leave nothing behind. What is checkpointed is the
+    # instrument, the start phases, the optimiser and the likelihood history: with the
+    # history, a resumed run stops on the same plateau an uninterrupted one would, rather
+    # than restarting a patience window that has already been spent. --steps is deliberately
+    # not part of the identity, because raising the cap and continuing is a thing to want; it
+    # only changes the travel budget the report is read against, which the report states.
+    ckpt_path = Path(a.ckpt_file or f"{a.out}.ckpt")
+    keys = {"channel": a.channel, "models": list(a.models), "phases": int(a.phases),
+            "truth_faces": int(a.truth_faces), "lr": float(a.lr),
+            "render": f"{render.height}x{render.width}x{render.sun_res}"}
+    history, start_step, elapsed_before = [], 0, 0.0
+    if ckpt_path.exists() and not a.no_resume:
+        st = torch.load(ckpt_path, map_location=dev, weights_only=False)
+        if st.get("keys") != keys:
+            print(f"  {ckpt_path} was written under other settings, so it is ignored and the "
+                  f"fit starts from the channel's own start", flush=True)
+        else:
+            inst.load_state_dict(st["instrument"])
+            opt.load_state_dict(st["opt"])
+            with torch.no_grad():
+                for M, b in bodies.items():
+                    if str(M) in st["psi0"]:
+                        b["psi0"].copy_(torch.as_tensor(st["psi0"][str(M)], device=dev))
+            history = list(st["history"])
+            start_step, elapsed_before = int(st["step"]) + 1, float(st["elapsed"])
+            print(f"  resumed {ckpt_path} at step {start_step} of {a.steps} "
+                  f"({elapsed_before:.0f}s of fitting before this run)", flush=True)
+
+    def save_ckpt(step: int) -> None:
+        """Written under a temporary name and renamed, so a kill mid-write leaves the
+        previous checkpoint rather than a truncated one."""
+        if not a.ckpt_every:
+            return
+        ckpt_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = ckpt_path.with_name(ckpt_path.name + ".part")
+        torch.save({"keys": keys, "instrument": inst.state_dict(), "opt": opt.state_dict(),
+                    "psi0": {str(M): float(b["psi0"]) for M, b in bodies.items()},
+                    "history": history, "step": step,
+                    "elapsed": elapsed_before + (time.time() - t_fit)}, tmp)
+        tmp.replace(ckpt_path)
     # raw-space starting point and travel budget of everything being fitted, for the
     # convergence report at the end
     named = {n: p for n, p in inst.fitted_parameters()}
     named["raw_eta"] = inst.raw_eta
     if render_fitted:
         named.update({f"psi0[{M}]": b["psi0"] for M, b in bodies.items()})
+    # The travel is measured from where this run started, which on a resumed run is the
+    # checkpointed instrument and not the channel's own start, so the budget it is read
+    # against is this run's steps and not every run's.
     start = {n: p.detach().clone() for n, p in named.items()}
-    budget = {n: a.steps * (a.lr / 10 if n.startswith("psi0") else a.lr) for n in named}
+    per_step = {n: (a.lr / 10 if n.startswith("psi0") else a.lr) for n in named}
+    steps_before = len(history)
+    t_fit = time.time()
 
     print(f"[fit] up to {a.steps} steps over {len(bodies)} bodies at {a.phases} phases "
-          f"(early stop: -logL improving by < {a.tol:g} over {a.patience} steps)", flush=True)
-    history = []
-    for step in range(a.steps):
+          f"(early stop: -logL improving by < {a.tol:g} over {a.patience} steps)"
+          + (f", time budget {a.time_budget:.0f}s" if a.time_budget else ""), flush=True)
+    stopped_on_time = False
+    for step in range(start_step, a.steps):
         opt.zero_grad()
         total = 0.0
         for M, b in bodies.items():
@@ -448,9 +515,22 @@ def main():
         if len(history) > a.patience and min(history[:-a.patience]) - mean_loss < a.tol:
             print(f"  stopped at step {step}: -logL improved by less than {a.tol:g} over the "
                   f"last {a.patience} steps", flush=True)
+            save_ckpt(step)
+            break
+        if a.ckpt_every and (step + 1) % a.ckpt_every == 0:
+            save_ckpt(step)
+        if a.time_budget and elapsed_before + (time.time() - t_fit) > a.time_budget:
+            # The report and the save below run either way, so stopping here writes the
+            # instrument the fit has reached rather than losing it. The checkpoint stays, so
+            # a later run continues from this step instead of starting over.
+            print(f"  the time budget stopped the fit at step {step}, with -logL at "
+                  f"{mean_loss:.4f}; the instrument it had reached is written and "
+                  f"{ckpt_path} continues it", flush=True)
+            save_ckpt(step)
+            stopped_on_time = True
             break
     steps_run = len(history)
-    budget = {n: v * steps_run / a.steps for n, v in budget.items()}
+    budget = {n: v * max(steps_run - steps_before, 1) for n, v in per_step.items()}
 
     print("\n[report] RMS residual at the true shape, per geometry (azimuth:value)")
     print("    /sigma  against the measurement noise alone")
@@ -460,7 +540,9 @@ def main():
     report = {"channel": a.channel, "models": a.models,
               "psi0_deg": {}, "residual": {}, "phase_offset_deg": {},
               "instrument": inst.summary(),
-              "steps_run": steps_run, "movement": moved, "budget_limited": limited}
+              "steps_run": steps_run, "steps_before_this_run": steps_before,
+              "stopped_on_time": stopped_on_time,
+              "movement": moved, "budget_limited": limited}
     with torch.no_grad():
         eta = inst.eta.reshape(2, N_CAMS).T
         worst_eta = torch.zeros_like(eta)

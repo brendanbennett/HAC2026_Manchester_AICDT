@@ -102,3 +102,20 @@ def test_a_run_that_held_out_nothing_is_not_a_candidate_to_rank_above_one_that_d
     cs = candidates([tmp_path / "all", tmp_path / "held"], 4, 1.0)
     accepted = [Path(c["dir"]).name for c in cs if c["accept"]]
     assert accepted == ["held"]
+
+
+def test_a_released_truth_overrules_the_misfit():
+    """On a public body the truth is known, and a refinement that fit the curves better while
+    moving away from the shape is the failure this gate exists to catch. Measured on model 1,
+    whose convex answer already overlapped its truth at 0.983: the refinement improved the
+    held-out misfit by a third and took the overlap to 0.647."""
+    better = {"held_out": [0, 27], "chi_held_convex": 3.8906, "chi_held_export": 2.5075,
+              "convex_dice": 0.9831, "final_dice": 0.6474}
+    assert not decide(better, 1.0)[0]
+    assert "0.9831 to 0.6474" in decide(better, 1.0)[1]
+    # the same numbers with the overlap improving are accepted
+    assert decide({**better, "final_dice": 0.9900}, 1.0)[0]
+    # and a scored model has no truth to appeal to, so the check says nothing there
+    assert decide({**better, "convex_dice": float("nan"),
+                   "final_dice": float("nan")}, 1.0)[0]
+    assert decide({k: v for k, v in better.items() if "dice" not in k}, 1.0)[0]

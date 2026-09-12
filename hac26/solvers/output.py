@@ -199,6 +199,29 @@ def restore_constraints(verts: np.ndarray, radius: float, tol: float = 0.03) -> 
     return v
 
 
+def edge_census(mesh) -> dict:
+    """How many edges the mesh has too few or too many faces on, and its Euler
+    characteristic.
+
+    A mesh that is not watertight while every repair reports success says nothing about why,
+    and the two reasons are different repairs: an edge with one face is a hole, which
+    fill_holes closes when it can find the loop, and an edge with more than two is a pinch,
+    which only dropping faces opens. Counting both, and the Euler characteristic beside them,
+    turns that silence into a number to act on. A closed surface of genus zero has
+    characteristic two and no edge off two faces.
+    """
+    import numpy as np
+    try:
+        faces = np.asarray(mesh.faces)
+        e = np.sort(faces[:, [0, 1, 1, 2, 2, 0]].reshape(-1, 2), axis=1)
+        _, counts = np.unique(e, axis=0, return_counts=True)
+        return {"edges_with_one_face": int((counts == 1).sum()),
+                "edges_over_two_faces": int((counts > 2).sum()),
+                "euler_characteristic": int(len(mesh.vertices) - len(counts) + len(faces))}
+    except Exception:                       # a diagnostic must never be the thing that fails
+        return {}
+
+
 def export_stl(path: str, verts: np.ndarray, faces: np.ndarray,
                strict: bool = True) -> dict:
     """Write a watertight binary STL with outward normals; returns a report of the repairs.
@@ -261,7 +284,8 @@ def export_stl(path: str, verts: np.ndarray, faces: np.ndarray,
               "faces": int(len(m.faces)), "degenerate_faces_dropped": n_degenerate,
               "nonmanifold_faces_dropped": n_nonmanifold,
               "components_dropped": n_dropped, "filled_holes": filled,
-              "winding_consistent": bool(m.is_winding_consistent)}
+              "winding_consistent": bool(m.is_winding_consistent),
+              **edge_census(m)}
     if strict and not (report["watertight"] and report["volume"] > 0.0):
         raise ValueError(f"refusing to write {path}: not a closed solid -- the mesh is not a "
                          f"single watertight body of positive volume after repair "

@@ -40,7 +40,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from check_data import entries, sha256                              # noqa: E402
+from check_data import entries, is_read, sha256                     # noqa: E402
 
 # The organisers' shared folder, from the challenge page's "Get the data" link.
 DROPBOX_URL = ("https://www.dropbox.com/scl/fo/gcqw0ffbt2xa6vfzlhu51/"
@@ -123,14 +123,19 @@ def flatten(root: Path) -> str | None:
 
 
 def report(root: Path, manifest: Path) -> int:
-    """Verify and print; 0 if everything matches."""
+    """Verify and print; 0 unless a file this repository reads is missing or changed.
+
+    The download carries videos and prose that nothing here opens (check_data.is_read), and a
+    mismatch in those is printed and passed over rather than stopping a run that never reads
+    them.
+    """
     ok, missing, changed = verify(root, manifest)
     print(f"\n{ok} of {ok + len(missing) + len(changed)} files match {manifest}")
     for label, items in (("missing", missing), ("changed", changed)):
         if items:
             print(f"{len(items)} {label}:")
             for rel in items[:20]:
-                print(f"   {rel}")
+                print(f"   {rel}" + ("" if is_read(rel) else "   (not read here)"))
             if len(items) > 20:
                 print(f"   ... and {len(items) - 20} more")
     if changed:
@@ -138,7 +143,13 @@ def report(root: Path, manifest: Path) -> int:
               "manifest was written or a manifest entry that was never refreshed. Check the\n"
               "challenge page's News & Updates, then regenerate with\n"
               "  python scripts/check_data.py --write")
-    return 0 if not (missing or changed) else 1
+    fatal = [rel for rel in missing + changed if is_read(rel)]
+    if missing or changed:
+        print(f"\n{len(fatal)} of these {'is' if len(fatal) == 1 else 'are'} read by the "
+              f"calibration and everything downstream of it."
+              if fatal else
+              "\nNone of these is read by anything here, so nothing downstream is affected.")
+    return 1 if fatal else 0
 
 
 def main() -> int:
@@ -165,10 +176,10 @@ def main() -> int:
                                       if not p.name.startswith("."))
     if present and a.manifest.exists() and not a.force:
         ok, missing, changed = verify(a.dest, a.manifest)
-        if not missing and not changed:
-            print(f"{ok} files in {a.dest} already match {a.manifest}; nothing to do "
-                  f"(--force to re-download).")
-            return 0
+        if not [rel for rel in missing + changed if is_read(rel)]:
+            print(f"{ok} files in {a.dest} match {a.manifest}, and nothing this repository "
+                  f"reads is missing or changed; nothing to do (--force to re-download).")
+            return report(a.dest, a.manifest) if (missing or changed) else 0
         # Report and stop. The download is several gigabytes and this is the case where
         # something is already there, so re-fetching it is the caller's decision to make and
         # not a side effect of running a check. It is also not always the right fix: a
