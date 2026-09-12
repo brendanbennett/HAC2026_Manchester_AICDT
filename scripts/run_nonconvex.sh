@@ -90,6 +90,10 @@ else
 fi
 
 dir_of() { case "$1" in gn) echo "$GN_DIR" ;; map) echo "$MAP_DIR" ;; esac; }
+for track in $TRACKS; do
+  [ -n "$(dir_of "$track")" ] || {
+    echo "TRACKS=$TRACKS: '$track' is not a solver here; expected gn or map" >&2; exit 1; }
+done
 
 failed=""
 # One body of one track. A body already written against this instrument is left alone; the
@@ -149,5 +153,12 @@ $PY scripts/select_answers.py --refined $DIRS --models $SCORED
 
 echo "=== check the submission $(date)"
 $PY scripts/check_submission.py results/submission
-[ -n "$failed" ] && echo "=== bodies that failed and left the convex answer standing:$failed"
+checked=$?
+if [ -n "$failed" ]; then
+  echo "=== bodies that failed and left the convex answer standing:$failed"
+fi
 echo "=== done $(date)"
+# The submission's own verdict is this script's: a tree with a file that would be read inside
+# out is the one failure a caller must not be able to miss. A body that failed to fit is not
+# that -- the convex answer stands for it and the tree is still a submission.
+exit "$checked"

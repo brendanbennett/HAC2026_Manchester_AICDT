@@ -1,5 +1,7 @@
 #!/bin/bash --login
-# hac26 full pipeline on CSF3, branch facet-radiance-surrogate, N_BODIES=1500.
+# hac26 full pipeline on CSF3: whatever branch is checked out, at N_BODIES=1500.
+# The branch is not named here because the job runs the working tree it is submitted
+# from, and a name written here goes stale the moment the work moves.
 #
 #   ./submit_csf3.sh                            # gpuA (A100 80GB), 4-day limit
 #   CSF_PARTITION=gpuH_short ./submit_csf3.sh   # H200, 1-day limit

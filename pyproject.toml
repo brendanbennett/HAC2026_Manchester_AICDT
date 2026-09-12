@@ -24,6 +24,11 @@ dependencies = [
 torch = ["torch>=2.1"]
 test = ["pytest>=7.0"]
 pipeline = ["torch>=2.1"]
+# What scripts/setup_toolchain.sh needs to build nvdiffrast. torch's extension builder
+# compiles with ninja when it finds one on PATH and falls back to one file at a time when it
+# does not, which is the difference between a build of a minute and a build of many; the
+# Makefile installs this extra by default and the script prints what to do when it is absent.
+toolchain = ["ninja"]
 
 [tool.setuptools]
 packages = ["hac26"]
