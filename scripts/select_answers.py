@@ -110,15 +110,27 @@ def calibrated_ratio(meta: dict) -> float:
 
 def decide(meta: dict, ratio: float) -> tuple:
     """(accept, reason) for one refinement's JSON. A refinement fitted without held-out
-    geometries has no honest number and is refused."""
+    geometries has no honest number and is refused.
+
+    The reason names the fraction of the convex answer's number the refinement reached, and
+    not the two numbers themselves: under the penalised objective they are exponentials
+    carrying the body's area as well as its misfit, so their size means nothing on its own
+    and printing them invites reading an area as a misfit. The numbers are in the selection
+    file for anyone who wants them, with the plain misfits beside them.
+    """
     held, base = held_pair(meta)
     if not meta.get("held_out"):
         return False, "no geometries were held out of the fit"
     if held is None or base is None or not (held < float("inf")):
         return False, "the written body has no held-out misfit"
+    if not base:
+        return False, "the convex answer has no held-out number to compare with"
+    got = held / base
     if held > ratio * base:
-        return False, f"held out {held:.3f} above {ratio:g} x the convex answer's {base:.3f}"
-    return True, f"held out {held:.3f} at or below {ratio:g} x the convex answer's {base:.3f}"
+        return False, (f"held out {got:.3f} of the convex answer's number, above the "
+                       f"{ratio:g} this run accepts")
+    return True, (f"held out {got:.3f} of the convex answer's number, at or below the "
+                  f"{ratio:g} this run accepts")
 
 
 def candidates(dirs, model: int, ratio: float) -> list:

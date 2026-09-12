@@ -367,7 +367,9 @@ def main() -> None:
         tmp.replace(ckpt_path)
 
     elapsed_before = float(st["elapsed"])
-    gate.renders = int(st["renders"])
+    # added to, not replaced: this run has already rendered the convex answer once, and the
+    # count the checkpoint carries is what every run before it spent
+    gate.renders += int(st["renders"])
     refused_volume[0] = int(st["refused_volume"])
 
     def out_of_time() -> bool:
@@ -429,7 +431,7 @@ def main() -> None:
         so that the designed ladder stays the one thing a reader of gauss_newton.py sees, and
         a shortened run is visibly a shortened run."""
         if a.max_degree:
-            kept = tuple(st for st in stages if st.degree and st.degree <= a.max_degree)
+            kept = tuple(sg for sg in stages if sg.degree and sg.degree <= a.max_degree)
             stages = kept or (Stage(a.max_degree, stages[0].n_dirs, stages[0].iters),)
         if not a.max_stage_iters:
             return stages
