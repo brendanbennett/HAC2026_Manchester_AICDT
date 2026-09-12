@@ -117,15 +117,22 @@ def test_a_count_curve_that_collapses_to_zero_is_refused():
     facet is bright enough. Model 2's released count curves do that; no other model's do, and
     the geometry keeps its intensity curve either way."""
     from hac26.data_io import count_curve_is_usable
-    from reconstruct_lpd import curve_weight, geometry_mask
+    from reconstruct_lpd import curve_weight, geometry_mask, measured_geometries
 
     cube = load_inversion_curves(DATA, 2, m=48, channel="blender")
     assert len(cube["count_curves_refused"]) == 18
     assert all(c >= N_CAMS for c in cube["count_curves_refused"])
-    # the intensity curves survive and every geometry is still fitted on something
-    assert int(geometry_mask(cube["mask"]).sum()) == 21
     w = curve_weight(cube["mask"])
     assert float(w[:, 0].sum()) == 21.0 and float(w[:, 1].sum()) == 8.0
+    # The intensity curves survive, and a solver fits every geometry that has one: it selects
+    # curves one at a time through curve_weight, so a geometry with one good curve is a
+    # geometry with a measurement in it.
+    assert len(measured_geometries(cube["mask"])) == 21
+    # The flow's conditioning cannot say that: it has one flag per geometry, so a geometry
+    # marked present with an absent curve would show the network a zero residual there and
+    # read as a perfect fit. It therefore requires both curves, and on this body that is
+    # eight geometries rather than twenty-one.
+    assert int(geometry_mask(cube["mask"]).sum()) == 8
 
     for model in (1, 3, 4, 5, 6, 7, 8, 9, 10):
         d = load_inversion_curves(DATA, model, m=48, channel="blender")
@@ -133,3 +140,24 @@ def test_a_count_curve_that_collapses_to_zero_is_refused():
 
     assert count_curve_is_usable(np.array([0.9, 1.0, 1.1]))
     assert not count_curve_is_usable(np.array([0.0, 0.0, 3.0]))
+
+
+def test_the_held_out_cameras_are_a_fixed_spread_over_the_camera_ordering():
+    """Which cameras a fit is tested on is part of the measurement: two runs of one body have
+    to be tested on the same ones or their numbers do not compare, and the held-out set has
+    to span the viewing geometries or the test is concentrated in one corner of them."""
+    from hac26.conventions import cameras
+    from hac26.data_io import held_out_geoms
+    cams = cameras()
+    present = [i for i in range(len(cams)) if cams[i].kind != "hor_b"]
+    held = held_out_geoms(present, 5)
+    assert held == held_out_geoms(present, 5)                 # fixed
+    assert len(held) == 5 and set(held) <= set(present)
+    assert len({cams[i].azimuth_deg for i in held}) == 5      # five different azimuths
+    assert len({cams[i].kind for i in held}) > 1              # and not one camera kind
+    assert held_out_geoms(present, 0) == []
+    # a prefix property is not claimed and is not needed; what is needed is that nothing is
+    # held out twice and that something is left to fit on
+    assert len(set(held_out_geoms(present, 8))) == 8
+    with pytest.raises(ValueError):
+        held_out_geoms(present, len(present))

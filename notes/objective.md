@@ -255,14 +255,27 @@ includes the polish: it minimises the misfit alone by design, so the body it sta
 kept and the two are scored under the penalty, the better one being the one written. A polish
 that buys its misfit with surface is then visible instead of exported.
 
-That selection asks a scored body to beat its convex answer by the ratio model 3's refinement
-reached, and the table above says why that is a demanding test rather than a neutral one: model
-3 is the released body whose convex answer was inflated, so the area term pays toward its truth
-and is part of the ratio it set. A secret body whose convex answer was not inflated has to find
-the same ratio with that term working against it. The rule is deliberately biased toward the
-convex answer -- it stands unless the correction is shown to be better -- and this is the size
-of the bias rather than an argument against it; the selection is seconds to re-run once the
-scored numbers exist, and it is the place to revisit with them in hand.
+That selection stands a correction where it beats its own convex answer on the cameras held
+out of its own fit, which is evidence about the body being decided. `--calibrate` tightens it
+to the ratio model 3's refinement reached, and the table above says why that is a demanding
+test rather than a neutral one: model 3 is the released body whose convex answer was inflated,
+so the area term pays toward its truth and is part of the ratio it set. A secret body whose
+convex answer was not inflated has to find the same ratio with that term working against it.
+That is why the tightening is offered and not required -- a public run that fell short would
+otherwise stand every convex answer in the submission, and a convex answer is not a safe
+default but a body known to be missing the concavities the challenge is about. Either way the
+rule is biased toward the convex answer, which stands unless the correction is shown to be
+better; the selection is seconds to re-run once the scored numbers exist, and it is the place
+to revisit with them in hand.
+
+Two solvers now offer a correction for each body, and the same rule decides between them:
+each is compared with the same convex answer on the same held-out cameras, and the one that
+removed more of its misfit is the candidate. Ranking them needs both to be measuring one
+thing, so they minimise the same functional, extract and measure the written body through one
+function at one resolution, and hold out the same cameras
+(`reconstruct_map.export_measure`, `data_io.held_out_geoms`). Comparing a body fitted under
+the penalty with one fitted on the misfit alone, or two bodies scored on different cameras,
+would be the comparison this note says may never be made.
 
 The volume falls from the convex answer's 2.52 to 1.27 against the body's 1.46, so the penalty
 overshoots the shrink by about a seventh of the volume even with the trust region holding each

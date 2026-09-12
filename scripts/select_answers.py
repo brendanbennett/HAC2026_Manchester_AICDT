@@ -1,13 +1,24 @@
 #!/usr/bin/env python3
-"""Decide, per scored model, whether a refined body replaces the convex answer.
+"""Decide, per scored model, which body enters the submission: a refinement or the convex answer.
 
-    python scripts/select_answers.py --refined results/gn --calibrate results/gn/Asteroid03.json
+    python scripts/select_answers.py --refined results/gn results/map \
+        --calibrate results/gn/Asteroid03.json
 
 A refinement is accepted for a model when its number on the geometries held out of its fit,
 measured on the body as written, is at most `ratio` times the convex answer's number on the
 same geometries, and the file passes the submission check. The held-out geometries are the
 whole of the argument: a body fitted on every camera can reach any misfit by shape or by
 overfitting, and only a camera the fit never saw separates the two.
+
+Several --refined directories can be given, which is how two solvers of the same problem are
+decided between. Each body is first compared with the convex answer on its own held-out
+cameras, and the candidates are then ranked by that comparison: a ratio is what transfers,
+since each one is a like-for-like measurement against the same convex body on the same
+cameras. The best candidate that also passes the submission check is the one copied. Both
+solvers measure through one function at one resolution (reconstruct_map.export_measure), and
+both hold out the same cameras for the same count (data_io.held_out_geoms), so in the normal
+case ranking by the ratio and ranking by the held-out number are the same ordering; when two
+runs held out different cameras the ranking is between two different tests and the run says so.
 
 The number is whichever functional the refinement was fitted under, and `held_pair` says why
 it has to be. A correction fitted under an objective that charges the body's surface as well
@@ -27,8 +38,8 @@ directly.
 
 The accepted files are copied over the convex answers under results/submission, which
 scripts/make_submission.py regenerates in seconds, and results/submission/selection.json
-records the choice and the numbers behind it, so the submitted directory says what it
-contains.
+records the choice, the candidates it was made among and the numbers behind it, so the
+submitted directory says what it contains and where each body came from.
 """
 from __future__ import annotations
 
@@ -110,11 +121,39 @@ def decide(meta: dict, ratio: float) -> tuple:
     return True, f"held out {held:.3f} at or below {ratio:g} x the convex answer's {base:.3f}"
 
 
+def candidates(dirs, model: int, ratio: float) -> list:
+    """Every refinement of one model that is on disk, ranked best first.
+
+    The key is the body's held-out number over the convex answer's on the same cameras. That
+    ratio is what compares across runs: each one is the same convex body measured on the same
+    held-out cameras as its challenger, so the ratio says how much of the misfit the
+    correction removed whatever cameras it was tested on, while the numbers themselves do not
+    if two runs held out different ones.
+    """
+    out = []
+    for d in dirs:
+        stl = Path(d) / f"Asteroid{model:02d}.stl"
+        js = stl.with_suffix(".json")
+        if not (stl.exists() and js.exists()):
+            continue
+        meta = json.loads(js.read_text())
+        held, base = held_pair(meta)
+        accept, reason = decide(meta, ratio)
+        key = (float(held) / float(base)) if (held and base and np.isfinite(held)
+                                              and np.isfinite(base)) else float("inf")
+        out.append({"dir": str(d), "stl": stl, "meta": meta, "held": held, "base": base,
+                    "gain": key, "accept": accept, "reason": reason,
+                    "held_out": list(meta.get("held_out") or [])})
+    out.sort(key=lambda q: q["gain"])
+    return out
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--refined", required=True,
-                    help="directory of Asteroid<NN>.stl and .json written by "
-                         "reconstruct_gn.py or reconstruct_map.py")
+    ap.add_argument("--refined", required=True, nargs="+",
+                    help="directories of Asteroid<NN>.stl and .json written by "
+                         "reconstruct_gn.py or reconstruct_map.py. Give more than one to "
+                         "decide between two solvers of the same body")
     ap.add_argument("--calibrate",
                     help="a public model's refinement JSON from the same run; the accepted "
                          "misfit ratio is the one it reached, and only if it improved the "
@@ -127,11 +166,9 @@ def main() -> None:
                     default=[M for M in range(1, 11) if M not in PUBLIC_MODELS])
     ap.add_argument("--into", default=None,
                     help="directory the chosen bodies are written to; by default the one "
-                         "answer_path names, which is the submission itself. Two tracks that "
-                         "both select into it overwrite each other, so give each its own "
-                         "directory and let a person choose between them. A directory other "
-                         "than the default is seeded with the convex answer for every model "
-                         "first, so what it holds is a complete submission either way")
+                         "answer_path names, which is the submission itself. A directory "
+                         "other than the default is seeded with the convex answer for every "
+                         "model first, so what it holds is a complete submission either way")
     a = ap.parse_args()
     if a.calibrate is not None and a.ratio is not None:
         raise SystemExit("give either --calibrate, to measure the ratio on a public model, "
@@ -168,32 +205,55 @@ def main() -> None:
         print(f"seeded {into} with the convex answer for {len(a.models)} models; what it "
               f"holds is a complete submission whatever is accepted below", flush=True)
     selection_file = str(into / "selection.json") if into else SELECTION_FILE
-    selection = {"ratio": ratio, "refined_dir": a.refined, "into": str(into) if into else None,
+    selection = {"ratio": ratio, "refined_dirs": list(a.refined),
+                 "into": str(into) if into else None,
                  "calibrated_on": a.calibrate, "models": {}}
     for M in a.models:
         target = str(into / Path(answer_path(M)).name) if into else answer_path(M)
-        stl = Path(a.refined) / f"Asteroid{M:02d}.stl"
-        js = stl.with_suffix(".json")
-        entry = {"answer": "convex"}
-        if not (stl.exists() and js.exists()):
+        cands = candidates(a.refined, M, ratio)
+        entry = {"answer": "convex", "candidates": [
+            {"dir": c["dir"], "held": c["held"], "held_convex": c["base"],
+             "gain": c["gain"], "accept": c["accept"], "reason": c["reason"],
+             "held_out": c["held_out"]} for c in cands]}
+        if not cands:
             entry["reason"] = "no refinement written"
         else:
-            meta = json.loads(js.read_text())
-            accept, reason = decide(meta, ratio)
-            check = inspect(stl, CYLINDER_R[M])
-            if accept and check["fails"]:
-                accept, reason = False, "refined file fails the submission check: " + \
-                    "; ".join(check["fails"])
-            held, base = held_pair(meta)
-            entry.update({"reason": reason, "held_convex": base, "held_refined": held,
-                          "chi_held_convex": meta.get("chi_held_convex"),
-                          "chi_held_export": meta.get("chi_held_export"),
-                          "held_out": meta.get("held_out")})
-            if accept:
-                shutil.copyfile(stl, target)
-                entry["answer"] = "refined"
+            sets = {tuple(c["held_out"]) for c in cands}
+            if len(sets) > 1:
+                print(f"model {M:>2}: the candidates held out different cameras "
+                      + "; ".join(f"{c['dir']} {c['held_out']}" for c in cands)
+                      + ". They are ranked by how much of the convex answer's misfit each "
+                        "removed on its own cameras, which is a comparison of two different "
+                        "tests.", flush=True)
+                entry["held_out_disagree"] = True
+            chosen, refused = None, []
+            for c in cands:
+                if not c["accept"]:
+                    refused.append(f"{c['dir']}: {c['reason']}")
+                    continue
+                check = inspect(c["stl"], CYLINDER_R[M])
+                if check["fails"]:
+                    refused.append(f"{c['dir']}: fails the submission check: "
+                                   + "; ".join(check["fails"]))
+                    continue
+                chosen = c
+                break
+            if chosen is None:
+                entry["reason"] = "; ".join(refused)
+            else:
+                shutil.copyfile(chosen["stl"], target)
+                entry.update({"answer": "refined", "from": chosen["dir"],
+                              "reason": chosen["reason"],
+                              "held_convex": chosen["base"], "held_refined": chosen["held"],
+                              "chi_held_convex": chosen["meta"].get("chi_held_convex"),
+                              "chi_held_export": chosen["meta"].get("chi_held_export"),
+                              "held_out": chosen["held_out"]})
+                if refused:
+                    entry["passed_over"] = refused
         selection["models"][M] = entry
-        print(f"model {M:>2}: {entry['answer']:8s} {entry['reason']}", flush=True)
+        origin = f" from {entry['from']}" if entry.get("from") else ""
+        print(f"model {M:>2}: {entry['answer']:8s}{origin}  {entry['reason']}", flush=True)
+    Path(selection_file).parent.mkdir(parents=True, exist_ok=True)
     Path(selection_file).write_text(json.dumps(selection, indent=2))
     print(f"wrote {selection_file}")
 

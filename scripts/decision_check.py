@@ -48,10 +48,11 @@ from hac26.solvers.output import metric_medoid                             # noq
 from reconstruct_lpd import (CONSENSUS_LEVELS, OCC_RES, consensus_bodies, decode,   # noqa: E402
                              candidate_diagnostic, dice_optimal_level, json_default,
                              make_resid_fn, mesh_misfit_by_geom, polish)
-from train_lpd import (CALIBRATION, CORPUS, RENDER, _enable_tf32, cond_channels,   # noqa: E402
-                       check_flow_metadata, file_digest, held_out, load_corpus,
-                       load_flow_file, load_instrument, model_error_scale, noise_sigma,
-                       probe_centres, probe_field, smooth_noise_like)
+from train_lpd import (CALIBRATION, CORPUS, _enable_tf32, add_render_flags,   # noqa: E402
+                       check_flow_metadata, cond_channels, file_digest, held_out,
+                       load_corpus, load_flow_file, load_instrument, model_error_scale,
+                       noise_sigma, probe_centres, probe_field, render_from, render_tag,
+                       smooth_noise_like)
 
 RULES = (("vote", "best_fit", "medoid", "oracle", "oracle_side", "consensus_opt")
          + tuple(f"consensus_{lv:g}" for lv in CONSENSUS_LEVELS))
@@ -113,7 +114,9 @@ def main():
                          "independent of")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--out", default="runs/decision_check.json")
+    add_render_flags(ap)
     a = ap.parse_args()
+    render = render_from(a, "check")
     if a.score_res == OCC_RES:
         raise SystemExit(f"--score-res {a.score_res} is the selection grid OCC_RES; the "
                          f"candidates would be scored on the grid they were chosen on and "
@@ -129,7 +132,7 @@ def main():
     dev = "cuda" if torch.cuda.is_available() else "cpu"
     inst = load_instrument(a.calibration, dev)
     eta = model_error_scale(inst)
-    op = CodeOperator(inst, psi_grid(phases), res=op_res, config=RENDER, device=dev)
+    op = CodeOperator(inst, psi_grid(phases), res=op_res, config=render, device=dev)
     # the network runs on the CPU and the operator on the GPU, as reconstruct_lpd.py runs
     # them: the corpus tensors and the sampler's state stay on one device throughout
     sd, flow_meta = load_flow_file(a.ckpt, map_location="cpu")
@@ -138,7 +141,8 @@ def main():
               f"using {'best' if flow_meta.get('loaded_best_state') else 'current'} weights "
               f"from step {flow_meta['loaded_step']}", flush=True)
     check_flow_metadata(flow_meta, corpus=a.corpus, calibration=a.calibration,
-                        phases=phases, operator_res=op_res, context=a.ckpt)
+                        phases=phases, operator_res=op_res, render=render_tag(render),
+                        context=a.ckpt)
     net = LPDFlow.from_state_dict(sd)
     net.eval()
     C = len(cameras())

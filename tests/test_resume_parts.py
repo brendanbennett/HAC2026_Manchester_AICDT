@@ -75,3 +75,33 @@ def test_a_stage_product_is_renamed_onto_the_path_readers_use(tmp_path):
             assert landed.exists(), f"{name}: {spelling} did not land where readers look"
             assert not Path(f"{out}.writing.npz").exists()
             landed.unlink()
+
+
+def test_a_learned_object_records_the_discretisation_it_was_trained_at():
+    """Every stage that renders takes the sensor size as a flag, so a flow trained against
+    curves from one discretisation could be used against another and nothing else here would
+    notice: the corpus digest, the phase count and the extraction resolution all agree while
+    the curves themselves are a different instrument's. The tag is what closes that."""
+    from train_lpd import RENDER, check_flow_metadata, render_tag
+    from dataclasses import replace
+    small = replace(RENDER, height=48, width=80, sun_res=32)
+    assert render_tag(RENDER) != render_tag(small)
+    # only the sensor and the sun view are in the tag; chunking does not change a curve
+    assert render_tag(replace(RENDER, phase_chunk=1, geom_chunk=1)) == render_tag(RENDER)
+    meta = {"phases": 96, "operator_res": 32, "render": render_tag(small)}
+    check_flow_metadata(meta, phases=96, operator_res=32, render=render_tag(small))
+    with pytest.raises(SystemExit):
+        check_flow_metadata(meta, phases=96, operator_res=32, render=render_tag(RENDER))
+
+
+def test_the_corpus_records_the_discretisation_its_curves_were_rendered_at():
+    """A corpus built small to check the wiring has to be a different corpus, or a later run
+    reuses it and trains the flow on curves from an instrument it will never meet."""
+    from dataclasses import replace
+    from train_lpd import RENDER
+    bc = _module("build_corpus")
+    small = replace(RENDER, height=48, width=80, sun_res=32)
+    args = (4, 16, 24, "models/lpd_convex.pt", "models/lpd_convex.pt")
+    full = bc.corpus_meta(*args, RENDER)
+    assert full["render"]["height"] == RENDER.height
+    assert bc.corpus_meta(*args, small) != full

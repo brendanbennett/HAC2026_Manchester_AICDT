@@ -67,9 +67,9 @@ from hac26.solvers.output import (export_stl, metric_medoid, planar_snap,      #
                                   ransac_planes, restore_constraints)
 from hac26.recon import dice, fit_to_cylinder, mesh_occupancy          # noqa: E402
 from hac26.shapes import rescale_touch_z                              # noqa: E402
-from train_lpd import (CALIBRATION, RENDER, _enable_tf32, cond_channels,   # noqa: E402
-                       check_flow_metadata, load_flow_file, load_instrument, residual_features,
-                       support_from_mesh)
+from train_lpd import (CALIBRATION, _enable_tf32, add_render_flags,   # noqa: E402
+                       check_flow_metadata, cond_channels, load_flow_file, load_instrument,
+                       render_from, render_tag, residual_features, support_from_mesh)
 
 SPREAD_MAX = 0.95    # mean Dice of the other draws against the medoid above which the draws
                      # are reported as one body rather than a spread of answers
@@ -114,6 +114,25 @@ def geometry_mask(mask56: np.ndarray) -> torch.Tensor:
     """(1, N_CAMS): a geometry counts as present only if BOTH its curves are."""
     return torch.tensor((mask56[:N_CAMS] > 0) & (mask56[N_CAMS:] > 0),
                         dtype=torch.float32)[None]
+
+
+def measured_geometries(mask56: np.ndarray) -> list:
+    """The geometries a solver can fit, as indices: those with at least one released curve
+    that carries shape.
+
+    This is not `geometry_mask`, and the difference is not an oversight. That mask is a
+    conditioning channel for the flow, which has one flag per geometry and no way to say that
+    one of a geometry's two curves is missing: a geometry marked present with an absent curve
+    would show the network a zero residual there and read as a perfect fit, so it requires
+    both. A solver carries `curve_weight` instead, which selects curves one at a time
+    wherever the residual is formed, so for it a geometry with one good curve is a geometry
+    with a measurement in it. Requiring both would throw that curve away -- which is what it
+    would do to the twenty geometries of the sawed-off cube whose count curves Otsu's
+    threshold collapses (data_io.count_curve_is_usable), and their intensity curves carry
+    shape.
+    """
+    w = np.asarray(mask56) > 0
+    return [i for i in range(N_CAMS) if bool(w[i] or w[i + N_CAMS])]
 
 
 def curve_weight(mask56: np.ndarray) -> torch.Tensor:
@@ -177,12 +196,25 @@ def make_resid_fn(net, op: CodeOperator, data, scale, geom_mask, M, cond, suppor
     return fn
 
 
-def whitened_misfit(pred, data, scale, geoms) -> float:
+def whitened_misfit(pred, data, scale, geoms, weight=None) -> float:
     """RMS of (data - pred) / scale over the geometries `geoms`, in standard deviations.
     `pred` holds those geometries only, in that order, as the operator returns them; `data`
-    and `scale` hold every geometry."""
+    and `scale` hold every geometry.
+
+    `weight` (N_CAMS, 2) from `curve_weight`, when given, restricts the average to the curves
+    that are measurements. The released set repeats columns and carries count curves, so
+    averaging over every column counts one recording twice and mixes the thresholded area
+    into the same number as the intensity; a solver that fits only the measurements has to be
+    scored on them as well, or its misfit is not the quantity it lowered. Nan when the named
+    geometries hold no measurement, which is the honest answer and never wins a comparison.
+    """
     r = (data[geoms] - pred) / scale[geoms][..., None]
-    return float(r.pow(2).mean().sqrt())
+    if weight is None:
+        return float(r.pow(2).mean().sqrt())
+    keep = weight[geoms] > 0
+    if not bool(keep.any()):
+        return float("nan")
+    return float(r[keep].pow(2).mean().sqrt())
 
 
 def mesh_misfit_by_geom(op: CodeOperator, verts, faces, radius, data, scale) -> torch.Tensor:
@@ -483,7 +515,9 @@ def main():
                     help="keep this many measured geometries, spread evenly over the list, "
                          "away from the inversion and report the answer's misfit on them; "
                          "0 uses every geometry")
+    add_render_flags(ap)
     a = ap.parse_args()
+    render = render_from(a, "reconstruction")
     _enable_tf32()
     if not a.medoid_volume_only and a.medoid_side_points <= 0:
         raise SystemExit("--medoid-side-points must be positive unless --medoid-volume-only "
@@ -496,7 +530,7 @@ def main():
     dev = "cuda" if torch.cuda.is_available() else "cpu"
 
     inst = load_instrument(a.calibration, dev)
-    op = CodeOperator(inst, psi, res=a.operator_res, config=RENDER, device=dev)
+    op = CodeOperator(inst, psi, res=a.operator_res, config=render, device=dev)
 
     sd, flow_meta = load_flow_file(a.ckpt, map_location="cpu")
     if "checkpoint_step" in flow_meta:
@@ -504,7 +538,7 @@ def main():
               f"using {'best' if flow_meta.get('loaded_best_state') else 'current'} weights "
               f"from step {flow_meta['loaded_step']}", flush=True)
     check_flow_metadata(flow_meta, calibration=a.calibration, phases=a.phases,
-                        operator_res=a.operator_res, context=a.ckpt)
+                        operator_res=a.operator_res, context=a.ckpt, render=render_tag(render))
     net = LPDFlow.from_state_dict(sd)
     net.eval()
 

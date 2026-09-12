@@ -13,16 +13,22 @@ A lightcurve misfit is not the score, and a body can fit the curves better while
 the truth less, so the run measures both. --hold-out-geoms keeps cameras out of the fit and
 reports the misfit on them, which is the difference between recovering a shape and fitting
 curves; on a public model the Dice against the released shape is printed at every checkpoint.
-The written body is extracted at EXPORT_RES, finer than the grid the descent ran on, and its
-own misfits are recorded beside the descent's, since it is the body that would be submitted.
-scripts/select_answers.py reads those numbers and decides, per model, whether this body
-replaces the convex answer.
+The written body is extracted at --export-res and measured at --export-phases, both
+independent of the grid and the phase count the descent could afford, because the number that
+decides whether it enters the submission is a property of the body rather than of what the
+descent cost. Those measurements are recorded beside the descent's own, and the objective
+beside every misfit: scripts/select_answers.py reads them, judges this body on the functional
+it was fitted under, and decides per model whether it replaces the convex answer.
 
 The step is a backtracking line search along the sign-normalised gradient, per block. The
 objective's curvature varies over orders of magnitude across the coordinates, and dh and g
 are in different units, so a fixed step or a single scale lets one block set the step for
 both; halving until the objective falls, and growing the step when it does, needs only the
 direction.
+
+A descent whose extracted mesh the export guard refuses exits 3 rather than 1. The descent
+finished in that case and its numbers are written; only the mesh is unusable, and the
+coefficients beside it (.code.npz) extract again without repeating the descent.
 """
 from __future__ import annotations
 
@@ -30,7 +36,6 @@ import argparse
 import json
 import sys
 import time
-from dataclasses import replace
 from pathlib import Path
 
 import numpy as np
@@ -40,24 +45,32 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from hac26.conventions import CYLINDER_R, PUBLIC_MODELS, psi_grid        # noqa: E402
-from hac26.data_io import N_CAMS, load_inversion_curves, public_stl      # noqa: E402
+from hac26.data_io import (held_out_geoms, load_inversion_curves,   # noqa: E402
+                           public_stl)
 from hac26.field import (CODE_DIM, EXTRACT_EXTENT, EXTRACT_RES, N_DIR,   # noqa: E402
                          depth_cap, extract_mesh)
 from hac26.recon import dice, fit_to_cylinder, mesh_occupancy            # noqa: E402
 from hac26.shapes import rescale_touch_z                                 # noqa: E402
 from hac26.solvers.operator import CodeOperator                          # noqa: E402
 from hac26.solvers.output import export_stl, restore_constraints         # noqa: E402
+from calibrate import ETA_FLOOR                                          # noqa: E402
 from reconstruct import answer_path                                      # noqa: E402
-from reconstruct_lpd import (curve_pairs, curve_weight, geometry_mask,   # noqa: E402
-                             json_default,
-                             residual_scale, support_from_convex, whitened_misfit)
+from reconstruct_lpd import (curve_pairs, curve_weight, json_default,   # noqa: E402
+                             measured_geometries, residual_scale,
+                             support_from_convex, whitened_misfit)
 from hac26.solvers.gauss_newton import AREA_WEIGHT, AREA_WINDOW           # noqa: E402
-from train_lpd import INSTRUMENT, RENDER, _enable_tf32, load_instrument   # noqa: E402
+from train_lpd import (INSTRUMENT, _enable_tf32, add_render_flags,   # noqa: E402
+                       load_instrument, render_from)
 
+EXPORT_REFUSED = 3    # exit status of a run whose fit finished and whose extracted mesh the
+                      # export guard refused. It is not the status of a run that broke: the
+                      # numbers are written, the coefficients are beside them, and only the
+                      # extraction has to be redone. Both solvers use it, so a runbook can
+                      # tell a body it has no mesh for from a stage that failed.
 OCC_RES = 128         # grid of the Dice reported at the checkpoints
-EXPORT_RES = EXTRACT_RES   # extraction resolution of the written mesh: the
-                           # operator's, so that the body written is the one whose misfit
-                           # was accepted
+EXPORT_RES = EXTRACT_RES   # default extraction resolution of the written mesh: the
+                           # operator's own, so that by default the body written is the one
+                           # whose misfit was accepted
 TARGET_SIGMA = 1.0    # stop once the answer explains the data to the noise level
 MAX_HALVINGS = 8      # trial steps per iteration before declaring convergence
 STEP_GROW = 1.6       # a step that works makes the next trial bolder
@@ -96,6 +109,36 @@ def convexity(verts, faces) -> float:
         return float(abs(m.volume) / ConvexHull(np.asarray(m.vertices)).volume)
     except Exception:                                    # noqa: BLE001
         return float("nan")
+
+
+def export_measure(op_x: CodeOperator, support, radius: float, data, scale, weight,
+                   area_weight: float):
+    """measure(code, geoms, c=None) -> (misfit, objective) of a correction on those cameras,
+    at the resolution and phase count a written body is scored at.
+
+    The objective goes beside the misfit because it is what was minimised. A gate that reads
+    the misfit alone prefers a corrugated body to a shaped one, which is the thing the area
+    term exists to stop, so selecting on a different functional from the one that was
+    minimised undoes the fit. Both solvers measure through here, so that a body from either
+    carries one number with one definition and the two can be compared.
+
+    `c` is the reshaping of the hull, which one solver fits beside the code and the other
+    carries in the code's own first block (field.split_code); a body that uses neither passes
+    nothing.
+    """
+    def measure(code, geoms, c=None) -> tuple:
+        g = [int(i) for i in geoms]
+        if not g:
+            return float("nan"), float("nan")
+        out = op_x.curves_with_shape(support, code, radius, geoms=g, c=c)
+        if out is None:
+            return float("inf"), float("inf")
+        cur, area, _ = out
+        chi = whitened_misfit(cur.cpu(), data, scale, g, weight)
+        if not np.isfinite(chi):
+            return chi, float("nan")
+        return chi, float(np.log(max(chi ** 2, 1e-300)) + area_weight * area)
+    return measure
 
 
 def posed_mesh(op: CodeOperator, support, code, radius: float, res: int):
@@ -140,31 +183,33 @@ def main() -> None:
                          "convex answer's; 0 turns the floor off")
     ap.add_argument("--ckpt-every", type=int, default=25,
                     help="steps between checkpoints; 0 writes none")
+    ap.add_argument("--time-budget", type=float, default=0.0,
+                    help="seconds after which the descent stops between steps and writes the "
+                         "best body it reached; 0 is no budget. The checkpoint is left "
+                         "behind, so rerunning continues rather than starting over")
     ap.add_argument("--no-resume", action="store_true",
                     help="start from the convex answer even when a checkpoint is there")
     ap.add_argument("--phases", type=int, default=96)
     ap.add_argument("--operator-res", type=int, default=EXTRACT_RES,
                     help="extraction resolution of the descent's operator")
-    ap.add_argument("--hold-out-geoms", type=int, default=0,
-                    help="cameras kept out of the fit; their misfit is the honest test")
+    ap.add_argument("--export-phases", type=int, default=96,
+                    help="phases the written body is measured at. Finer than the descent's "
+                         "grid, because the number that decides whether this body enters the "
+                         "submission is a property of the body and not of the grid the "
+                         "descent could afford")
+    ap.add_argument("--export-res", type=int, default=EXPORT_RES,
+                    help="extraction resolution of the written body and of the measurement "
+                         "it is judged on")
+    ap.add_argument("--hold-out-geoms", type=int, default=5,
+                    help="cameras kept out of the fit; their misfit is the only honest test "
+                         "of the body that was written, and scripts/select_answers.py "
+                         "refuses a refinement that held out none")
     ap.add_argument("--every", type=int, default=25, help="steps between diagnostics")
-    ap.add_argument("--height", type=int, default=RENDER.height,
-                    help="sensor image height; with --width and --sun-res, a lower value "
-                         "checks the wiring at a fraction of the cost and is not a "
-                         "reconstruction")
-    ap.add_argument("--width", type=int, default=RENDER.width)
-    ap.add_argument("--sun-res", type=int, default=RENDER.sun_res)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--device", default="cuda")
+    add_render_flags(ap)
     a = ap.parse_args()
-    # The image size is a flag so that a wiring check costs a fraction of a reconstruction.
-    # A run at a reduced size is not a reconstruction and says so in its metadata.
-    render = RENDER if (a.height, a.width, a.sun_res) == (RENDER.height, RENDER.width,
-                                                          RENDER.sun_res) \
-        else replace(RENDER, height=a.height, width=a.width, sun_res=a.sun_res)
-    if render is not RENDER:
-        print(f"  NOTE: rendering at {a.height}x{a.width}, sun view {a.sun_res}; a run at a "
-              f"reduced size checks the wiring and is not a reconstruction", flush=True)
+    render = render_from(a, "reconstruction")
 
     torch.manual_seed(a.seed)
     _enable_tf32()
@@ -173,7 +218,8 @@ def main() -> None:
     inst = load_instrument(a.calibration or INSTRUMENT[a.channel], device=dev)
     psi = psi_grid(a.phases)
     op = CodeOperator(inst, psi, res=a.operator_res, config=render, device=dev)
-    op_export = CodeOperator(inst, psi, res=EXPORT_RES, config=render, device=dev)
+    op_x = CodeOperator(inst, psi_grid(a.export_phases), res=a.export_res, config=render,
+                        device=dev)
 
     sup_stl = a.support_from or str(answer_path(a.model))
     support = support_from_convex(sup_stl)
@@ -188,15 +234,12 @@ def main() -> None:
         print(f"  {len(d['duplicate_columns'])} repeated columns and "
               f"{len(d['count_curves_refused'])} count curves dropped; "
               f"{int(weight.sum())} curves fitted", flush=True)
-    scale = residual_scale(d, inst.eta)
+    scale = residual_scale(d, inst.eta).clamp_min(ETA_FLOOR)
     print(f"  curves: {d['channel']}   eta median {float(inst.eta.median()):.4f}   "
           f"median scale {float(scale.median()):.4f}", flush=True)
-    gmask = geometry_mask(d["mask"])[0] > 0
-    present = [i for i in range(N_CAMS) if bool(gmask[i])]
+    present = measured_geometries(d["mask"])
 
-    rng = np.random.default_rng(a.seed)
-    held = sorted(rng.choice(present, a.hold_out_geoms, replace=False).tolist()) \
-        if a.hold_out_geoms else []
+    held = held_out_geoms(present, a.hold_out_geoms)
     fit_geoms = [g for g in present if g not in held]
     print(f"model {a.model}  R={R}  h from {Path(sup_stl).name}  "
           f"fit on {len(fit_geoms)} geometries" + (f", holding out {held}" if held else ""),
@@ -266,7 +309,7 @@ def main() -> None:
         p0, p1, p2 = (vc[ff[:, i]] for i in range(3))
         A = 0.5 * torch.cross(p1 - p0, p2 - p0, dim=1).norm(dim=1).sum()
         gz, = torch.autograd.grad(A, zz)
-        return float(A), gz.detach()
+        return float(A.detach()), gz.detach()
 
     def held_misfit(operator, z):
         if not held:
@@ -275,12 +318,10 @@ def main() -> None:
         return whitened_misfit(ch.cpu(), data, scale, held, weight) if ch is not None \
             else float("inf")
 
-    def export_misfits(z):
-        """The misfits of the body as it would be written, extracted at EXPORT_RES."""
-        cur = op_export.curves(support, z, R, geoms=fit_geoms)
-        fit = whitened_misfit(cur.cpu(), data, scale, fit_geoms, weight) if cur is not None \
-            else float("inf")
-        return fit, held_misfit(op_export, z)
+    d_x = load_inversion_curves(a.data_dir, a.model, m=a.export_phases, channel=a.channel)
+    measure_at_export = export_measure(op_x, support, R, curve_pairs(d_x["curves"]),
+                                       residual_scale(d_x, inst.eta).clamp_min(ETA_FLOOR),
+                                       weight, a.area_weight)
 
     code = torch.zeros(CODE_DIM, device=dev)
     hist, best = [], None
@@ -330,14 +371,18 @@ def main() -> None:
         tmp.replace(ckpt_path)
 
     J, chi = objective(code)
-    convex_fit, convex_held = export_misfits(code)
-    print(f"  convex answer at export resolution: chi_fit {convex_fit:.3f}"
-          + (f"  chi_held {convex_held:.3f}" if held else ""), flush=True)
+    time_limited = False
+    zero = torch.zeros(CODE_DIM, device=dev)
+    convex_fit, convex_fit_obj = measure_at_export(zero, fit_geoms)
+    convex_held, convex_held_obj = measure_at_export(zero, held)
+    print(f"  the convex answer, at the resolution the written body is measured at: "
+          f"chi_fit {convex_fit:.3f}"
+          + (f", chi_held {convex_held:.3f}" if held else ""), flush=True)
     for it in range(start_it, a.steps + 1):
         if it % a.every == 0 or it == a.steps:
             row = {"step": it, "chi_fit": chi, "objective": J, "step_size": step,
                    "seconds": round(time.time() - t0, 1)}
-            m = posed_mesh(op, support, code, R, EXPORT_RES)
+            m = posed_mesh(op, support, code, R, a.export_res)
             if m is not None:
                 row["dice"] = truth_dice(m[0], m[1], a.model, a.data_dir)
                 row["convexity"] = convexity(m[0], m[1])
@@ -354,7 +399,15 @@ def main() -> None:
                   + f"  dice {row.get('dice', float('nan')):.4f}"
                     f"  convexity {row.get('convexity', float('nan')):.3f}"
                     f"  step {step:.4f}  [{row['seconds']:.0f}s]", flush=True)
-        if it == a.steps or chi <= TARGET_SIGMA:
+        if it == a.steps or (chi is not None and chi <= TARGET_SIGMA):
+            break
+        if a.time_budget and elapsed_before + (time.time() - t0) > a.time_budget:
+            # The best body so far is already tracked and is what gets written, so stopping
+            # here costs the steps not taken and nothing that was found.
+            print(f"  the time budget stopped the descent at step {it}; the body written is "
+                  f"the best of the {len(hist)} checkpoints reached", flush=True)
+            save_ckpt(it, step)
+            time_limited = True
             break
 
         _, grad = op.adjoint(support, code, R, cot_fn, geoms=fit_geoms)
@@ -407,12 +460,13 @@ def main() -> None:
         Path(a.out).parent.mkdir(parents=True, exist_ok=True)
         np.savez(Path(a.out).with_suffix(".code.npz"), code=z.cpu().numpy(),
                  support=support.cpu().numpy())
-        m = posed_mesh(op, support, z, R, EXPORT_RES)
+        m = posed_mesh(op, support, z, R, a.export_res)
         if m is None:
             raise SystemExit("the final body is degenerate; the code is in the .code.npz "
                              "beside it")
         v, f = m
-        fit_x, held_x = export_misfits(z)
+        fit_x, fit_x_obj = measure_at_export(z, fit_geoms)
+        held_x, held_x_obj = measure_at_export(z, held)
         export_error = None
         try:
             rep = export_stl(a.out, v, f)
@@ -421,21 +475,32 @@ def main() -> None:
             print(f"  !!! {exc}", flush=True)
         meta = {"model": a.model, "channel": d["channel"], "radius": R, "steps": a.steps,
                 "lr": a.lr, "l2": a.l2, "phases": a.phases, "operator_res": a.operator_res,
-                "export_res": EXPORT_RES, "held_out": held, "history": hist, "export": rep,
+                "export_res": a.export_res, "export_phases": a.export_phases,
+                "held_out": held, "fit_geoms": fit_geoms, "history": hist, "export": rep,
+                "curves_fitted": int(weight.sum()),
                 "chi_fit_convex": convex_fit, "chi_held_convex": convex_held,
                 "chi_fit_export": fit_x, "chi_held_export": held_x,
+                "objective_fit_convex": convex_fit_obj,
+                "objective_held_convex": convex_held_obj,
+                "objective_fit_export": fit_x_obj, "objective_held_export": held_x_obj,
                 "final_dice": truth_dice(v, f, a.model, a.data_dir),
                 "convex_dice": convex_dice(sup_stl, a.model, a.data_dir),
                 "final_convexity": convexity(v, f),
                 "area_weight": a.area_weight, "volume_floor": a.volume_floor,
+                "time_limited": time_limited, "steps_taken": len(hist),
                 "export_refused": export_error}
         Path(a.out).with_suffix(".json").write_text(json.dumps(meta, indent=2,
                                                                default=json_default))
         if export_error is not None:
-            raise SystemExit(
-                f"model {a.model}: the descent finished and its code is written beside this, "
-                f"but the extracted mesh is not a closed solid and was refused. Re-extract "
-                f"from {Path(a.out).with_suffix('.code.npz')} rather than descending again.")
+            # A distinct status, because this is not the same failure as a run that broke:
+            # the descent finished, its numbers are in the JSON, and only the extraction is
+            # unusable. A runbook can carry on past it, and the wiring test can count it as a
+            # stage that ran.
+            print(f"model {a.model}: the descent finished and its code is written beside "
+                  f"this, but the extracted mesh is not a closed solid and was refused. "
+                  f"Re-extract from {Path(a.out).with_suffix('.code.npz')} rather than "
+                  f"descending again.", flush=True)
+            raise SystemExit(EXPORT_REFUSED)
         print(f"  wrote {a.out}  ({rep['faces']} faces, volume {rep['volume']:.3f}); "
               f"at export resolution chi_fit {fit_x:.3f}"
               + (f", chi_held {held_x:.3f} against the convex answer's {convex_held:.3f}"

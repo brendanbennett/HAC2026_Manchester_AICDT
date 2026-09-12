@@ -31,7 +31,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from hac26.conventions import PUBLIC_MODELS                    # noqa: E402
 from hac26.data_io import public_stl                           # noqa: E402
-from hac26.field import N_DIR, SH_DEGREE, ImplicitBody, _real_sh   # noqa: E402
+from hac26.field import N_DIR, SH_DEGREE, ImplicitBody, real_sh   # noqa: E402
 from hac26.shapes import canonicalize_r, mesh_support, rescale_touch_z   # noqa: E402
 from hac26.stl_io import load_stl                              # noqa: E402
 from reconstruct_lpd import support_from_convex                # noqa: E402
@@ -51,7 +51,7 @@ def main():
     a = ap.parse_args()
 
     normals = ImplicitBody().core.n.numpy().astype(np.float64)
-    Y = _real_sh(normals, SH_DEGREE)
+    Y = real_sh(normals, SH_DEGREE)
     band = Y @ np.linalg.pinv(Y)                    # projector onto what dh can express
     print(f"{'model':>5} {'band rms':>9} {'remainder rms':>14} {'max |d|':>8}   "
           f"(inverse-softplus units of the canonical support)")

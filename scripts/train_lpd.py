@@ -59,6 +59,8 @@ import time
 from pathlib import Path
 from typing import NamedTuple
 
+from dataclasses import replace
+
 import numpy as np
 import torch
 
@@ -75,8 +77,7 @@ from hac26.forward.mesh.instrument import Instrument                            
 from hac26.noise import NOISE_HI, NOISE_LO, NOISE_PROFILE                       # noqa: E402
 from hac26.shapes import canonicalize_r, mesh_support, rescale_touch_z          # noqa: E402
 from hac26.solvers.lpd_flow import (N_EXPERTS, N_FEAT, N_MODES, N_NODE_CH,     # noqa: E402
-                                    N_SPHERE_CH, FlowInputs, LPDFlow, flow_inputs,
-                                    geometry_tags)
+                                    N_SPHERE_CH, LPDFlow, flow_inputs, geometry_tags)
 from hac26.solvers.operator import CodeOperator                                 # noqa: E402
 
 from calibrate import OUT_INSTRUMENT as INSTRUMENT   # noqa: E402  per channel, by calibrate.py
@@ -84,6 +85,41 @@ CALIBRATION = INSTRUMENT["real"]                      # the laboratory channel's
 PRIOR = "runs/prior_flow.pt"                       # written by scripts/train_prior.py
 CORPUS = "runs/corpus.npz"                         # written by scripts/build_corpus.py
 RENDER = RenderConfig()                            # the operator's discretisation
+
+
+def add_render_flags(ap) -> None:
+    """--height, --width and --sun-res: the sensor and sun-view discretisation of the exact
+    forward model, for every stage that renders.
+
+    They default to RENDER, so a run that passes none of them renders at the size the
+    pipeline is calibrated at. They exist because the cost of this pipeline is dominated by
+    the sensor pixels, and a check of whether the stages agree with each other -- which is
+    what a whole-pipeline test on a small library is -- says the same thing at a fraction of
+    the size, while at the calibrated size it costs what a run costs.
+    """
+    ap.add_argument("--height", type=int, default=RENDER.height,
+                    help="sensor image height; with --width and --sun-res, a lower value "
+                         "checks the wiring at a fraction of the cost and is not a result")
+    ap.add_argument("--width", type=int, default=RENDER.width)
+    ap.add_argument("--sun-res", type=int, default=RENDER.sun_res)
+
+
+def render_tag(cfg: RenderConfig) -> str:
+    """How a discretisation is written into a file's metadata, so that a learned object and
+    the run using it can be compared. It is the sensor and the sun view, which is what the
+    flags move; the rest of RenderConfig is chunking and does not change a curve."""
+    return f"{cfg.height}x{cfg.width}x{cfg.sun_res}"
+
+
+def render_from(a, what: str = "run") -> RenderConfig:
+    """The configuration --height, --width and --sun-res ask for, with a notice when it is
+    not the calibrated one. A reduced size resolves the lit region's boundary more coarsely,
+    so its curves are not the instrument's and its numbers are not the pipeline's."""
+    cfg = replace(RENDER, height=a.height, width=a.width, sun_res=a.sun_res)
+    if cfg != RENDER:
+        print(f"  NOTE: rendering at {cfg.height}x{cfg.width}, sun view {cfg.sun_res}; a "
+              f"{what} at a reduced size checks the wiring and is not a {what}", flush=True)
+    return cfg
 
 OCC_WEIGHT = 1.0       # weight of the occupancy term against the endpoint term. Both are of
                        # order one at initialisation, so one is the neutral choice.
@@ -867,6 +903,7 @@ def load_flow_file(path: str, map_location="cpu") -> tuple:
 
 def check_flow_metadata(meta: dict, *, corpus: str | None = None, calibration: str | None = None,
                         phases: int | None = None, operator_res: int | None = None,
+                        render: str | None = None,
                         context: str = "flow checkpoint") -> None:
     """Refuse known mismatches between a flow file and the run trying to use it."""
     if not meta:
@@ -885,6 +922,15 @@ def check_flow_metadata(meta: dict, *, corpus: str | None = None, calibration: s
         if meta[key] != live:
             problems.append(f"{key}: checkpoint={meta[key]!r}, current={live!r}")
 
+    def expect_value(key, value):
+        if value is None:
+            return
+        if key not in meta:
+            missing.append(key)
+            return
+        if meta[key] != value:
+            problems.append(f"{key}: checkpoint={meta[key]!r}, current={value!r}")
+
     def expect_int(key, value):
         if value is None:
             return
@@ -898,6 +944,9 @@ def check_flow_metadata(meta: dict, *, corpus: str | None = None, calibration: s
     expect_digest("calibration", calibration)
     expect_int("phases", phases)
     expect_int("operator_res", operator_res)
+    # A network trained against curves from one discretisation and used against another is
+    # being asked about a different instrument, and nothing else here would notice.
+    expect_value("render", render)
     if problems:
         raise SystemExit(f"{context} was written for different settings ({'; '.join(problems)})")
     if missing:
@@ -986,7 +1035,9 @@ def main():
     ap.add_argument("--extra-steps", type=int, default=0,
                     help="when resuming, train this many steps beyond the checkpoint's step "
                          "instead of up to the --steps cap; for the branched second run")
+    add_render_flags(ap)
     a = ap.parse_args()
+    render = render_from(a, "training")
     _enable_tf32()
     torch.manual_seed(a.seed)
     if torch.cuda.is_available():
@@ -1002,7 +1053,7 @@ def main():
     phases, op_res = int(cmeta["phases"]), int(cmeta["operator_res"])
     inst = load_instrument(a.calibration, dev)
     eta = model_error_scale(inst)
-    op = CodeOperator(inst, psi_grid(phases), res=op_res, config=RENDER, device=dev)
+    op = CodeOperator(inst, psi_grid(phases), res=op_res, config=render, device=dev)
     print(f"  exact operator on {dev}, extraction res {op_res}, {len(cameras())} "
           f"geometries, {phases} phases; model error median {float(eta.median()):.4f}",
           flush=True)
@@ -1128,6 +1179,7 @@ def main():
         "phases": phases,
         "operator_res": op_res,
         "train_geoms": train_geoms,
+        "render": render_tag(render),
         "corpus": file_digest(a.corpus),
         "prior": file_digest(a.prior),
     }

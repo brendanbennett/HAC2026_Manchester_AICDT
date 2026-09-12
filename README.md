@@ -183,10 +183,12 @@ calibrated on it, then the scored models.
 scripts/run_nonconvex.sh
 ```
 
-which calibrates the channel if it has not been calibrated, reconstructs the public model
-with a concavity, then the scored models, and decides. Every setting is a variable at the top
-of it and can be overridden from the environment; `scripts/reconstruct_gn.py --help` runs one
-model on its own.
+which calibrates the channel if it has not been calibrated, runs both solvers on the public
+model with a concavity and then on the scored models, and decides. Every setting is a variable
+at the top of it and can be overridden from the environment; `scripts/reconstruct_gn.py
+--help` runs one model of one solver on its own. Every body is a unit of work: one already
+written against the same instrument is skipped, and both solvers checkpoint inside a body, so
+a job that stops part way carries on where it stopped rather than starting over.
 
 Cameras are held out of every fit, and the body's misfit on them is written beside the convex
 answer's on the same cameras. That pair is the only test of whether a shape was recovered
@@ -198,8 +200,15 @@ not, because a public run that falls short would then stand every convex answer,
 answer is not a safe default but a body known to be missing the concavities the challenge is
 about.
 
-`scripts/reconstruct_map.py` is the same problem by gradient descent on the exact misfit,
-without the reshaping, and writes the same fields, so `select_answers.py` reads either.
+`scripts/reconstruct_map.py` searches the same problem differently. It minimises the same
+objective from the convex answer alone, by the adjoint rather than by a secant Jacobian: one
+gradient costs two rendering passes where a secant Jacobian costs one render per coordinate,
+which is about a hundred times as much optimisation per render, and it buys that by descending
+into one basin instead of sweeping a designed grid of starts. Neither dominates, so the
+runbook runs both. They measure the written body through one function at one resolution and
+hold out the same cameras, so their answers for a body are comparable, and
+`select_answers.py` is given both directories and decides per model on the cameras neither
+fit saw.
 
 How many directions the depth is carried on is not a free choice. A carve the field can only
 hold blurred fits the curves worse than no carve at all, because a shadow is cast by an edge, so
@@ -250,7 +259,7 @@ hac26/scoring/    official (the organisers' measures), voxel, side_view
 hac26/            conventions, geometry, field, shapes, noise, shape_library, curves_mesh,
                   data_io, recon, library_io, library_metrics
 scripts/          entry points; make_submission.py builds the submission and
-                  select_answers.py decides which corrections enter it
+                  select_answers.py decides which corrections, from which solver, enter it
 notes/            measurements that settle a choice made in the code
 models/           the trained convex solver; the calibrations calibrate.py writes go here
 results/          submission/ the scored models, public/ the public ones, public_scores.json

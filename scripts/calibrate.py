@@ -437,7 +437,7 @@ def main():
             # eta enters only through the likelihood, so its gradient is direct
             loss, _ = nll(pred, b["real"], b["present"], b["sigma"], eta)
             loss.backward()
-            total += float(loss)
+            total += float(loss.detach())
         opt.step()
         mean_loss = total / len(bodies)
         history.append(mean_loss)

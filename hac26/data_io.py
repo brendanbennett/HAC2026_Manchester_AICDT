@@ -39,6 +39,32 @@ def distinct_geometries() -> list:
     return [groups[k] for k in sorted(groups)]
 
 
+def held_out_geoms(present, n: int) -> list:
+    """`n` of the geometries in `present` to keep out of a fit, spread evenly over the camera
+    ordering.
+
+    The held-out cameras are the only honest test of a reconstruction: a body fitted on every
+    camera can reach any misfit by shape or by overfitting, and only a camera the fit never
+    saw separates the two. That makes how they are chosen part of the measurement rather than
+    a detail. The released cameras are ordered azimuth-major with the three distinct
+    geometries of each azimuth together, so an even spread over the list takes cameras from
+    across the azimuths and across the elevations, and both the fitted and the held-out set
+    span the range of viewing geometries. A random draw does not: five drawn at random can
+    fall in one azimuth, which leaves that azimuth out of the fit and puts the whole test
+    inside it, and it makes two runs of the same body incomparable because they are then
+    scored on different cameras. `present` is in camera order and the result is a subset of
+    it, so two runs that hold out the same count hold out the same cameras.
+    """
+    idx = np.asarray(present)
+    if not n:
+        return []
+    if n >= len(idx):
+        raise ValueError(f"{n} geometries held out of {len(idx)} present leaves nothing to "
+                         f"fit on")
+    take = np.unique(np.linspace(0, len(idx) - 1, int(n)).round().astype(int))
+    return [int(idx[i]) for i in take]
+
+
 def duplicate_columns(curves: np.ndarray, atol: float = 1e-12) -> np.ndarray:
     """(2 * N_CAMS,) marking every column that repeats an earlier column of its own geometry
     and curve type.

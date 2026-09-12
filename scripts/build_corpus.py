@@ -51,9 +51,10 @@ from hac26.field import (CODE_DIM, DESIGN_N, EXTRACT_RES, KNN, N_DIR,           
 from hac26.forward.convex_egi import normalize_np                                 # noqa: E402
 from hac26.solvers.operator import CodeOperator                                   # noqa: E402
 from hac26.train import load_net                                                  # noqa: E402
-from train_lpd import (CALIBRATION, CORPUS, RENDER, _enable_tf32, dh_expand,      # noqa: E402
-                       file_digest, inv_softplus, load_instrument, model_error_scale,
-                       noise_sigma, smooth_noise_like, support_from_mesh)
+from train_lpd import (CALIBRATION, CORPUS, _enable_tf32, add_render_flags,   # noqa: E402
+                       dh_expand, file_digest, inv_softplus, load_instrument,
+                       model_error_scale, noise_sigma, render_from, smooth_noise_like,
+                       support_from_mesh)
 
 CODES = "runs/corpus_codes.npz"       # written by scripts/fit_shapes.py
 CONVEX = "models/lpd_convex.pt"       # the convex stage's checkpoint, as scripts/reconstruct.py
@@ -107,9 +108,13 @@ def corpus_radius(i: int, recorded: float) -> float:
     return float(lo * (hi / lo) ** u)
 
 
-def corpus_meta(n, phases, op_res, calibration, convex) -> dict:
+def corpus_meta(n, phases, op_res, calibration, convex, render) -> dict:
     """Everything the corpus depends on, stored with it. `schema` is bumped whenever the
-    operator or the layout changes, so an older corpus is rebuilt rather than reused."""
+    operator or the layout changes, so an older corpus is rebuilt rather than reused.
+
+    `render` is the discretisation the curves were actually rendered at and not the
+    calibrated one, so that a corpus built small to check the wiring is visibly a different
+    corpus and is rebuilt rather than trained on."""
     return {
         "schema": 9,
         "bodies": int(n),
@@ -127,7 +132,7 @@ def corpus_meta(n, phases, op_res, calibration, convex) -> dict:
         "node_beta": float(NODE_BETA),
         "calibration": file_digest(calibration),
         "convex": file_digest(convex),
-        "render": asdict(RENDER),
+        "render": asdict(render),
     }
 
 
@@ -261,7 +266,9 @@ def main():
     ap.add_argument("--out", default=CORPUS)
     ap.add_argument("--workers", type=int, default=max(1, min(8, (os.cpu_count() or 2) // 2)),
                     help="CPU processes running the convex stage; 0 runs it in this process")
+    add_render_flags(ap)
     a = ap.parse_args()
+    render = render_from(a, "corpus")
     _enable_tf32()
     dev = "cuda" if torch.cuda.is_available() else "cpu"
     if not Path(a.convex).exists():
@@ -274,8 +281,8 @@ def main():
               f"radius; those get one drawn from the published range", flush=True)
     inst = load_instrument(a.calibration, dev)
     eta = model_error_scale(inst)
-    op = CodeOperator(inst, psi_grid(a.phases), res=a.operator_res, config=RENDER, device=dev)
-    expected = corpus_meta(n, a.phases, a.operator_res, a.calibration, a.convex)
+    op = CodeOperator(inst, psi_grid(a.phases), res=a.operator_res, config=render, device=dev)
+    expected = corpus_meta(n, a.phases, a.operator_res, a.calibration, a.convex, render)
     to_dh = correction_matrix()
     part_dir = Path(f"{a.out}.parts")
     pool = None

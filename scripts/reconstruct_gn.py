@@ -40,6 +40,10 @@ objective on them beside the convex answer's on the same cameras. That pair is w
 scripts/select_answers.py reads, and it is the only test of whether a shape was recovered
 rather than curves fitted. On a public model the overlap with the released shape is reported
 as well.
+
+A fit whose extracted mesh the export guard refuses exits 3 rather than 1. The fit
+finished in that case and its numbers are written; only the mesh is unusable, and the
+coefficients beside it (.fit.npz) extract again without repeating the fit.
 """
 from __future__ import annotations
 
@@ -48,7 +52,7 @@ import json
 import sys
 import time
 from collections import Counter
-from dataclasses import replace
+
 from pathlib import Path
 
 import numpy as np
@@ -58,7 +62,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from hac26.conventions import CYLINDER_R, psi_grid                       # noqa: E402
-from hac26.data_io import N_CAMS, load_inversion_curves                  # noqa: E402
+from hac26.data_io import held_out_geoms, load_inversion_curves   # noqa: E402
 from hac26.field import (CODE_DIM, EXTRACT_RES, N_NODES, N_RADIAL,       # noqa: E402
                          DepthSphere, depth_cap, node_kernel)
 from hac26.recon import fit_to_cylinder                                  # noqa: E402
@@ -69,13 +73,14 @@ from hac26.solvers.gauss_newton import (AREA_WEIGHT, AREA_WINDOW,    # noqa: E40
 from hac26.solvers.operator import CodeOperator                          # noqa: E402
 from hac26.solvers.output import export_stl, restore_constraints         # noqa: E402
 from reconstruct import answer_path                                      # noqa: E402
-from reconstruct_lpd import (curve_pairs, curve_weight, geometry_mask,   # noqa: E402
-                             json_default,
-                             residual_scale, support_from_convex)
+from reconstruct_lpd import (curve_pairs, curve_weight, json_default,   # noqa: E402
+                             measured_geometries, residual_scale,
+                             support_from_convex)
 from calibrate import ETA_FLOOR                                          # noqa: E402
-from reconstruct_map import (EXPORT_RES, convex_dice, convexity,     # noqa: E402
-                             truth_dice)
-from train_lpd import INSTRUMENT, RENDER, _enable_tf32, load_instrument   # noqa: E402
+from reconstruct_map import (EXPORT_REFUSED, EXPORT_RES, convex_dice,   # noqa: E402
+                             convexity, export_measure, truth_dice)
+from train_lpd import (INSTRUMENT, _enable_tf32, _hms, add_render_flags,   # noqa: E402
+                       load_instrument, render_from, render_tag)
 
 RESTARTS = 9               # starts given the coarse screen: the convex answer and the best
                            # eight of the designed grid, which are now chosen by rendering
@@ -179,36 +184,55 @@ def main() -> None:
                     help="secant step of a carve coordinate, in body units of depth")
     ap.add_argument("--step-c", type=float, default=STEP_C,
                     help="secant step of a reshaping coefficient, in body units")
+    ap.add_argument("--max-degree", type=int, default=0,
+                    help="drop every stage of every ladder above this spherical-harmonic "
+                         "degree, and lower a ladder that would then be empty to it; 0 "
+                         "leaves the designed ladder. Lowering the top degree gives a "
+                         "smoother correction at a fraction of the cost, because a "
+                         "degree-L stage costs (L+1)^2 - 9 renders an iteration, and it is "
+                         "the answer to a run that is too slow to finish -- the bound the "
+                         "ladder's top degree carries is an upper one (notes/objective.md), "
+                         "so a lower ceiling is safe where a higher one is not")
     ap.add_argument("--max-stage-iters", type=int, default=0,
                     help="cap every stage of every ladder at this many iterations; 0 leaves "
                          "each at its designed count. A run capped here is bounded by the cap "
                          "and not by the curves, which the written body records as "
                          "budget_limited; the point of the flag is a check that the whole path "
                          "executes, or an answer by a fixed time")
-    ap.add_argument("--height", type=int, default=RENDER.height,
-                    help="sensor image height; with --width and --sun-res, a lower value "
-                         "checks the wiring at a fraction of the cost and is not a "
-                         "reconstruction")
-    ap.add_argument("--width", type=int, default=RENDER.width)
-    ap.add_argument("--sun-res", type=int, default=RENDER.sun_res)
+    ap.add_argument("--time-budget", type=float, default=0.0,
+                    help="seconds after which the fit stops between units of work and writes "
+                         "the best finished body; 0 is no budget. A run that stops this way "
+                         "records time_limited and leaves its checkpoint, so rerunning it "
+                         "continues rather than starting over")
+    ap.add_argument("--ckpt-file", default=None,
+                    help="resumable checkpoint; by default <--out>.gn.ckpt. The fit is a "
+                         "sweep of independent starts, so what is checkpointed is the "
+                         "finished ones: a killed run loses at most the start it was on")
+    ap.add_argument("--no-resume", action="store_true",
+                    help="start the sweep from the beginning even when a checkpoint for "
+                         "these settings is there")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--device", default="cuda")
+    add_render_flags(ap)
     a = ap.parse_args()
-    # The image size is a flag so that a wiring check costs a fraction of a reconstruction.
-    # A run at a reduced size is not a reconstruction and says so in its metadata.
-    render = RENDER if (a.height, a.width, a.sun_res) == (RENDER.height, RENDER.width,
-                                                          RENDER.sun_res) \
-        else replace(RENDER, height=a.height, width=a.width, sun_res=a.sun_res)
-    if render is not RENDER:
-        print(f"  NOTE: rendering at {a.height}x{a.width}, sun view {a.sun_res}; a run at a "
-              f"reduced size checks the wiring and is not a reconstruction", flush=True)
+    # named for the discretisation and not `render`, which is the closure below that the
+    # solver calls to render a trial
+    render_cfg = render_from(a, "reconstruction")
+    # The first nine coordinates of the field are the reshaping, which the solver fits
+    # separately, so a stage's coordinates are the degrees above them: below degree three a
+    # stage has none and the ladder would fit nothing.
+    if a.max_degree and a.max_degree < 3:
+        raise SystemExit(f"--max-degree {a.max_degree} leaves a stage with no coordinates: "
+                         f"the first nine belong to the reshaping, so three is the lowest "
+                         f"degree that carves at all")
 
     torch.manual_seed(a.seed)
     _enable_tf32()
     dev = a.device if torch.cuda.is_available() else "cpu"
     R = CYLINDER_R[a.model]
     inst = load_instrument(a.calibration or INSTRUMENT[a.channel], device=dev)
-    op = CodeOperator(inst, psi_grid(a.phases), res=a.operator_res, config=render, device=dev)
+    op = CodeOperator(inst, psi_grid(a.phases), res=a.operator_res, config=render_cfg,
+                      device=dev)
 
     sup_stl = a.support_from or str(answer_path(a.model))
     support = support_from_convex(sup_stl)
@@ -220,9 +244,8 @@ def main() -> None:
     data = curve_pairs(d["curves"])                                  # (N_CAMS, 2, P)
     weight = curve_weight(d["mask"])                                 # (N_CAMS, 2)
     scale = residual_scale(d, inst.eta).clamp_min(ETA_FLOOR)         # (N_CAMS, 2)
-    present = [i for i in range(N_CAMS) if float(geometry_mask(d["mask"])[0, i]) > 0]
-    held = [present[i] for i in np.unique(np.linspace(0, len(present) - 1, a.hold_out_geoms)
-                                          .round().astype(int))] if a.hold_out_geoms else []
+    present = measured_geometries(d["mask"])
+    held = held_out_geoms(present, a.hold_out_geoms)
     fit_geoms = [g for g in present if g not in held]
     print(f"model {a.model}  R={R}  channel {d['channel']}  h from {Path(sup_stl).name}\n"
           f"  {int(weight.sum())} curves of {len(present)} geometries; fitting on "
@@ -234,7 +257,6 @@ def main() -> None:
               f"dropped", flush=True)
 
     fit_g, keep_fit = curve_index(weight, fit_geoms)
-    held_g, keep_held = curve_index(weight, held) if held else ([], None)
     data_fit = flat_curves(data[fit_g], keep_fit)
     scale_fit = np.repeat(scale[fit_g].numpy()[keep_fit.numpy()], data.shape[-1])
     zero_code = torch.zeros(CODE_DIM, device=dev)
@@ -302,22 +324,85 @@ def main() -> None:
     # given the coarse screen below. The whole grid at one render each costs about what
     # screening nine starts used to, which is what makes a grid of this size affordable.
     t0 = time.time()
+    # The sweep is a list of independent units -- one render per designed start, then one
+    # coarse screen per carried start, then one full ladder per kept start -- so what a
+    # checkpoint has to hold is which of them are finished. There is no optimiser state to
+    # restore and nothing partial to reconstruct: a killed run loses the unit it was in and
+    # nothing else, which is what makes this safe to rely on rather than only cheap.
+    ckpt_path = Path(a.ckpt_file or f"{a.out}.gn.ckpt") if a.out else None
+    keys = {"model": a.model, "channel": a.channel, "support": Path(sup_stl).name,
+            "phases": a.phases, "operator_res": a.operator_res,
+            "render": render_tag(render_cfg),
+            "hold_out_geoms": a.hold_out_geoms, "area_weight": a.area_weight,
+            "volume_trust": a.volume_trust, "volume_floor": a.volume_floor,
+            "screen_starts": int(min(a.screen_starts, N_STARTS)), "restarts": a.restarts,
+            "restart_keep": a.restart_keep, "max_stage_iters": a.max_stage_iters,
+            "max_degree": a.max_degree,
+            "step_g": a.step_g, "step_c": a.step_c, "seed": a.seed}
+    st = {"pool": [], "next_start": 0, "skipped_depth": 0, "skipped_floor": 0,
+          "screened": [], "next_screen": 0, "done": [], "renders": 0, "refused_volume": 0,
+          "elapsed": 0.0}
+    if ckpt_path is not None and ckpt_path.exists() and not a.no_resume:
+        prev = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+        if prev.get("keys") != keys:
+            print(f"  {ckpt_path} was written under other settings, so it is ignored and the "
+                  f"sweep starts from the beginning", flush=True)
+        else:
+            st = prev["state"]
+            print(f"  resumed {ckpt_path}: {st['next_start']} starts ranked, "
+                  f"{st['next_screen']} screened, {len(st['done'])} ladders finished "
+                  f"({_hms(st['elapsed'])} of fitting before this run)", flush=True)
+
+    def save() -> None:
+        """Written under a temporary name and renamed, so a kill mid-write leaves the
+        previous checkpoint rather than a truncated one."""
+        if ckpt_path is None:
+            return
+        st["renders"] = gate.renders
+        st["refused_volume"] = refused_volume[0]
+        st["elapsed"] = elapsed_before + (time.time() - t0)
+        ckpt_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = ckpt_path.with_name(ckpt_path.name + ".part")
+        torch.save({"keys": keys, "state": st}, tmp)
+        tmp.replace(ckpt_path)
+
+    elapsed_before = float(st["elapsed"])
+    gate.renders = int(st["renders"])
+    refused_volume[0] = int(st["refused_volume"])
+
+    def out_of_time() -> bool:
+        return bool(a.time_budget) and (elapsed_before + time.time() - t0) > a.time_budget
+
     ranked_from = gate.renders
-    pool, skipped_depth, skipped_floor = [], 0, 0
-    for i in range(min(a.screen_starts, N_STARTS)):
+    pool = st["pool"]
+    limit = int(min(a.screen_starts, N_STARTS))
+    for i in range(st["next_start"], limit):
         c0, g0, rec = conjunction_start(nodes, i, n_radial=N_RADIAL)
         # A carve deeper than a body has room for is not a body, so it is passed over rather
         # than shortened: a start clipped to the bound is a different start from the one the
         # grid means, and the grid would then no longer be a spread.
         if float(g0.max()) > cap:
-            skipped_depth += 1
-            continue
-        r_i, area_i, _ = gate._render(c0, g0)
-        if r_i is None:
-            skipped_floor += 1
-            continue
-        pool.append({"objective": gate.objective(r_i, area_i), "c": c0, "g": g0,
-                     "recipe": {"start": rec["kind"], **rec}})
+            st["skipped_depth"] += 1
+        else:
+            r_i, area_i, _ = gate._render(c0, g0)
+            if r_i is None:
+                st["skipped_floor"] += 1
+            else:
+                pool.append({"objective": gate.objective(r_i, area_i), "c": c0, "g": g0,
+                             "recipe": {"start": rec["kind"], **rec}})
+        st["next_start"] = i + 1
+        save()
+        if (i + 1) % 20 == 0 or i + 1 == limit:
+            print(f"    ranked {i + 1}/{limit} designed starts [{time.time() - t0:.0f}s]",
+                  flush=True)
+        if out_of_time():
+            print(f"    the time budget stopped the ranking at {i + 1} of {limit} starts",
+                  flush=True)
+            break
+    skipped_depth, skipped_floor = st["skipped_depth"], st["skipped_floor"]
+    if not pool:
+        raise SystemExit("no designed start is a body this model has room for; there is "
+                         "nothing to rank and nothing to fit")
     pool.sort(key=lambda q: q["objective"])
     take = max(0, a.restarts - 1)
     starts = ([(np.zeros(N_RADIAL), np.zeros(N_NODES))]
@@ -337,9 +422,15 @@ def main() -> None:
         return rows[-1][key] if rows else float("inf")
 
     def capped(stages):
-        """`stages` with every iteration count held at --max-stage-iters. The cap is applied
-        here rather than inside the solver so that the designed ladder stays the one thing a
-        reader of gauss_newton.py sees, and a shortened run is visibly a shortened run."""
+        """`stages` with every iteration count held at --max-stage-iters and every degree at
+        --max-degree. A ladder left empty by the degree bound becomes one stage at that
+        degree, with the first stage's iteration count, so that a bound below the designed
+        ladder still fits something. Both caps are applied here rather than inside the solver
+        so that the designed ladder stays the one thing a reader of gauss_newton.py sees, and
+        a shortened run is visibly a shortened run."""
+        if a.max_degree:
+            kept = tuple(st for st in stages if st.degree and st.degree <= a.max_degree)
+            stages = kept or (Stage(a.max_degree, stages[0].n_dirs, stages[0].iters),)
         if not a.max_stage_iters:
             return stages
         return tuple(Stage(st.degree, st.n_dirs, min(st.iters, a.max_stage_iters))
@@ -368,22 +459,36 @@ def main() -> None:
               f"  {'step' if row['accepted'] else 'no step'}  [{time.time()-t0:.0f}s]",
               flush=True)
 
-    screened = []
-    for i, (c0, g0) in enumerate(starts):
+    screened = st["screened"]
+    for i in range(st["next_screen"], len(starts)):
+        c0, g0 = starts[i]
         f = new_fit(a.seed + i)
         c, g, hist = f.run(c0, g0, stages=screen_stages, target=TARGET_SIGMA)
         screened.append({"i": i, "objective": last(hist, "objective"),
                          "chi": last(hist, "chi"), "c": c, "g": g, "renders": f.renders})
+        st["next_screen"] = i + 1
+        save()
         print(f"  start {i} ({recipes[i]['start']}): objective "
               f"{screened[-1]['objective']:.4f}, chi {screened[-1]['chi']:.4f} after "
               f"{screen_stages[0].iters} coarse steps, {f.renders} renders "
               f"[{time.time()-t0:.0f}s]", flush=True)
+        if out_of_time():
+            print(f"    the time budget stopped the coarse screen at {i + 1} of "
+                  f"{len(starts)} starts", flush=True)
+            break
     # Starts are compared on what is being minimised. A start that has bought misfit with
     # surface is not ahead of one that has not.
-    screened.sort(key=lambda s: s["objective"])
+    screened.sort(key=lambda q: q["objective"])
 
-    best = None
-    for s in screened[:max(1, a.restart_keep)]:
+    # Which starts are finished, by their index and not by how many there are: a resumed run
+    # screens more starts, which re-sorts the ranking, and a start that has moved would
+    # otherwise be fitted twice while another was skipped. A start fitted under an earlier
+    # ranking still counts -- it was fitted to the end and scored on the same functional, so
+    # it is a candidate whether or not it would be carried today.
+    done = st["done"]
+    fitted = {int(q["start"]) for q in done}
+    keep = [q for q in screened[:max(1, a.restart_keep)] if int(q["i"]) not in fitted]
+    for s in keep:
         f = new_fit(a.seed + s["i"] + 100)
         floor_before = refused_volume[0]
         cu, gu, hist = f.run(s["c"], s["g"], stages=ladder_stages, target=TARGET_SIGMA,
@@ -416,12 +521,37 @@ def main() -> None:
         # which is also the one the written body is judged by downstream.
         print(f"  start {s['i']} finished at chi {chi:.4f}, area {area:.3f}, objective "
               f"{obj:.4f} ({f.renders + s['renders']} renders)", flush=True)
-        if best is None or obj < best["objective"]:
-            best = {"objective": obj, "chi": chi, "c": c, "g": g, "start": s["i"],
-                    "history": hist, "renders": f.renders + s["renders"],
-                    "recipe": recipes[s["i"]], "refused_depth": f.refused_depth,
-                    "refused_volume": refused_volume[0] - floor_before,
-                    "polished": keep_polish, "budget_limited": still_descending(hist)}
+        done.append({"objective": obj, "chi": chi, "c": c, "g": g, "start": s["i"],
+                     "history": hist, "renders": f.renders + s["renders"],
+                     "recipe": recipes[s["i"]], "refused_depth": f.refused_depth,
+                     "refused_volume": refused_volume[0] - floor_before,
+                     "polished": keep_polish, "budget_limited": still_descending(hist)})
+        save()
+        if out_of_time() and s is not keep[-1]:
+            print(f"    the time budget stopped the ladder after {len(done)} of "
+                  f"{len(keep) + len(fitted)} kept starts", flush=True)
+            break
+    time_limited = out_of_time()
+    if not done:
+        # Nothing finished, so there is no body to write and nothing to select. The
+        # checkpoint holds every unit that did finish, so the answer is to run this again --
+        # with a larger budget, or a shorter ladder -- rather than to write out a start that
+        # has had no fit.
+        raise SystemExit(
+            f"model {a.model}: the time budget ran out before any start finished its ladder. "
+            f"The ranked starts and the coarse screen are in "
+            f"{ckpt_path if ckpt_path is not None else 'no checkpoint (no --out)'}; rerun to "
+            f"continue from there, with a larger --time-budget or a smaller "
+            f"--max-stage-iters.")
+    # Two finished starts are compared under the penalty, not under the misfit the polish was
+    # run on; the comparison is made here so that it is the same one whether the starts were
+    # fitted in one run or across several.
+    best = min(done, key=lambda q: q["objective"])
+    if time_limited:
+        print(f"  !!! the time budget stopped this fit; the body written is the best of the "
+              f"{len(done)} start(s) that finished, not of the {max(1, a.restart_keep)} the "
+              f"ladder was given. The checkpoint holds them, so rerunning this continues "
+              f"with the rest.", flush=True)
     if best["budget_limited"]:
         print("  !!! the ladder was still taking steps at its last iteration, so this body "
               "is bounded by the iteration counts and not by the curves", flush=True)
@@ -435,36 +565,22 @@ def main() -> None:
 
     # the body as it would be submitted, and its misfits, measured at the export resolution
     # and the export phase count, which is what a scored body is
-    op_x = CodeOperator(inst, psi_grid(a.export_phases), res=a.export_res, config=render,
+    op_x = CodeOperator(inst, psi_grid(a.export_phases), res=a.export_res, config=render_cfg,
                         device=dev)
     d_x = load_inversion_curves(a.data_dir, a.model, m=a.export_phases, channel=a.channel)
     data_x = curve_pairs(d_x["curves"])
     scale_x = residual_scale(d_x, inst.eta).clamp_min(ETA_FLOOR)
 
-    def measure_at_export(c, g, geoms):
-        """(misfit, objective) on those cameras, at the resolution and phase count a written
-        body is scored at.
+    # One measurement, shared with the other solver, so that a body from either carries the
+    # same number and scripts/select_answers.py can compare them. The reshaping travels
+    # beside the code here and inside it there, which is the one difference between the two.
+    measure = export_measure(op_x, support, R, data_x, scale_x, weight, a.area_weight)
 
-        The objective goes beside the misfit because it is what was minimised. A gate that
-        reads the misfit alone prefers a corrugated body to a shaped one, which is the thing
-        the penalty exists to stop, so selecting on a different functional from the one that
-        was minimised undoes the fit."""
-        if not geoms:
-            return float("nan"), float("nan")
-        gg, keep = curve_index(weight, geoms)
+    def measure_at_export(c, g, geoms):
         code = zero_code.clone()
         code[-N_NODES:] = torch.tensor(np.asarray(g), dtype=torch.float32, device=dev)
-        out = op_x.curves_with_shape(support, code, R, geoms=gg,
-                                     c=torch.tensor(np.asarray(c), dtype=torch.float32,
-                                                    device=dev))
-        if out is None:
-            return float("inf"), float("inf")
-        cur, area, _ = out
-        pred = flat_curves(cur, keep)
-        obs = flat_curves(data_x[gg], keep)
-        sc = np.repeat(scale_x[gg].numpy()[keep.numpy()], data_x.shape[-1])
-        chi2 = float(np.mean(((pred - obs) / sc) ** 2))
-        return float(np.sqrt(chi2)), float(np.log(max(chi2, 1e-300)) + a.area_weight * area)
+        return measure(code, geoms,
+                       c=torch.tensor(np.asarray(c), dtype=torch.float32, device=dev))
 
     convex_fit, convex_fit_obj = measure_at_export(*zeros, fit_geoms)
     convex_held, convex_held_obj = measure_at_export(*zeros, held)
@@ -511,6 +627,9 @@ def main() -> None:
             "restart_keep": a.restart_keep, "polished": best["polished"],
             "screen_starts": a.screen_starts, "starts_ranked": len(pool),
             "max_stage_iters": a.max_stage_iters,
+            "max_degree": a.max_degree,
+            "time_limited": time_limited, "ladders_finished": len(done),
+            "ladders_asked": max(1, a.restart_keep),
             "starts_over_depth_cap": skipped_depth, "starts_under_floor": skipped_floor,
             "budget_limited": best["budget_limited"],
             "refused_volume": best["refused_volume"],
@@ -533,10 +652,13 @@ def main() -> None:
     Path(a.out).with_suffix(".json").write_text(json.dumps(meta, indent=2,
                                                            default=json_default))
     if export_error is not None:
-        raise SystemExit(
-            f"model {a.model}: the fit finished and is written beside this, but the extracted "
-            f"mesh is not a closed solid and was refused. Re-extract from "
-            f"{Path(a.out).with_suffix('.fit.npz')} rather than refitting.")
+        # A distinct status, because this is not the same failure as a run that broke: the
+        # fit finished, its numbers are in the JSON, and only the extraction is unusable. A
+        # runbook can carry on past it, and the wiring test can count it as a stage that ran.
+        print(f"model {a.model}: the fit finished and is written beside this, but the "
+              f"extracted mesh is not a closed solid and was refused. Re-extract from "
+              f"{Path(a.out).with_suffix('.fit.npz')} rather than refitting.", flush=True)
+        raise SystemExit(EXPORT_REFUSED)
     print(f"  wrote {a.out} ({rep['faces']} faces, volume {rep['volume']:.3f}); at export "
           f"resolution chi_fit {fit_x:.3f} against the convex answer's {convex_fit:.3f}"
           + (f", chi_held {held_x:.3f} against {convex_held:.3f}" if held else "")

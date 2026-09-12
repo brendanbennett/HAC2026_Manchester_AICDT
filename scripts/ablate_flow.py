@@ -29,10 +29,11 @@ from hac26.conventions import cameras, psi_grid          # noqa: E402
 from hac26.field import N_DIR                            # noqa: E402
 from hac26.solvers.lpd_flow import N_MODES, LPDFlow, geometry_tags   # noqa: E402
 from hac26.solvers.operator import CodeOperator          # noqa: E402
-from train_lpd import (CALIBRATION, CORPUS, FIT_FROM, OCC_WEIGHT, RENDER,   # noqa: E402
-                       Corpus, check_flow_metadata, file_digest, flow_loss, held_out,
-                       load_corpus, load_flow_file, load_instrument, model_error_scale,
-                       noise_sigma, probe_centres, probe_field, smooth_noise_like)
+from train_lpd import (CALIBRATION, CORPUS, FIT_FROM, OCC_WEIGHT, Corpus,   # noqa: E402
+                       add_render_flags, check_flow_metadata, file_digest, flow_loss,
+                       held_out, load_corpus, load_flow_file, load_instrument,
+                       model_error_scale, noise_sigma, probe_centres, probe_field,
+                       render_from, render_tag, smooth_noise_like)
 
 
 def carving(corpus: Corpus) -> torch.Tensor:
@@ -87,7 +88,9 @@ def main():
                     help="must match the training run")
     ap.add_argument("--fit-from", type=float, default=FIT_FROM,
                     help="must match the training run; used for metadata consistency")
+    add_render_flags(ap)
     a = ap.parse_args()
+    render = render_from(a, "comparison")
 
     data, meta = load_corpus(a.corpus)
     if meta["calibration"] != file_digest(a.calibration):
@@ -97,10 +100,10 @@ def main():
     dev = "cuda" if torch.cuda.is_available() else "cpu"
     inst = load_instrument(a.calibration, dev)
     eta = model_error_scale(inst)
-    op = CodeOperator(inst, psi_grid(phases), res=op_res, config=RENDER, device=dev)
+    op = CodeOperator(inst, psi_grid(phases), res=op_res, config=render, device=dev)
     sd, flow_meta = load_flow_file(a.ckpt, map_location="cpu")
     check_flow_metadata(flow_meta, corpus=a.corpus, calibration=a.calibration,
-                        phases=phases, operator_res=op_res, context=a.ckpt)
+                        phases=phases, operator_res=op_res, context=a.ckpt, render=render_tag(render))
     net = LPDFlow.from_state_dict(sd)
     net = net.to(dev).eval()
     data = data.to(dev)

@@ -29,8 +29,8 @@ the search.
 The two basins are separated by 0.0069, and the renderer used to measure them misses the
 released curves at the released mesh by 0.011. The ordering is real but finer than the
 instrument that measured it, which is why the residual `scripts/calibrate.py` reports is the
-first number to read, and why `scripts/select_answers.py` will not correct a scored body that
-no public body has vouched for.
+first number to read, and why `scripts/select_answers.py` decides every body on cameras its
+own fit never saw rather than on the misfit it was fitted to.
 
 ## The hull cannot be had from the unshadowed geometries
 
