@@ -58,6 +58,14 @@ POINTS_PER_NODE = 12   # fewest sample points per depth the fit will accept. Mea
                        # convexity 0.34 to a Dice of 0.97. A smooth body needs far fewer, since
                        # most of its depths are near zero, so this floor is set by the bodies
                        # that matter. See main.
+POINTS_PER_NODE_DEFAULT = 18   # sample points per depth when --points is not given. Above the
+                       # floor rather than at it: the floor is the fewest the solve tolerates,
+                       # and a default sitting on it leaves every run that does not override
+                       # it at the edge of being decided by the ridge, where the fitted-Dice
+                       # check can refuse the corpus over the sampling rather than the bodies.
+                       # Eighteen is just past the seventeen at which a deeply carved body
+                       # came back at a Dice of 0.97. Both numbers are per depth, so neither
+                       # goes stale when the representation changes how many there are.
 DICE_FLOOR = 0.75      # median fitted Dice below which the corpus is refused; see
                        # report_corpus
 
@@ -284,7 +292,7 @@ def main():
     ap.add_argument("--bodies", type=int, default=40)
     ap.add_argument("--workers", type=int, default=1,
                     help="parallel workers for independent SDF/support preprocessing")
-    ap.add_argument("--points", type=int, default=POINTS_PER_NODE * N_NODES,
+    ap.add_argument("--points", type=int, default=POINTS_PER_NODE_DEFAULT * N_NODES,
                     help="surface sample points per body. The depths are solved from these, "
                          "and how far the code is a property of the body rather than of the "
                          "sampling improves as their square root, so this is worth as much as "

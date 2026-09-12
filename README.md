@@ -245,10 +245,12 @@ correction. The pipeline's last stage is the non-convex track above, which is wh
 `results/submission`.
 
 `submit_csf3.sh` is that pipeline as a batch job, with the partitions, the modules and the
-GPU architectures of one cluster settled in it. `CSF_STAGE=nonconvex ./submit_csf3.sh` runs
-the correction and the submission alone: those read no corpus and no flow, only the
-calibration and the committed convex answers, so they need none of the training and are
-hours rather than days.
+GPU architectures of one cluster settled in it. `submit_csf3_gn.sh` is the correction and the
+submission on their own: they read no corpus and no flow, only the calibration and the
+committed convex answers, so they need none of the training. It asks for hours rather than
+days, and for a rasterisation-shaped GPU rather than a training-shaped one, because a
+Jacobian column there is one render of one candidate. Run it with `SCORED="4"` first to see
+what one body costs before trusting a wallclock for all of them.
 
 ## Tests
 

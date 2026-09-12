@@ -111,7 +111,23 @@ def curve_pairs(curves56: np.ndarray) -> torch.Tensor:
 
 
 def geometry_mask(mask56: np.ndarray) -> torch.Tensor:
-    """(1, N_CAMS): a geometry counts as present only if BOTH its curves are."""
+    """(1, N_CAMS): a geometry counts as present only if BOTH its curves are.
+
+    AND, and not OR, because of what this mask is for. It is the flow's conditioning channel:
+    one flag per geometry, handed to `flow_inputs` beside features that `residual_features`
+    computes over both curve columns of every marked geometry, and used to choose the
+    geometries the adjoint's cotangent is formed on. Neither path carries `curve_weight`, so
+    marking a geometry whose count curve Otsu's threshold collapsed does not recover its
+    intensity curve; it shows the network the collapsed curve as data, in the features and in
+    the gradient, and a zero residual there reads as a perfect fit. Dropping the geometry
+    costs one curve. Marking it corrupts the other.
+
+    The intensity curve of such a geometry is recovered for the solvers instead, by
+    `measured_geometries` below: they select curves one at a time through `curve_weight`
+    wherever a residual is formed, so for them a geometry with one good curve is a geometry
+    with a measurement in it. That is where model 2's eighteen refused count curves stop
+    costing anything.
+    """
     return torch.tensor((mask56[:N_CAMS] > 0) & (mask56[N_CAMS:] > 0),
                         dtype=torch.float32)[None]
 

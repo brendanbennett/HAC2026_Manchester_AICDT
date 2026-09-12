@@ -4,7 +4,6 @@
 # from, and a name written here goes stale the moment the work moves.
 #
 #   ./submit_csf3.sh                            # gpuA (A100 80GB), 4-day limit
-#   CSF_STAGE=nonconvex ./submit_csf3.sh        # the correction and the submission only
 #   CSF_PARTITION=gpuH_short ./submit_csf3.sh   # H200, 1-day limit
 #   CSF_PARTITION=gpuH ./submit_csf3.sh         # H200, 4-day limit
 #   CSF_PARTITION=gpuL ./submit_csf3.sh         # L40S 48GB, 4-day limit
@@ -13,11 +12,12 @@
 #
 # CSF_TIME overrides the wallclock and CSF_ACCOUNT the H200 account code.
 #
-# CSF_STAGE=nonconvex runs scripts/run_nonconvex.sh alone: it calibrates the rendered
-# channel, corrects every body from the committed convex answers with both solvers, and
-# writes a submission. It reads no corpus and no flow, so it needs neither the library nor
-# any training, and it is hours rather than days. The default runs the whole pipeline, which
-# ends with the same stage.
+# This is the whole pipeline, which ends with the correction and the submission.
+# submit_csf3_gn.sh is that last part on its own: it reads no corpus and no flow, only the
+# calibration and the committed convex answers, so it needs neither the library nor any
+# training and it asks for hours on a rasterisation-shaped GPU rather than days on a
+# training-shaped one. That is the job to submit when a submission is wanted before the
+# training finishes.
 #
 # =============================================================================
 # Partition, modules and the torch build are all confirmed against this cluster:
@@ -109,14 +109,37 @@ export HF_HOME="$SCRATCH/cache/huggingface"
 # directory without -L, so pointing that variable at a symlink silently yields no models and
 # the library is built with the "real" family empty.
 mkdir -p dataset
-if [ ! -L dataset/raw ]; then
-  rm -rf dataset/raw
-  ln -s "$SCRATCH/raw" dataset/raw
-fi
-if [ ! -L runs ]; then
-  rm -rf runs
-  ln -s "$SCRATCH/runs" runs
-fi
+# The path the scripts use, and where the bytes should live. A path that is already a
+# symlink is left alone. A populated path with empty scratch is moved rather than deleted, so
+# a dataset that has been fetched and validated once -- or rsynced from a machine that did --
+# is not fetched again, and the organisers' hosted files cannot drift out from under a
+# checked-in dataset/MANIFEST.sha256 between one job and the next. Both populated is the one
+# case this cannot decide: scratch is what accumulates across jobs and may hold a training
+# checkpoint, the checkout may hold the data someone just copied in, and picking either would
+# throw away the other. It stops instead, while stopping is still cheap.
+# submit_csf3_gn.sh carries the same function; keep the two the same.
+_scratch_link() {
+  local path="$1" target="$2"
+  [ -L "$path" ] && return 0
+  local here="" there=""
+  [ -d "$path" ] && here=$(ls -A "$path" 2>/dev/null | head -1)
+  [ -d "$target" ] && there=$(ls -A "$target" 2>/dev/null | head -1)
+  if [ -n "$here" ] && [ -n "$there" ]; then
+    echo "ERROR: $path and $target both have content, and only one can be kept." >&2
+    echo "       Scratch is what carries over between jobs; the checkout is what a copy" >&2
+    echo "       lands in. Delete whichever is stale and resubmit." >&2
+    exit 1
+  fi
+  if [ -n "$here" ]; then
+    echo "  $path already has content; moving it to $target rather than fetching it again"
+    rm -rf "$target"; mv "$path" "$target"
+  else
+    rm -rf "$path"; mkdir -p "$target"
+  fi
+  ln -s "$target" "$path"
+}
+_scratch_link dataset/raw "$SCRATCH/raw"
+_scratch_link runs "$SCRATCH/runs"
 export SHAPE_MODELS_DIR="$SCRATCH/shape_models"
 export LIB_DIR="$SCRATCH/generated/shapes"
 mkdir -p "$SHAPE_MODELS_DIR" "$LIB_DIR"
@@ -174,8 +197,4 @@ make data 2>&1 | tee logs/csf3_data.log || \
 # complete, so a job that hits the wall clock can be resubmitted as is. The
 # non-convex track keeps its state per body instead, so it too carries on
 # where a killed job stopped.
-case "${CSF_STAGE:-pipeline}" in
-  pipeline)  ./scripts/run_remote_pipeline.sh ;;
-  nonconvex) ./scripts/run_nonconvex.sh ;;
-  *) echo "CSF_STAGE=$CSF_STAGE: expected pipeline or nonconvex" >&2; exit 1 ;;
-esac
+./scripts/run_remote_pipeline.sh

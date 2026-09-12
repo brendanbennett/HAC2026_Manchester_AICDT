@@ -35,13 +35,11 @@ N_BODIES=${N_BODIES:-4}
 LIB_RES=${LIB_RES:-32}
 LIB_WORKERS=${LIB_WORKERS:-$(nproc 2>/dev/null || echo 2)}
 FIT_WORKERS=${FIT_WORKERS:-$LIB_WORKERS}
-# Not set here. The fit refuses fewer than a dozen sample points per depth, because below
-# that the solve is decided by the ridge rather than by the body and the smoke test would be
-# exercising something no real run does. That floor is a property of how many directions the
-# field carries, so it moves whenever the representation does -- a number written here went
-# stale the moment the field grew from a lattice to 2560 depths. fit_shapes derives its own
-# default from the same constant as the floor, so leaving it unset cannot go stale. Set
-# FIT_POINTS to override, and the fit will refuse anything under its floor.
+# Not set here. Both the floor the fit refuses to run under and the default it uses instead
+# are counts per depth, so they move with the representation: a number written here went
+# stale the moment the field grew from a lattice to 2560 depths, and would go stale again.
+# The default is above the floor rather than on it, so the fitted-Dice check this stage makes
+# is deciding on the bodies rather than on the sampling. Set FIT_POINTS to override.
 FIT_POINTS=${FIT_POINTS:-}
 FLOW_STEPS=${FLOW_STEPS:-8}
 FLOW_PHASES=${FLOW_PHASES:-16}     # few phases keep the run short
