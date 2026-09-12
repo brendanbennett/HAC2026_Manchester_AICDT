@@ -21,6 +21,11 @@ ones are at the physical scale of the printed model, z spanning 6–8 rather tha
 | 09-08 | *convex hull of truth* — the convex ceiling, not a legal run | 0.9969 | 0.9941 | 0.9997 | 0.9165 | 0.8828 | 0.9848 | **5.775** |
 | 09-08 | `results/convex` — LPD convex stage, `--fit-cylinder` | 0.9786 | 0.9929 | 0.9106 | 0.9905 | 0.7147 | 0.9568 | **5.544** |
 | 09-08 | `results/lpd` — convex start + flow + polish (as shipped) | 0.9554 | 0.9865 | 0.8109 | 0.9711 | 0.7216 | 0.9589 | **5.405** |
+| 09-12 | flow retrained on CSF3, 800 bodies, 11M, polish 30 | 0.9552 | 0.9914 | 0.8598 | 0.9824 | 0.7330 | 0.9576 | **5.480** |
+| 09-12 | the same, polish 0 | 0.9530 | 0.9902 | 0.8736 | 0.9764 | 0.7249 | 0.9566 | **5.475** |
+| 09-12 | flow retrained, 2500 bodies, **304M** parameters | 0.529\* | — | 0.356\* | — | 0.422\* | — | **far worse** |
+
+\* Dice against truth, not the full measure; the run was abandoned once these were seen.
 
 Model 1 is Vesta (near-convex), 2 the sawed-off cube (convex), 3 Mithra (a contact binary, the
 only public body whose shape needs concavity).
@@ -112,6 +117,48 @@ refinement: the Track A run that ended at chi 1.109 stayed at convexity 1.000 th
 it was a convex body fitted to the data, and its Dice still fell 0.690 → 0.665. The convex
 stage's answer is good because it is a learned prior over plausible convex bodies, not because
 it fits the curves; fitting the curves is what breaks it.
+
+## What the retrained flow changed, and what it did not
+
+Retraining on CSF3 H200s with the two silently-dropped shape families restored (real asteroid
+models and Thingi10K objects) took the flow from **5.405 to 5.480**. It is the best flow this
+project has produced and it is still **0.064 below the convex stage at 5.544**.
+
+The per-model detail is the interesting part, and it is why no per-model rule is shipped:
+
+| model | convex | retrained flow | winner |
+|---|---|---|---|
+| 1 Vesta, near-convex | 1.972 | 1.947 | convex |
+| 2 sawed cube | 1.901 | 1.842 | convex |
+| 3 Mithra, contact binary | 1.672 | **1.691** | **flow** |
+
+The flow wins on the one public body whose shape needs concavity and loses on the two that do
+not, which is exactly what it was built to do. A rule that picked per model would score 5.564.
+There is no such rule: the obvious candidate, how deeply the flow carved, does not separate
+the cases -- model 3's answer has convexity 0.978, between model 1's 0.988 and model 2's
+0.897, and the flow wins only on model 3. Picking per model on the public scores would be
+fitting to truth the secret models do not come with.
+
+## Where the remaining error actually is
+
+Three measurements, none of which is about the concavity machinery:
+
+**The convex stage under-estimates the body.** Fraction of each truth lying OUTSIDE the convex
+answer, which a carve can never recover: model 1 2.9%, model 2 **17.9%**, model 3 3.9%.
+Carving alone caps the cube at Dice 0.821 while the convex stage already scores 0.911 there,
+so on that body the binding error is the convex inversion, not concavity.
+
+**The representation can already fix this, and does not.** `dh`, the flow's correction to the
+support function, is 128 samples band-limited to spherical harmonics of degree 5 -- 36
+effective numbers over 4096 normals, which looks far too coarse for a cube. Fitted to the gap
+between the convex stage's support and the truth's hull support it captures **99.5%, 99.4% and
+98.1%** of it on models 1, 2 and 3. The capacity is there and unused.
+
+**So the limit is the objective, not the parametrisation.** The oracle reaches Dice 0.991 on
+Mithra from the convex stage's own support; the line probe shows the misfit rising 9% on the
+way to the truth; the forward model misses the lab curves by 4-11% RMS at the *true* shape.
+A body that fits the data better is not reliably a body that is more like the truth, and no
+change to how concavity is represented alters that.
 
 ## Two quirks of the released evaluation code
 
