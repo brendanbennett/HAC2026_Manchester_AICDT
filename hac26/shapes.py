@@ -170,6 +170,12 @@ def rescale_touch_z(verts: np.ndarray, faces: np.ndarray | None = None,
         v[:, 0] -= c[0]
         v[:, 1] -= c[1]
     zmin, zmax = v[:, 2].min(), v[:, 2].max()
+    if not zmax - zmin > 1e-12:
+        # Dividing by it anyway returns inf and nan, a nan extent makes every occupancy grid
+        # empty, and dice() reads two empty grids as two identical bodies and returns 1.0 --
+        # so a degenerate body would score perfectly. hac26.shape_library.pose raises on
+        # exactly this condition; so does this.
+        raise ValueError("degenerate body: zero z extent")
     v[:, 2] -= 0.5 * (zmin + zmax)
     return v * (2.0 / (zmax - zmin))
 

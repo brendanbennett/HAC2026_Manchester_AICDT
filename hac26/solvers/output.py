@@ -233,16 +233,19 @@ def export_stl(path: str, verts: np.ndarray, faces: np.ndarray,
         n_dropped = len(pieces) - 1
         m = keep
     m.fix_normals()                      # consistent winding, outward
+    filled = False
     if not m.is_watertight:
         m.fill_holes()
         m.fix_normals()
+        filled = True
     report = {"watertight": bool(m.is_watertight), "volume": float(m.volume),
               "faces": int(len(m.faces)), "degenerate_faces_dropped": n_degenerate,
-              "components_dropped": n_dropped,
+              "components_dropped": n_dropped, "filled_holes": filled,
               "winding_consistent": bool(m.is_winding_consistent)}
     if strict and not (report["watertight"] and report["volume"] > 0.0):
-        raise ValueError(f"refusing to write {path}: the mesh is not a single watertight body "
-                         f"of positive volume after repair ({report}). Writing it would "
+        raise ValueError(f"refusing to write {path}: not a closed solid -- the mesh is not a "
+                         f"single watertight body of positive volume after repair "
+                         f"({report}). Writing it would "
                          f"submit a surface an evaluator may read inside out.")
     m.export(path, file_type="stl")      # trimesh writes binary STL by default
     return report
