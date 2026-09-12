@@ -140,6 +140,12 @@ done
 
 mkdir -p runs runs/.done logs results/lpd
 
+# Everything the run needs, checked while it is still cheap to fix. A missing wheel or an
+# unbuilt extension otherwise surfaces hours in, and some of those failures do not look like
+# what they are: a missing decimation package used to read as a body with no curves.
+$PY scripts/preflight.py --data-dir "$DATA_DIR" || {
+  echo "preflight failed; not starting a long run. See above." >&2; exit 1; }
+
 # ---------------------------------------------------------------- helpers
 STAGES_AFTER_FORCE=0
 

@@ -35,6 +35,12 @@ CALIBRATE_MODELS=${CALIBRATE_MODELS:-"1 3"}   # public bodies the instrument is 
 
 mkdir -p "$OUT_DIR" logs
 
+# Everything the run needs, checked while it is still cheap to fix. A missing wheel or an
+# unbuilt extension otherwise surfaces hours in, and some of those failures do not look like
+# what they are: a missing decimation package used to read as a body with no curves.
+$PY scripts/preflight.py --data-dir "$DATA_DIR" || {
+  echo "preflight failed; not starting a long run. See above." >&2; exit 1; }
+
 # the file the calibration writes for this channel, named by the code rather than here
 INSTRUMENT=$($PY -c "import sys; sys.path.insert(0, 'scripts'); \
 from calibrate import OUT_INSTRUMENT; print(OUT_INSTRUMENT['$CHANNEL'])")
