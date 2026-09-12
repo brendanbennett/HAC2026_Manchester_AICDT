@@ -42,8 +42,8 @@
 #   4c. prior       scripts/train_prior.py           -- the prior part of the flow; no operator
 #   5. flow         scripts/train_lpd.py             -- the data part with one expert, on the
 #                   straight line between noise and body; needs nvdiffrast on a GPU
-#   5b. flow-rollout the same run continued: branched into its experts and trained on the
-#                   sampler's own states; the main training phase (see train_lpd.py)
+#   5b. flow-experts the same run continued, branched into its experts so that each interval
+#                   of t has its own velocity; the main training phase (see train_lpd.py)
 #   5c. decision    scripts/decision_check.py         -- reconstructs held-out corpus bodies
 #                   and scores every rule for picking the answer against their truth
 #   6. convex       scripts/reconstruct.py, all ten models -- the starts the flow corrects;
@@ -51,6 +51,9 @@
 #   6b. reconstruct scripts/reconstruct_lpd.py, all ten models -- needs nvdiffrast
 #   7. score        hac26/scoring/voxel.py and side_view.py on the public models --
 #                   needs dataset/raw
+#   8. nonconvex    scripts/run_nonconvex.sh -- calibrates the rendered channel, corrects
+#                   every body with both solvers and decides which corrections are submitted.
+#                   This is the stage that writes results/submission; NONCONVEX=0 skips it.
 #
 # The exact forward model renders with nvdiffrast, which scripts/setup_toolchain.sh builds;
 # the pipeline stops before the calibration if it cannot be imported.
@@ -74,7 +77,13 @@ DESIGN_N=${DESIGN_N:-4096}
 DESIGN_DEVICE=${DESIGN_DEVICE:-}
 
 FIT_WORKERS=${FIT_WORKERS:-$LIB_WORKERS}
-FIT_POINTS=${FIT_POINTS:-60000}
+FIT_POINTS=${FIT_POINTS:-60000}   # surface samples per body, about twenty-three per
+                                  # depth. The fit refuses fewer than twelve per depth
+                                  # and reproduces a deeply carved body at seventeen,
+                                  # so this number is only meaningful against
+                                  # field.N_NODES and has to be reread whenever the
+                                  # representation changes; unset it to take the floor
+                                  # the code derives (scripts/fit_shapes.py)
 CODES_FILE=runs/corpus_codes.npz
 
 CONVEX_CKPT=${CONVEX_CKPT:-models/lpd_convex.pt}   # the convex stage, whose starts the flow corrects
@@ -97,12 +106,18 @@ FLOW_CKPT=${FLOW_CKPT:-runs/lpd_flow.pt.ckpt}   # under runs/, not /tmp: it has 
 FLOW_LOG_EVERY=${FLOW_LOG_EVERY:-10}
 FLOW_OPERATOR_RES=${FLOW_OPERATOR_RES:-32}
 FLOW_TRAIN_GEOMS=${FLOW_TRAIN_GEOMS:-28}   # geometries the operator renders per step; all of them
-FLOW_FIT_WEIGHT=${FLOW_FIT_WEIGHT:-1.0}
-FLOW_FIT_FROM=${FLOW_FIT_FROM:-0.75}
-FLOW_ROLLOUT_STEPS=${FLOW_ROLLOUT_STEPS:-1000}  # cap on the second run's extra steps: branched into
-                                                # experts, rolled out, the main phase; 0 skips it
-FLOW_ROLLOUT_FRAC=${FLOW_ROLLOUT_FRAC:-0.5}     # share of its draws that come from the sampler
+FLOW_FIT_WEIGHT=${FLOW_FIT_WEIGHT:-1.0}   # the interval it applies over is the last expert's
+                                          # and is derived from their number, so it is not a
+                                          # setting here (train_lpd.FIT_FROM)
+FLOW_EXTRA_STEPS=${FLOW_EXTRA_STEPS:-1000}  # cap on the second run's extra steps: branched
+                                            # into experts, the main phase; 0 skips it
 
+NONCONVEX=${NONCONVEX:-1}            # 1 runs scripts/run_nonconvex.sh at the end, which is
+                                     # the stage that writes results/submission
+NONCONVEX_TIME_BUDGET=${NONCONVEX_TIME_BUDGET:-0}   # seconds one body of one solver may take
+                                     # there; 0 is no cap. On a job with a wallclock this is
+                                     # what stops a queue of ten bodies being spent on the
+                                     # first of them
 RECON_SAMPLES=${RECON_SAMPLES:-64}   # draws per model. They are the candidates and they are
                                      # what the consensus bodies are built from, so this also
                                      # sets how finely a consensus level can be placed: the
@@ -223,18 +238,17 @@ stage_signature() {
       ;;
     flow)
       stage_signature prior | sed 's/^stage=prior$/stage=flow/'
-      printf 'FLOW_STEPS=%s\nFLOW_BATCH=%s\nFLOW_VAL_EVERY=%s\nFLOW_PATIENCE=%s\nFLOW_CKPT_EVERY=%s\nFLOW_CKPT=%s\nFLOW_LOG_EVERY=%s\nFLOW_TRAIN_GEOMS=%s\nFLOW_FIT_WEIGHT=%s\nFLOW_FIT_FROM=%s\n' \
+      printf 'FLOW_STEPS=%s\nFLOW_BATCH=%s\nFLOW_VAL_EVERY=%s\nFLOW_PATIENCE=%s\nFLOW_CKPT_EVERY=%s\nFLOW_CKPT=%s\nFLOW_LOG_EVERY=%s\nFLOW_TRAIN_GEOMS=%s\nFLOW_FIT_WEIGHT=%s\n' \
         "$FLOW_STEPS" "$FLOW_BATCH" "$FLOW_VAL_EVERY" "$FLOW_PATIENCE" \
         "$FLOW_CKPT_EVERY" "$FLOW_CKPT" "$FLOW_LOG_EVERY" "$FLOW_TRAIN_GEOMS" \
-        "$FLOW_FIT_WEIGHT" "$FLOW_FIT_FROM"
+        "$FLOW_FIT_WEIGHT"
       ;;
-    flow-rollout)
-      stage_signature flow | sed 's/^stage=flow$/stage=flow-rollout/'
-      printf 'FLOW_ROLLOUT_STEPS=%s\nFLOW_ROLLOUT_FRAC=%s\n' \
-        "$FLOW_ROLLOUT_STEPS" "$FLOW_ROLLOUT_FRAC"
+    flow-experts)
+      stage_signature flow | sed 's/^stage=flow$/stage=flow-experts/'
+      printf 'FLOW_EXTRA_STEPS=%s\n' "$FLOW_EXTRA_STEPS"
       ;;
     decision)
-      stage_signature flow-rollout | sed 's/^stage=flow-rollout$/stage=decision/'
+      stage_signature flow-experts | sed 's/^stage=flow-experts$/stage=decision/'
       printf 'RECON_SAMPLES=%s\nRECON_POLISH_STEPS=%s\nRECON_RES=%s\nSWEEP=%s\nSIDE_POINTS=%s\nSRC=%s\n' \
         "$RECON_SAMPLES" "$RECON_POLISH_STEPS" "$RECON_RES" "$RECON_GUIDANCE_SWEEP" \
         "$MEDOID_SIDE_POINTS" "$SRC_OUTPUT"
@@ -244,9 +258,9 @@ stage_signature() {
         "$DATA_DIR" "$CONVEX_CKPT" "$SRC_CORPUS" "$SRC_FORWARD"
       ;;
     reconstruct)
-      printf 'stage=reconstruct\nDESIGN_N=%s\nFLOW_STEPS=%s\nFLOW_PHASES=%s\nFLOW_BATCH=%s\nFLOW_OPERATOR_RES=%s\nFLOW_TRAIN_GEOMS=%s\nFLOW_ROLLOUT_STEPS=%s\nFLOW_ROLLOUT_FRAC=%s\nCONVEX_CKPT=%s\nRECON_SAMPLES=%s\nRECON_POLISH_STEPS=%s\nRECON_RES=%s\nRECON_SNAP=%s\nMEDOID_VOLUME_ONLY=%s\nMEDOID_SIDE_POINTS=%s\nMEDOID_SIDE_DIRS=%s\nMEDOID_SIDE_RES=%s\nMEDOID_SIDE_MODE=%s\n' \
+      printf 'stage=reconstruct\nDESIGN_N=%s\nFLOW_STEPS=%s\nFLOW_PHASES=%s\nFLOW_BATCH=%s\nFLOW_OPERATOR_RES=%s\nFLOW_TRAIN_GEOMS=%s\nFLOW_EXTRA_STEPS=%s\nCONVEX_CKPT=%s\nRECON_SAMPLES=%s\nRECON_POLISH_STEPS=%s\nRECON_RES=%s\nRECON_SNAP=%s\nMEDOID_VOLUME_ONLY=%s\nMEDOID_SIDE_POINTS=%s\nMEDOID_SIDE_DIRS=%s\nMEDOID_SIDE_RES=%s\nMEDOID_SIDE_MODE=%s\n' \
         "$DESIGN_N" "$FLOW_STEPS" "$FLOW_PHASES" "$FLOW_BATCH" "$FLOW_OPERATOR_RES" \
-        "$FLOW_TRAIN_GEOMS" "$FLOW_ROLLOUT_STEPS" "$FLOW_ROLLOUT_FRAC" "$CONVEX_CKPT" \
+        "$FLOW_TRAIN_GEOMS" "$FLOW_EXTRA_STEPS" "$CONVEX_CKPT" \
         "$RECON_SAMPLES" "$RECON_POLISH_STEPS" "$RECON_RES" "$RECON_SNAP" \
         "$MEDOID_VOLUME_ONLY" "$MEDOID_SIDE_POINTS" "$MEDOID_SIDE_DIRS" \
         "$MEDOID_SIDE_RES" "$MEDOID_SIDE_MODE"
@@ -446,28 +460,27 @@ run_stage flow runs/lpd_flow.pt \
     --patience "$FLOW_PATIENCE" \
     --ckpt-every "$FLOW_CKPT_EVERY" --ckpt-file "$FLOW_CKPT" \
     --log-every "$FLOW_LOG_EVERY" \
-    --fit-weight "$FLOW_FIT_WEIGHT" --fit-from "$FLOW_FIT_FROM" \
+    --fit-weight "$FLOW_FIT_WEIGHT" \
     --corpus "$CORPUS_FILE"
 
-# ---------------------------------------------------------------- 5b. flow, rolled out
-# The same run continued from its checkpoint, branched into the default number of experts:
-# part of the draws now take their state from the sampler itself, for up to
-# FLOW_ROLLOUT_STEPS more steps. This is the main phase; the first run only prepares it.
-if [ "$FLOW_ROLLOUT_STEPS" -gt 0 ]; then
-  run_stage flow-rollout runs/lpd_flow.pt \
+# ---------------------------------------------------------------- 5b. flow, branched
+# The same run continued from its checkpoint, branched into the default number of experts, so
+# that each interval of t gets its own velocity, for up to FLOW_EXTRA_STEPS more steps. This
+# is the main phase; the first run only prepares it.
+if [ "$FLOW_EXTRA_STEPS" -gt 0 ]; then
+  run_stage flow-experts runs/lpd_flow.pt \
     $PY scripts/train_lpd.py \
-      --steps "$FLOW_STEPS" --extra-steps "$FLOW_ROLLOUT_STEPS" \
+      --steps "$FLOW_STEPS" --extra-steps "$FLOW_EXTRA_STEPS" \
       --batch "$FLOW_BATCH" \
       --train-geoms "$FLOW_TRAIN_GEOMS" --out runs/lpd_flow.pt \
       --val-bodies "$FLOW_VAL_BODIES" --val-every "$FLOW_VAL_EVERY" \
       --patience "$FLOW_PATIENCE" \
       --ckpt-every "$FLOW_CKPT_EVERY" --ckpt-file "$FLOW_CKPT" \
       --log-every "$FLOW_LOG_EVERY" \
-      --fit-weight "$FLOW_FIT_WEIGHT" --fit-from "$FLOW_FIT_FROM" \
-      --rollout-frac "$FLOW_ROLLOUT_FRAC" \
+      --fit-weight "$FLOW_FIT_WEIGHT" \
       --corpus "$CORPUS_FILE"
 else
-  log "=== flow-rollout: skipped (FLOW_ROLLOUT_STEPS=0)"
+  log "=== flow-experts: skipped (FLOW_EXTRA_STEPS=0)"
 fi
 
 # ---------------------------------------------------------------- 5c. the decision rule
@@ -598,6 +611,25 @@ if [ -d "$DATA_DIR" ]; then
   "
 else
   log "=== score: skipped ($DATA_DIR not present)"
+fi
+
+# ---------------------------------------------------------------- 8. the non-convex track
+# The stage that produces a submission. It is a runbook of its own, with its own per-body
+# resume, so it is run rather than wrapped in a stage marker: a second invocation of this
+# pipeline skips the bodies that are written and retries the ones that are not.
+if [ "$NONCONVEX" = "1" ] && [ -d "$DATA_DIR" ]; then
+  log "=== nonconvex: starting (both solvers, then the selection)"
+  if DATA_DIR="$DATA_DIR" PY="$PY" TIME_BUDGET="$NONCONVEX_TIME_BUDGET" \
+     ./scripts/run_nonconvex.sh 2>&1 | tee -a logs/nonconvex.log; then
+    log "=== nonconvex: done"
+  else
+    log "=== nonconvex: FAILED -- see logs/nonconvex.log. The convex answers stand wherever"
+    log "    no correction was written, so results/submission is still a submission."
+  fi
+elif [ "$NONCONVEX" != "1" ]; then
+  log "=== nonconvex: skipped (NONCONVEX=0)"
+else
+  log "=== nonconvex: skipped ($DATA_DIR not present)"
 fi
 
 log "=== pipeline complete"

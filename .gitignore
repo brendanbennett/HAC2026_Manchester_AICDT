@@ -15,6 +15,16 @@ dataset/*
 # asset instead; the stable ones live in models/.
 runs/
 
+# What a run writes under results/: the two solvers' bodies, their coefficients and
+# checkpoints, the selection, and the wiring test's whole tree. The convex answers under
+# results/submission and results/public are tracked, and are the only files there that are.
+results/gn/
+results/map/
+results/lpd/
+results/convex/
+results/smoke/
+results/submission/selection.json
+
 # Written into the repo root by a run, not source.
 calibration.json
 logs/

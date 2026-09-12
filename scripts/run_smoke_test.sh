@@ -51,6 +51,17 @@ FLOW_PHASES=${FLOW_PHASES:-16}     # few phases keep the run short
 # the grid pitch is twice the extraction extent over this number, so sixteen -- chosen when
 # the field was a coarse lattice -- no longer reaches it and twenty-four does.
 FLOW_OPERATOR_RES=${FLOW_OPERATOR_RES:-24}
+# The sensor, for every stage that renders. The cost of this pipeline is dominated by the
+# pixels, so a whole-pipeline check at the calibrated 320x568 costs what a run costs and says
+# nothing more about whether the stages agree; the numbers below are meaningless at this size
+# and the stages say so themselves.
+SMOKE_HEIGHT=${SMOKE_HEIGHT:-48}
+SMOKE_WIDTH=${SMOKE_WIDTH:-80}
+SMOKE_SUN_RES=${SMOKE_SUN_RES:-32}
+SIZE=(--height "$SMOKE_HEIGHT" --width "$SMOKE_WIDTH" --sun-res "$SMOKE_SUN_RES")
+# The released meshes the calibration renders, decimated. The visibility test that builds
+# their patches runs on the CPU and is most of a body's cost here.
+TRUTH_FACES=${TRUTH_FACES:-2000}
 DESIGN_N=${DESIGN_N:-4096}
 CONVEX_CKPT=${CONVEX_CKPT:-models/lpd_convex.pt}
 
@@ -65,12 +76,23 @@ log() { echo "[$(date -u +%H:%M:%S)] $*"; }
 t_start=$(date +%s)
 
 # Runs one stage and stops the script with a message if it fails. The command's own exit
-# status is read from PIPESTATUS, since the output goes through tee.
+# status is read from PIPESTATUS, since the output goes through tee. ALLOW holds statuses that
+# are not failures of the stage: the solvers report a refused export as 3, which means the fit
+# ran to the end and its numbers are written but the extracted mesh is not a closed solid.
+# That is a property of the body at this resolution rather than of the wiring, and a wiring
+# test that stopped there would have checked every stage and reported a failure.
+ALLOW=""
 run() {
   local desc="$1" logfile="$2"; shift 2
   "$@" > >(tee "$logfile") 2>&1
   local status=${PIPESTATUS[0]}
   if [ "$status" -ne 0 ]; then
+    for ok in $ALLOW; do
+      if [ "$status" = "$ok" ]; then
+        log "    NOTE: $desc exited $status, which this test allows -- see $logfile"
+        return 0
+      fi
+    done
     log "FAILED: $desc (exit $status) -- see $logfile"
     log "command was: $*"
     exit "$status"
@@ -161,7 +183,7 @@ run "build_corpus" logs/smoke_corpus.log \
   "$PY" scripts/build_corpus.py \
     --bodies "$N_BODIES" --phases "$FLOW_PHASES" --operator-res "$FLOW_OPERATOR_RES" \
     --codes-file "$OUT/corpus_codes.npz" --calibration "$CAL" --convex "$CONVEX" \
-    --out "$OUT/corpus.npz"
+    "${SIZE[@]}" --out "$OUT/corpus.npz"
 tail -5 logs/smoke_corpus.log
 
 log "=== 5/14 train_prior: the prior part over the smoke corpus"
@@ -177,7 +199,7 @@ run "train_lpd" logs/smoke_flow.log \
     --steps "$FLOW_STEPS" --batch 1 --experts 1 \
     --val-bodies 2 --val-every 10 --patience 2 \
     --ckpt-every 10 --log-every 5 --no-resume \
-    --corpus "$OUT/corpus.npz" \
+    --corpus "$OUT/corpus.npz" "${SIZE[@]}" \
     --calibration "$CAL" --prior "$OUT/prior_flow.pt" \
     --out "$OUT/lpd_flow.pt"
 tail -20 logs/smoke_flow.log
@@ -188,7 +210,7 @@ run "train_lpd (experts)" logs/smoke_flow_experts.log \
     --steps "$FLOW_STEPS" --extra-steps 4 --batch 1 \
     --val-bodies 2 --val-every 2 --patience 2 \
     --ckpt-every 2 --log-every 1 \
-    --corpus "$OUT/corpus.npz" \
+    --corpus "$OUT/corpus.npz" "${SIZE[@]}" \
     --calibration "$CAL" --prior "$OUT/prior_flow.pt" \
     --out "$OUT/lpd_flow.pt"
 tail -12 logs/smoke_flow_experts.log
@@ -199,7 +221,7 @@ run "decision_check" logs/smoke_decision.log \
   "$PY" scripts/decision_check.py --bodies 1 --samples 2 --polish-steps 2 --res 24 \
     --val-bodies 2 --side-points 20000 \
     --ckpt "$OUT/lpd_flow.pt" --corpus "$OUT/corpus.npz" --calibration "$CAL" \
-    --out "$OUT/decision_check.json"
+    "${SIZE[@]}" --out "$OUT/decision_check.json"
 tail -12 logs/smoke_decision.log
 
 if [ -d dataset/raw ]; then
@@ -213,7 +235,7 @@ if [ -d dataset/raw ]; then
     "$PY" scripts/reconstruct_lpd.py --model 1 --samples 2 --res 24 --polish-steps 2 \
       --hold-out-geoms 2 \
       --phases "$FLOW_PHASES" --operator-res "$FLOW_OPERATOR_RES" \
-      --ckpt "$OUT/lpd_flow.pt" --calibration "$CAL" \
+      --ckpt "$OUT/lpd_flow.pt" --calibration "$CAL" "${SIZE[@]}" \
       --support-from results/smoke/convex_Asteroid01.stl \
       --medoid-volume-only --out results/smoke/Asteroid01.stl
   tail -20 logs/smoke_reconstruct.log
@@ -226,19 +248,23 @@ if [ -d dataset/raw ]; then
   log "=== 11/14 calibrate: two steps on the blender channel, models 1 and 3"
   run "calibrate" logs/smoke_calibrate.log \
     "$PY" scripts/calibrate.py --channel blender --models 1 3 --steps 2 \
-      --phases 8 --height 48 --width 80 --sun-res 32 \
+      --phases 8 "${SIZE[@]}" --truth-faces "$TRUTH_FACES" \
       --out "$OUT/instrument_smoke.pt" --report "$OUT/instrument_smoke.json"
 
   # 80 designed starts rather than a handful: the grid is caps first and waists from index
   # 72, so anything under that never exercises the family added for multi-lobed bodies.
+  # --max-degree 16 drops the top stage of the ladder, which is more than half its renders
+  # at one render per coordinate, and changes nothing about the path being checked: the
+  # extraction, the polish, the export and the measurement are the same code at any ceiling.
   log "=== 12/14 reconstruct_gn: model 3, one iteration a stage, both start families"
+  ALLOW=3   # a refused export; see run() above
   run "reconstruct_gn" logs/smoke_gn.log \
     "$PY" scripts/reconstruct_gn.py --model 3 --channel blender \
       --calibration "$OUT/instrument_smoke.pt" \
-      --max-stage-iters 1 --restarts 2 --restart-keep 1 --screen-starts 80 \
+      --max-stage-iters 1 --max-degree 16 \
+      --restarts 2 --restart-keep 1 --screen-starts 80 \
       --phases 8 --operator-res 24 --export-res 32 --export-phases 8 \
-      --height 64 --width 112 --sun-res 64 \
-      --hold-out-geoms 2 --out results/smoke/gn/Asteroid03.stl
+      "${SIZE[@]}" --hold-out-geoms 2 --out results/smoke/gn/Asteroid03.stl
   tail -8 logs/smoke_gn.log
 
   log "=== 13/14 reconstruct_map: model 3, a few descent steps on the same objective"
@@ -246,23 +272,25 @@ if [ -d dataset/raw ]; then
     "$PY" scripts/reconstruct_map.py --model 3 --channel blender \
       --calibration "$OUT/instrument_smoke.pt" \
       --steps 4 --every 2 --ckpt-every 2 \
-      --phases 8 --operator-res 24 --hold-out-geoms 2 \
-      --height 64 --width 112 --sun-res 64 \
+      --phases 8 --operator-res 24 --export-res 32 --export-phases 8 \
+      "${SIZE[@]}" --hold-out-geoms 2 \
       --out results/smoke/map/Asteroid03.stl
   tail -8 logs/smoke_map.log
+  ALLOW=""
 
-  # Both tracks select into their own directory, which is the arrangement that keeps one from
-  # overwriting the other's submission. Model 3 is public, so this also checks the path that
-  # reads a released truth.
-  log "=== 14/14 select_answers: each track into its own tree, then the submission check"
-  for track in gn map; do
-    run "select_answers ($track)" "logs/smoke_select_$track.log" \
-      "$PY" scripts/select_answers.py --refined "results/smoke/$track" --models 3 \
-        --into "results/smoke/submission-$track"
-    run "check_submission ($track)" "logs/smoke_check_$track.log" \
-      "$PY" scripts/check_submission.py "results/smoke/submission-$track"
-  done
-  log "    two independent submissions under results/smoke/submission-{gn,map}/"
+  # Both tracks at once, which is what run_nonconvex.sh does: the decision between two
+  # solvers of one body is made on the cameras held out of both fits. Model 3 is public, so
+  # this also checks the path that reads a released truth. --into keeps the smoke test out of
+  # the real submission.
+  log "=== 14/14 select_answers: both tracks, one decision, then the submission check"
+  # A track whose export was refused has no STL, and the selection keeps the convex answer
+  # for it and says so; with both refused the selection is still a complete submission.
+  run "select_answers" logs/smoke_select.log \
+    "$PY" scripts/select_answers.py --refined results/smoke/gn results/smoke/map \
+      --models 3 --into results/smoke/submission
+  run "check_submission" logs/smoke_check.log \
+    "$PY" scripts/check_submission.py results/smoke/submission
+  log "    the chosen bodies are under results/smoke/submission/"
 else
   log "=== 9/14 onwards: skipped (dataset/raw not present)"
   log "    Both need the real measured curves, so they can't run offline. Everything up to"
@@ -280,7 +308,7 @@ log "    flow:     $OUT/lpd_flow.pt"
 log "    the non-convex track, when dataset/raw was present:"
 log "    instrument: $OUT/instrument_smoke.pt"
 log "    bodies:     results/smoke/{gn,map}/Asteroid03.stl"
-log "    submissions: results/smoke/submission-{gn,map}/"
+log "    submission: results/smoke/submission/ (selection.json says which track won)"
 log ""
 log "If this all ran without error, scripts/run_remote_pipeline.sh should too. Nothing"
 log "here touched runs/corpus_codes.npz, runs/corpus.npz, runs/lpd_flow.pt, models/ or"
