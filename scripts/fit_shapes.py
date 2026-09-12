@@ -63,7 +63,14 @@ SOLVE_CHUNK = 20000    # sample points per block of the solve. Both the core sup
 # The sampled points have to cover the lattice and its kernels, not just the body: a site the
 # sampler never sees is an amplitude the fit cannot determine.
 SAMPLE_EXTENT = LATTICE_EXTENT + 3.0 * LATTICE_ALPHA * (2.0 * LATTICE_EXTENT / LATTICE_SHAPE[0])
-SD_CHUNK = 500         # query points per call to the mesh's signed distance; see sample_arrays
+SD_CHUNK = 20000       # query points per call to the mesh's signed distance; see sample_arrays
+GPU_PAIRS = 4_000_000  # point-triangle pairs per block of the GPU signed distance. Each block
+                       # is scored against every face at once, so this and nothing else sets
+                       # the memory the query needs, about a gigabyte here. Measured flat in
+                       # speed from this size to four times larger, so it is set at the low
+                       # end and leaves the card free for whatever else is on it.
+SDF_TOL = 1e-4         # how far the GPU signed distance may sit from trimesh's; see
+                       # check_sdf_backend. Measured at most 9e-6 over the library.
 POINTS_PER_SITE = 12   # fewest sample points per amplitude the fit will accept. Measured
                        # on the library: at five per amplitude a carved body's fit
                        # overshoots and decodes to a body unlike itself, at seventeen it
@@ -79,6 +86,145 @@ def _trimesh_signed_distance(m, pts):
     """Signed distances with this file's convention: positive outside."""
     return -np.concatenate([m.nearest.signed_distance(pts[i:i + SD_CHUNK])
                             for i in range(0, len(pts), SD_CHUNK)])
+
+
+def _prepare_mesh(verts, faces):
+    """The body as a cleaned trimesh whose faces face outward."""
+    import trimesh
+    m = trimesh.Trimesh(verts, faces, process=True)
+    m.remove_unreferenced_vertices()
+    m.merge_vertices()
+    m.fix_normals()
+    if m.volume < 0.0:
+        m.invert()
+    return m
+
+
+def _safe_div(num, den):
+    """num / den clamped to [0, 1], a zero denominator giving zero."""
+    return (num / torch.where(den.abs() < 1e-30, torch.ones_like(den), den)).clamp(0.0, 1.0)
+
+
+def _point_triangle_sq(p, a, b, c):
+    """Squared distance from each point to each triangle: p is (n, 1, 3) and a, b, c are
+    (1, f, 3), so the result is (n, f).
+
+    The closest point of a triangle is either inside it, on one of its three edges or at one
+    of its three vertices, and which of the seven it is follows from the signs of the six dot
+    products below (Ericson, Real-Time Collision Detection, 5.1.5). The cases are masks over
+    the whole block rather than branches, applied in the reverse of the order the sequential
+    test checks them: where two of them overlap on a boundary the last one written wins, so
+    reversing the order leaves the case the sequential test would have returned.
+    """
+    ab, ac, ap = b - a, c - a, p - a
+    d1 = (ab * ap).sum(-1)
+    d2 = (ac * ap).sum(-1)
+    bp = p - b
+    d3 = (ab * bp).sum(-1)
+    d4 = (ac * bp).sum(-1)
+    cp = p - c
+    d5 = (ab * cp).sum(-1)
+    d6 = (ac * cp).sum(-1)
+    va = d3 * d6 - d5 * d4          # the barycentric coordinates of the projection into the
+    vb = d5 * d2 - d1 * d6          # plane of the triangle, before they are normalised
+    vc = d1 * d4 - d3 * d2
+    v = _safe_div(vb, va + vb + vc)
+    w = _safe_div(vc, va + vb + vc)
+    q = a + v[..., None] * ab + w[..., None] * ac                       # inside the face
+    for mask, val in (
+            ((va <= 0) & ((d4 - d3) >= 0) & ((d5 - d6) >= 0),
+             b + _safe_div(d4 - d3, (d4 - d3) + (d5 - d6))[..., None] * (c - b)),
+            ((vb <= 0) & (d2 >= 0) & (d6 <= 0), a + _safe_div(d2, d2 - d6)[..., None] * ac),
+            ((d6 >= 0) & (d5 <= d6), c.expand_as(q)),
+            ((vc <= 0) & (d1 >= 0) & (d3 <= 0), a + _safe_div(d1, d1 - d3)[..., None] * ab),
+            ((d3 >= 0) & (d4 <= d3), b.expand_as(q)),
+            ((d1 <= 0) & (d2 <= 0), a.expand_as(q))):
+        q = torch.where(mask[..., None], val, q)
+    d = p - q
+    return (d * d).sum(-1)
+
+
+def _winding_number(p, a, b, c):
+    """The mesh's generalized winding number at each point, from (n, 1, 3) against (1, f, 3).
+
+    The solid angle each triangle subtends at the point (Van Oosterom and Strackee, 1983),
+    summed over the faces and divided by 4 pi: one inside a closed surface and zero outside
+    it. It is read off the face winding, so it reports an inward-facing mesh as the
+    complement of itself, exactly as a sign taken from the face normals would.
+    """
+    pa, pb, pc = a - p, b - p, c - p
+    la, lb, lc = pa.norm(dim=-1), pb.norm(dim=-1), pc.norm(dim=-1)
+    num = (pa * torch.linalg.cross(pb, pc, dim=-1)).sum(-1)
+    den = (la * lb * lc + (pa * pb).sum(-1) * lc + (pb * pc).sum(-1) * la
+           + (pc * pa).sum(-1) * lb)
+    return torch.atan2(num, den).sum(-1) / (2.0 * np.pi)
+
+
+def _gpu_signed_distance(m, pts, device):
+    """Signed distances with this file's convention, positive outside, computed on a GPU.
+
+    The unsigned distance is the least point-triangle distance over every face and the sign
+    is the generalized winding number, both of them a minimum or a sum over the faces with
+    no acceleration structure at all. That is the shape a GPU wants. trimesh's rtree prunes
+    far more work per point, but it does the pruning one call at a time in Python, and over
+    the library this path is several times quicker for it even on a small card.
+
+    The sign comes from the mesh's winding exactly as trimesh's does, so an inward-facing
+    mesh is negated here too and sample_arrays' check for that covers this path as well.
+    """
+    tri = torch.as_tensor(np.asarray(m.vertices), dtype=torch.float32, device=device)[
+        torch.as_tensor(np.asarray(m.faces), dtype=torch.int64, device=device)]   # (f, 3, 3)
+    a, b, c = tri[:, 0][None], tri[:, 1][None], tri[:, 2][None]
+    q = torch.as_tensor(np.asarray(pts), dtype=torch.float32, device=device)
+    # every point of a block is scored against every face, so the block is sized to hold the
+    # pair count the card has room for however many faces this particular body has
+    chunk = max(1, GPU_PAIRS // max(len(tri), 1))
+    out = torch.empty(len(q), dtype=torch.float32, device=device)
+    for i in range(0, len(q), chunk):
+        p = q[i:i + chunk, None, :]
+        d = _point_triangle_sq(p, a, b, c).amin(-1).clamp_min(0.0).sqrt()
+        out[i:i + chunk] = torch.where(_winding_number(p, a, b, c) > 0.5, -d, d)
+    return out.double().cpu().numpy()
+
+
+def _signed_distance(m, pts, device=None):
+    """The body's signed distance at pts, positive outside, on `device` when that is a GPU
+    and through trimesh otherwise."""
+    if device is not None and torch.device(device).type != "cpu":
+        return _gpu_signed_distance(m, pts, device)
+    return _trimesh_signed_distance(m, pts)
+
+
+def check_sdf_backend(verts, faces, device, n_pts=1000, seed=0):
+    """The GPU signed distance against trimesh's on one body, before the run commits to it.
+
+    This path is arithmetic the file does itself rather than a library call it can take on
+    trust, and a wrong answer from it would not announce itself: every body would be fitted
+    to a shape that is not the one on disk, the residuals would fall as usual, and only the
+    fitted Dice at the very end would show it. A thousand points against the path it
+    replaces costs a fraction of a second, once, and is the whole of the evidence that the
+    two agree.
+
+    Returns the largest disagreement. Points within a hair of the surface are left out of
+    the sign comparison, being the one place the two may legitimately differ.
+    """
+    m = _prepare_mesh(verts, faces)
+    rng = np.random.default_rng(seed)
+    ext = max(float(np.abs(np.asarray(m.vertices, dtype=np.float64)).max()) * 1.3,
+              SAMPLE_EXTENT)
+    pts = rng.uniform(-ext, ext, (n_pts, 3))
+    ref = _trimesh_signed_distance(m, pts)
+    got = _gpu_signed_distance(m, pts, device)
+    err = float(np.abs(got - ref).max())
+    off = np.abs(ref) > 1e-5
+    flips = int((np.sign(got[off]) != np.sign(ref[off])).sum())
+    if err > SDF_TOL or flips:
+        raise SystemExit(
+            f"the GPU signed distance disagrees with trimesh's on the first body: largest "
+            f"difference {err:.2e} against a tolerance of {SDF_TOL}, and {flips} of "
+            f"{int(off.sum())} points put on the wrong side of the surface. Rerun with "
+            f"--sdf cpu, the path this one is checked against.")
+    return err
 
 
 def _contains_signed_distance(m, pts):
@@ -100,28 +246,24 @@ def _bad_signed_distances(sd, far):
     return bool(far.any() and sd[far].min() <= 0.0)
 
 
-def sample_arrays(verts, faces, n_pts=6000, seed=0):
+def sample_arrays(verts, faces, n_pts=6000, seed=0, device=None):
     """Sample points for the fit and the body's signed distance at them (positive outside):
     n_pts uniform in a box covering the lattice, plus half as many jittered surface points.
 
-    The distances are queried a block of points at a time. The query allocates per point
-    against the whole mesh, so asking for all of them at once needs memory in proportion to
-    the point count, which is the one thing the point count must not cost; the blocks also
-    stay in cache, so they are quicker than the single call they replace."""
+    With `device` a GPU the distances go through _gpu_signed_distance, which is the whole of
+    this stage's cost and several times quicker there. Otherwise they are queried through
+    trimesh a block of points at a time: that query allocates per point against the whole
+    mesh, so asking for all of them at once needs memory in proportion to the point count,
+    which is the one thing the point count must not cost."""
     import trimesh
-    m = trimesh.Trimesh(verts, faces, process=True)
-    m.remove_unreferenced_vertices()
-    m.merge_vertices()
-    m.fix_normals()
-    if m.volume < 0.0:
-        m.invert()
+    m = _prepare_mesh(verts, faces)
     rng = np.random.default_rng(seed)
     verts = np.asarray(m.vertices, dtype=np.float64)
     ext = max(float(np.abs(verts).max()) * 1.3, SAMPLE_EXTENT)
     pts = rng.uniform(-ext, ext, (n_pts, 3))
     surf, _ = trimesh.sample.sample_surface(m, n_pts // 2, seed=seed)
     pts = np.vstack([pts, surf + rng.normal(0, 0.03, surf.shape)])
-    sd = _trimesh_signed_distance(m, pts)
+    sd = _signed_distance(m, pts, device)
     # The sign comes from the mesh's winding, so a mesh that is inside out returns the whole
     # field negated and the body is fitted as its own complement, with no sign of it in the
     # residual. A point beyond the body's own bounding sphere is outside whatever the mesh
@@ -129,7 +271,7 @@ def sample_arrays(verts, faces, n_pts=6000, seed=0):
     far = np.linalg.norm(pts, axis=1) > float(np.linalg.norm(verts, axis=1).max()) + 1e-6
     if _bad_signed_distances(sd, far):
         m.invert()
-        sd = _trimesh_signed_distance(m, pts)
+        sd = _signed_distance(m, pts, device)
     if _bad_signed_distances(sd, far):
         sd = _contains_signed_distance(m, pts)
         # A point beyond every vertex radius is outside by construction, even when a
@@ -142,10 +284,14 @@ def sample_arrays(verts, faces, n_pts=6000, seed=0):
 
 
 def _prepare_shape(args):
-    """One body's sample points, signed distances and hull support, for a worker pool."""
-    i, verts, faces, normals, n_pts = args
+    """One body's sample points, signed distances and hull support, for a worker pool.
+
+    `device` is a GPU only when the caller has already forced the pool to one worker and is
+    therefore running this in the main process: a forked worker cannot use the parent's CUDA
+    context, and initialising its own would put one context per worker on the card."""
+    i, verts, faces, normals, n_pts, device = args
     try:
-        pts, sd = sample_arrays(verts, faces, n_pts=n_pts, seed=i)
+        pts, sd = sample_arrays(verts, faces, n_pts=n_pts, seed=i, device=device)
     except Exception as exc:
         raise RuntimeError(f"failed to prepare library body {i}") from exc
     h0 = np.maximum((verts @ normals.T).max(axis=0), 1e-3).astype(np.float32)
@@ -353,6 +499,13 @@ def main():
                     help="shuffle seed when reading --shapes-dir")
     ap.add_argument("--dice-bodies", type=int, default=64,
                     help="bodies sampled for the fitted-Dice check by family; 0 skips it")
+    ap.add_argument("--sdf", choices=("auto", "gpu", "cpu"), default="auto",
+                    help="where the sample points' signed distances are computed, which is "
+                         "the whole cost of the preprocessing. auto takes the GPU when "
+                         "there is one; it is several times quicker than the trimesh path "
+                         "and, being in this process, leaves --workers unused. cpu keeps "
+                         "the trimesh path over --workers processes, which can be the "
+                         "quicker of the two on a machine with many cores and a weak GPU.")
     a = ap.parse_args()
     # The amplitudes are the solution of a system with N_SITES unknowns, and the sample points
     # are its equations. Below a few equations per unknown only the ridge decides the answer,
@@ -398,13 +551,32 @@ def main():
         print(f"  posed {n_posed}/{len(shape_list)} bodies into the canonical frame "
               f"(z span 2, xy r_max 1)", flush=True)
 
+    dev = torch.device(a.device or ("cuda" if torch.cuda.is_available() else "cpu"))
+    if dev.type == "cuda":
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+    if a.sdf == "gpu" and dev.type != "cuda":
+        raise SystemExit("--sdf gpu was asked for but the fit is on the CPU; drop the flag "
+                         "or pass --device cuda.")
+    sdf_dev = dev if (a.sdf == "gpu" or (a.sdf == "auto" and dev.type == "cuda")) else None
+
     data, h0s = [None] * len(shape_list), [None] * len(shape_list)
     ref = ImplicitBody()
     nrm = ref.core.n.detach().cpu().numpy()
     jobs = [(i, np.asarray(v, dtype=np.float64), np.asarray(f, dtype=np.int64), nrm,
-             a.points)
+             a.points, sdf_dev)
             for i, (v, f) in enumerate(shape_list)]
     workers = max(1, int(a.workers))
+    if sdf_dev is not None:
+        # the signed distances are the whole cost here and they are now on the card, so the
+        # pool would only fork processes to wait on it
+        v0, f0 = shape_list[0]
+        err = check_sdf_backend(np.asarray(v0, dtype=np.float64),
+                                np.asarray(f0, dtype=np.int64), sdf_dev)
+        print(f"  signed distances on {sdf_dev}, checked against trimesh on the first body "
+              f"to {err:.1e}" + (f"; --workers {workers} not used" if workers > 1 else ""),
+              flush=True)
+        workers = 1
     pool = None
     if workers == 1:
         iterator = map(_prepare_shape, jobs)
@@ -429,10 +601,6 @@ def main():
                 pool.close()
             pool.join()
 
-    dev = torch.device(a.device or ("cuda" if torch.cuda.is_available() else "cpu"))
-    if dev.type == "cuda":
-        torch.backends.cuda.matmul.allow_tf32 = True
-        torch.backends.cudnn.allow_tf32 = True
     fitter = LatticeFit(dev)
     print(f"[2] fit on {dev}: {len(data)} bodies x {N_SITES} amplitudes against "
           f"{DESIGN_N} core normals, solved one body at a time", flush=True)
