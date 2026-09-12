@@ -64,7 +64,7 @@ from hac26.recon import fit_to_cylinder                                  # noqa:
 from hac26.solvers.gauss_newton import (AREA_WEIGHT, AREA_WINDOW,    # noqa: E402
                                         DEFAULT_STAGES, N_STARTS, POLISH_STAGES,
                                         SCREEN_STAGES, STEP_C, STEP_G, TARGET_SIGMA,
-                                        VOLUME_TRUST, CarveFit, conjunction_start)
+                                        VOLUME_TRUST, CarveFit, Stage, conjunction_start)
 from hac26.solvers.operator import CodeOperator                          # noqa: E402
 from hac26.solvers.output import export_stl, restore_constraints         # noqa: E402
 from reconstruct import answer_path                                      # noqa: E402
@@ -178,6 +178,12 @@ def main() -> None:
                     help="secant step of a carve coordinate, in body units of depth")
     ap.add_argument("--step-c", type=float, default=STEP_C,
                     help="secant step of a reshaping coefficient, in body units")
+    ap.add_argument("--max-stage-iters", type=int, default=0,
+                    help="cap every stage of every ladder at this many iterations; 0 leaves "
+                         "each at its designed count. A run capped here is bounded by the cap "
+                         "and not by the curves, which the written body records as "
+                         "budget_limited; the point of the flag is a check that the whole path "
+                         "executes, or an answer by a fixed time")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--device", default="cuda")
     a = ap.parse_args()
@@ -315,6 +321,19 @@ def main() -> None:
         rows = [h for h in hist if key in h]
         return rows[-1][key] if rows else float("inf")
 
+    def capped(stages):
+        """`stages` with every iteration count held at --max-stage-iters. The cap is applied
+        here rather than inside the solver so that the designed ladder stays the one thing a
+        reader of gauss_newton.py sees, and a shortened run is visibly a shortened run."""
+        if not a.max_stage_iters:
+            return stages
+        return tuple(Stage(st.degree, st.n_dirs, min(st.iters, a.max_stage_iters))
+                     for st in stages)
+
+    screen_stages, ladder_stages, polish_stages = (capped(SCREEN_STAGES),
+                                                   capped(DEFAULT_STAGES),
+                                                   capped(POLISH_STAGES))
+
     def penalised(chi, area) -> float:
         """The functional a finished body is compared under, here and downstream. It is not
         the one the polish minimises, which is why both sides of the polish are scored with
@@ -337,12 +356,12 @@ def main() -> None:
     screened = []
     for i, (c0, g0) in enumerate(starts):
         f = new_fit(a.seed + i)
-        c, g, hist = f.run(c0, g0, stages=SCREEN_STAGES, target=TARGET_SIGMA)
+        c, g, hist = f.run(c0, g0, stages=screen_stages, target=TARGET_SIGMA)
         screened.append({"i": i, "objective": last(hist, "objective"),
                          "chi": last(hist, "chi"), "c": c, "g": g, "renders": f.renders})
         print(f"  start {i} ({recipes[i]['start']}): objective "
               f"{screened[-1]['objective']:.4f}, chi {screened[-1]['chi']:.4f} after "
-              f"{SCREEN_STAGES[0].iters} coarse steps, {f.renders} renders "
+              f"{screen_stages[0].iters} coarse steps, {f.renders} renders "
               f"[{time.time()-t0:.0f}s]", flush=True)
     # Starts are compared on what is being minimised. A start that has bought misfit with
     # surface is not ahead of one that has not.
@@ -352,7 +371,7 @@ def main() -> None:
     for s in screened[:max(1, a.restart_keep)]:
         f = new_fit(a.seed + s["i"] + 100)
         floor_before = refused_volume[0]
-        cu, gu, hist = f.run(s["c"], s["g"], stages=DEFAULT_STAGES, target=TARGET_SIGMA,
+        cu, gu, hist = f.run(s["c"], s["g"], stages=ladder_stages, target=TARGET_SIGMA,
                              log=show)
         chi_u, area_u = last(hist, "chi"), last(hist, "area")
         obj_u = penalised(chi_u, area_u)
@@ -364,7 +383,7 @@ def main() -> None:
         # the penalty. Without that, a polish that buys misfit with surface is written out and
         # nothing downstream can see that it happened.
         print("    polish, on the misfit alone", flush=True)
-        cp, gp, polish = f.run(cu, gu, stages=POLISH_STAGES, target=TARGET_SIGMA,
+        cp, gp, polish = f.run(cu, gu, stages=polish_stages, target=TARGET_SIGMA,
                                area_weight=0.0, log=show)
         chi_p, area_p = last(hist + polish, "chi"), last(hist + polish, "area")
         obj_p = penalised(chi_p, area_p)
@@ -459,6 +478,7 @@ def main() -> None:
             "start": best["recipe"], "renders": best["renders"],
             "restart_keep": a.restart_keep, "polished": best["polished"],
             "screen_starts": a.screen_starts, "starts_ranked": len(pool),
+            "max_stage_iters": a.max_stage_iters,
             "starts_over_depth_cap": skipped_depth, "starts_under_floor": skipped_floor,
             "budget_limited": best["budget_limited"],
             "refused_volume": best["refused_volume"],
