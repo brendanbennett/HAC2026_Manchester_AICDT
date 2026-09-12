@@ -35,6 +35,11 @@ from hac26.conventions import CYLINDER_R, PUBLIC_MODELS              # noqa: E40
 from hac26.data_io import public_stl                                 # noqa: E402
 from hac26.shapes import rescale_touch_z                             # noqa: E402
 
+LABELS = {"results/convex": "convex stage",
+          "results/lpd": "convex + flow (old)",
+          "results/flow_p30": "convex + flow (retrained)",
+          "results/flow_p0": "convex + flow (no polish)"}
+
 LIGHT = np.array([-1.0, 0.35, 0.55])          # the lab's light is at (-inf, 0, 0)
 LIGHT = LIGHT / np.linalg.norm(LIGHT)
 FACE_CAP = 4000                               # decimation cap: enough to read the silhouette
@@ -119,8 +124,10 @@ def summary_page(scores):
     fig.suptitle("Where the score is going  ·  public models, organisers' own measures",
                  color=FG, fontsize=14)
     models = [1, 2, 3]
-    pipes = [("results/convex", "convex stage", "#7aa2f7"),
-             ("results/lpd", "convex + flow", "#f7768e")]
+    # whatever the caller actually scored, in the order given, rather than two fixed names
+    palette = ["#7aa2f7", "#f7768e", "#bb9af7", "#7dcfff"]
+    pipes = [(k, LABELS.get(k, Path(k).name), palette[i % len(palette)])
+             for i, k in enumerate(scores)]
 
     ax = fig.add_subplot(1, 2, 1, facecolor=BG)
     w = 0.36
@@ -161,17 +168,12 @@ def summary_page(scores):
 
     tot = {key: sum(scores[key][str(m)]["voxel"] + scores[key][str(m)]["proj_released"]
                     for m in models) for key, _, _ in pipes}
+    parts = "    ·    ".join(f"{lbl} {tot[k]:.3f}" for k, lbl, _ in pipes)
     fig.text(0.5, 0.055,
              f"summed over the three public models (max 6):    "
-             f"convex hull of truth 5.775    ·    convex stage {tot['results/convex']:.3f}"
-             f"    ·    convex + flow {tot['results/lpd']:.3f}",
+             f"convex hull of truth 5.775    ·    {parts}",
              ha="center", color="#e0af68", fontsize=10.5)
-    fig.text(0.5, 0.018,
-             f"the learned non-convex correction is a net loss of "
-             f"{tot['results/convex'] - tot['results/lpd']:.3f}, and gains 0.007 on model 3 — "
-             f"the one body whose shape needs concavity",
-             ha="center", color="#9aa5b1", fontsize=9.5)
-    fig.tight_layout(rect=(0, 0.085, 1, 0.94))
+    fig.tight_layout(rect=(0, 0.075, 1, 0.94))
     return fig
 
 
@@ -192,8 +194,9 @@ def main() -> None:
             return "no truth to score against"
         return f"voxel {r['voxel']:.3f}   projection {r['proj_released']:.3f}   → {r['score']:.3f}"
 
-    labels = {"results/convex": "convex stage", "results/lpd": "convex + flow (shipped)"}
-    colours = {"results/convex": "#7aa2f7", "results/lpd": "#f7768e"}
+    labels = dict(LABELS)
+    colours = {"results/convex": "#7aa2f7", "results/lpd": "#f7768e",
+               "results/flow_p30": "#f7768e", "results/flow_p0": "#bb9af7"}
     figs = []
 
     cells, rows = {}, []

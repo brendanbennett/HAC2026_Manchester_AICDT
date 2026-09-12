@@ -459,7 +459,8 @@ def rollout(net, op, x0, k, h, radius, data, sigma, geoms, step_mask, sph, vol, 
 
 # ------------------------------------------------------------------------------- the loss
 
-def step_loss(net, xt, t, v, x1, sup_true, code_true, h_base, occ_weight, occ_eps):
+def step_loss(net, xt, t, v, x1, sup_true, code_true, h_base, occ_weight, occ_eps,
+              live=None):
     """The two terms scored on a velocity v at the state (xt, t).
 
     The flow term is the squared error of v against the velocity that takes the state
@@ -487,9 +488,27 @@ def step_loss(net, xt, t, v, x1, sup_true, code_true, h_base, occ_weight, occ_ep
     a single spacing, and left unbounded a single site with a large field contributes hundreds
     to the loss and destabilises the step.
 
+    `live` (B,) is 0 for a body the operator could not render and 1 otherwise. Such a body is
+    excluded from both terms rather than merely from the data features, which is what it used
+    to be. It matters only in the rollout phase, and there it matters entirely: the state xt
+    came from the sampler, so when it has wandered off-distribution the target
+    (x1 - xt) / (1 - t) is enormous and points nowhere useful, yet it was still averaged into
+    the flow term at full weight. A body with no curves has no information in it, and training
+    on it is training on the failure. Both runs of 2026-09-11 reached validation 2.5e3 and
+    3.6e10 this way, with amplitudes 87x and 147x the corpus scale.
+
     Returns (total, flow term, occupancy term, decoded endpoint)."""
     err = (v - (x1 - xt) / (1 - t[:, None])) ** 2
-    flow = 0.5 * (err[:, :N_DIR].mean() + err[:, N_DIR:].mean())
+    if live is None:
+        w_b = torch.ones(len(err), device=err.device)
+    else:
+        w_b = live.to(err.device).float()
+    n_live = w_b.sum().clamp_min(1.0)
+
+    def _mean(e):                       # mean over live bodies and all their coordinates
+        return (e.mean(1) * w_b).sum() / n_live
+
+    flow = 0.5 * (_mean(err[:, :N_DIR]) + _mean(err[:, N_DIR:]))
     x1_hat = xt + (1 - t[:, None]) * v
     with torch.no_grad():
         g_true = code_true[:, N_DIR:]
@@ -500,8 +519,9 @@ def step_loss(net, xt, t, v, x1, sup_true, code_true, h_base, occ_weight, occ_ep
     raw = net.codec.decode(x1_hat)
     f_est = site_field(support_with(h_base, raw[:, :N_DIR]), raw[:, N_DIR:])
     logit = OCC_LOGIT * torch.tanh(-f_est / (occ_eps * OCC_LOGIT))
-    occ = (torch.nn.functional.binary_cross_entropy_with_logits(logit, occ_true,
-                                                                reduction="none") * w).mean()
+    occ_per = (torch.nn.functional.binary_cross_entropy_with_logits(logit, occ_true,
+                                                                    reduction="none") * w)
+    occ = _mean(occ_per)
     return flow + occ_weight * occ, flow, occ, raw
 
 
@@ -677,12 +697,16 @@ def flow_loss(net, op: CodeOperator, corpus: Corpus, eta, idx, x0, t, M, tag, ma
                                      data, scale, geoms, step_mask, sph, vol, M)
     n_dropped += n_bad
     step_mask = inp.mask
+    # operator_inputs zeroes every geometry of a body whose mesh would not render, so the mask
+    # already says which bodies have information in them. A body with none is excluded from
+    # the loss below rather than trained on at full weight.
+    live_b = (step_mask.sum(-1) > 0).float()
     u = net.velocity(xt, t, radius, tag_b, inp)
     loss, flow, occ, raw = step_loss(net, xt, t, u, x1, sup_true, codes, h_base, occ_weight,
-                                     occ_eps)
+                                     occ_eps, live=live_b)
     if ablate:
         return loss, step_loss(net, xt, t, v0, x1, sup_true, codes, h_base, occ_weight,
-                               occ_eps)[0], n_dropped
+                               occ_eps, live=live_b)[0], n_dropped
 
     fit = torch.zeros((), device=dev)
     if fit_weight > 0:
@@ -950,6 +974,9 @@ def main():
                          "dominated by the operator, which renders one body at a time in a "
                          "Python loop over the batch, not by the network -- so this is the "
                          "one axis that can be raised without paying for it in steps.")
+    ap.add_argument("--grad-clip", type=float, default=1.0,
+                    help="max global gradient norm. There was no clipping before, which is "
+                         "part of how the rollout phase reached a loss of 5e11.")
     ap.add_argument("--lr", type=float, default=1e-3,
                     help="Adam step size. It was hard-coded at 1e-3, which was fine while "
                          "every run trained the same 11M-parameter network; it is a flag now "
@@ -1241,7 +1268,17 @@ def main():
                                 return_diag=True, occ_weight=a.occ_weight, occ_eps=occ_eps,
                                 fit_weight=a.fit_weight, fit_from=a.fit_from)
         dropped += parts.dropped
-        opt.zero_grad(); loss.backward(); opt.step(); ema.update(net)
+        opt.zero_grad()
+        loss.backward()
+        # Clip before stepping. There was no clipping at all, and the rollout phase is where
+        # that shows: a state the sampler reached off-distribution makes the flow target
+        # (x1 - xt)/(1 - t) enormous, one step throws the weights further out, and the next
+        # state is worse. Two runs reached validation 2.5e3 and 3.6e10 that way. Clipping does
+        # not remove the bad signal -- masking the bodies that produced it does -- but it
+        # bounds what a single step can do while the mask takes effect.
+        gnorm = float(torch.nn.utils.clip_grad_norm_(
+            [q for q in net.parameters() if q.requires_grad], a.grad_clip))
+        opt.step(); ema.update(net)
         now = time.time()
         step_s = now - t_step
         elapsed = elapsed_before + (now - t_run)
@@ -1271,6 +1308,7 @@ def main():
                 "occupancy": float(parts.occ), "data_fit": float(parts.fit),
                 "dropped": int(dropped), "seen": int(seen), "step_s": float(step_s),
                 "elapsed_s": float(elapsed), "lr": float(opt.param_groups[0]["lr"]),
+                "grad_norm": gnorm,
                 "rolled": int(rolled) if a.rollout_frac > 0 else 0, "phase": "train"})
             print(f"  [{_now()}] step {s:>5}  loss {float(loss.detach()):.5f}  "
                   f"(flow {parts.flow:.5f}, occupancy {parts.occ:.5f}, "
