@@ -169,6 +169,32 @@ class DepthFit:
                 float(np.sqrt(np.mean(core ** 2))), float(np.sqrt(np.mean(left ** 2))))
 
 
+def _load_fit(path: Path, expected: dict, i: int):
+    """A body's saved depths as (a, rms before, rms after), or None when the part is missing,
+    unreadable or was written under settings that would change the answer."""
+    if not path.exists():
+        return None
+    try:
+        z = np.load(path, allow_pickle=False)
+        meta = json.loads(str(z["meta"]))
+    except Exception as exc:                           # noqa: BLE001  corrupt: solve it again
+        print(f"    ignoring unreadable part {path}: {exc}", flush=True)
+        return None
+    if int(z["body_index"]) != i or meta != expected:
+        print(f"    ignoring stale part {path}", flush=True)
+        return None
+    return z["a"], float(z["before"]), float(z["after"])
+
+
+def _save_fit(path: Path, i: int, expected: dict, a: np.ndarray, before: float, after: float):
+    """Written under a temporary name and renamed, so a kill mid-write leaves no half part."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".part")
+    np.savez(tmp, body_index=int(i), meta=json.dumps(expected, sort_keys=True),
+             a=a, before=np.float32(before), after=np.float32(after))
+    tmp.replace(path)
+
+
 def fitted_dice(bodies, shape_list, families, n_sample: int, seed: int = 0) -> np.ndarray:
     """Dice of the decoded fitted body against the mesh it was fitted to, for a random sample
     of n_sample bodies (NaN for the rest), printed by family."""
@@ -237,6 +263,17 @@ def report_corpus(bodies, data, codes, before, after, fit_dice=None) -> bool:
     for b_ in bad:
         print(f"  ERROR: {b_}", flush=True)
     return not bad
+
+
+def _out_tmp(out: str) -> str:
+    """The stage's product is written here and renamed onto `out` by _out_commit, so a job
+    killed mid-write leaves the previous file rather than a truncated one. numpy appends .npz
+    to a name without it, so the temporary carries the extension already."""
+    return f"{out}.writing.npz"
+
+
+def _out_commit(out: str) -> None:
+    Path(f"{out}.writing.npz").replace(out if out.endswith(".npz") else f"{out}.npz")
 
 
 def main():
@@ -340,10 +377,27 @@ def main():
     print(f"[2] fit on {dev}: {len(data)} bodies x {N_NODES} depths against "
           f"{DESIGN_N} core normals, solved one body at a time", flush=True)
 
+    # One solve per body, and every solve is independent of every other, so the stage is
+    # resumable a body at a time under <out>.parts/ the way the corpus is. Without it a run
+    # killed near the end -- a wallclock on a shared machine, most often -- loses every body
+    # it fitted, and this stage is hours on a full library.
+    part_dir = Path(f"{a.out}.parts")
+    expected = {"nodes": int(N_NODES), "points": int(a.points),
+                "shapes_dir": str(a.shapes_dir)}
     t0 = time.time()
     bodies, before, after = [], [], []
+    n_resumed = 0
     for i, pts in enumerate(data):
-        g, r0, r1 = fitter.solve(pts, h0s[i])
+        got = _load_fit(part_dir / f"body_{i:05d}.npz", expected, i)
+        if got is None:
+            g, r0, r1 = fitter.solve(pts, h0s[i])
+            _save_fit(part_dir / f"body_{i:05d}.npz", i, expected,
+                      np.asarray(g.detach().cpu() if hasattr(g, "detach") else g,
+                                 dtype=np.float32), float(r0), float(r1))
+        else:
+            g, r0, r1 = got
+            g = torch.as_tensor(g, dtype=torch.float32, device=dev)
+            n_resumed += 1
         b = ImplicitBody().to(dev)
         with torch.no_grad():
             b.set_support(torch.as_tensor(h0s[i]))
@@ -351,8 +405,8 @@ def main():
         bodies.append(b)
         before.append(r0); after.append(r1)
         if (i + 1) % 25 == 0 or i + 1 == len(data):
-            print(f"    fitted {i + 1}/{len(data)} bodies, residual median "
-                  f"{np.median(before):.4f} -> {np.median(after):.4f}  "
+            print(f"    fitted {i + 1}/{len(data)} bodies ({n_resumed} resumed), residual "
+                  f"median {np.median(before):.4f} -> {np.median(after):.4f}  "
                   f"{time.time()-t0:.0f}s", flush=True)
 
     # the dh block is stored as zeros rather than omitted, so codes.shape[1] is CODE_DIM
@@ -382,8 +436,9 @@ def main():
     }
     fit_d = (fitted_dice(bodies, shape_list, families, a.dice_bodies, seed=a.seed)
              if a.dice_bodies > 0 else np.full(len(bodies), np.nan))
-    np.savez(a.out, codes=codes, support=sup, fit_dice=fit_d, family=np.array(families),
+    np.savez(_out_tmp(a.out), codes=codes, support=sup, fit_dice=fit_d, family=np.array(families),
              radius=radii, meta=json.dumps(meta, sort_keys=True))
+    _out_commit(a.out)
     print(f"  codes {codes.shape}, depth variance {codes[:, N_DIR:].var(0).mean():.5f}")
     print(f"  wrote {a.out}")
     if not report_corpus(bodies, data, codes, before, after, fit_dice=fit_d):

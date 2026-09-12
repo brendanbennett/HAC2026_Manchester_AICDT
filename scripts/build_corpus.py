@@ -190,6 +190,12 @@ class _Done:
         return self._value
 
 
+# What a body's part holds, and therefore what a resumed body must bring back: the corpus
+# stacks each of these at the end, so a field saved and not reloaded is a crash after the
+# stage has done all its work.
+PART_FIELDS = ("code", "curve", "turned_counts", "support", "support_true", "radius")
+
+
 def _load_part(path: Path, expected: dict, i: int):
     """A body's saved part, or None when it is missing, unreadable or from other settings.
     `bodies` is left out of the comparison: body i does not depend on how many were asked."""
@@ -205,12 +211,35 @@ def _load_part(path: Path, expected: dict, i: int):
                                         if k != "bodies"):
         print(f"  ignoring stale part {path}", flush=True)
         return None
-    return {k: z[k] for k in ("code", "curve", "support", "support_true", "radius")}
+    # Every field the part was saved with, because every one of them is stacked into the
+    # corpus at the end. Returning a subset made a resumed body raise on the final write,
+    # after the whole stage had already paid for its rendering.
+    return {k: z[k] for k in PART_FIELDS}
 
 
 def _save_part(path: Path, i: int, part: dict, expected: dict):
+    """Written under a temporary name and renamed, so a job killed mid-write leaves either the
+    previous part or none, never half of one. A truncated part would be caught by _load_part
+    and redone, but only after it had been read, and a rename costs nothing."""
+    missing = [k for k in PART_FIELDS if k not in part]
+    if missing:
+        raise KeyError(f"body {i} is missing {missing} from its part; the corpus stacks every "
+                       f"field of PART_FIELDS and would fail at the final write instead")
     path.parent.mkdir(parents=True, exist_ok=True)
-    np.savez(path, body_index=int(i), meta=json.dumps(expected, sort_keys=True), **part)
+    tmp = path.with_name(path.name + ".part")
+    np.savez(tmp, body_index=int(i), meta=json.dumps(expected, sort_keys=True), **part)
+    tmp.replace(path)
+
+
+def _out_tmp(out: str) -> str:
+    """The stage's product is written here and renamed onto `out` by _out_commit, so a job
+    killed mid-write leaves the previous file rather than a truncated one. numpy appends .npz
+    to a name without it, so the temporary carries the extension already."""
+    return f"{out}.writing.npz"
+
+
+def _out_commit(out: str) -> None:
+    Path(f"{out}.writing.npz").replace(out if out.endswith(".npz") else f"{out}.npz")
 
 
 def main():
@@ -313,7 +342,7 @@ def main():
 
     index = sorted(parts)
     Path(a.out).parent.mkdir(parents=True, exist_ok=True)
-    np.savez(a.out,
+    np.savez(_out_tmp(a.out),
              codes=np.stack([parts[i]["code"] for i in index]).astype(np.float32),
              curves=np.stack([parts[i]["curve"] for i in index]).astype(np.float32),
              turned_counts=np.stack([parts[i]["turned_counts"] for i in index]).astype(np.float32),
@@ -322,6 +351,7 @@ def main():
              radius=np.asarray([parts[i]["radius"] for i in index], dtype=np.float32),
              index=np.asarray(index, dtype=np.int64),
              meta=json.dumps(expected, sort_keys=True))
+    _out_commit(a.out)
     dh_all = np.stack([parts[i]["code"][:N_DIR] for i in index])
     print(f"  wrote {a.out}: {len(parts)} of {n} bodies; correction rms per body "
           f"{np.sqrt((dh_all ** 2).mean(1)).min():.4f}-{np.sqrt((dh_all ** 2).mean(1)).max():.4f}",

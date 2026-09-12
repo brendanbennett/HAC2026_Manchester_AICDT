@@ -408,8 +408,8 @@ def main() -> None:
                     "refused_volume": refused_volume[0] - floor_before,
                     "polished": keep_polish, "budget_limited": still_descending(hist)}
     if best["budget_limited"]:
-        print(f"  !!! the ladder was still taking steps at its last iteration, so this body "
-              f"is bounded by the iteration counts and not by the curves", flush=True)
+        print("  !!! the ladder was still taking steps at its last iteration, so this body "
+              "is bounded by the iteration counts and not by the curves", flush=True)
     if best["refused_volume"]:
         print(f"  the volume floor turned away {best['refused_volume']} trials of the kept "
               f"start; a large count is a fit pressed against it rather than one stopped by "

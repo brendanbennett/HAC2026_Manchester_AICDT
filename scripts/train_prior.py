@@ -20,6 +20,13 @@ The same bodies are held out as in train_lpd.py (train_lpd.held_out), scored eve
 --val-every steps at fixed draws for early stopping; the saved weights are the best-scoring
 ones, averaged over recent steps as in train_lpd.py.
 
+Checkpoints every --ckpt-every steps to --ckpt-file (default <--out>.ckpt) and resumes from it
+by default, carrying the optimiser, the averaged weights, the best state and the early-stopping
+counters, so a resumed run stops at the step an uninterrupted one would have. A run that is too
+slow to finish can be finalised from where it reached rather than abandoned: rerun it with
+--steps at or below the checkpointed step and it writes the product from the best state it has
+without training further.
+
 Writes --out (default runs/prior_flow.pt): the prior's weights, the codec, and metadata.
 """
 from __future__ import annotations
@@ -76,7 +83,15 @@ def main():
     ap.add_argument("--occ-eps", type=float, default=None, help="must match train_lpd.py")
     ap.add_argument("--ema", type=float, default=0.999)
     ap.add_argument("--log-every", type=int, default=100)
+    ap.add_argument("--ckpt-every", type=int, default=500,
+                    help="steps between checkpoints; 0 writes none, which loses the run to a "
+                         "wallclock")
+    ap.add_argument("--ckpt-file", default=None,
+                    help="resumable checkpoint; by default <--out>.ckpt")
+    ap.add_argument("--no-resume", action="store_true",
+                    help="start from step 0 even when a checkpoint for these settings is there")
     a = ap.parse_args()
+    ckpt_path = Path(a.ckpt_file or f"{a.out}.ckpt")
     _enable_tf32()
     torch.manual_seed(a.seed)
     dev = "cuda" if torch.cuda.is_available() else "cpu"
@@ -120,9 +135,45 @@ def main():
         return float(l), float(f), float(o)
 
     best, best_state, best_step, stale = float("inf"), None, -1, 0
+    start_step, elapsed_before = 0, 0.0
+    # The early-stopping state is checkpointed with the weights and not only beside them. A
+    # resume that restarted the patience window would train far past the step this run would
+    # have stopped at, and one that lost `best` would take a worse state as its answer.
+    keys = {"corpus": file_digest(a.corpus), "bodies": int(len(codes)),
+            "occ_weight": float(a.occ_weight), "occ_eps": float(occ_eps),
+            "batch": int(a.batch), "lr": float(a.lr), "val_bodies": int(n_val)}
+    if ckpt_path.exists() and not a.no_resume:
+        st = torch.load(ckpt_path, map_location=dev, weights_only=False)
+        if st.get("keys") != keys:
+            print(f"  [{_now()}] {ckpt_path} was written under other settings, so it is "
+                  f"ignored and the run starts from step 0", flush=True)
+        else:
+            net.load_state_dict(st["net"]); opt.load_state_dict(st["opt"])
+            ema.shadow = {k: v.to(dev) for k, v in st["ema"].items()}
+            ema.n = int(st["ema_n"])
+            best, best_step, stale = float(st["best"]), int(st["best_step"]), int(st["stale"])
+            best_state = st["best_state"]
+            start_step, elapsed_before = int(st["step"]) + 1, float(st["elapsed"])
+            torch.set_rng_state(st["rng"].cpu())
+            print(f"  [{_now()}] resumed {ckpt_path} at step {start_step} "
+                  f"(best {best:.5f} from step {best_step}, {stale}/{a.patience} stale)",
+                  flush=True)
+
+    def save_ckpt(step):
+        """Written under a temporary name and renamed, so a kill mid-write leaves the previous
+        checkpoint rather than a truncated one."""
+        ckpt_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = ckpt_path.with_name(ckpt_path.name + ".part")
+        torch.save({"net": net.state_dict(), "opt": opt.state_dict(), "ema": ema.shadow,
+                    "ema_n": ema.n, "best": best, "best_state": best_state,
+                    "best_step": best_step, "stale": stale, "step": step,
+                    "elapsed": elapsed_before + (time.time() - t0), "rng": torch.get_rng_state(),
+                    "keys": keys}, tmp)
+        tmp.replace(ckpt_path)
+
     t0 = time.time()
-    s = -1
-    for s in range(a.steps):
+    s = start_step - 1
+    for s in range(start_step, a.steps):
         idx = train_idx[torch.randint(0, len(train_idx), (a.batch,), device=dev)]
         x0 = torch.randn(a.batch, codes.shape[1], device=dev)
         t = ((torch.arange(a.batch, dtype=torch.float32) + torch.rand(a.batch)) / a.batch)
@@ -131,8 +182,11 @@ def main():
         loss, flow, occ = prior_loss(net, data, idx, x0, t, a.occ_weight, occ_eps, turns)
         opt.zero_grad(); loss.backward(); opt.step(); ema.update(net)
         if a.log_every and (s % a.log_every == 0 or s == a.steps - 1):
+            # elapsed counts the whole run and not this process, so a resumed job reports
+            # the training's age rather than its own, which is what a rate is read from
             print(f"  [{_now()}] step {s:>6}  loss {float(loss):.5f}  (flow {float(flow):.5f}, "
-                  f"occupancy {float(occ):.5f})  elapsed {_hms(time.time() - t0)}", flush=True)
+                  f"occupancy {float(occ):.5f})  elapsed "
+                  f"{_hms(elapsed_before + (time.time() - t0))}", flush=True)
         if n_v and ((s + 1) % a.val_every == 0 or s == a.steps - 1):
             vl, vf, vo = validate()
             if vl < best - a.min_delta:
@@ -146,7 +200,10 @@ def main():
                       f"from step {best_step}, {stale}/{a.patience})", flush=True)
                 if a.patience and stale >= a.patience:
                     print(f"  early stop at step {s}", flush=True)
+                    save_ckpt(s)
                     break
+        if a.ckpt_every and (s + 1) % a.ckpt_every == 0:
+            save_ckpt(s)
     steps_trained = s + 1
     if best_state is not None:
         net.load_state_dict(best_state)
@@ -160,7 +217,8 @@ def main():
                          "n_val": int(n_v), "occ_weight": float(a.occ_weight),
                          "occ_eps": float(occ_eps), "corpus": file_digest(a.corpus)}},
                a.out)
-    print(f"[{_now()}] wrote {a.out} after {_hms(time.time() - t0)}", flush=True)
+    print(f"[{_now()}] wrote {a.out} after "
+          f"{_hms(elapsed_before + (time.time() - t0))}", flush=True)
 
 
 if __name__ == "__main__":
