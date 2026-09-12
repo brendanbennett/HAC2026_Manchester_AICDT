@@ -231,10 +231,12 @@ def _save_part(path: Path, i: int, part: dict, expected: dict):
         raise KeyError(f"body {i} is missing {missing} from its part; the corpus stacks every "
                        f"field of PART_FIELDS and would fail at the final write instead")
     path.parent.mkdir(parents=True, exist_ok=True)
-    # The suffix ends in .npz on purpose: np.savez appends .npz to any name that does not,
-    # so a temporary called .part would be written as .part.npz and the rename below would
-    # look for a file that was never created.
-    tmp = path.with_name(path.name + ".part.npz")
+    # The temporary name has to end in .npz itself: np.savez silently appends .npz to any
+    # filename that does not already end with it (_out_tmp below already works around this
+    # for the final combined write; this per-part write needs the same treatment), so a plain
+    # "<name>.npz.part" is actually written as "<name>.npz.part.npz" and the rename below
+    # then fails with FileNotFoundError every time, having never found the file it wrote.
+    tmp = path.with_suffix(".part.npz")
     np.savez(tmp, body_index=int(i), meta=json.dumps(expected, sort_keys=True), **part)
     tmp.replace(path)
 
