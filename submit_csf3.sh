@@ -185,12 +185,17 @@ set +e
 # ---------------------------------------------------------------- data
 # Several GB from the organisers' Dropbox. Downloads only when dataset/raw is
 # empty; if it is already populated and matches dataset/MANIFEST.sha256 this is
-# a no-op. Needed by the convex, reconstruct and score stages at the end of the
-# run; the library, corpus and flow training stages do not touch it, and
-# models/instrument_calibration.pt is committed so calibrate is skipped either
-# way. A failure here therefore costs the last three stages, not the run.
-make data 2>&1 | tee logs/csf3_data.log || \
-  echo "WARNING: data fetch failed; stages through flow training still run"
+# a no-op. No calibration is committed -- models/ holds only the convex stage --
+# so the curves are what the calibration is fitted against, and every stage from
+# there on needs the instrument it writes. A failure here therefore costs the
+# run and not only its last stages, which is why the pipeline stops at the
+# calibration rather than going on without one.
+make data 2>&1 | tee logs/csf3_data.log
+if [ "${PIPESTATUS[0]}" -ne 0 ]; then
+  echo "ERROR: data fetch failed; see logs/csf3_data.log. The calibration, and so every" >&2
+  echo "       stage after it, needs dataset/raw. Stopping." >&2
+  exit 1
+fi
 
 # ---------------------------------------------------------------- run
 # Each stage writes a marker under runs/.done/ and is skipped if already
