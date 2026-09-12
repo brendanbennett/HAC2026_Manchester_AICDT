@@ -81,6 +81,22 @@ level 0.5  (== 4/8)            962 / 22730        False
 
 Nothing about this is specific to the data; `--samples 7` would have hidden it entirely.
 
+The arithmetic that caused it is also what sets how good a consensus body can be, which is the
+reason the draw count is now 64 rather than 8. The occupied fraction of a voxel takes only the
+values k / samples, so at eight draws a level set can be placed in nine ways and
+`dice_optimal_level` is choosing among nine bodies; at sixty-four it is choosing among
+sixty-five. The draws are therefore not only the candidates being scored, they are the
+resolution of the consensus bodies, and the count is the binding constraint on both.
+
+What it costs was measured rather than assumed. Everything in the step is linear in the count
+except `metric_medoid`, which compares every candidate against every draw and is quadratic:
+with one outline set built per body at about a second, and a boundary comparison between two of
+them at about 77 milliseconds, the selection runs about four minutes a model at 64 draws
+against a quarter of a minute at 8. That is affordable beside the rest of a run. Note that the
+side of the comparison grid was chosen against ensembles of eight draws, and the quantisation
+that tied it there no longer binds at this count, so `OCC_RES` is now a number worth measuring
+again rather than one that is known to be right.
+
 `reconstruct_lpd.off_lattice_level` moves a requested level down to the middle of the cell
 below it, (k − 0.5)/n_draws. That keeps exactly the voxels the level meant -- those where
 at least k of the draws agree -- while passing strictly between attainable values, so every

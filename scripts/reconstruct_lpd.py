@@ -95,6 +95,11 @@ POLISH_STEP = 0.1    # first step of the polish, in whitened units per coordinat
 # values as there are draws, so a finer grid past this makes the level set jagged rather than
 # sharper, and 192 measured worse than 128. It is also no more expensive, since a mesh this
 # fine is no longer decimated on the way in.
+#
+# Both measurements above were taken on ensembles of eight draws, and the draw count has since
+# gone up. The tie that held the grid here was the quantisation, and at the present count it no
+# longer binds at this side, so a finer grid may now be worth what it costs. Nothing here
+# assumes one side over another; what is missing is the same measurement taken again.
 OCC_RES = 128
 
 
@@ -347,8 +352,8 @@ def off_lattice_level(level: float, n_draws: int) -> float:
     cubes then places vertices on grid points and emits zero-area triangles and pinch
     points: the body comes back with a fifth of its faces degenerate and its winding
     inverted, which `export_stl` cannot repair and no voxel measure that relies on
-    orientation can read. CONSENSUS_LEVELS holds 0.5 and the default draw count is 8, so
-    the majority level landed on the lattice on every run.
+    orientation can read. CONSENSUS_LEVELS holds 0.5 and the draw count is even, so the
+    majority level lands on the lattice on every run whatever that count is.
 
     The level is moved down to the middle of the cell below it, (k - 0.5) / n_draws. That
     keeps exactly the voxels the requested level meant -- those where at least k of the
@@ -431,7 +436,12 @@ def main():
                     help="the Instrument written by scripts/calibrate.py; must be the one "
                          "the flow was trained with")
     ap.add_argument("--data-dir", default="dataset/raw")
-    ap.add_argument("--samples", type=int, default=8)
+    ap.add_argument("--samples", type=int, default=64,
+                    help="draws from the flow. They are the candidates and they are also what "
+                         "the consensus bodies are built from, and the fraction of draws "
+                         "occupying a voxel can only take the values k/samples, so this sets "
+                         "how finely a consensus level set can be placed as well as how many "
+                         "bodies are scored")
     ap.add_argument("--steps", type=int, default=N_STEPS,
                     help="steps of the sampler from noise to a body; the operator runs at "
                          "each")

@@ -103,7 +103,12 @@ FLOW_ROLLOUT_STEPS=${FLOW_ROLLOUT_STEPS:-1000}  # cap on the second run's extra 
                                                 # experts, rolled out, the main phase; 0 skips it
 FLOW_ROLLOUT_FRAC=${FLOW_ROLLOUT_FRAC:-0.5}     # share of its draws that come from the sampler
 
-RECON_SAMPLES=${RECON_SAMPLES:-8}
+RECON_SAMPLES=${RECON_SAMPLES:-64}   # draws per model. They are the candidates and they are
+                                     # what the consensus bodies are built from, so this also
+                                     # sets how finely a consensus level can be placed: the
+                                     # occupied fraction of a voxel takes only k/RECON_SAMPLES.
+                                     # The medoid is quadratic in it and measured at about four
+                                     # minutes a model here; everything else is linear.
 RECON_POLISH_STEPS=${RECON_POLISH_STEPS:-30}   # most gradient steps of the polish per draw; 0 skips it
 RECON_RES=${RECON_RES:-96}
 RECON_SNAP=${RECON_SNAP:-0}

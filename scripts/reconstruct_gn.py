@@ -47,6 +47,7 @@ import argparse
 import json
 import sys
 import time
+from collections import Counter
 from pathlib import Path
 
 import numpy as np
@@ -75,13 +76,15 @@ from reconstruct_map import (EXPORT_RES, convex_dice, convexity,     # noqa: E40
                              truth_dice)
 from train_lpd import INSTRUMENT, RENDER, _enable_tf32, load_instrument   # noqa: E402
 
-RESTARTS = 9               # starts screened, the convex answer and eight of the designed
-                           # grid: enough for one sweep of the grid's axes, which is the factor
-                           # the ladder's own first stage cannot correct cheaply. Measured, a
-                           # screening costs about fifty renders against the ladder's four
-                           # thousand, so the sweep is affordable; measured also, the random
-                           # draws this grid replaces were worth nothing at all, so it is the
-                           # spread and not the count that has to earn its place.
+RESTARTS = 9               # starts given the coarse screen: the convex answer and the best
+                           # eight of the designed grid, which are now chosen by rendering
+                           # every start once and ranking rather than by taking the first eight
+                           # indices. The screen answers a question a render cannot -- whether
+                           # a start descends -- and costs about a hundred renders against the
+                           # ladder's thousands, so a handful of them is what is affordable
+                           # here and the ranking above is what decides which handful. Measured
+                           # also, the random draws this grid replaces were worth nothing at
+                           # all, so it is the spread and not the count that earns its place.
 RESTART_KEEP = 2           # starts carried to the end of the ladder
 VOLUME_FLOOR = 0.50        # smallest volume an accepted body may have, as a fraction of the
                            # convex answer's. The cheapest surface area in this representation
@@ -148,6 +151,10 @@ def main() -> None:
     ap.add_argument("--export-res", type=int, default=EXPORT_RES)
     ap.add_argument("--hold-out-geoms", type=int, default=5)
     ap.add_argument("--restarts", type=int, default=RESTARTS)
+    ap.add_argument("--screen-starts", type=int, default=N_STARTS,
+                    help="designed starts rendered once and ranked before the coarse screen; "
+                         "the whole grid by default, since a render each is a small part of "
+                         "one ladder")
     ap.add_argument("--restart-keep", type=int, default=RESTART_KEEP,
                     help="screened starts carried to the end of the ladder. This is what a "
                          "run costs, the ladder being far more renders than the screening, "
@@ -267,26 +274,43 @@ def main() -> None:
               f"normally has concavity to find at. The correction is run and flagged; the "
               f"selection decides on the held-out geometries.", flush=True)
 
-    # Every start is judged on the first few iterations of the coarse stage, which tells a
-    # start that is descending from one that is not; the best are then carried to the end.
+    # The grid is swept in two tiers, because the two questions cost differently. Ranking a
+    # start needs the number the fit minimises at that start, and that is one render; telling a
+    # start that descends from one that does not needs the coarse stage, and that is about a
+    # hundred. So every designed start is rendered once and ranked, and only the best few are
+    # given the coarse screen below. The whole grid at one render each costs about what
+    # screening nine starts used to, which is what makes a grid of this size affordable.
     t0 = time.time()
-    starts, recipes = [(np.zeros(N_RADIAL), np.zeros(N_NODES))], [{"start": "convex answer"}]
-    skipped = 0
-    i = 0
-    while len(starts) < a.restarts and i < N_STARTS:
+    ranked_from = gate.renders
+    pool, skipped_depth, skipped_floor = [], 0, 0
+    for i in range(min(a.screen_starts, N_STARTS)):
         c0, g0, rec = conjunction_start(nodes, i, n_radial=N_RADIAL)
-        i += 1
-        # A cap of a body that has little room to carve is not a body, so it is passed over
-        # rather than shortened: a start clipped to the cap is a different start from the one
-        # the grid means, and the grid would then no longer be a spread.
+        # A carve deeper than a body has room for is not a body, so it is passed over rather
+        # than shortened: a start clipped to the bound is a different start from the one the
+        # grid means, and the grid would then no longer be a spread.
         if float(g0.max()) > cap:
-            skipped += 1
+            skipped_depth += 1
             continue
-        starts.append((c0, g0))
-        recipes.append({"start": "cap", **rec})
-    if skipped:
-        print(f"  {skipped} of the designed starts carve deeper than this body's own centre "
-              f"allows and were passed over", flush=True)
+        r_i, area_i, _ = gate._render(c0, g0)
+        if r_i is None:
+            skipped_floor += 1
+            continue
+        pool.append({"objective": gate.objective(r_i, area_i), "c": c0, "g": g0,
+                     "recipe": {"start": rec["kind"], **rec}})
+    pool.sort(key=lambda q: q["objective"])
+    take = max(0, a.restarts - 1)
+    starts = ([(np.zeros(N_RADIAL), np.zeros(N_NODES))]
+              + [(q["c"], q["g"]) for q in pool[:take]])
+    recipes = [{"start": "convex answer"}] + [q["recipe"] for q in pool[:take]]
+    kept_kinds = Counter(q["recipe"]["kind"] for q in pool[:take])
+    print(f"  ranked {len(pool)} designed starts on one render each "
+          f"({gate.renders - ranked_from} renders, {time.time() - t0:.0f}s); carrying "
+          + (", ".join(f"{n} {k}" for k, n in sorted(kept_kinds.items())) or "none")
+          + " to the coarse screen"
+          + (f"; {skipped_depth} carve deeper than this body's own centre allows" if
+             skipped_depth else "")
+          + (f"; {skipped_floor} fall under the volume floor" if skipped_floor else ""),
+          flush=True)
     def last(hist, key):
         rows = [h for h in hist if key in h]
         return rows[-1][key] if rows else float("inf")
@@ -434,6 +458,8 @@ def main() -> None:
             "step_g": a.step_g, "step_c": a.step_c, "restarts": a.restarts,
             "start": best["recipe"], "renders": best["renders"],
             "restart_keep": a.restart_keep, "polished": best["polished"],
+            "screen_starts": a.screen_starts, "starts_ranked": len(pool),
+            "starts_over_depth_cap": skipped_depth, "starts_under_floor": skipped_floor,
             "budget_limited": best["budget_limited"],
             "refused_volume": best["refused_volume"],
             "chi_fit": best["chi"], "objective_fit": best["objective"],

@@ -97,6 +97,41 @@ surface, which a reconstruction does not have; what a reconstruction has is the 
 whether they determine the same body is the separate question notes/identifiability.md asks. The
 table says only that when a fit stops short of these numbers, the degree cap is not the reason.
 
+## What the grid of starts can hold
+
+The ladder is local, so what it can reach is bounded by where it begins as well as by what its
+coordinates span. The grid of starts was eight spherical caps by three radii by three depths,
+and a cap is a crater: the field it writes is a single connected region of one depth. No
+setting of those three numbers makes a neck, and `BENCHMARKS.md` records that the one released
+non-convex body is a contact binary. So the grid excluded the shape of the answer at every
+size, and enlarging it would have produced more craters rather than a body of the right kind.
+
+The second family is a neck. A body's two lobes lie on an axis, and the neck between them is
+the band of carve around the great circle perpendicular to it, which is the directions u with
+u . axis near zero; `waist_depths` writes a constant depth over the band within a half-width of
+that circle. The axes are the eight the caps use, in the band about the equator, together with
+the spin axis itself, because the challenge fixes the axis of rotation but not which way a body
+was mounted on it: a waist about an equatorial axis is the neck of a body lying across the
+axis, and a waist about the spin axis the neck of one standing on it. Half-widths run from
+twelve to thirty degrees, and the mean spacing of 2560 nodes is about four degrees, so the
+narrowest band is six spacings across and is carried rather than smoothed away.
+
+The uniform shrink came out of the grid at the same time, from three levels to one. Measured on
+the released bodies, the canonical pose divides a uniform inward displacement almost entirely
+back out, since z is rescaled to span [-1, 1] and the widest radius to one and an offset is
+nearly a similarity: the deepest level of the range moves the canonical volume of model 3 by a
+twentieth and of model 1 by a hundredth. Three levels were therefore three bodies that a
+ranking cannot separate, and they would have filled a shortlist with copies of one start. The
+level is kept non-zero because its purpose is the linearisation rather than the body -- it puts
+the secant probe of the hull coefficient somewhere the hull is already moving.
+
+The grid is 72 caps and 81 waists, and it is swept whole rather than truncated, because the two
+questions about a start cost differently. Ranking a start needs the number the fit minimises at
+that start, which is one render; telling a start that descends from one that does not needs the
+coarse stage, which is about a hundred. So every start is rendered once and ranked, and the
+best eight are given the coarse screen. The whole grid at one render each is 153 renders
+against the roughly twelve thousand a body costs, and the screen it feeds is unchanged.
+
 ## The node set, and why it is not a plain spiral
 
 A quarter turn about the spin axis is an exact symmetry of the problem and is what gives the

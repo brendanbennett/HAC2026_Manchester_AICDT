@@ -36,7 +36,8 @@ import numpy as np
 from ..field import RADIAL_DEGREE, real_sh
 
 __all__ = ["Stage", "DEFAULT_STAGES", "SCREEN_STAGES", "POLISH_STAGES", "CarveFit",
-           "degree_basis", "node_subspace_basis", "cap_depths", "conjunction_start",
+           "degree_basis", "node_subspace_basis", "cap_depths", "waist_depths",
+           "conjunction_start", "N_CAP_STARTS", "N_WAIST_STARTS",
            "start_recipe", "N_STARTS", "SHRINK_RANGE", "STEP_G", "STEP_C",
            "AREA_WEIGHT", "AREA_WINDOW", "VOLUME_TRUST", "DEPTH_TRUST", "TARGET_SIGMA",
            "DAMP_FLOOR", "SMOOTHING_LENGTHS", "CAP_RADII_DEG", "CAP_DEPTHS", "CAP_BAND_DEG"]
@@ -143,8 +144,40 @@ SHRINK_RANGE = (0.02, 0.14)            # uniform inward displacements of the hul
                                        # from, in body units of the canonical pose, where a body
                                        # spans [-1, 1]. The range covers a body that is barely
                                        # non-convex through a contact binary.
-SHRINK_LEVELS = (0.5, 0.0, 1.0)        # positions in that range, middle level first
-N_STARTS = CAP_AXES * len(CAP_RADII_DEG) * len(CAP_DEPTHS) * len(SHRINK_LEVELS)
+SHRINK_LEVELS = (0.5,)                 # positions in that range. One, not three. Measured on
+                                       # the released bodies, the canonical pose divides a
+                                       # uniform inward displacement almost entirely back out
+                                       # -- z is rescaled to span [-1, 1] and the widest radius
+                                       # to one, and an offset is nearly a similarity -- so the
+                                       # deepest level of the range moves the canonical volume
+                                       # of model 3 by a twentieth and of model 1 by a
+                                       # hundredth. Three levels therefore make three bodies a
+                                       # ranking cannot tell apart, and they would fill a
+                                       # shortlist with copies of one start. The level is kept
+                                       # non-zero because its purpose is the linearisation
+                                       # rather than the body: it puts the secant probe of the
+                                       # hull coefficient somewhere the hull is already moving.
+
+# The waist family. A cap is a crater and cannot make a neck, and the one released non-convex
+# body is a contact binary, so a grid of caps alone cannot start anywhere near the shape of the
+# answer. A neck is a band of carve around the great circle perpendicular to the axis the lobes
+# lie on, which is what waist_depths writes.
+WAIST_AXES = 8                         # lobe axes across the same band the caps use. The spin
+                                       # axis is added to them in _waist_axes, since a body may
+                                       # equally lie across the axis of rotation or stand on it.
+WAIST_HALFWIDTHS_DEG = (20.0, 12.0, 30.0)   # half-width of the carved band, middle level first.
+                                       # At this many nodes the mean spacing is about four
+                                       # degrees, so the narrowest band here is six spacings
+                                       # across and is resolved rather than smoothed away.
+WAIST_DEPTHS = (0.35, 0.20, 0.50)      # its depth, in body units, middle level first. Deeper
+                                       # than a crater because a neck is the deepest feature a
+                                       # body of this kind has; a start deeper than a given
+                                       # body's star-shaped bound is passed over by the caller.
+
+N_CAP_STARTS = CAP_AXES * len(CAP_RADII_DEG) * len(CAP_DEPTHS) * len(SHRINK_LEVELS)
+N_WAIST_STARTS = ((WAIST_AXES + 1) * len(WAIST_HALFWIDTHS_DEG) * len(WAIST_DEPTHS)
+                  * len(SHRINK_LEVELS))
+N_STARTS = N_CAP_STARTS + N_WAIST_STARTS
 
 
 @dataclass(frozen=True)
@@ -256,6 +289,27 @@ def cap_depths(nodes: np.ndarray, axis, radius_deg: float, depth: float) -> np.n
     return np.where(u @ n >= np.cos(np.deg2rad(float(radius_deg))), float(depth), 0.0)
 
 
+def waist_depths(nodes: np.ndarray, axis, halfwidth_deg: float, depth: float) -> np.ndarray:
+    """The coefficients of a neck: `depth` on the nodes within `halfwidth_deg` of the great
+    circle perpendicular to `axis`, zero elsewhere.
+
+    A direction u sits on that great circle exactly where u . axis vanishes, and within
+    `halfwidth_deg` of it where |u . axis| is at most the sine of that angle, which is the
+    test below. `axis` is the line the two lobes lie on, so the band runs around the body
+    between them.
+
+    Written straight into the coefficients with no rescaling, for the reason cap_depths is: the
+    node weights are a partition of unity, so a constant over a region is reproduced exactly
+    inside it and the field falls to zero across about one node spacing at each rim. A neck has
+    two rims rather than one, and both are the sharp edge a convex inversion cannot see.
+    """
+    u = np.asarray(nodes, dtype=float)
+    n = np.asarray(axis, dtype=float).ravel()
+    n = n / max(float(np.linalg.norm(n)), 1e-12)
+    return np.where(np.abs(u @ n) <= np.sin(np.deg2rad(float(halfwidth_deg))),
+                    float(depth), 0.0)
+
+
 def _cap_axes(n: int = CAP_AXES, band_deg: float = CAP_BAND_DEG) -> np.ndarray:
     """`n` quasi-uniform axes in the band within `band_deg` of the equator, by the same spiral
     the nodes use, restricted to that band."""
@@ -266,26 +320,52 @@ def _cap_axes(n: int = CAP_AXES, band_deg: float = CAP_BAND_DEG) -> np.ndarray:
     return np.stack([r * np.cos(azim), r * np.sin(azim), z], axis=1)
 
 
-def start_recipe(index: int) -> dict:
-    """The `index`-th start of the designed grid, as its four numbers.
+def _waist_axes(n: int = WAIST_AXES, band_deg: float = CAP_BAND_DEG) -> np.ndarray:
+    """The lobe axes a neck is taken about: the band the cap axes use, and the spin axis.
 
-    The grid is swept with the axis varying fastest and every other factor at its middle level
-    first, so that a run which can afford only a few starts spends them on where the dent is
-    rather than on how deep it is. The depth and the radius are what the ladder's own first
-    stage corrects most cheaply; the axis is not.
+    A waist about an equatorial axis is the neck of a body lying across the axis of rotation,
+    and a waist about the spin axis the neck of one standing on it; the challenge fixes the
+    axis but not which way a body was mounted on it, so both are in the grid. An axis and its
+    antipode give the same band, so the band's own axes are not doubled.
+    """
+    return np.concatenate([_cap_axes(n, band_deg),
+                           np.array([[0.0, 0.0, 1.0]], dtype=float)], axis=0)
+
+
+def start_recipe(index: int) -> dict:
+    """The `index`-th start of the designed grid, as its family and that family's numbers.
+
+    The grid is two families laid end to end, the caps first and then the waists, each swept
+    with the axis varying fastest and every other factor at its middle level first. A run which
+    can afford only part of a family therefore spends it on where the feature is rather than on
+    how large it is: the depth and the width are what the ladder's own first stage corrects most
+    cheaply, and the axis is not.
     """
     i = int(index)
-    axes = _cap_axes()
-    axis = axes[i % len(axes)]
-    i //= len(axes)
-    radius = CAP_RADII_DEG[i % len(CAP_RADII_DEG)]
-    i //= len(CAP_RADII_DEG)
-    depth = CAP_DEPTHS[i % len(CAP_DEPTHS)]
-    i //= len(CAP_DEPTHS)
+    if i < N_CAP_STARTS:
+        axes = _cap_axes()
+        axis = axes[i % len(axes)]
+        i //= len(axes)
+        radius = CAP_RADII_DEG[i % len(CAP_RADII_DEG)]
+        i //= len(CAP_RADII_DEG)
+        depth = CAP_DEPTHS[i % len(CAP_DEPTHS)]
+        i //= len(CAP_DEPTHS)
+        rec = {"kind": "cap", "axis": axis.tolist(), "radius_deg": float(radius),
+               "depth": float(depth)}
+    else:
+        i -= N_CAP_STARTS
+        axes = _waist_axes()
+        axis = axes[i % len(axes)]
+        i //= len(axes)
+        half = WAIST_HALFWIDTHS_DEG[i % len(WAIST_HALFWIDTHS_DEG)]
+        i //= len(WAIST_HALFWIDTHS_DEG)
+        depth = WAIST_DEPTHS[i % len(WAIST_DEPTHS)]
+        i //= len(WAIST_DEPTHS)
+        rec = {"kind": "waist", "axis": axis.tolist(), "halfwidth_deg": float(half),
+               "depth": float(depth)}
     level = SHRINK_LEVELS[i % len(SHRINK_LEVELS)]
-    shrink = SHRINK_RANGE[0] + level * (SHRINK_RANGE[1] - SHRINK_RANGE[0])
-    return {"axis": axis.tolist(), "radius_deg": float(radius), "depth": float(depth),
-            "shrink": float(shrink)}
+    rec["shrink"] = float(SHRINK_RANGE[0] + level * (SHRINK_RANGE[1] - SHRINK_RANGE[0]))
+    return rec
 
 
 def conjunction_start(nodes: np.ndarray, index: int, n_radial: int = 9) -> tuple:
@@ -302,9 +382,15 @@ def conjunction_start(nodes: np.ndarray, index: int, n_radial: int = 9) -> tuple
 
     The shrink is uniform, the degree-zero coefficient alone, because that is the part of the
     excess that does not depend on which way a body is turned; the rest is left to the fit.
+
+    The carve is a crater or a neck, by the family the index falls in. A crater is what a grid
+    of caps can make and a neck is not, and a neck is the shape of the one released non-convex
+    body, so a grid without the second family cannot start near that answer at any size.
     """
     rec = start_recipe(index)
-    a = cap_depths(nodes, rec["axis"], rec["radius_deg"], rec["depth"])
+    a = (waist_depths(nodes, rec["axis"], rec["halfwidth_deg"], rec["depth"])
+         if rec["kind"] == "waist" else
+         cap_depths(nodes, rec["axis"], rec["radius_deg"], rec["depth"]))
     c = np.zeros(int(n_radial))
     c[0] = rec["shrink"]
     return c, a, rec

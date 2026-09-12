@@ -11,9 +11,10 @@ from hac26.forward.mesh.exact import RenderConfig
 from hac26.forward.mesh.instrument import Instrument
 from hac26.shapes import canonicalize_r, icosphere, mesh_support, rescale_touch_z
 from hac26.solvers.gauss_newton import (AREA_WEIGHT, AREA_WINDOW, CAP_DEPTHS, DEPTH_TRUST,
+                                        N_CAP_STARTS, N_STARTS, N_WAIST_STARTS,
                                         SMOOTHING_LENGTHS, VOLUME_TRUST, CarveFit, Stage,
                                         cap_depths, conjunction_start, degree_basis,
-                                        node_subspace_basis, start_recipe)
+                                        node_subspace_basis, start_recipe, waist_depths)
 from hac26.solvers.operator import CodeOperator
 
 TINY = RenderConfig(height=24, width=40, supersample=1, sun_res=64, n_source=1,
@@ -115,7 +116,47 @@ def test_a_designed_start_carves_the_cap_it_asks_for():
     assert np.array_equal(a > 0, NODES[:, 2] >= np.cos(np.deg2rad(30.0)))
 
 
+def test_a_designed_waist_carves_the_band_it_asks_for():
+    """The grid's second family is a neck rather than a crater, because the one released
+    non-convex body is a contact binary and no cap can make a neck. A waist about an axis is
+    the band within its half-width of the great circle perpendicular to that axis, and the
+    field it makes has to be as deep as it asks for, the weights being a partition of unity."""
+    K = node_kernel()
+    # a waist about the spin axis is exactly the equatorial band
+    a = waist_depths(NODES, [0.0, 0.0, 1.0], 20.0, 0.3)
+    assert np.array_equal(a > 0, np.abs(NODES[:, 2]) <= np.sin(np.deg2rad(20.0)))
+    assert float(np.abs(K @ a).max()) == pytest.approx(0.3, rel=1e-3)
+    # a waist about an equatorial axis runs through both poles, which a cap in the grid's own
+    # band can never reach
+    b = waist_depths(NODES, [1.0, 0.0, 0.0], 20.0, 0.3)
+    assert b[int(np.argmax(NODES[:, 2]))] > 0 and b[int(np.argmin(NODES[:, 2]))] > 0
+    # half-width 30 degrees is half the sphere by Archimedes: the band |u.n| <= sin(30) has
+    # exactly half the area, so the fraction of nodes in it is a check on the node set too
+    half = waist_depths(NODES, [0.0, 0.0, 1.0], 30.0, 0.3)
+    assert float((half > 0).mean()) == pytest.approx(0.5, abs=0.02)
+
+
+def test_the_start_grid_holds_both_families_and_repeats_none_of_them():
+    """A run that can afford only part of the grid takes it in order, so the caps come first
+    and the axis varies fastest inside each family. Every index has to be a different start:
+    a grid that repeats a recipe is spending a ranking slot on a body it has already seen."""
+    assert N_STARTS == N_CAP_STARTS + N_WAIST_STARTS
+    kinds = [start_recipe(i)["kind"] for i in range(N_STARTS)]
+    assert set(kinds[:N_CAP_STARTS]) == {"cap"} and set(kinds[N_CAP_STARTS:]) == {"waist"}
+    keys = {repr(sorted(((k, tuple(v) if isinstance(v, list) else v)
+                         for k, v in start_recipe(i).items()), key=str))
+            for i in range(N_STARTS)}
+    assert len(keys) == N_STARTS
+    # every start is a body the representation can hold: one depth, written straight in
+    for i in (0, N_CAP_STARTS - 1, N_CAP_STARTS, N_STARTS - 1):
+        c, a, rec = conjunction_start(NODES, i)
+        assert a.max() == pytest.approx(rec["depth"]) and (a >= 0.0).all()
+        assert c[0] == pytest.approx(rec["shrink"])
+
+
 def _operator_and_bodies():
+
+
     """A small operator, a convex support, and a body carved out of it by a known cap."""
     v, f = icosphere(2)
     v = np.asarray(v) * np.array([1.0, 0.82, 0.72])
