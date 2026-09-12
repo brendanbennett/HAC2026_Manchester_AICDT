@@ -189,7 +189,10 @@ def _load_fit(path: Path, expected: dict, i: int):
 def _save_fit(path: Path, i: int, expected: dict, a: np.ndarray, before: float, after: float):
     """Written under a temporary name and renamed, so a kill mid-write leaves no half part."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(path.name + ".part")
+    # The suffix ends in .npz on purpose: np.savez appends .npz to any name that does not,
+    # so a temporary called .part would be written as .part.npz and the rename below would
+    # look for a file that was never created.
+    tmp = path.with_name(path.name + ".part.npz")
     np.savez(tmp, body_index=int(i), meta=json.dumps(expected, sort_keys=True),
              a=a, before=np.float32(before), after=np.float32(after))
     tmp.replace(path)
