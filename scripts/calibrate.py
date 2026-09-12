@@ -297,7 +297,12 @@ def main():
     ap.add_argument("--models", nargs="+", type=int, default=list(PUBLIC_MODELS),
                     help="public bodies to fit on. One eta is shared across them, so a body "
                          "the chain cannot reproduce raises the model error admitted for "
-                         "every other body")
+                         "every other body and for every secret model fitted against the "
+                         "result. Model 2, the sawed-off cube, misses by 4.2x the combined "
+                         "noise where models 1 and 3 sit at 0.2-0.7x: its flat faces put "
+                         "Otsu in a regime the chain does not reproduce. Every secret model "
+                         "is round-regime like 1 and 3, so fitting on the cube buys nothing "
+                         "and costs the noise floor.")
     ap.add_argument("--out", default=None,
                     help=f"instrument file; by channel, {OUT_INSTRUMENT}")
     ap.add_argument("--report", default=None,
