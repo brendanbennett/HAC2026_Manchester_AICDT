@@ -21,7 +21,7 @@ ones are at the physical scale of the printed model, z spanning 6–8 rather tha
 | 09-08 | *convex hull of truth* — the convex ceiling, not a legal run | 0.9969 | 0.9941 | 0.9997 | 0.9165 | 0.8828 | 0.9848 | **5.775** |
 | 09-08 | `results/convex` — LPD convex stage, `--fit-cylinder` | 0.9786 | 0.9929 | 0.9106 | 0.9905 | 0.7147 | 0.9568 | **5.544** |
 | 09-08 | `results/lpd` — convex start + flow + polish (as shipped) | 0.9554 | 0.9865 | 0.8109 | 0.9711 | 0.7216 | 0.9589 | **5.405** |
-| 09-12 | flow retrained on CSF3, 800 bodies, 11M, polish 30 | 0.9552 | 0.9914 | 0.8598 | 0.9824 | 0.7330 | 0.9576 | **5.480** |
+| 09-12 | flow retrained on CSF3, 800 bodies, 11M, polish 30 (`results/flow_all`, all ten built) | 0.9552 | 0.9914 | 0.8598 | 0.9824 | 0.7330 | 0.9576 | **5.480** |
 | 09-12 | the same, polish 0 | 0.9530 | 0.9902 | 0.8736 | 0.9764 | 0.7249 | 0.9566 | **5.475** |
 | 09-12 | flow retrained, 2500 bodies, **304M** parameters | 0.529\* | — | 0.356\* | — | 0.422\* | — | **far worse** |
 

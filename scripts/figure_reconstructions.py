@@ -38,7 +38,8 @@ from hac26.shapes import rescale_touch_z                             # noqa: E40
 LABELS = {"results/convex": "convex stage",
           "results/lpd": "convex + flow (old)",
           "results/flow_p30": "convex + flow (retrained)",
-          "results/flow_p0": "convex + flow (no polish)"}
+          "results/flow_p0": "convex + flow (no polish)",
+          "results/flow_all": "convex + flow (retrained)"}
 
 LIGHT = np.array([-1.0, 0.35, 0.55])          # the lab's light is at (-inf, 0, 0)
 LIGHT = LIGHT / np.linalg.norm(LIGHT)
