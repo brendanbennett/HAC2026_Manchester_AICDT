@@ -57,6 +57,46 @@ five of the directions held there. It costs almost nothing here -- five directio
 and out of 2560 -- but it is not slack, and on a body whose convex answer is inflated further it
 would be the thing that decides how deep a carve can go.
 
+## What each rung of the ladder can hold
+
+The family is not the only cap on what a fit can reach. The solver never searches the depths
+directly; each of its stages searches the real spherical harmonics up to a degree, so a stage's
+ceiling is what that degree can hold and not what the 2560 directions can. The same protocol
+answers it: the core is pinned to the convex stage's answer for model 3, the body's own surface
+is sampled, and the depths are solved inside each stage's coordinates together with the nine
+reshaping coefficients the fit carries beside them. The columns are scaled the way `CarveFit`
+scales them, by the peak depth each makes in the field, without which the unnormalised
+harmonics reach 1e31 by degree 24 and the solve returns nothing. The overlap below is taken on
+a 64-cubed grid rather than the 128-cubed of the table above, which is why the last row reads
+0.994 where that table reads 0.9966; the rows here are comparable with each other.
+
+| stage | coefficients | rms field residual | volume | overlap |
+|---|---|---|---|---|
+| the convex answer, uncorrected | 0 | 0.192 | 3.279 | 0.706 |
+| degree 4 | 16 | 0.044 | 2.075 | 0.929 |
+| degree 10 | 112 | 0.020 | 1.938 | 0.969 |
+| degree 16 | 280 | 0.010 | 1.927 | 0.985 |
+| degree 24 | 616 | 0.007 | 1.871 | 0.992 |
+| degree 32 | 1080 | 0.005 | 1.907 | 0.992 |
+| all directions | 2560 | 0.004 | 1.900 | 0.994 |
+
+The body's own volume is 1.885, so every rung from degree 4 up recovers it to within a few per
+cent, and the overlap is what separates them. What the table settles is that the ladder's
+ceiling is not what limits a reconstruction: the coarsest stage of all can hold the released
+body at 0.929 and the third at 0.969, both above what the challenge is being aimed at, and
+degree 24 buys 0.007 over degree 16 for twice the renders an iteration.
+
+The cost runs the other way, since a secant Jacobian spends one render per coefficient. A
+degree-24 iteration is thirteen degree-4 iterations, so a ladder that spends its iterations
+evenly spends most of them on the rung that carries least. That is why `DEFAULT_STAGES` gives
+the coarse rungs most of the iterations and leaves degree 24 as a refinement, and why the
+polish runs at degree 16.
+
+This is an upper bound on a stage and not a prediction of a run. It is fitted to the body's own
+surface, which a reconstruction does not have; what a reconstruction has is the curves, and
+whether they determine the same body is the separate question notes/identifiability.md asks. The
+table says only that when a fit stops short of these numbers, the degree cap is not the reason.
+
 ## The node set, and why it is not a plain spiral
 
 A quarter turn about the spin axis is an exact symmetry of the problem and is what gives the

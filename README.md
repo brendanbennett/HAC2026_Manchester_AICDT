@@ -181,10 +181,12 @@ model on its own.
 Cameras are held out of every fit, and the body's misfit on them is written beside the convex
 answer's on the same cameras. That pair is the only test of whether a shape was recovered
 rather than curves fitted: a body fitted on all of them can reach any misfit by overfitting.
-`select_answers.py` accepts a correction for a scored model only where it beats its convex
-answer on its held-out cameras by as much as the public model's correction did, and only if
-that public correction raised the overlap with its released shape. Where it did not, a lower
-misfit is not evidence of a better body and the convex answers stand.
+`select_answers.py` accepts a correction for a scored model where it beats its convex answer
+on its own held-out cameras. Passing `--calibrate` tightens that to the margin a public
+model's correction reached, which is one body's margin asked of every other; the runbook does
+not, because a public run that falls short would then stand every convex answer, and a convex
+answer is not a safe default but a body known to be missing the concavities the challenge is
+about.
 
 `scripts/reconstruct_map.py` is the same problem by gradient descent on the exact misfit,
 without the reshaping, and writes the same fields, so `select_answers.py` reads either.
@@ -204,8 +206,8 @@ body the fit reaches from its convex answer, and the fit released from the body 
 so the curves do prefer the body; but the two are separated by less than the forward model's
 own error at the released shapes. A search that selects on the misfit is only selecting
 between them once that residual is well below the separation, which is why the calibration's
-number is the first one to read and why `select_answers.py` requires a public body to have
-vouched for a correction before any scored body is corrected. `notes/identifiability.md`
+number is the first one to read, and why `select_answers.py` judges a correction on cameras
+held out of its own fit rather than on the misfit it was fitted to. `notes/identifiability.md`
 carries the measurement.
 
 The flow pipeline, `scripts/run_remote_pipeline.sh`, builds a shape library, fits shape codes

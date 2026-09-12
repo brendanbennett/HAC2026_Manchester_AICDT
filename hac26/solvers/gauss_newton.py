@@ -153,23 +153,36 @@ class Stage:
 
 
 # The ladder. A degree-L stage has (L+1)^2 - 9 coordinates, so this is 16, 40, 112, 280 and 616,
-# and a secant Jacobian spends one render on each. It ends at degree 24 because that is where
-# the family already reaches the floor of what any correction of this size can do, and because
-# its angular wavelength is ten extraction pitches at the surface -- far from the node scale the
-# area cannot charge. There is deliberately no node-space stage: measured, the same ladder with
-# one ends below the convex answer it started from.
-DEFAULT_STAGES = (Stage(degree=4, n_dirs=0, iters=4),
-                  Stage(degree=6, n_dirs=0, iters=4),
-                  Stage(degree=10, n_dirs=0, iters=4),
-                  Stage(degree=16, n_dirs=0, iters=3),
-                  Stage(degree=24, n_dirs=0, iters=3))
+# and a secant Jacobian spends one render on each; with the line search a stage costs about
+# (L+1)^2 + 25 renders an iteration. It ends at degree 24 because that is where the family
+# already reaches the floor of what any correction of this size can do, and because its angular
+# wavelength is ten extraction pitches at the surface -- far from the node scale the area cannot
+# charge. There is deliberately no node-space stage: measured, the same ladder with one ends
+# below the convex answer it started from.
+#
+# How the iterations are shared out follows what each degree is worth, which is measured in
+# notes/representation.md by fitting the released body's own surface inside each stage's
+# coordinates: degree 4 alone carries the overlap from the convex answer's 0.706 to 0.929,
+# degree 10 reaches 0.969, and degree 24 adds 0.007 over degree 16. The cost runs the other way,
+# a degree-24 iteration being thirteen times a degree-4 one, so the iterations are concentrated
+# where the shape is and the top of the ladder is left as a refinement. A coarse stage also
+# needs the iterations for a second reason: it is where the volume journey is made, and the
+# trust region allows a fixed fraction of it per step.
+DEFAULT_STAGES = (Stage(degree=4, n_dirs=0, iters=10),
+                  Stage(degree=6, n_dirs=0, iters=8),
+                  Stage(degree=10, n_dirs=0, iters=6),
+                  Stage(degree=16, n_dirs=0, iters=4),
+                  Stage(degree=24, n_dirs=0, iters=2))
 
 # What every start is judged on. Measured, two iterations of the coarsest stage take almost the
 # whole of the overlap the full ladder reaches, so this is a screening that sees the answer.
 SCREEN_STAGES = (Stage(degree=4, n_dirs=0, iters=2),)
 
-# Run with the penalty off, after the penalised phase has put the shape where it goes.
-POLISH_STAGES = (Stage(degree=24, n_dirs=0, iters=3),)
+# Run with the penalty off, after the penalised phase has put the shape where it goes. At degree
+# 16 rather than 24: the polish recovers misfit at a shape the penalised phase has already
+# chosen, and the measurement above puts all but 0.007 of the reachable overlap inside degree
+# 16, so the wider stage spends twice the renders refining a body the curves have already fixed.
+POLISH_STAGES = (Stage(degree=16, n_dirs=0, iters=3),)
 
 
 def degree_basis(nodes: np.ndarray, degree: int, skip: int = RADIAL_DEGREE) -> np.ndarray:

@@ -64,9 +64,12 @@ for M in $SCORED; do
 done
 
 echo "=== decide $(date)"
-CP=$(printf "%02d" "$CALIBRATION_MODEL")
-$PY scripts/select_answers.py --refined "$OUT_DIR" \
-    --calibrate "$OUT_DIR/Asteroid$CP.json" --models $SCORED
+# A correction stands where it fits its own held-out cameras at least as well as the convex
+# answer does. Passing --calibrate here as well would additionally require it to reproduce the
+# public body's margin, which stands every convex answer in the submission when that one run
+# falls short; a convex answer is not a safe default but a body known to be missing the
+# concavities the challenge is about.
+$PY scripts/select_answers.py --refined "$OUT_DIR" --models $SCORED
 
 echo "=== check the submission $(date)"
 $PY scripts/check_submission.py results/submission

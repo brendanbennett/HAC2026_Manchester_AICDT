@@ -225,8 +225,11 @@ correcting one that needed it gains 0.045.
 
 What replaces the band is one measurement, not a redesign: render the convex answers of models 1
 and 3 against their own curves under the calibration actually being used, and read the two
-anchors again. That is two renders, and it is worth doing before a submission run, because the
-gate decides whether a body is corrected at all.
+anchors again. That is two renders and it is worth doing, though it is no longer urgent: the
+threshold now flags a body rather than refusing it, because the body it was measured on is one
+whose convex inversion had already recovered it, and a secret body's fate is not read from
+that. The correction runs either way and `scripts/select_answers.py` decides on geometries held
+out of the body's own fit.
 
 ## What it is worth
 

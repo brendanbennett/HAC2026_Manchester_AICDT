@@ -93,21 +93,24 @@ VOLUME_FLOOR = 0.50        # smallest volume an accepted body may have, as a fra
                            # weakness --min-convex-sigmas has: what would make it principled is
                            # the distribution of that ratio over the shape library, which is the
                            # same corpus a learned acceptance gate would need.
-MIN_CONVEX_SIGMAS = 6.5    # how badly the convex answer must fit before a body is worth
-                           # correcting, in model errors. A body whose convex answer already
-                           # explains its curves has no concavity for the correction to find,
-                           # and an objective that charges surface will then trade overlap it
-                           # cannot regain for a misfit it does not need. Measured on the most
-                           # nearly convex public body, that costs a sixth of the overlap while
-                           # improving the misfit, so no gate that reads a misfit catches it;
-                           # this one is read before the fit instead.
+MIN_CONVEX_SIGMAS = 6.5    # how badly the convex answer has to fit before a body is expected
+                           # to have concavity to find, in model errors. A body under this is
+                           # flagged in the metadata and corrected anyway; the flag is a warning
+                           # to the selection, not a refusal. Measured on the most nearly convex
+                           # public body, correcting where there is nothing to find costs a
+                           # sixth of the overlap while improving the misfit, so no gate that
+                           # reads a misfit afterwards catches it -- but that body is one whose
+                           # convex inversion had already recovered it, and reading a secret
+                           # body's fate from it is the inference this project does not make.
+                           # scripts/select_answers.py decides instead, on geometries held out
+                           # of the body's own fit.
                            #
                            # The unit is the calibrated model error, and that is a unit which
                            # moves: the released curves carry a measured noise two orders below
                            # it, so the residual is divided by very nearly the calibration's own
                            # eta and every sigma reported here scales inversely with it. Taking
                            # the sawed-off cube out of the calibration lowered eta and lifted
-                           # both of the bodies this gate was placed between, and the value
+                           # both of the bodies this threshold was placed between, and the value
                            # above is the band that separates them under the calibration it was
                            # measured on and under the narrower one in use. notes/objective.md
                            # records the band and the one measurement that would replace it.
@@ -155,10 +158,11 @@ def main() -> None:
                     help="smallest volume an accepted body may have, as a fraction of the "
                          "convex answer's; 0 turns the floor off")
     ap.add_argument("--min-convex-sigmas", type=float, default=MIN_CONVEX_SIGMAS,
-                    help="leave a body alone whose convex answer already explains its curves "
-                         "to fewer than this many model errors; the unit is the calibration's "
-                         "own eta and moves with it, so a refitted instrument needs the "
-                         "threshold read again")
+                    help="flag a body whose convex answer already explains its curves to "
+                         "fewer than this many model errors; it is corrected either way and "
+                         "the selection decides. The unit is the calibration's own eta and "
+                         "moves with it, so a refitted instrument needs the threshold read "
+                         "again")
     ap.add_argument("--step-g", type=float, default=STEP_G,
                     help="secant step of a carve coordinate, in body units of depth")
     ap.add_argument("--step-c", type=float, default=STEP_C,
@@ -241,12 +245,19 @@ def main() -> None:
           f"own centre; below {floor[0]:.3f} of volume a body is refused", flush=True)
     print(f"  the convex answer explains the fitted curves to {convex_sigmas:.2f} model "
           f"errors; area {area0:.3f}, volume {vol0:.3f}", flush=True)
-    if convex_sigmas < a.min_convex_sigmas:
-        raise SystemExit(
-            f"model {a.model}: the convex answer already fits to {convex_sigmas:.2f} model "
-            f"errors, under the {a.min_convex_sigmas:g} this correction is worth running at. "
-            f"A body with no concavity to find loses overlap to an objective that charges "
-            f"surface, so it is left alone and its convex answer stands.")
+    # A body whose convex answer already fits is flagged and still corrected. The measurement
+    # behind the threshold is model 1, whose released body holds 1.009 of its convex answer's
+    # volume, so it is a body the convex inversion had already got right; deciding a secret
+    # body from it is the inference this project does not make. The correction is run, the flag
+    # is written into the metadata, and scripts/select_answers.py chooses between the two on
+    # geometries held out of the fit, which is evidence about this body rather than about
+    # model 1. Refusing here would instead settle the question before any evidence exists.
+    convex_explains = convex_sigmas < a.min_convex_sigmas
+    if convex_explains:
+        print(f"  WARNING: the convex answer already explains the fitted curves to "
+              f"{convex_sigmas:.2f} model errors, under the {a.min_convex_sigmas:g} a body "
+              f"normally has concavity to find at. The correction is run and flagged; the "
+              f"selection decides on the held-out geometries.", flush=True)
 
     # Every start is judged on the first few iterations of the coarse stage, which tells a
     # start that is descending from one that is not; the best are then carried to the end.
@@ -377,6 +388,7 @@ def main() -> None:
             "curves_fitted": int(weight.sum()), "area_weight": a.area_weight,
             "volume_trust": a.volume_trust, "volume_floor": a.volume_floor,
             "convex_volume": vol0, "depth_cap": cap, "convex_sigmas": convex_sigmas,
+            "convex_explains_curves": convex_explains,
             "step_g": a.step_g, "step_c": a.step_c, "restarts": a.restarts,
             "start": best["recipe"], "renders": best["renders"],
             "chi_fit": best["chi"], "objective_fit": best["objective"],

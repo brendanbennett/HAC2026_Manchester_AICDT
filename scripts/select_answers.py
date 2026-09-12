@@ -14,13 +14,16 @@ it has to be. A correction fitted under an objective that charges the body's sur
 as its misfit, judged here on the misfit alone, would be thrown away in favour of a corrugated
 body that fits the curves better and looks less like the truth.
 
-The ratio is a measured quantity rather than a constant of this script. It comes from a
-public model, whose truth is released: `--calibrate` reads that model's refinement, checks
-that the refinement moved the body toward its truth rather than away from it, and takes the
-misfit ratio it reached there. A refinement of a scored model is then trusted only where it
-beats its convex answer by at least as much. Where no public model's refinement improved the
-overlap, there is no evidence that a lower misfit is a better shape, and the convex answers
-stand. `--ratio` sets the number directly, for a run whose calibrating model is not at hand.
+The ratio is one by default: a refinement stands where it fits the held-out geometries at
+least as well as the convex answer does, which is evidence about the body being decided. It
+can be tightened by a measured quantity instead. `--calibrate` reads a public model's
+refinement, checks that the refinement moved that body toward its released truth rather than
+away from it, and takes the misfit ratio it reached; a refinement is then trusted only where
+it beats its convex answer by at least as much. That is one body's margin asked of every
+other, so it is offered and not required: a public run that falls short would otherwise stand
+every convex answer in the submission, and a convex answer is not a safe default here but a
+body known to be missing the concavities the challenge is about. `--ratio` sets the number
+directly.
 
 The accepted files are copied over the convex answers under results/submission, which
 scripts/make_submission.py regenerates in seconds, and results/submission/selection.json
@@ -123,11 +126,17 @@ def main() -> None:
     ap.add_argument("--models", nargs="+", type=int,
                     default=[M for M in range(1, 11) if M not in PUBLIC_MODELS])
     a = ap.parse_args()
-    if (a.calibrate is None) == (a.ratio is None):
+    if a.calibrate is not None and a.ratio is not None:
         raise SystemExit("give either --calibrate, to measure the ratio on a public model, "
-                         "or --ratio to set it")
+                         "or --ratio to set it, not both")
     calibration = json.loads(Path(a.calibrate).read_text()) if a.calibrate else None
-    ratio = a.ratio if a.ratio is not None else calibrated_ratio(calibration)
+    # With neither, the ratio is one: a refinement is accepted when it fits the geometries held
+    # out of its own fit at least as well as the convex answer does. That is evidence about the
+    # body being decided. A public model's ratio is a tightening on top of it, and it is one
+    # body's margin asked of every other, so it is offered rather than required -- a public run
+    # that falls short would otherwise stand every convex answer in the submission.
+    ratio = (a.ratio if a.ratio is not None else
+             calibrated_ratio(calibration) if calibration is not None else 1.0)
     if not 0.0 < ratio <= 1.0:
         raise SystemExit(f"the accepted ratio {ratio:g} is outside (0, 1]: a refinement that "
                          f"fits the held-out geometries no better than the convex answer is "
@@ -136,6 +145,10 @@ def main() -> None:
         print(f"ratio {ratio:.3f}, from model {calibration['model']}, whose refinement took "
               f"the overlap with its released truth from {calibration['convex_dice']:.4f} to "
               f"{calibration['final_dice']:.4f}", flush=True)
+    elif a.ratio is None:
+        print("ratio 1.000: a refinement stands where it fits the held-out geometries at "
+              "least as well as the convex answer. Pass --calibrate to require a public "
+              "model's own margin as well.", flush=True)
 
     selection = {"ratio": ratio, "refined_dir": a.refined,
                  "calibrated_on": a.calibrate, "models": {}}
