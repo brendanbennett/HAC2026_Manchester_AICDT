@@ -46,6 +46,11 @@ HOLD_OUT_GEOMS=${HOLD_OUT_GEOMS:-5}   # cameras kept out of each fit; their misf
 PHASES=${PHASES:-48}
 RESTARTS=${RESTARTS:-9}                # the convex answer and one sweep of the designed
                                       # grid of caps; hac26/solvers/gauss_newton.py says why
+MAX_DEGREE=${MAX_DEGREE:-0}            # ceiling on the Gauss-Newton ladder's spherical
+                                      # harmonic degree; 0 is the designed ladder. A degree-L
+                                      # stage costs (L+1)^2 - 9 renders an iteration, so
+                                      # lowering this is the answer to a run that will not
+                                      # finish, and it lowers a bound that is an upper one
 MAP_STEPS=${MAP_STEPS:-300}            # descent steps of the gradient solver
 TIME_BUDGET=${TIME_BUDGET:-0}          # seconds one body of one track may take; 0 is no cap
 REDO=${REDO:-0}                        # 1 refits bodies that are already written
@@ -96,6 +101,7 @@ for track in $TRACKS; do
 done
 
 failed=""
+refused=""
 # One body of one track. A body already written against this instrument is left alone; the
 # solvers' own checkpoints handle an interruption inside a body. A body that fails does not
 # stop the queue: the rest are still worth having, and select_answers.py keeps the convex
@@ -115,6 +121,7 @@ fit_one() {
               --hold-out-geoms "$HOLD_OUT_GEOMS" --out "$out")
   case "$track" in
     gn)  args+=(--restarts "$RESTARTS")
+         [ "$MAX_DEGREE" != "0" ] && args+=(--max-degree "$MAX_DEGREE")
          [ "$TIME_BUDGET" != "0" ] && args+=(--time-budget "$TIME_BUDGET")
          $PY -u scripts/reconstruct_gn.py "${args[@]}" \
            2>&1 | tee "logs/reconstruct_gn_$(printf '%02d' "$M").log" ;;
@@ -124,7 +131,15 @@ fit_one() {
            2>&1 | tee "logs/reconstruct_map_$(printf '%02d' "$M").log" ;;
   esac
   local status=${PIPESTATUS[0]}
-  if [ "$status" -ne 0 ]; then
+  # Three exits, and they are not the same news. Zero wrote a body. Three fitted one and then
+  # refused the mesh it extracted, so its numbers are written and only the extraction has to
+  # be redone; that body has no file for the selection to read and the convex answer stands
+  # for it. Anything else is the solver stopping, which is the one worth a line at the end.
+  if [ "$status" = "3" ]; then
+    echo "  --- $track model $M: fitted, but the extracted mesh was refused; the fit is in "\
+         "${out%.stl}.json and the coefficients beside it"
+    refused="$refused $track/$M"
+  elif [ "$status" -ne 0 ]; then
     echo "  --- $track model $M FAILED (exit $status)"
     failed="$failed $track/$M"
   fi
@@ -154,6 +169,10 @@ $PY scripts/select_answers.py --refined $DIRS --models $SCORED
 echo "=== check the submission $(date)"
 $PY scripts/check_submission.py results/submission
 checked=$?
+if [ -n "$refused" ]; then
+  echo "=== bodies whose fit finished and whose mesh was refused:$refused"
+  echo "    their numbers are written; re-extract from the coefficients beside them"
+fi
 if [ -n "$failed" ]; then
   echo "=== bodies that failed and left the convex answer standing:$failed"
 fi
