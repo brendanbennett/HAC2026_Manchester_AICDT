@@ -96,6 +96,7 @@ FLOW_CKPT=${FLOW_CKPT:-runs/lpd_flow.pt.ckpt}   # under runs/, not /tmp: it has 
                                                 # the job that wrote it
 FLOW_LOG_EVERY=${FLOW_LOG_EVERY:-10}
 FLOW_OPERATOR_RES=${FLOW_OPERATOR_RES:-32}
+FLOW_LR=${FLOW_LR:-1e-3}
 FLOW_WIDTH=${FLOW_WIDTH:-96}            # the reader's width
 FLOW_COND_WIDTH=${FLOW_COND_WIDTH:-256}  # each expert's conditioning trunk
 FLOW_SPHERE_WIDTH=${FLOW_SPHERE_WIDTH:-128}  # the dh branch
@@ -218,8 +219,8 @@ stage_signature() {
       ;;
     flow)
       stage_signature prior | sed 's/^stage=prior$/stage=flow/'
-      printf 'FLOW_WIDTH=%s\nFLOW_COND_WIDTH=%s\nFLOW_SPHERE_WIDTH=%s\nFLOW_VOL_WIDTH=%s\nFLOW_BRANCH_BLOCKS=%s\nFLOW_EXPERTS=%s\nFLOW_STEPS=%s\nFLOW_BATCH=%s\nFLOW_VAL_EVERY=%s\nFLOW_PATIENCE=%s\nFLOW_CKPT_EVERY=%s\nFLOW_CKPT=%s\nFLOW_LOG_EVERY=%s\nFLOW_TRAIN_GEOMS=%s\nFLOW_FIT_WEIGHT=%s\nFLOW_FIT_FROM=%s\n' \
-        "$FLOW_WIDTH" "$FLOW_COND_WIDTH" "$FLOW_SPHERE_WIDTH" "$FLOW_VOL_WIDTH" \
+      printf 'FLOW_LR=%s\nFLOW_WIDTH=%s\nFLOW_COND_WIDTH=%s\nFLOW_SPHERE_WIDTH=%s\nFLOW_VOL_WIDTH=%s\nFLOW_BRANCH_BLOCKS=%s\nFLOW_EXPERTS=%s\nFLOW_STEPS=%s\nFLOW_BATCH=%s\nFLOW_VAL_EVERY=%s\nFLOW_PATIENCE=%s\nFLOW_CKPT_EVERY=%s\nFLOW_CKPT=%s\nFLOW_LOG_EVERY=%s\nFLOW_TRAIN_GEOMS=%s\nFLOW_FIT_WEIGHT=%s\nFLOW_FIT_FROM=%s\n' \
+        "$FLOW_LR" "$FLOW_WIDTH" "$FLOW_COND_WIDTH" "$FLOW_SPHERE_WIDTH" "$FLOW_VOL_WIDTH" \
         "$FLOW_BRANCH_BLOCKS" "$FLOW_EXPERTS" \
         "$FLOW_STEPS" "$FLOW_BATCH" "$FLOW_VAL_EVERY" "$FLOW_PATIENCE" \
         "$FLOW_CKPT_EVERY" "$FLOW_CKPT" "$FLOW_LOG_EVERY" "$FLOW_TRAIN_GEOMS" \
@@ -437,7 +438,7 @@ run_stage prior runs/prior_flow.pt \
 # One expert first; the second run branches it into the experts (train_lpd.py --experts).
 run_stage flow runs/lpd_flow.pt \
   $PY scripts/train_lpd.py \
-    --width "$FLOW_WIDTH" --cond-width "$FLOW_COND_WIDTH" \
+    --lr "$FLOW_LR" --width "$FLOW_WIDTH" --cond-width "$FLOW_COND_WIDTH" \
     --sphere-width "$FLOW_SPHERE_WIDTH" --vol-width "$FLOW_VOL_WIDTH" \
     --branch-blocks "$FLOW_BRANCH_BLOCKS" \
     --steps "$FLOW_STEPS" --batch "$FLOW_BATCH" --experts 1 \
@@ -456,7 +457,7 @@ run_stage flow runs/lpd_flow.pt \
 if [ "$FLOW_ROLLOUT_STEPS" -gt 0 ]; then
   run_stage flow-rollout runs/lpd_flow.pt \
     $PY scripts/train_lpd.py \
-    --width "$FLOW_WIDTH" --cond-width "$FLOW_COND_WIDTH" \
+    --lr "$FLOW_LR" --width "$FLOW_WIDTH" --cond-width "$FLOW_COND_WIDTH" \
     --sphere-width "$FLOW_SPHERE_WIDTH" --vol-width "$FLOW_VOL_WIDTH" \
     --branch-blocks "$FLOW_BRANCH_BLOCKS" \
       --steps "$FLOW_STEPS" --extra-steps "$FLOW_ROLLOUT_STEPS" \

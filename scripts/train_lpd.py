@@ -950,6 +950,11 @@ def main():
                          "dominated by the operator, which renders one body at a time in a "
                          "Python loop over the batch, not by the network -- so this is the "
                          "one axis that can be raised without paying for it in steps.")
+    ap.add_argument("--lr", type=float, default=1e-3,
+                    help="Adam step size. It was hard-coded at 1e-3, which was fine while "
+                         "every run trained the same 11M-parameter network; it is a flag now "
+                         "because a much larger one at the same rate is an untested "
+                         "combination, and the held-out curve is the thing to watch for it.")
     ap.add_argument("--metrics", default="runs/train_metrics.jsonl",
                     help="JSONL file of per-step metrics, appended; \"\" disables it")
     ap.add_argument("--cond-width", type=int, default=256,
@@ -1079,7 +1084,7 @@ def main():
           f"g sd {float(net.codec.sd[1]):.5f}; corpus in whitened space reaches "
           f"|z| = {float(z[:, N_DIR:].abs().max()):.2f}", flush=True)
 
-    def fresh_optimiser_and_ema():
+    def fresh_optimiser_and_ema(lr=None):
         # EMA of the weights. The velocity target is noisy, so an average of recent weights
         # is a better estimate than the last iterate. Validation scores the averaged weights
         # and the averaged weights are what is saved, so the model selected is the model
@@ -1092,7 +1097,7 @@ def main():
             print(f"  EMA decay {decay:.5f} (window ~{1/(1-decay):.0f} steps of {a.steps})",
                   flush=True)
         params = list(net.reader.parameters()) + list(net.experts.parameters())
-        return torch.optim.Adam(params, lr=1e-3), EMA(net, decay=decay)
+        return torch.optim.Adam(params, lr=a.lr if lr is None else lr), EMA(net, decay=decay)
 
     opt, ema = fresh_optimiser_and_ema()
     C = len(cameras())
