@@ -18,6 +18,7 @@ from hac26.geometry import build_cameras
 from hac26.recon import dice
 from hac26.scoring.voxel import score_mesh, prepare_truth
 from hac26.data_io import load_model_curves
+from hac26.conventions import PUBLIC_MODELS
 from hac26.genetic_utils import make_target_coefficients, sh_fitness, surface_fitness, \
                                 save_shape_stl,  load_truth_mesh, \
                                 plot_lightcurve_comparison, plot_genetic_convergence, \
@@ -356,17 +357,26 @@ def main():
         # TODO: use the mask?
         target_mask = lc_dict['mask']
 
-        truth_mesh = load_truth_mesh(
-            args.model,
-            data_dir,
-        )
+        # Models 4-10 are secret: the challenge withholds their true shape, which is the
+        # whole point of the competition. Dice against a truth only makes sense for
+        # PUBLIC_MODELS (1-3); for the rest, skip it rather than fail outright, and let the
+        # printouts/checkpoints below report "n/a" instead of a number.
+        if args.model in PUBLIC_MODELS:
+            truth_mesh = load_truth_mesh(
+                args.model,
+                data_dir,
+            )
 
-        truth_mesh_voxelised = prepare_truth(
-            truth_mesh.vertices,
-            truth_mesh.faces,
-            n=args.dice_resolution,
-            simplify_faces=args.simplify_faces
-        )
+            truth_mesh_voxelised = prepare_truth(
+                truth_mesh.vertices,
+                truth_mesh.faces,
+                n=args.dice_resolution,
+                simplify_faces=args.simplify_faces
+            )
+        else:
+            print(f"Model {args.model} is secret -- no truth shape, Dice will be reported "
+                 f"as n/a")
+            truth_mesh_voxelised = None
 
     # ------------------------------------------------------------
     # Load initialisation
@@ -481,13 +491,15 @@ def main():
             forward=forward,
         )
 
-        initial_dice = score_mesh(
-            initial_mesh.vertices,
-            initial_mesh.faces,
-            truth_mesh_voxelised,
-        )
-
-        print(f"Initial STL Dice: {initial_dice:.4f}")
+        if truth_mesh_voxelised is not None:
+            initial_dice = score_mesh(
+                initial_mesh.vertices,
+                initial_mesh.faces,
+                truth_mesh_voxelised,
+            )
+            print(f"Initial STL Dice: {initial_dice:.4f}")
+        else:
+            print("Initial STL Dice: n/a (secret model)")
 
 
     else:
@@ -569,7 +581,7 @@ def main():
         # Dice score
         # --------------------------------------------------------
 
-        dice_score = score_mesh(
+        dice_score = None if truth_mesh_voxelised is None else score_mesh(
             mesh.vertices,
             mesh.faces,
             truth_mesh_voxelised,
@@ -581,10 +593,11 @@ def main():
 
         elapsed_time = time.perf_counter() - start_time
 
+        dice_str = "n/a" if dice_score is None else f"{dice_score:.4f}"
         print(
             f"Checkpoint generation {generation}: "
             f"fitness={best_fitness:.6g}, "
-            f"dice={dice_score:.4f}, "
+            f"dice={dice_str}, "
             f"time={elapsed_time:.1f}s"
         )
 

@@ -76,13 +76,22 @@ def prepare_truth(
             f"{len(truth_mesh.faces):,} faces"
         )
 
+    # Already posed in the challenge frame (a released public STL, or this project's own
+    # reconstruction) -- centre_xy=False leaves it there. Re-centering on its own solid
+    # centroid (the old default) shifts it off the rotation axis, which is exactly the bug
+    # main's score() was fixed for; prepare_truth/score_mesh need the identical fix, since a
+    # truth mesh and a candidate built by two different pipelines drift apart under it in
+    # a way two library-synthetic bodies from the same pipeline mostly do not.
     truth_vertices = rescale_touch_z(
-        np.asarray(truth_mesh.vertices)
+        np.asarray(truth_mesh.vertices),
+        centre_xy=False,
     )
 
     truth_faces = np.asarray(truth_mesh.faces)
 
-    extent = float(np.abs(truth_vertices).max()) * 1.05
+    # Per-axis max understates the bounding radius whenever the extreme vertex isn't
+    # axis-aligned (e.g. near 45 degrees in xy): a vector norm is the correct bound.
+    extent = float(np.linalg.norm(truth_vertices, axis=1).max()) * 1.05
 
     truth_occupancy = occupancy(
         truth_vertices,
@@ -119,8 +128,11 @@ def score_mesh(
         Voxel Dice score.
     """
 
+    # Same reasoning as prepare_truth above: leave the candidate on the rotation axis rather
+    # than re-centering it on its own solid centroid.
     recon_vertices = rescale_touch_z(
-        np.asarray(recon_vertices)
+        np.asarray(recon_vertices),
+        centre_xy=False,
     )
     recon_faces = np.asarray(recon_faces)
 
@@ -240,7 +252,10 @@ def score(stl: str, model: int, data_dir: str = "dataset/raw", n: int = 128) -> 
     # rotation axis where it is. Centring either on its own centroid would slide them apart.
     rv = rescale_touch_z(np.asarray(r.vertices), np.asarray(r.faces), centre_xy=False)
     tv = rescale_touch_z(np.asarray(t.vertices), np.asarray(t.faces), centre_xy=False)
-    e = max(float(np.abs(rv).max()), float(np.abs(tv).max())) * 1.05
+    # Per-axis max understates the bounding radius whenever the extreme vertex isn't
+    # axis-aligned (e.g. near 45 degrees in xy): a vector norm is the correct bound.
+    e = max(float(np.linalg.norm(rv, axis=1).max()),
+            float(np.linalg.norm(tv, axis=1).max())) * 1.05
     occ_r = mesh_occupancy(rv, np.asarray(r.faces), n, e)
     occ_t = mesh_occupancy(tv, np.asarray(t.faces), n, e)
     if not occ_r.any() or not occ_t.any():

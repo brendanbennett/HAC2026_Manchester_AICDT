@@ -11,6 +11,7 @@ import trimesh
 from scipy.sparse import coo_matrix
 from scipy.sparse.csgraph import dijkstra
 
+from hac26.forward.mesh.radiosity import RadiosityError
 from hac26.scoring.voxel import score_mesh
 from hac26.shapes import (
     icosphere,
@@ -18,6 +19,18 @@ from hac26.shapes import (
     mesh_curves_convex,
     solid_centroid,
 )
+from hac26.stl_io import load_stl
+
+# Returned by sh_fitness/surface_fitness in place of crashing when a candidate's mesh is
+# degenerate enough (self-intersecting, fallen apart into pieces) that ExactForward's
+# radiosity solve cannot be built on it (RadiosityError) -- a real, expected outcome of
+# mutation exploring the parameter space, not a bug. A GA population routinely produces a
+# few such candidates per generation; letting one propagate as an uncaught exception kills
+# the entire run (every trial, every remaining generation), not just that candidate.
+# Finite (not -inf) so it stays safe through np.mean/np.argmax/JSON/CSV without special-casing
+# elsewhere, and far enough below any real -mean_squared_residual value (bounded by the
+# curves' own scale) to always rank last.
+DEGENERATE_MESH_FITNESS = -1e10
 
 
 import trimesh
@@ -44,10 +57,14 @@ def load_truth_mesh(model, data_dir):
             f"Truth STL not found: {path}"
         )
 
-    return trimesh.load(
-        path,
-        process=False,
-    )
+    # trimesh.load(path, process=False) leaves an STL's vertices unmerged -- every triangle
+    # gets its own 3 vertices with no index sharing with its neighbours. The Dice/occupancy
+    # math is purely per-triangle and unaffected by that, but load_stl merges duplicate
+    # vertices (by rounded position) regardless, which is the correct topology for a mesh
+    # this module might also feed into deform_surface/build_surface_influence_matrix (those
+    # need real vertex adjacency -- see the note by that import).
+    verts, faces = load_stl(str(path))
+    return trimesh.Trimesh(vertices=verts, faces=faces, process=False)
 
 
 def load_initialisation_mesh(args):
@@ -67,7 +84,15 @@ def load_initialisation_mesh(args):
                 f"Initial STL not found: {initial_stl}"
             )
 
-        initial_mesh = trimesh.load(initial_stl, process=False)
+        # Merge duplicate vertices (see load_truth_mesh) -- critical here specifically,
+        # since this mesh goes straight into build_surface_influence_matrix's
+        # mesh.edges_unique + Dijkstra geodesic graph. On unmerged triangle-soup input, each
+        # triangle's vertices are graph-disconnected from its neighbours' (no shared index),
+        # so geodesic influence from a control point never crosses a triangle boundary --
+        # every triangle then deforms independently of its neighbours. That is exactly the
+        # "floating disconnected triangles" artefact seen in GA output STLs.
+        verts, faces = load_stl(str(initial_stl))
+        initial_mesh = trimesh.Trimesh(vertices=verts, faces=faces, process=False)
 
         print(f"Loaded initial shape from {initial_stl}")
         print(f"  vertices: {len(initial_mesh.vertices)}")
@@ -252,15 +277,18 @@ def sh_fitness(
 
     convex_kwargs = {} if forward is not None else dict(
         c_lambert=c_lambert, sigma=sigma, delta=delta, psi0=psi0, ls_weight=ls_weight)
-    curves = render_curves(
-        vertices,
-        faces,
-        cameras=cameras,
-        m=m,
-        curve_types=curve_types,
-        forward=forward,
-        **convex_kwargs,
-    )
+    try:
+        curves = render_curves(
+            vertices,
+            faces,
+            cameras=cameras,
+            m=m,
+            curve_types=curve_types,
+            forward=forward,
+            **convex_kwargs,
+        )
+    except RadiosityError:
+        return DEGENERATE_MESH_FITNESS
 
     # ------------------------------------------------------------
     # Residual
@@ -291,14 +319,17 @@ def surface_fitness(
             influence,
         )
 
-        curves = render_curves(
-            mesh.vertices,
-            mesh.faces,
-            cameras=cameras,
-            m=m,
-            curve_types=curve_types,
-            forward=forward,
-        )
+        try:
+            curves = render_curves(
+                mesh.vertices,
+                mesh.faces,
+                cameras=cameras,
+                m=m,
+                curve_types=curve_types,
+                forward=forward,
+            )
+        except RadiosityError:
+            return DEGENERATE_MESH_FITNESS
 
         residual = curves - target_curves
 
@@ -533,7 +564,7 @@ def save_checkpoint_results(
         results["checkpoints"] = {}
 
     results["checkpoints"][f"generation_{generation:04d}"] = {
-        "dice_score": float(dice_score),
+        "dice_score": None if dice_score is None else float(dice_score),
         "time_taken": float(time_taken),
         "best_fitness": float(best_fitness)
     }

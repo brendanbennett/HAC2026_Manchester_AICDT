@@ -87,19 +87,21 @@ from hac26.scoring.voxel import prepare_truth, score_mesh                       
 from hac26.shapes import hull_mesh                                                # noqa: E402
 from hac26.solvers.genetic import GeneticSolver                                   # noqa: E402
 
-# The search space. Bounds cover the historically-explored surface-mode range
-# (results/genetic/surfaces/, results/genetic/example_surface_deformations/ used population
-# 100-304, generations 100-403, mutation_scale 0.05/0.5/0.75). population_size and
-# n_generations both multiply directly into per-trial cost -- at ~34ms per lightcurve
-# evaluation (measured on one ~8k-face body), the upper corner (population=300,
-# generations=400) is roughly a shape-hour on its own, so a trial landing there is slow, not
-# broken; narrow the bounds instead of widening n_trials if that turns out to dominate wall
-# clock in practice. Narrow or widen any of these and rerun rather than editing deeper in the
-# file.
+# The search space. population_size and n_generations multiply directly into per-trial cost
+# (roughly population_size * (n_generations + 1) * n_shapes * ~9ms/evaluation, measured on
+# this laptop against actual shape-library convex hulls -- see the effective-cost note in
+# scripts/run_tuning_laptop.sh). Bounded here to keep a single trial's worst case around
+# 20-25 minutes rather than the ~1-2 hours the full historically-explored range
+# (results/genetic/surfaces/: population 100-304, generations 100-403) would allow, so one
+# unlucky trial cannot dominate a large share of a fixed wall-clock budget shared across
+# several parallel workers (scripts/run_tuning_laptop.sh). On a GPU machine (--forward-model
+# exact with nvdiffrast, or just more time available) widen population_size/n_generations
+# back up toward that historical range rather than assuming these bounds are universally
+# correct -- they are sized for a time-boxed CPU laptop run, not a hardware limit.
 SEARCH_SPACE = {
     "mutation_scale": dict(low=0.02, high=0.8, log=True),
-    "population_size": dict(low=30, high=300),
-    "n_generations": dict(low=20, high=400),
+    "population_size": dict(low=30, high=120),
+    "n_generations": dict(low=20, high=150),
     "mutation_decay": dict(low=0.9, high=1.0),
     "deform_width": dict(low=0.05, high=0.6),
     "max_amp": dict(low=0.1, high=0.8),
@@ -267,7 +269,18 @@ def main():
                     help="a library written by scripts/build_shape_library.py")
     ap.add_argument("--n-shapes", type=int, default=6,
                     help="library bodies tested per hyperparameter setting")
-    ap.add_argument("--n-trials", type=int, default=100, help="Optuna trials to run")
+    ap.add_argument("--n-trials", type=int, default=100_000,
+                    help="Optuna trials to run; with --timeout set, whichever limit is hit "
+                         "first stops the run, so the default is effectively unbounded and "
+                         "--timeout does the real work")
+    ap.add_argument("--timeout", type=float, default=None,
+                    help="stop launching new trials after this many seconds (an in-flight "
+                         "trial finishes rather than being killed, so wall-clock can run a "
+                         "bit past this, not under it). The robust way to target a wall-clock "
+                         "budget: per-trial cost varies with what Optuna samples (population "
+                         "size and n_generations are themselves searched -- module docstring), "
+                         "so a fixed --n-trials cannot reliably predict wall-clock the way "
+                         "this can.")
     ap.add_argument("--m", type=int, default=50, help="lightcurve phase samples")
     ap.add_argument("--dice-resolution", type=int, default=16,
                     help="voxel grid resolution for Dice scoring")
@@ -309,9 +322,77 @@ def main():
     ap.add_argument("--exact-radiosity-faces", type=int, default=200,
                     help="patches the interreflection solve uses; RenderConfig's own default "
                          "is 600, expensive per call in a GA's inner loop")
+    ap.add_argument("--exact-max-population", type=int, default=40,
+                    help="only with --forward-model exact: overrides SEARCH_SPACE's "
+                         "population_size upper bound (default 120, sized for the convex "
+                         "kernel's ~9ms/eval). Exact evaluations were measured at least two "
+                         "orders of magnitude slower even under nvdiffrast (the CPU-bound "
+                         "radiosity/visibility setup in ExactForward.mesh_constants does not "
+                         "shrink with a GPU); size this from a real per-eval measurement "
+                         "(scripts/profile_exact_forward.py) on the actual GPU, not guessed")
+    ap.add_argument("--exact-max-generations", type=int, default=40,
+                    help="only with --forward-model exact: overrides SEARCH_SPACE's "
+                         "n_generations upper bound (default 150) -- see --exact-max-population")
     ap.add_argument("--exact-res", type=int, nargs=2, default=[108, 192],
                     metavar=("HEIGHT", "WIDTH"), help="sensor resolution before supersampling")
+    ap.add_argument("--warm-start-from", default=None,
+                    help="a best_params.json from a cheaper search (e.g. --forward-model "
+                         "convex) to seed this one from, multi-fidelity-style, instead of "
+                         "searching blind. Narrows mutation_scale/mutation_decay tightly "
+                         "around the loaded values (pure search mechanics, not expected to "
+                         "differ between forward models) and enqueues one trial at exactly "
+                         "those values (population_size/n_generations clamped to this run's "
+                         "own --exact-max-* bounds first, since the cheap search's optimum is "
+                         "usually far above what an expensive search's budget allows). "
+                         "deform_width/max_amp/n_cpts are deliberately NOT narrowed: they "
+                         "govern how finely the GA can carve concavities, and a convex-mode "
+                         "search is blind to concavity, so its optimum there may reflect "
+                         "exploiting that blindness rather than a value that transfers.")
     a = ap.parse_args()
+
+    if a.forward_model == "exact":
+        # SEARCH_SPACE's default bounds are sized for the convex kernel's ~9ms/eval (see its
+        # own comment); left alone here, one exact-mode trial could ask for population_size=120,
+        # n_generations=150 -- 18000 evaluations, each orders of magnitude more expensive than
+        # convex's 9ms. Narrow the two bounds that multiply directly into per-trial cost.
+        # Clamp low as well as high: a cap below the convex-mode low (30 / 20, e.g. a smoke
+        # test's --exact-max-population 4) would otherwise leave low > high, which
+        # optuna.suggest_int rejects outright (ValueError, kills the whole run, not just one
+        # trial) rather than just under-using the range.
+        old_pop, old_gen = SEARCH_SPACE["population_size"], SEARCH_SPACE["n_generations"]
+        new_pop_high = min(old_pop["high"], a.exact_max_population)
+        new_gen_high = min(old_gen["high"], a.exact_max_generations)
+        SEARCH_SPACE["population_size"] = dict(old_pop, low=min(old_pop["low"], new_pop_high),
+                                               high=new_pop_high)
+        SEARCH_SPACE["n_generations"] = dict(old_gen, low=min(old_gen["low"], new_gen_high),
+                                             high=new_gen_high)
+        print(f"[forward model exact] narrowed SEARCH_SPACE: population_size "
+             f"{old_pop['low']}-{old_pop['high']} -> {SEARCH_SPACE['population_size']['low']}-"
+             f"{SEARCH_SPACE['population_size']['high']}, n_generations {old_gen['low']}-"
+             f"{old_gen['high']} -> {SEARCH_SPACE['n_generations']['low']}-"
+             f"{SEARCH_SPACE['n_generations']['high']}", flush=True)
+
+    warm_start = None
+    if a.warm_start_from:
+        with open(a.warm_start_from) as fh:
+            warm_start = json.load(fh)["params"]
+        # mutation_scale is log-scaled; a multiplicative window keeps it one on that scale.
+        # mutation_decay is bounded in [0.9, 1.0]; an additive window is more natural there.
+        ms, md = SEARCH_SPACE["mutation_scale"], SEARCH_SPACE["mutation_decay"]
+        ms_lo = max(ms["low"], warm_start["mutation_scale"] / 2.0)
+        ms_hi = min(ms["high"], warm_start["mutation_scale"] * 2.0)
+        md_lo = max(md["low"], warm_start["mutation_decay"] - 0.03)
+        md_hi = min(md["high"], warm_start["mutation_decay"] + 0.03)
+        SEARCH_SPACE["mutation_scale"] = dict(ms, low=min(ms_lo, ms_hi), high=max(ms_lo, ms_hi))
+        SEARCH_SPACE["mutation_decay"] = dict(md, low=min(md_lo, md_hi), high=max(md_lo, md_hi))
+        print(f"[warm start] from {a.warm_start_from} (mean_dice under its own forward model: "
+             f"{json.load(open(a.warm_start_from)).get('mean_dice', 'n/a')}): narrowed "
+             f"mutation_scale to {SEARCH_SPACE['mutation_scale']['low']:.4g}-"
+             f"{SEARCH_SPACE['mutation_scale']['high']:.4g}, mutation_decay to "
+             f"{SEARCH_SPACE['mutation_decay']['low']:.4g}-"
+             f"{SEARCH_SPACE['mutation_decay']['high']:.4g}. deform_width/max_amp/n_cpts left "
+             f"at their full range -- concavity-sculpting params a convex-blind search should "
+             f"not be trusted to have found the right region for.", flush=True)
 
     cameras = build_cameras()
     curve_types = ["intensity"] * len(cameras)
@@ -343,8 +424,30 @@ def main():
         sampler=optuna.samplers.TPESampler(seed=a.seed),
         pruner=optuna.pruners.MedianPruner(n_warmup_steps=1),
     )
+    if warm_start is not None:
+        # Clamp every value to this run's own (possibly much narrower, budget-driven) bounds
+        # before enqueuing: optuna.enqueue_trial raises if a fixed value falls outside the
+        # distribution suggest_* builds for it, and the cheap search's population_size/
+        # n_generations optimum is normally far above what an expensive run's budget allows.
+        def _clamp(key, value):
+            b = SEARCH_SPACE[key]
+            return max(b["low"], min(b["high"], value))
+        pop = int(_clamp("population_size", warm_start["population_size"]))
+        enqueued = {
+            "population_size": pop,
+            "n_parents": max(4, min(warm_start["n_parents"], max(4, pop // 2))),
+            "mutation_scale": _clamp("mutation_scale", warm_start["mutation_scale"]),
+            "n_generations": int(_clamp("n_generations", warm_start["n_generations"])),
+            "mutation_decay": _clamp("mutation_decay", warm_start["mutation_decay"]),
+            "deform_width": _clamp("deform_width", warm_start["deform_width"]),
+            "max_amp": _clamp("max_amp", warm_start["max_amp"]),
+            "n_cpts": int(_clamp("n_cpts", warm_start["n_cpts"])),
+        }
+        study.enqueue_trial(enqueued)
+        print(f"[warm start] enqueued trial 0 at {enqueued} (clamped from {a.warm_start_from})",
+             flush=True)
     study.optimize(make_objective(shapes, cameras, curve_types, a.m, a.seed, forward=forward),
-                   n_trials=a.n_trials, n_jobs=a.n_jobs)
+                   n_trials=a.n_trials, timeout=a.timeout, n_jobs=a.n_jobs)
 
     print(f"[3/3] writing results to {a.output_dir}", flush=True)
     out = Path(a.output_dir)
