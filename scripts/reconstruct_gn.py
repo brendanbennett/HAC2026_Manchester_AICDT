@@ -456,17 +456,34 @@ def main() -> None:
     fit_x, fit_x_obj = measure_at_export(best["c"], best["g"], fit_geoms)
     held_x, held_x_obj = measure_at_export(best["c"], best["g"], held)
 
+    # The fit is written before anything is asked of the mesh. Extraction and export can
+    # refuse a body the fit spent hours on -- a deeply carved surface can pinch, and the guard
+    # is right to refuse it -- and losing the coefficients with it means refitting rather than
+    # re-exporting. With this file a body can be extracted again at another resolution, or
+    # after a better repair, for the cost of one extraction.
+    Path(a.out).parent.mkdir(parents=True, exist_ok=True)
+    np.savez(Path(a.out).with_suffix(".fit.npz"), c=best["c"], g=best["g"],
+             support=support.cpu().numpy())
+    print(f"  wrote {Path(a.out).with_suffix('.fit.npz')}: the fitted coefficients, before "
+          f"the mesh is extracted", flush=True)
+
     code = zero_code.clone()
     code[-N_NODES:] = torch.tensor(best["g"], dtype=torch.float32, device=dev)
     m = op_x.mesh(support, code, res=a.export_res,
                   c=torch.tensor(best["c"], dtype=torch.float32, device=dev))
     if m is None:
-        raise SystemExit("the fitted body is degenerate; nothing written")
+        raise SystemExit("the fitted body is degenerate; the fit is in the .fit.npz beside it")
     v = fit_to_cylinder(restore_constraints(
         CodeOperator.canonical(m[0], m[1]).cpu().numpy(), R), R)
     f = m[1].cpu().numpy()
-    Path(a.out).parent.mkdir(parents=True, exist_ok=True)
-    rep = export_stl(a.out, v, f)
+    # A refused export still writes the report, so the run says why it has no body rather than
+    # leaving a directory with nothing in it. The refusal stands: the STL is not written.
+    export_error = None
+    try:
+        rep = export_stl(a.out, v, f)
+    except ValueError as exc:
+        export_error, rep = str(exc), {"refused": str(exc)}
+        print(f"  !!! {exc}", flush=True)
     meta = {"model": a.model, "channel": d["channel"], "radius": R, "phases": a.phases,
             "export_phases": a.export_phases, "operator_res": a.operator_res,
             "export_res": a.export_res, "held_out": held, "fit_geoms": fit_g,
@@ -496,11 +513,15 @@ def main() -> None:
             "depth_refusals": best["refused_depth"],
             "final_dice": truth_dice(v, f, a.model, a.data_dir),
             "convex_dice": convex_dice(sup_stl, a.model, a.data_dir),
-            "final_convexity": convexity(v, f)}
+            "final_convexity": convexity(v, f),
+            "export_refused": export_error}
     Path(a.out).with_suffix(".json").write_text(json.dumps(meta, indent=2,
                                                            default=json_default))
-    np.savez(Path(a.out).with_suffix(".fit.npz"), c=best["c"], g=best["g"],
-             support=support.cpu().numpy())
+    if export_error is not None:
+        raise SystemExit(
+            f"model {a.model}: the fit finished and is written beside this, but the extracted "
+            f"mesh is not a closed solid and was refused. Re-extract from "
+            f"{Path(a.out).with_suffix('.fit.npz')} rather than refitting.")
     print(f"  wrote {a.out} ({rep['faces']} faces, volume {rep['volume']:.3f}); at export "
           f"resolution chi_fit {fit_x:.3f} against the convex answer's {convex_fit:.3f}"
           + (f", chi_held {held_x:.3f} against {convex_held:.3f}" if held else "")

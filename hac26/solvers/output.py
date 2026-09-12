@@ -223,6 +223,25 @@ def export_stl(path: str, verts: np.ndarray, faces: np.ndarray,
     n_degenerate = n_faces_in - int(len(m.faces))
     m.remove_unreferenced_vertices()
     m.merge_vertices()
+    # A deeply carved body pinches: two sheets of its own surface meet, and the extractor
+    # emits an edge there shared by four faces rather than two. Such a mesh is not a surface
+    # at all, so it is not watertight, and none of the repairs below can reach it -- there is
+    # no boundary loop for fill_holes to close and the winding is already consistent, which is
+    # why the failure reports every repair as having succeeded. Dropping the faces at such an
+    # edge opens the pinch into a boundary that fill_holes can then close.
+    n_nonmanifold = 0
+    if len(m.faces):
+        edges = m.edges_sorted
+        _, inverse, counts = np.unique(edges, axis=0, return_inverse=True, return_counts=True)
+        on_bad_edge = (counts > 2)[inverse.reshape(-1)]
+        if on_bad_edge.any():
+            # edges_sorted runs three rows per face, in face order
+            bad = np.unique(np.repeat(np.arange(len(m.faces)), 3)[on_bad_edge])
+            keep = np.ones(len(m.faces), dtype=bool)
+            keep[bad] = False
+            m.update_faces(keep)
+            m.remove_unreferenced_vertices()
+            n_nonmanifold = int(len(bad))
     # Stray shards can survive the weld. The body is the largest piece; anything else is
     # extraction debris, and leaving it in costs volume in the voxel measure and an outline
     # in the side-view one.
@@ -240,6 +259,7 @@ def export_stl(path: str, verts: np.ndarray, faces: np.ndarray,
         filled = True
     report = {"watertight": bool(m.is_watertight), "volume": float(m.volume),
               "faces": int(len(m.faces)), "degenerate_faces_dropped": n_degenerate,
+              "nonmanifold_faces_dropped": n_nonmanifold,
               "components_dropped": n_dropped, "filled_holes": filled,
               "winding_consistent": bool(m.is_winding_consistent)}
     if strict and not (report["watertight"] and report["volume"] > 0.0):
