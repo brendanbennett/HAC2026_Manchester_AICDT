@@ -94,16 +94,18 @@ PRIOR_BATCH=${PRIOR_BATCH:-64}
 
 FLOW_STEPS=${FLOW_STEPS:-1000}   # a cap: training stops early once the held-out loss plateaus
 FLOW_PHASES=${FLOW_PHASES:-96}
-FLOW_BATCH=${FLOW_BATCH:-8}     # two draws per expert per step: t is stratified across the
-                                # batch, so a batch of 2 * N_EXPERTS gives each of the four
-                                # experts two draws, and gives the data-fit band (t >= 0.75)
-                                # two draws every step rather than one draw in four steps.
-                                # A step costs about a batch's worth of operator calls, so
-                                # this is roughly 4x the step time of a batch of 2; lower
-                                # FLOW_STEPS to match if the budget is tight.
+FLOW_BATCH=${FLOW_BATCH:-4}     # one draw per expert per step: t is stratified across the
+                                # batch, so a batch of N_EXPERTS gives each of the four experts
+                                # a draw, and gives the data-fit band (t >= 0.75) one every
+                                # step rather than one in four. A step costs about a batch's
+                                # worth of operator calls, so this is roughly 2x the step time
+                                # of a batch of 2. 2 * N_EXPERTS would halve the variance again
+                                # at another 2x; that is the setting to raise if there is time.
 FLOW_VAL_BODIES=${FLOW_VAL_BODIES:-16}  # held out of training: early stopping scores them and
                                         # the decision check reconstructs them; 0 turns both off
-FLOW_VAL_EVERY=${FLOW_VAL_EVERY:-200}
+FLOW_VAL_EVERY=${FLOW_VAL_EVERY:-100}   # 200 over a 1000-step cap gave five evaluations, too
+                                        # few for --patience to fire before the cap and too few
+                                        # to tell a plateau from a step that destabilised
 FLOW_PATIENCE=${FLOW_PATIENCE:-5}
 FLOW_CKPT_EVERY=${FLOW_CKPT_EVERY:-100}   # steps between resumable checkpoints; 0 disables
 FLOW_CKPT=${FLOW_CKPT:-runs/lpd_flow.pt.ckpt}   # under runs/, not /tmp: it has to outlive
@@ -128,6 +130,11 @@ RECON_SNAP=${RECON_SNAP:-0}
 RECON_GUIDANCE_WAS_SET=${RECON_GUIDANCE+x}
 RECON_GUIDANCE=${RECON_GUIDANCE:-}
 RECON_GUIDANCE_SWEEP=${RECON_GUIDANCE_SWEEP:-1.0 1.5 2.0 3.0}
+DECISION_BODIES=${DECISION_BODIES:-$FLOW_VAL_BODIES}   # how many of the held-out bodies the
+                                        # decision check reconstructs. Held out of training is
+                                        # FLOW_VAL_BODIES and belongs to the flow stage's
+                                        # signature; changing that retrains the flow, so cut
+                                        # the decision check's cost with this instead
 MEDOID_VOLUME_ONLY=${MEDOID_VOLUME_ONLY:-0}
 MEDOID_SIDE_POINTS=${MEDOID_SIDE_POINTS:-200000}
 MEDOID_SIDE_DIRS=${MEDOID_SIDE_DIRS:-36}
@@ -238,9 +245,9 @@ stage_signature() {
       ;;
     decision)
       stage_signature flow-rollout | sed 's/^stage=flow-rollout$/stage=decision/'
-      printf 'RECON_SAMPLES=%s\nRECON_POLISH_STEPS=%s\nRECON_RES=%s\nSWEEP=%s\nSIDE_POINTS=%s\nSRC=%s\n' \
+      printf 'RECON_SAMPLES=%s\nRECON_POLISH_STEPS=%s\nRECON_RES=%s\nSWEEP=%s\nBODIES=%s\nSIDE_POINTS=%s\nSRC=%s\n' \
         "$RECON_SAMPLES" "$RECON_POLISH_STEPS" "$RECON_RES" "$RECON_GUIDANCE_SWEEP" \
-        "$MEDOID_SIDE_POINTS" "$SRC_OUTPUT"
+        "$DECISION_BODIES" "$MEDOID_SIDE_POINTS" "$SRC_OUTPUT"
       ;;
     convex)
       printf 'stage=convex\nDATA_DIR=%s\nCONVEX_CKPT=%s\nSRC=%s\nSRC_FWD=%s\n' \
@@ -481,7 +488,7 @@ if [ "$FLOW_VAL_BODIES" -gt 0 ]; then
   run_stage decision runs/decision_check.json \
     $PY scripts/decision_check.py \
       --ckpt runs/lpd_flow.pt --corpus "$CORPUS_FILE" --val-bodies "$FLOW_VAL_BODIES" \
-      --bodies "$FLOW_VAL_BODIES" --samples "$RECON_SAMPLES" \
+      --bodies "$DECISION_BODIES" --samples "$RECON_SAMPLES" \
       --polish-steps "$RECON_POLISH_STEPS" --res "$RECON_RES" \
       --guidance $RECON_GUIDANCE_SWEEP \
       --side-points "$MEDOID_SIDE_POINTS" --out runs/decision_check.json
