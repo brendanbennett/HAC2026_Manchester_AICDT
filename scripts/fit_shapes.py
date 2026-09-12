@@ -187,9 +187,14 @@ def _load_fit(path: Path, expected: dict, i: int):
 
 
 def _save_fit(path: Path, i: int, expected: dict, a: np.ndarray, before: float, after: float):
-    """Written under a temporary name and renamed, so a kill mid-write leaves no half part."""
+    """Written under a temporary name and renamed, so a kill mid-write leaves no half part.
+
+    The temporary name has to end in .npz itself: np.savez silently appends .npz to any
+    filename that does not already end with it, so a plain "<name>.npz.part" is actually
+    written as "<name>.npz.part.npz", and the rename below then fails with FileNotFoundError
+    every time, having never found the file it thinks it wrote."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(path.name + ".part")
+    tmp = path.with_suffix(".part.npz")
     np.savez(tmp, body_index=int(i), meta=json.dumps(expected, sort_keys=True),
              a=a, before=np.float32(before), after=np.float32(after))
     tmp.replace(path)

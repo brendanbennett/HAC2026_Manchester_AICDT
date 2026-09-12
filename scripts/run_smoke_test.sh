@@ -35,11 +35,13 @@ N_BODIES=${N_BODIES:-4}
 LIB_RES=${LIB_RES:-32}
 LIB_WORKERS=${LIB_WORKERS:-$(nproc 2>/dev/null || echo 2)}
 FIT_WORKERS=${FIT_WORKERS:-$LIB_WORKERS}
-# Above the fit's own floor of a few sample points per amplitude (fit_shapes.main), which
-# is a property of the code and not of how short this run is: below it the solve is
-# decided by the ridge and the smoke test would be exercising something the real run
-# never does.
-FIT_POINTS=${FIT_POINTS:-14000}
+# Above the fit's own floor of POINTS_PER_NODE per depth (fit_shapes.py), which is a
+# property of the code and not of how short this run is: below it the solve is decided by
+# the ridge and the smoke test would be exercising something the real run never does. That
+# floor is POINTS_PER_NODE * hac26.field.N_NODES = 12 * 2560 = 30720 as of this branch's
+# depth-field resolution -- comfortably above it, not just over the line, since a future
+# increase in N_NODES should not silently drop this back under the floor again.
+FIT_POINTS=${FIT_POINTS:-36000}
 FLOW_STEPS=${FLOW_STEPS:-8}
 FLOW_PHASES=${FLOW_PHASES:-16}     # few phases keep the run short
 FLOW_OPERATOR_RES=${FLOW_OPERATOR_RES:-16}

@@ -111,8 +111,17 @@ def curve_pairs(curves56: np.ndarray) -> torch.Tensor:
 
 
 def geometry_mask(mask56: np.ndarray) -> torch.Tensor:
-    """(1, N_CAMS): a geometry counts as present only if BOTH its curves are."""
-    return torch.tensor((mask56[:N_CAMS] > 0) & (mask56[N_CAMS:] > 0),
+    """(1, N_CAMS): a geometry counts as present if EITHER of its curves does.
+
+    Not AND: count_curve_is_usable exists specifically to refuse a count curve that has
+    collapsed to the transfer curve (model 2's released data does this on 18 geometries)
+    while leaving that geometry's intensity curve, which carries no such failure mode, fully
+    usable. curve_weight already handles this at the individual-curve level (each of a
+    geometry's two curves is independently zero-weighted or not); geometry_mask decides the
+    coarser set of geometries worth including in `present` at all, for hold-out selection and
+    the like, and requiring both curves there discarded a geometry's still-usable intensity
+    data whenever only its count curve was refused."""
+    return torch.tensor((mask56[:N_CAMS] > 0) | (mask56[N_CAMS:] > 0),
                         dtype=torch.float32)[None]
 
 
