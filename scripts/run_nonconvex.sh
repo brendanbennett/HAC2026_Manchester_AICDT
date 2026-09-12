@@ -38,13 +38,26 @@ mkdir -p "$OUT_DIR" logs
 # the file the calibration writes for this channel, named by the code rather than here
 INSTRUMENT=$($PY -c "import sys; sys.path.insert(0, 'scripts'); \
 from calibrate import OUT_INSTRUMENT; print(OUT_INSTRUMENT['$CHANNEL'])")
-if [ ! -f "$INSTRUMENT" ]; then
+# Present is not enough: an instrument fitted against other cameras or another transfer loads
+# into a different question, and every threshold downstream is measured in the model error it
+# carries. Instrument.load refuses such a file, and refuses one that does not say what it was
+# fitted against, so the test for reuse is that it loads rather than that it exists.
+loads_here() {
+  $PY -c "import sys; sys.path.insert(0, '.')
+from hac26.forward.mesh.instrument import Instrument
+Instrument.load('$INSTRUMENT')" >/dev/null 2>&1
+}
+if [ -f "$INSTRUMENT" ] && loads_here; then
+  echo "=== calibrate: $INSTRUMENT is already there and was fitted against these cameras"
+else
+  if [ -f "$INSTRUMENT" ]; then
+    echo "=== calibrate: $INSTRUMENT does not load against the cameras this tree renders,"
+    echo "    so it is refitted. Commit the new one and later runs will skip this stage."
+  fi
   echo "=== calibrate the $CHANNEL channel $(date)"
   $PY -u scripts/calibrate.py --channel "$CHANNEL" --steps "$CALIBRATE_STEPS" \
       --models $CALIBRATE_MODELS --data-dir "$DATA_DIR" \
       2>&1 | tee logs/calibrate_"$CHANNEL".log
-else
-  echo "=== calibrate: $INSTRUMENT is already there"
 fi
 
 echo "=== reconstruct the calibrating model $CALIBRATION_MODEL $(date)"
