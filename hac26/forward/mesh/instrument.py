@@ -209,14 +209,24 @@ class Instrument(nn.Module):
         from ...conventions import geometry_digest
         state = torch.load(path, map_location="cpu", weights_only=True)
         saved = state.pop("_geometry", None)
-        if saved is not None:
-            was = bytes(saved.tolist()).hex()
-            if was != geometry_digest():
-                raise RuntimeError(
-                    f"{path} was fitted against different cameras or a different transfer "
-                    f"({was} against {geometry_digest()}). Every parameter in it is the answer "
-                    f"to a different question, so rerun scripts/calibrate.py rather than using "
-                    f"it; the pipeline skips the calibration when this file is present.")
+        if saved is None:
+            # A file with no digest was written before the digest existed, so the cameras and
+            # the transfer it was fitted against are unknown rather than equal to these. That
+            # is the same failure as a mismatch and has to be refused the same way: the
+            # pipeline skips the calibration when this file is present, so an instrument
+            # carried over from another tree would set the model error every threshold
+            # downstream is measured in, in silence.
+            raise RuntimeError(
+                f"{path} records no camera geometry, so it was written before the geometry "
+                f"was recorded and there is no way to tell what it was fitted against. Rerun "
+                f"scripts/calibrate.py rather than using it.")
+        was = bytes(saved.tolist()).hex()
+        if was != geometry_digest():
+            raise RuntimeError(
+                f"{path} was fitted against different cameras or a different transfer "
+                f"({was} against {geometry_digest()}). Every parameter in it is the answer "
+                f"to a different question, so rerun scripts/calibrate.py rather than using "
+                f"it; the pipeline skips the calibration when this file is present.")
         inst = cls(sensor=PowerTransfer() if "sensor.raw_gamma" in state else None)
         try:
             inst.load_state_dict(state)
