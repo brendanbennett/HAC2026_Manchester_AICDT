@@ -158,10 +158,19 @@ SHRINK_LEVELS = (0.5,)                 # positions in that range. One, not three
                                        # rather than the body: it puts the secant probe of the
                                        # hull coefficient somewhere the hull is already moving.
 
-# The waist family. A cap is a crater and cannot make a neck, and the one released non-convex
-# body is a contact binary, so a grid of caps alone cannot start anywhere near the shape of the
-# answer. A neck is a band of carve around the great circle perpendicular to the axis the lobes
-# lie on, which is what waist_depths writes.
+# The waist family. A cap is a crater: one connected region at one depth, and no setting of its
+# axis, radius and depth makes a neck. The shape library gives its bilobe and trilobe families
+# just under a third of the bodies between them (LibrarySpec.family_weights), which is this
+# project's own statement of what a scored body may be, so a grid that cannot start near a
+# multi-lobed body is a grid missing a third of what it is meant to cover. A neck is a band of
+# carve around the great circle perpendicular to the axis the lobes lie on, which is what
+# waist_depths writes.
+#
+# Not measured from the released bodies, and not inferred from them. Sweeping sixty directions
+# for an interior minimum of the body's width, model 3 reaches 23 per cent against the sawed-off
+# cube's 20 -- and the cube is exactly convex, so that is what the measure reads on a body with
+# no neck at all. Model 3 is a fifth of its hull's volume short without being bilobed, so this
+# family is carried for the library's sake and not for its.
 WAIST_AXES = 8                         # lobe axes across the same band the caps use. The spin
                                        # axis is added to them in _waist_axes, since a body may
                                        # equally lie across the axis of rotation or stand on it.
@@ -384,8 +393,9 @@ def conjunction_start(nodes: np.ndarray, index: int, n_radial: int = 9) -> tuple
     excess that does not depend on which way a body is turned; the rest is left to the fit.
 
     The carve is a crater or a neck, by the family the index falls in. A crater is what a grid
-    of caps can make and a neck is not, and a neck is the shape of the one released non-convex
-    body, so a grid without the second family cannot start near that answer at any size.
+    of caps can make and a neck is not, and the shape library gives its bilobe and trilobe
+    families just under a third of the bodies between them, so a grid without the second family
+    cannot start near a third of what it is meant to cover, at any size.
     """
     rec = start_recipe(index)
     a = (waist_depths(nodes, rec["axis"], rec["halfwidth_deg"], rec["depth"])

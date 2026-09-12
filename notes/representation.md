@@ -102,9 +102,16 @@ table says only that when a fit stops short of these numbers, the degree cap is 
 The ladder is local, so what it can reach is bounded by where it begins as well as by what its
 coordinates span. The grid of starts was eight spherical caps by three radii by three depths,
 and a cap is a crater: the field it writes is a single connected region of one depth. No
-setting of those three numbers makes a neck, and `BENCHMARKS.md` records that the one released
-non-convex body is a contact binary. So the grid excluded the shape of the answer at every
-size, and enlarging it would have produced more craters rather than a body of the right kind.
+setting of those three numbers makes a neck, so a body with one cannot be started near.
+
+Whether a scored body has one is the question, and it is not settled by the released three.
+Sweeping sixty directions for an interior minimum of the body's width, model 3 reaches 23 per
+cent of its width against the sawed-off cube's 20 -- and the cube is exactly convex, its volume
+equalling its hull's, so twenty per cent is what this measure reads on a body with no neck at
+all. Model 3 is short of its hull by a fifth of its volume without being bilobed. What does say
+a neck must be reachable is the shape library, which gives its bilobe and trilobe families just
+under a third of the bodies between them; that is this project's own statement of what a scored
+body may be, and a grid that cannot start near one is missing a third of its job.
 
 The second family is a neck. A body's two lobes lie on an axis, and the neck between them is
 the band of carve around the great circle perpendicular to it, which is the directions u with
