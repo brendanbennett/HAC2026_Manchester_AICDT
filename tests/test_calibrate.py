@@ -145,3 +145,21 @@ def test_a_channel_with_no_independent_pair_still_calibrates():
     with pytest.raises(ValueError):
         ab_mismatch(curves, np.zeros(2 * N_CAMS))
     assert np.isfinite(ab_mismatch(curves, np.ones(2 * N_CAMS))).all()
+
+
+def test_a_measured_instrument_has_nothing_to_fit_through_the_render():
+    """The rendered channel's instrument is measured against the release rather than fitted
+    against it, so fitted_parameters() is empty there: a render has no penumbra, no lens
+    falloff, no point spread and no spline transfer, and each of those would be a direction a
+    fit could use to absorb an error of shape.
+
+    The calibration therefore has no render-path parameter to move on that channel, which is
+    what lets it hold the curves fixed and fit the model error alone. The laboratory channel
+    does have them, and must."""
+    from hac26.forward.mesh.instrument import Instrument
+    rendered = Instrument.blender_start()
+    assert rendered.fitted_parameters() == []
+    assert not bool(rendered.interreflection) and bool(rendered.orthographic)
+
+    lab = Instrument()
+    assert [n for n, _ in lab.fitted_parameters()], "the laboratory chain has nothing to fit"

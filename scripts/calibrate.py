@@ -383,14 +383,35 @@ def main():
                  f"{float(mismatch.median()/sigma.median()):.0f}x") + "), "
               f"start phase {np.degrees(psi0):+.1f} deg ({time.time()-t0:.0f}s)", flush=True)
 
-    opt = torch.optim.Adam([{"params": fit_params + [inst.raw_eta]},
-                            {"params": [b["psi0"] for b in bodies.values()], "lr": a.lr / 10}],
-                           lr=a.lr)
+    # A channel whose instrument is measured rather than fitted has no render-path parameter to
+    # move: fitted_parameters() is empty by construction there, and the start phase is already
+    # the best of every whole-frame shift, searched exactly rather than descended to. Nothing
+    # that reaches the rendering then changes from step to step, so the predictions are
+    # constant: they are rendered once here and only eta is fitted, whose gradient is direct
+    # through the likelihood. That takes the render, and the gradient through it, out of the
+    # loop entirely -- which is both what the channel means and the only way the fit can be
+    # stated, since a gradient with respect to a start phase alone is the one thing the vjp is
+    # then being asked for and it is not a quantity this instrument has.
+    render_fitted = bool(fit_params)
+    if not render_fitted:
+        with torch.no_grad():
+            for b in bodies.values():
+                b["psi0"] = b["psi0"].detach()
+                b["pred"] = normalise(fwd.raw_curves(b["verts"], b["faces"],
+                                                     psi0=float(b["psi0"]), mesh=b["mesh"]))
+        print("  the instrument of this channel is measured rather than fitted, so the curves "
+              "are rendered once and only the model error is fitted", flush=True)
+
+    groups = [{"params": fit_params + [inst.raw_eta]}]
+    if render_fitted:
+        groups.append({"params": [b["psi0"] for b in bodies.values()], "lr": a.lr / 10})
+    opt = torch.optim.Adam(groups, lr=a.lr)
     # raw-space starting point and travel budget of everything being fitted, for the
     # convergence report at the end
     named = {n: p for n, p in inst.fitted_parameters()}
     named["raw_eta"] = inst.raw_eta
-    named.update({f"psi0[{M}]": b["psi0"] for M, b in bodies.items()})
+    if render_fitted:
+        named.update({f"psi0[{M}]": b["psi0"] for M, b in bodies.items()})
     start = {n: p.detach().clone() for n, p in named.items()}
     budget = {n: a.steps * (a.lr / 10 if n.startswith("psi0") else a.lr) for n in named}
 
@@ -402,15 +423,19 @@ def main():
         total = 0.0
         for M, b in bodies.items():
             eta = inst.eta.reshape(2, N_CAMS).T
-            # the curves and the gradient of the likelihood with respect to every instrument
-            # parameter and this body's start phase, through the rendering
-            raw, _, grads = fwd.vjp(
-                b["verts"], b["faces"], lambda r: likelihood_cotangent(r, b, eta.detach()),
-                psi0=b["psi0"], params=fit_params + [b["psi0"]], mesh=b["mesh"])
-            for p, g in zip(fit_params + [b["psi0"]], grads):
-                p.grad = g if p.grad is None else p.grad + g
+            if render_fitted:
+                # the curves and the gradient of the likelihood with respect to every
+                # instrument parameter and this body's start phase, through the rendering
+                raw, _, grads = fwd.vjp(
+                    b["verts"], b["faces"], lambda r: likelihood_cotangent(r, b, eta.detach()),
+                    psi0=b["psi0"], params=fit_params + [b["psi0"]], mesh=b["mesh"])
+                for p, g in zip(fit_params + [b["psi0"]], grads):
+                    p.grad = g if p.grad is None else p.grad + g
+                pred = normalise(raw)
+            else:
+                pred = b["pred"]          # constant: nothing reaching the render is fitted
             # eta enters only through the likelihood, so its gradient is direct
-            loss, _ = nll(normalise(raw), b["real"], b["present"], b["sigma"], eta)
+            loss, _ = nll(pred, b["real"], b["present"], b["sigma"], eta)
             loss.backward()
             total += float(loss)
         opt.step()
