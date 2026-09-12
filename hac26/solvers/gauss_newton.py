@@ -71,13 +71,22 @@ STEP_C = 0.08
 AREA_WEIGHT = 0.9
 AREA_WINDOW = (0.30, 2.40)
 
-# Largest change of volume an accepted step may make, as a fraction. The cheapest area in any
-# representation of this kind is a hull shrink, and a penalty on area alone walks down it until
-# the body is gone; refusing a step that moves the volume by more than this removes that and
-# costs nothing, since the extraction has already given the volume. A correction larger than
-# this is reached in several steps, which is why the line search carries lengths short enough to
-# land inside it: a trust region that refuses every trial is a fit that cannot move at all.
-VOLUME_TRUST = 0.08
+# Largest change of volume an accepted step may make, as a fraction of the volume it starts
+# from. The region is there for the single step. The cheapest area in this representation is a
+# hull shrink, the linear term of a penalised step points straight down it, and unconstrained
+# the first step of a coarse stage leaves no body at all; _trust_length shortens such a step
+# rather than refusing it, because a region that refuses every trial is a fit that cannot move.
+#
+# It is not what keeps the fit from walking the volume away, although it was once asked to be.
+# The floor in scripts/reconstruct_gn.py does that, and it acts on the body rather than on the
+# step, so it costs an honest correction nothing. What sets the width here is therefore the
+# journey rather than the collapse: a convex inversion returns a hull larger than the body's,
+# so a correction that arrives has given up a large part of a volume, and a region much tighter
+# than this spends the whole ladder crossing it. The screening stage binds hardest, ranking a
+# start on two iterations; under a tighter region the bodies it ranks have barely left the
+# convex answer they all started from, and it is then sorting starts on a difference that is
+# not yet there. notes/objective.md works the width out against the journey it has to allow.
+VOLUME_TRUST = 0.25
 
 # Deepest carve one accepted step may add or remove, in body units. The node kernel's rows sum
 # to one, so the largest depth the field makes is at most the largest coefficient and this

@@ -93,7 +93,7 @@ VOLUME_FLOOR = 0.50        # smallest volume an accepted body may have, as a fra
                            # weakness --min-convex-sigmas has: what would make it principled is
                            # the distribution of that ratio over the shape library, which is the
                            # same corpus a learned acceptance gate would need.
-MIN_CONVEX_SIGMAS = 4.0    # how badly the convex answer must fit before a body is worth
+MIN_CONVEX_SIGMAS = 6.5    # how badly the convex answer must fit before a body is worth
                            # correcting, in model errors. A body whose convex answer already
                            # explains its curves has no concavity for the correction to find,
                            # and an objective that charges surface will then trade overlap it
@@ -101,6 +101,16 @@ MIN_CONVEX_SIGMAS = 4.0    # how badly the convex answer must fit before a body 
                            # nearly convex public body, that costs a sixth of the overlap while
                            # improving the misfit, so no gate that reads a misfit catches it;
                            # this one is read before the fit instead.
+                           #
+                           # The unit is the calibrated model error, and that is a unit which
+                           # moves: the released curves carry a measured noise two orders below
+                           # it, so the residual is divided by very nearly the calibration's own
+                           # eta and every sigma reported here scales inversely with it. Taking
+                           # the sawed-off cube out of the calibration lowered eta and lifted
+                           # both of the bodies this gate was placed between, and the value
+                           # above is the band that separates them under the calibration it was
+                           # measured on and under the narrower one in use. notes/objective.md
+                           # records the band and the one measurement that would replace it.
 
 
 def curve_index(weight: torch.Tensor, geoms) -> tuple:
@@ -146,7 +156,9 @@ def main() -> None:
                          "convex answer's; 0 turns the floor off")
     ap.add_argument("--min-convex-sigmas", type=float, default=MIN_CONVEX_SIGMAS,
                     help="leave a body alone whose convex answer already explains its curves "
-                         "to fewer than this many model errors")
+                         "to fewer than this many model errors; the unit is the calibration's "
+                         "own eta and moves with it, so a refitted instrument needs the "
+                         "threshold read again")
     ap.add_argument("--step-g", type=float, default=STEP_G,
                     help="secant step of a carve coordinate, in body units of depth")
     ap.add_argument("--step-c", type=float, default=STEP_C,

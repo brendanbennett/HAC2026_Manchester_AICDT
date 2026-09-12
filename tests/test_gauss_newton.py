@@ -176,7 +176,12 @@ def test_one_step_moves_a_body_and_leaves_it_a_body():
                          stages=(Stage(4, 0, 2),), target=0.0)
     assert hist and hist[0]["accepted"], "no damping and no step length improved the objective"
     assert hist[-1]["objective"] < obj0
-    assert abs(hist[-1]["volume"] - vol0) < 3.0 * VOLUME_TRUST * vol0   # three steps of it
+    # Each accepted step moves the volume by at most the region's fraction of the volume it
+    # starts from, so after n of them the volume is inside vol0 (1 +- trust)^n. Bounding it by
+    # n times the region instead would be the wrong test on the growing side, and a fixed
+    # multiple of the region would go stale the moment the region is rewidened.
+    steps = sum(1 for row in hist if row.get("accepted"))
+    assert abs(hist[-1]["volume"] - vol0) <= vol0 * ((1.0 + VOLUME_TRUST) ** steps - 1.0)
     assert float(np.abs(K @ g).max()) < 3.0 * DEPTH_TRUST
     assert np.isfinite(g).all() and np.isfinite(c).all()
 

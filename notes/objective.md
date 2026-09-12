@@ -91,6 +91,43 @@ The same bound is why a stage that searches random smooth fields on the nodes bu
 smoothing over at least two node spacings. One application of the node kernel to white noise is
 exactly the direction above.
 
+## When the penalty helps, and when it does not
+
+A concavity adds surface, so a body carries more area than its own hull, and an area penalty
+taken at face value should push away from a carved body rather than toward it. What makes it
+push the right way on model 3 is not the concavity but the inflation: a convex inversion
+imitates shadowing by enlarging the hull, and the enlarged body it returns carries more surface
+than the true one despite the true one's dents. That is a property of the convex answer and not
+of the body, so it has to be checked body by body rather than assumed.
+
+Posed canonically, the released bodies and the convex answers the correction starts from are:
+
+| body | truth area | truth volume | answer area | answer volume |
+|---|---|---|---|---|
+| 1 | 12.280 | 3.965 | 12.061 | 3.928 |
+| 2 | 14.820 | 3.883 | 12.612 | 3.409 |
+| 3 | 9.091 | 1.885 | 10.915 | 3.280 |
+
+The truths are the released meshes themselves and the answers are extracted from their supports
+at a coarse resolution, which moves the last digit and not the comparison.
+
+Only model 3 was inflated. Its answer holds 1.74 times the body's volume and 1.20 times its
+area, so at the weight above the penalty pays about 1.6 of objective toward the truth and
+removes the barrier the misfit alone puts in the way. Models 1 and 2 were not inflated at all --
+their answers hold *less* volume than the bodies do -- and on model 2 the body carries 2.2 more
+area than its answer, so the same term charges the truth about 2.0 to get there and the misfit
+has to find that much on its own.
+
+This is the mechanism the gate on the convex misfit is really guarding, which is more than its
+own comment claims for it. An answer that over-inflates is an answer that explains the curves
+badly, so the number that says a body has concavity to find is the same number that says the
+penalty will be pointing toward it; on the two bodies where both are known they agree, model 1
+sitting near the noise with an answer that was never inflated and model 3 far from it with one
+that was. Two bodies are not a calibration, and what that gate needs is the same corpus the
+floor needs. What the table settles is narrower and firmer: the penalty is not a property of
+the objective alone, and a body whose convex answer already fits should be left alone for this
+reason as well as the one recorded below.
+
 ## The floor on the volume
 
 The penalty's risk is the hull shrink, and the trust region bounds each step rather than the
@@ -105,6 +142,48 @@ It is calibrated on one body. Model 3's own volume is 0.580 of its convex answer
 floor sits below it with room; what would make the number principled rather than calibrated is
 the distribution of that ratio over the shape library, and that is the same corpus the gate on
 the convex answer's misfit would need.
+
+## How wide the trust region on each step has to be
+
+Because the floor takes the walk, the region on each step is left bounding one step, and its
+width is then a question about the journey rather than about the collapse. The journey is the
+gap the floor's own calibration names, and it can be read straight off the meshes without a
+fit: posed canonically, model 3's released body holds 1.885 of volume against the 3.280 of the
+convex answer the correction starts from, a ratio of 0.575, so a correction that arrives has
+given up two fifths of a volume. A region of a fraction f crosses that in at least
+log(0.575) / log(1 - f) maximal steps, which is seven steps at a twelfth of the volume and two
+at a quarter.
+
+Seven is more than the screening has. A start is ranked on two iterations of the coarse stage,
+so under the tighter region every start reaching that ranking is still most of the way back at
+the convex answer they were all given, and the ranking is sorting them on a correction that has
+not happened yet; the whole point of a designed spread of starts is the shape of the correction
+each one carries, and two capped steps have to be enough to tell one from another. At a quarter
+those two iterations are about the length of the journey, so the screening compares bodies
+rather than intentions. Nothing else moves with it: the line search still takes the best of five
+lengths inside whatever region it is given, the depth region still bounds the carve, and the
+floor still refuses a body that has gone too far.
+
+The floor is what binds after this change rather than the region, which is where a stop on a
+walk belongs. Two maximal steps at a quarter reach 0.5625 of the convex answer's volume against
+a floor at 0.50, so on a body whose own volume sits where model 3's does, the fit arrives with
+the floor a tenth of a volume away. On a body more strongly non-convex than the released one it arrives
+underneath it, and the floor is then not a stop on an overshoot but a ceiling on the answer.
+
+How much of the library that covers can be read off the library's own design rather than
+guessed. `LibrarySpec.convexity_bins` opens at 0.55 of the hull volume and
+`convexity_shares` gives that deepest band a fifth of the bodies, unbounded below, because a
+sampler whose deepest edge is higher stops at the first body that crosses it and never makes a
+deeply carved one. The floor is measured against the convex *answer* rather than the hull, and
+the answer is the larger of the two -- that is why the correction from it shrinks the hull, and
+model 3's own correction shifts it inward by 0.087 body units -- so a body's volume over the
+convex answer sits below its volume over its hull. A floor at half the convex answer's volume
+therefore stands at or above the top of the band the library gives a fifth of its bodies to.
+Against the working assumption that the secret bodies are strongly non-convex, that is a
+ceiling in the wrong place, and it is a stronger bias toward convex answers than the gate on
+the convex misfit is: the gate declines to correct a body, while the floor corrects it and
+stops it short. Setting it from the library's own bands rather than from the one released body
+is what it needs, and nothing about the correction below depends on the value.
 
 ## What the penalty exposed
 
@@ -132,6 +211,23 @@ misfit, so nothing downstream can catch it. The ratio of the convex answer's mis
 channel's model error is read before the fit instead: it is 7.9 on model 3 and 1.8 on model 1,
 and running the penalty on model 1 costs 0.166 of overlap.
 
+Those two numbers were read under a calibration that has since changed, and the unit moved with
+it. The released curves carry a measured noise of about 0.001 per curve against a model error
+in the hundredths, so the residual is divided by very nearly the calibration's own eta and every
+sigma quoted here scales inversely with it; taking the sawed-off cube out of the calibration,
+which is right for its own reasons, lowered eta and lifted both anchors together. A gate placed
+between 1.8 and 7.9 therefore sits below the near-convex body once eta falls by much more than a
+factor of two, which is the direction it fell. The threshold is set at 6.5, the band that stays
+above model 1 and below model 3 under the calibration the anchors were read on and under the
+narrower one in use, and the asymmetry says to sit high inside that band rather than in its
+middle: correcting a body that should have been left alone costs 0.166 of overlap where
+correcting one that needed it gains 0.045.
+
+What replaces the band is one measurement, not a redesign: render the convex answers of models 1
+and 3 against their own curves under the calibration actually being used, and read the two
+anchors again. That is two renders, and it is worth doing before a submission run, because the
+gate decides whether a body is corrected at all.
+
 ## What it is worth
 
 The numbers on model 3, from the convex stage's answer, through the same stand-in renderer,
@@ -152,6 +248,15 @@ It reaches that at a *worse* misfit, which is the whole point and the thing to w
 selection that reads the misfit alone prefers the second row to the third and would throw the
 better body away, so `scripts/select_answers.py` reads the functional the correction was
 fitted under. Nothing that compares two corrections may read the misfit on its own.
+
+That selection asks a scored body to beat its convex answer by the ratio model 3's refinement
+reached, and the table above says why that is a demanding test rather than a neutral one: model
+3 is the released body whose convex answer was inflated, so the area term pays toward its truth
+and is part of the ratio it set. A secret body whose convex answer was not inflated has to find
+the same ratio with that term working against it. The rule is deliberately biased toward the
+convex answer -- it stands unless the correction is shown to be better -- and this is the size
+of the bias rather than an argument against it; the selection is seconds to re-run once the
+scored numbers exist, and it is the place to revisit with them in hand.
 
 The volume falls from the convex answer's 2.52 to 1.27 against the body's 1.46, so the penalty
 overshoots the shrink by about a seventh of the volume even with the trust region holding each
