@@ -38,3 +38,6 @@ surrogate_check.py
 *.pid
 
 uv.lock
+
+# Local run tracking, not part of the method.
+RUNS.md
