@@ -39,6 +39,11 @@ RECON_POLISH=${RECON_POLISH:-20}       # gradient steps each candidate is refine
 RECON_STEPS=${RECON_STEPS:-16}         # sampler steps from noise to a body
 RECON_RES=${RECON_RES:-96}             # extraction resolution of the written mesh
 RECON_GUIDANCE=${RECON_GUIDANCE:-1.0}  # weight on the data part; 1.0 is what the flow trained at
+# A draw whose mesh extracts as a body plus a few specks is otherwise refused for having more
+# than one component. Above this fraction the largest piece is kept and the specks dropped;
+# below it the pieces are comparable, which a bilobed body would also look like, so the draw
+# is left alone. 0 disables it.
+RECON_REPAIR=${RECON_REPAIR:-0.98}
 FLOW_PHASES=${FLOW_PHASES:-96}
 FLOW_OPERATOR_RES=${FLOW_OPERATOR_RES:-32}
 
@@ -148,6 +153,7 @@ stage_reconstruct() {
         --ckpt "$FLOW_CKPT" --calibration "$CALIBRATION" --data-dir "$DATA_DIR" \
         --samples "$RECON_SAMPLES" --polish-steps "$RECON_POLISH" --steps "$RECON_STEPS" \
         --res "$RECON_RES" --guidance "$RECON_GUIDANCE" \
+        --repair-components "$RECON_REPAIR" \
         --phases "$FLOW_PHASES" --operator-res "$FLOW_OPERATOR_RES" \
         --out "$out"
     rc=$?
