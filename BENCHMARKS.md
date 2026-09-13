@@ -175,10 +175,38 @@ against this objective, the hull explains concavity-induced darkness as convex s
 the wrong direction. The capacity split is not the bug. The objective is, and no reallocation
 of degrees of freedom between two blocks fixes a loss whose minimum is in the wrong place.
 
-The one variant that is not answered by this is **block alternation** -- refining the hull
-holding the carving fixed, then the carving holding the hull fixed (`--alternate N`). That is
-the only mechanism that structurally prevents one block from absorbing the other's residual,
-and it is the last untested idea in this direction.
+### Block alternation, the last variant, also fails -- and says why
+
+Refining the hull with the carving held fixed and then the carving with the hull held fixed
+(`--alternate N`) is the only mechanism that structurally stops one block absorbing the other's
+residual. Run at periods of 5 and 10 steps, at both band limits:
+
+| model | arm | chi | Dice | convexity |
+|---|---|---|---|---|
+| 3 (concave) | alt5 | stalls at step 17 | 0.6902 | **1.000** |
+| 3 | alt10 | stalls at step 18 | 0.6902 | **1.000** |
+| 3 | deg10alt5 | 1.242 -> 0.740 | 0.6902 -> 0.6717 | **1.000** |
+| 1 (near-convex) | alt5 | 0.570 -> 0.329 | 0.9833 -> 0.9853 | 1.000 |
+| 1 | deg10alt5 | 0.570 -> 0.324 | 0.9833 -> **0.9860** | 1.000 |
+| 2 (cube) | alt5 | 4.442 -> 2.916 | 0.9200 -> **0.8696** | 0.980 |
+| 2 | deg10alt5 | 4.442 -> 2.931 | 0.9200 -> 0.8779 | 0.986 |
+
+**On model 3 the convexity stays at exactly 1.000 in every arm.** The carver is handed the step
+with the hull frozen and still cannot lower the objective: the gradient with respect to the
+1728 amplitudes points nowhere useful on the one public body that needs carving. That is the
+most direct statement of this project's problem available -- not capacity, not coupling, not
+the optimiser, and not the representation. The objective does not reward the right shape.
+
+The one consistent positive is model 1: **+0.0015 to +0.0027 Dice** across every arm. Refining
+the hull genuinely helps a near-convex body, and it is the first time descending this misfit
+has moved a shape the right way. It does not generalise -- model 2 loses 0.05 and model 3 loses
+0.02 -- so applying it is strongly net-negative: one small win against two larger losses. Not
+shipped.
+
+An earlier pass at this with `--alternate 40` measured nothing, because every run converges by
+step 20-45 and the schedule `(it // 40) % 2` never reached the second block. Those arms were
+`dh`-only, which is why their convexity never moved. Recorded so the mistake is not repeated:
+the alternation period has to be well inside the convergence horizon.
 
 
 ## The referee arbitrating all eight draws: fails, and shows where its skill ends
