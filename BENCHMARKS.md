@@ -300,7 +300,12 @@ of which curves it is calibrated against or of anything the calibration can abso
 | models 1 and 3 only, lab curves | 0.0378 | 0.0375 | 0.1058 |
 | models 1 and 3 only, **Blender** curves | 0.0372 | 0.0256 (blender) | 0.0667 (blender) |
 
-**What this means for a submission.** Ship the convex answers. Any misfit-driven refinement of
+**What this means for a submission.** *(Superseded: see "The referee" above -- the submission is
+`results/SUBMISSION`, which beats convex at 5.5632 by choosing convex-or-carved per body with an
+independent renderer. The paragraph below remains true about misfit-driven refinement, which is
+why the referee never descends the misfit -- it only ranks finished candidates.)*
+
+Ship the convex answers. Any misfit-driven refinement of
 them has been measured to make the shape worse -- and note that this includes *convex*
 refinement: the Track A run that ended at chi 1.109 stayed at convexity 1.000 throughout, so
 it was a convex body fitted to the data, and its Dice still fell 0.690 → 0.665. The convex
