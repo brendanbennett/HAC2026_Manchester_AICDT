@@ -180,6 +180,41 @@ holding the carving fixed, then the carving holding the hull fixed (`--alternate
 the only mechanism that structurally prevents one block from absorbing the other's residual,
 and it is the last untested idea in this direction.
 
+
+## The referee arbitrating all eight draws: fails, and shows where its skill ends
+
+The pipeline picks among its eight samples by volume and side-view agreement -- a consensus
+heuristic with no connection to the measurement -- so the obvious extension of the 2-way rule
+is to let the referee choose among all eight draws plus the convex body. Every draw was decoded
+(`scripts/decode_codes.py --all-draws`), scored by the referee, and scored officially against
+truth on the public models.
+
+| model | referee picks | its score | best available | convex |
+|---|---|---|---|---|
+| 1 | draw 5 | 1.9543 | convex **1.9716** | 1.9716 |
+| 2 | convex | 1.9011 | convex **1.9011** | 1.9011 |
+| 3 | draw 6 | 1.6639 | draw 7 **1.7025** | 1.6715 |
+
+| pipeline | total |
+|---|---|
+| 9-way referee pick | **5.5193** |
+| convex everywhere | 5.5442 |
+| 2-way rule (the submission) | **5.5632** |
+| oracle best-of-9, not achievable | 5.5752 |
+
+**Below convex, and 0.044 below the 2-way rule.** On model 3 it picks worse than the medoid
+heuristic it was meant to replace.
+
+The reason is the useful part. The 2-way rule asks the referee to tell a convex body from a
+carved one -- a large structural difference, and it is right 3 times out of 3. The 9-way rule
+asks it to rank eight *similar* carved draws whose referee scores differ by less than its own
+error. Skill at a coarse question is not skill at a fine one, and the argmin of nine noisy
+numbers is a much riskier estimator than the better of two.
+
+Note the ceiling as well: an oracle choosing perfectly among all nine reaches 5.5752, only
+0.012 above the submission. The draws are not good enough for selection among them to matter,
+whoever does the selecting.
+
 ## What has been tried against the convex answer, and has failed
 
 Everything below beats the convex answer on *misfit* and loses to it on *Dice*, which is the
