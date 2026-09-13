@@ -79,3 +79,50 @@ models are for. Runs 20312571 (0.5) and 20312572 (0.25) are the test.
 should stop being convex -- convexity below 0.98 on model 3, where every previous flow gave
 1.000 -- whether or not the score improves. If convexity stays pinned at 1.000, the diagnosis
 is wrong and the corpus is not the lever.
+
+## The result: the prediction was right, and the conclusion is the opposite of the hope
+
+**The gate passed decisively.** At `--eta-scale 0.5` the flow carves model 3 to convexity
+**0.6934**, against a pre-registered gate of 0.980 and the flat 1.000 that every previous flow
+in this project has produced. The truth's own convexity is 0.7681, so it goes from the wrong
+side of the answer to slightly past it, in one change. The diagnosis was right: eta was the
+knob that decided whether the network carves at all.
+
+**And carving made everything worse.**
+
+| model | convexity | truth convexity | score | vs convex |
+|---|---|---|---|---|
+| 1 (Vesta) | 0.8664 | 0.9965 | 1.8697 | -0.10 |
+| 2 (sawed-off cube) | **0.4996** | **0.9999** | 1.5850 | -0.32 |
+| 3 (Mithra) | 0.6934 | 0.7681 | 1.5113 | -0.16 |
+| | | | **4.9660** | **-0.60** |
+
+It carved a **cube** down to half its volume. And on Mithra, where the convexity is now nearly
+right, the score still *fell* -- Dice 0.5566 against the convex stage's 0.7147. The carving is
+the right size and in the wrong places.
+
+### What eta actually is
+
+eta is not a noise level. It is **how much the network is told to distrust our forward model**,
+and the sweep shows the network's convexity was never a defect:
+
+- eta high: the data is discounted, the answer is convex, score 5.48-5.52.
+- eta low: the data is trusted, the body carves, it fits the curves better and truth worse,
+  score 4.97.
+
+That is the project's central anti-correlation -- misfit against Dice -- arriving from a fifth
+independent direction, after MAP descent, the carving search, the GA on another branch, the
+widened `dh` band and block alternation. **The flow was correctly discounting a forward model
+that an independent renderer beats by 17x.** Its convexity was the right response to the
+information it was given, not a failure to learn.
+
+### What this does and does not license
+
+It does not license "the corpus is the problem". The library is diverse and deeply carved
+(above), and the concavity signal really is below the injected noise -- both measurements
+stand. What is wrong is the inference I drew from them: recovering the signal lets the network
+act on the data, and acting on this data is harmful.
+
+The only untested direction the sweep points at is **the other way**: if trusting the data less
+is better, the calibrated eta may already be too low. Arms at 1.5 and 2.5 test it. If they are
+flat or worse, eta is already optimal and this line is closed.
