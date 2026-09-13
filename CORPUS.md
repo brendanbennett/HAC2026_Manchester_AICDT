@@ -189,7 +189,13 @@ has cost score.
 | 1.0 (control) | 1.7352 | 1.7268 | 1.5501 | **5.0121** |
 | *rollout-trained checkpoints, any eta* | | | | **5.48 - 5.52** |
 
-The three arms span 0.15 with **no monotonic trend**. That is noise. Every rollout-trained
+Completed in both directions, six values:
+
+| eta x | 0.25 | 0.5 | 0.75 | 1.0 | 1.5 | 2.5 |
+|---|---|---|---|---|---|---|
+| total | 5.1164 | 4.9660 | 5.1278 | 5.0121 | 5.1581 | 5.1364 |
+
+They span 4.966 - 5.158 with **no monotonic trend in either direction**. That is noise. Every rollout-trained
 checkpoint sits 0.4 - 0.5 above all of them. So the entire difference is the rollout phase and
 eta is not a lever on the score at all -- the apparent effect at 0.5 was one draw of a noisy
 process, and reading a trend from it would have been reading noise.
