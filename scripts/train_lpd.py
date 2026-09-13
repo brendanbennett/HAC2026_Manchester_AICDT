@@ -982,6 +982,19 @@ def main():
                          "every run trained the same 11M-parameter network; it is a flag now "
                          "because a much larger one at the same rate is an untested "
                          "combination, and the held-out curve is the thing to watch for it.")
+    ap.add_argument("--eta-scale", type=float, default=1.0,
+                    help="multiply the calibration's model error before it is injected into "
+                         "the training curves. The default 1.0 injects eta ~ 0.119 of smooth "
+                         "random noise, while the whole concavity signal of Mithra -- the "
+                         "difference between its curves and its own convex hull's -- is "
+                         "0.078. At that ratio the concavity sits below the injected noise "
+                         "and the correct response to the training distribution is to answer "
+                         "convex, which is what every flow trained here has done. eta is our "
+                         "renderer's error, not a property of the measurement: an independent "
+                         "renderer reaches 0.005 on the same curves, so injecting it at full "
+                         "strength treats a deficiency of ours as irreducible noise.\n"
+                         "Lowering it trades robustness for signal. 0.5 puts Mithra's "
+                         "concavity at signal-to-noise 1.3")
     ap.add_argument("--metrics", default="runs/train_metrics.jsonl",
                     help="JSONL file of per-step metrics, appended; \"\" disables it")
     ap.add_argument("--cond-width", type=int, default=256,
@@ -1071,7 +1084,7 @@ def main():
                          f"rebuild the corpus or point --calibration at the one it used")
     phases, op_res = int(cmeta["phases"]), int(cmeta["operator_res"])
     inst = load_instrument(a.calibration, dev)
-    eta = model_error_scale(inst)
+    eta = model_error_scale(inst) * a.eta_scale
     op = CodeOperator(inst, psi_grid(phases), res=op_res, config=RENDER, device=dev)
     print(f"  exact operator on {dev}, extraction res {op_res}, {len(cameras())} "
           f"geometries, {phases} phases; model error median {float(eta.median()):.4f}",
