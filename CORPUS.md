@@ -126,3 +126,56 @@ act on the data, and acting on this data is harmful.
 The only untested direction the sweep points at is **the other way**: if trusting the data less
 is better, the calibrated eta may already be too low. Arms at 1.5 and 2.5 test it. If they are
 flat or worse, eta is already optimal and this line is closed.
+
+## The control overturns the attribution: it is the rollout phase, not eta
+
+The control -- **unchanged calibrated eta** -- carves model 3 to convexity 0.7474 against a
+truth of 0.7681, closer to truth than the eta x0.5 arm managed. So lowering eta did not unlock
+carving. Every arm here carves, because every arm here is **data-phase only**: `--experts 1`
+with no rollout, where every checkpoint this project has shipped went through rollout after.
+
+The evidence had been visible since the first validation point and I did not follow it:
+
+| | \|g\|hat vs corpus |
+|---|---|
+| data phase, all arms, step 99-199 | **89%** |
+| reference run, in rollout, step 5099 | **68%** |
+
+And the direction is the opposite of the hope. Scored on the public models:
+
+| pipeline | m1 | m2 | m3 | total |
+|---|---|---|---|---|
+| eta x0.5, data-phase only | 1.8697 | 1.5850 | 1.5113 | **4.9660** |
+| eta x1.0, data-phase only | 1.7352 | 1.7268 | 1.5501 | **5.0121** |
+| convex stage | 1.9716 | 1.9011 | 1.6715 | 5.5442 |
+| referee-selected (the submission) | 1.9716 | 1.9011 | 1.6905 | **5.5632** |
+
+The control removes **40% of Vesta's volume** (2.961 against a true 4.974, convexity 0.7017
+against 0.9965) and all eight of its draws are carved, spanning convexity 0.39 to 0.87, on a
+body that has nothing to carve.
+
+**So the rollout phase is worth about 0.55 of score, and what it teaches is restraint.** The
+data phase trains on a library where 70% of bodies are carved, so its prior says carve; rollout
+feeds the network its own samples through the operator, where carving a body that should not be
+carved makes the fit worse. On real bodies it then over-corrects all the way to convex --
+because the forward model cannot resolve genuine concavity.
+
+## Four attributions, all wrong in the same direction
+
+| claimed | measured |
+|---|---|
+| the corpus lacks concave shapes | wrong: 35% contact binaries, 70% below 0.85 convexity |
+| eta buries the concavity signal | right as a measurement (0.078 signal, 0.119 injected) |
+| lowering eta unlocks carving | it carves, and scores 4.966 -- it halved a **cube** |
+| the rollout phase destroys carving | backwards: rollout teaches restraint, worth 0.55 |
+
+Every one was caught by a control or a validation rather than by care. The pre-registered gate
+is what stopped the eta result being written up as a success when it passed the gate at 0.6934
+and then scored 4.966.
+
+The underlying fact now stands from six independent directions -- MAP descent, the carving
+search, the GA branch, the widened `dh` band, block alternation, and the training distribution:
+**the misfit is anti-correlated with Dice, and every mechanism that increases reliance on it
+loses.** The flow's convexity is not a defect. It is a load-bearing correction for a forward
+model that an independent renderer beats by 17x, and every attempt to remove that correction
+has cost score.
