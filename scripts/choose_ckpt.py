@@ -19,7 +19,15 @@ from pathlib import Path
 import numpy as np
 
 WINDOW = 150      # steps of history summarised for each candidate
-TOL = 1.25        # a candidate is "good" if within this factor of the best window median
+
+# How much worse than the best window the newest one may be before it is passed over. The
+# point is to catch a blow-up, not ordinary scatter, so it is set well above the scatter: the
+# eight windows of the n1500 expert run spanned 0.855 to 1.100, a factor of 1.29, with no
+# trend, while the spike this guard exists for took the flow term from about 0.8 to 5.5, a
+# factor of six. At 1.25 the guard fired on that noise and passed over the newest weights for
+# no reason; at 2.0 it ignores the scatter and still catches anything of the size that
+# matters.
+TOL = 2.0
 
 pat = re.compile(r"\] step\s+(\d+)\s+loss\s+[\d.]+\s+\(flow\s+([\d.]+), occupancy\s+([\d.]+), "
                  r"data fit\s+([\d.]+)\)")
@@ -53,7 +61,10 @@ def main() -> None:
 
     scored = [(s, p, window_median(s)) for s, p in cands]
     usable = [(s, p, m) for s, p, m in scored if m is not None]
-    print(f"  {len(scored)} snapshots, {len(rows)} clean logged steps")
+    meds = [m for _, _, m in scored if m is not None]
+    spread = (f", windows span {min(meds):.4f}-{max(meds):.4f} "
+              f"(factor {max(meds)/min(meds):.2f})" if meds else "")
+    print(f"  {len(scored)} snapshots, {len(rows)} clean logged steps{spread}")
     for s, p, m in scored:
         print(f"    step {s:>5}  window median {'n/a' if m is None else f'{m:.4f}'}")
 
