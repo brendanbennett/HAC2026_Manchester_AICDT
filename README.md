@@ -17,9 +17,16 @@ built the way it is.
 
 ## The submission
 
-The submitted bodies are `results/submission/Asteroid04.stl` to `Asteroid10.stl`. They are
-built in two steps: a convex inversion, which is quick and always available, and a correction
-of it, which is accepted per model only where it has been shown to help. The convex stage is
+The submitted bodies are `results/submission/Asteroid04.stl` to `Asteroid10.stl`, and each is
+the flow's reconstruction of that model: the end of the pipeline described under "The
+non-convex path" below, trained on a library of 1500 bodies. Which run each body came from,
+and that file's sha256, is recorded per model in `results/submission/provenance.json`.
+
+They rest on a convex inversion, which is both the body the flow corrects and the fallback
+where the flow produced nothing. A model can end without a flow body -- the reconstruction
+refuses to answer when every draw comes out in several disconnected pieces or when none of
+them render -- and the convex answer for that model then stands rather than leaving a gap.
+The convex stage is
 
 ```
 python scripts/make_submission.py
@@ -44,14 +51,22 @@ assumes, and the laboratory columns of several bodies are out of phase with thei
 geometry by tens of degrees. `scripts/reconstruct.py --channel` forces either channel for one
 model.
 
+`scripts/assemble_submission.py` is what puts the flow's bodies in place, and
+`./reproduce.sh submit` runs it. It copies nothing until every chosen body has passed
+`scripts/check_submission.py`, and keeps whatever it replaced under
+`results/submission/convex-backup`.
+
 The convex answer is not the body, and on a body with concavities it is not even the body's
 hull. A convex inversion returns the convex body whose own shadowing best imitates the
 concavities, which is larger than the hull of the body that cast them; of the three public
 bodies the answer exceeds the true hull on the one that has concavities and falls short of it
-on the two that do not. Correcting it is the subject of the non-convex path below, and a
-correction replaces a convex answer only where `scripts/select_answers.py` accepts it.
-`results/submission/selection.json` then records, per model, which answer was submitted and
-the numbers behind the choice.
+on the two that do not. Correcting it is the subject of the non-convex path below.
+
+That path has two tracks. The submitted bodies come from the flow, and
+`scripts/assemble_submission.py` puts them in place. The other track, Gauss-Newton and MAP
+refinements of the convex answer, is described below and is not what was submitted here; it
+enters a submission through `scripts/select_answers.py`, which judges a refinement on cameras
+held out of its own fit, and `results/submission/selection.json` then records what it chose.
 
 The convex network was trained against a photometric kernel that has since been measured to
 be wrong (`notes/photometry.md`). An unrolled scheme is an estimator fitted against one
@@ -272,8 +287,10 @@ hac26/solvers/    lpd_convex, lpd_flow, gauss_newton, minkowski, operator, outpu
 hac26/scoring/    official (the organisers' measures), voxel, side_view
 hac26/            conventions, geometry, field, shapes, noise, shape_library, curves_mesh,
                   data_io, recon, library_io, library_metrics
-scripts/          entry points; make_submission.py builds the submission and
-                  select_answers.py decides which corrections, from which solver, enter it
+scripts/          entry points; reconstruct_lpd.py is the flow's reconstruction and
+                  assemble_submission.py makes those bodies the submission.
+                  make_submission.py builds the convex answers they rest on, and
+                  select_answers.py belongs to the Gauss-Newton and MAP track
 notes/            measurements that settle a choice made in the code
 models/           the trained convex solver; the calibrations calibrate.py writes go here
 results/          submission/ the scored models, public/ the public ones, public_scores.json
