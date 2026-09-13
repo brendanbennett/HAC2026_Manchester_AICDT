@@ -1,0 +1,39 @@
+{
+  "models": {
+    "10": {
+      "answer_misfit_sigma": null,
+      "from": "results/gn/Asteroid10.stl",
+      "sha256": "1c1310f18598bff5499dd9a23cd3d8ef4e2386a6c0ed9798e0036153f1a8d9fe"
+    },
+    "4": {
+      "answer_misfit_sigma": null,
+      "from": "results/gn/Asteroid04.stl",
+      "sha256": "c1ea83acfd65201a74430fd08873ed9ff615ea494ded52723306bf10f3ec7fa3"
+    },
+    "5": {
+      "answer_misfit_sigma": 1.9246046543121338,
+      "from": "results/lpd-late/Asteroid05.stl",
+      "sha256": "241859527a83cbfc045541f2de77514ea0e8d9c37287fe3e7292d6a6a2783596"
+    },
+    "6": {
+      "answer_misfit_sigma": 2.504779577255249,
+      "from": "results/lpd/Asteroid06.stl",
+      "sha256": "4dcc6906c157bcf36e99dc75dc301c1b27a3d518b8a31f0a2ebd1dcc02900063"
+    },
+    "7": {
+      "answer_misfit_sigma": 1.820560097694397,
+      "from": "results/lpd-late/Asteroid07.stl",
+      "sha256": "51496b793e1505a52d419e0b527679f0571a74acc296996f15d65c40e5ba84b5"
+    },
+    "8": {
+      "answer_misfit_sigma": 0.9880234003067017,
+      "from": "results/lpd/Asteroid08.stl",
+      "sha256": "b7b93c9935da0b4928189a760dd082a43886b203ef45f4bdf3fa500b16c58c91"
+    }
+  },
+  "sources_in_order": [
+    "results/lpd-late",
+    "results/lpd",
+    "results/gn"
+  ]
+}
