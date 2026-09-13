@@ -264,11 +264,13 @@ stage_signature() {
         "$RECON_GUIDANCE" "$SRC_OUTPUT" "$SRC_FLOW" "$SRC_FORWARD"
       ;;
     score)
-      printf 'stage=score\nDATA_DIR=%s\nRECON_DIR=results/lpd\nRECON_SAMPLES=%s\nRECON_RES=%s\nRECON_SNAP=%s\nMEDOID_VOLUME_ONLY=%s\nMEDOID_SIDE_POINTS=%s\nMEDOID_SIDE_DIRS=%s\nMEDOID_SIDE_RES=%s\nMEDOID_SIDE_MODE=%s\n' \
-        "$DATA_DIR" "$RECON_SAMPLES" "$RECON_RES" "$RECON_SNAP" \
-        "$MEDOID_VOLUME_ONLY" "$MEDOID_SIDE_POINTS" "$MEDOID_SIDE_DIRS" \
-        "$MEDOID_SIDE_RES" "$MEDOID_SIDE_MODE"
-      printf 'SRC=%s\n' "$SRC_OUTPUT"
+      # Extends reconstruct's, because score reads exactly the meshes reconstruct writes.
+      # Listing a subset of reconstruct's settings instead let the two disagree: a run that
+      # changed the rollout steps and the guidance weight rewrote every mesh in results/lpd
+      # and then skipped the scoring, because none of what it changed appeared here, and the
+      # stale numbers in logs/score.log read as though they described the new meshes.
+      stage_signature reconstruct | sed 's/^stage=reconstruct$/stage=score/'
+      printf 'DATA_DIR=%s\nRECON_DIR=results/lpd\nSRC=%s\n' "$DATA_DIR" "$SRC_OUTPUT"
       ;;
     *)
       printf 'stage=%s\n' "$1"
