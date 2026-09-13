@@ -116,6 +116,17 @@ def main() -> None:
                          "noise floor swallow the concavity signal")
     ap.add_argument("--dh-weight", type=float, default=1.0,
                     help="relative step for the convex-core block against the carving block")
+    ap.add_argument("--sh-degree", type=int, default=0,
+                    help="band limit for dh; 0 keeps the built-in 5. Degree d gives (d+1)^2 "
+                         "degrees of freedom to the hull correction against g's 1728 -- at "
+                         "the default that is 36 against 1728, a 48x imbalance on a problem "
+                         "where two thirds of the public-model error is convex-inversion "
+                         "error. Costs no parameters: dh is N_DIR samples either way. "
+                         "Saturates at N_DIR=128, reached at degree 12")
+    ap.add_argument("--alternate", type=int, default=0,
+                    help="alternate between the two blocks every N steps instead of moving "
+                         "both at once: refine the hull holding the carving fixed, then the "
+                         "carving holding the hull fixed. 0 moves both every step")
     ap.add_argument("--uncalibrated", action="store_true",
                     help="run against a default Instrument instead of a fitted one. For "
                          "shaking out the plumbing only: the misfit is then measured against "
@@ -125,6 +136,14 @@ def main() -> None:
 
     torch.manual_seed(a.seed)
     _enable_tf32()
+    if a.sh_degree:
+        # read at call time by sh_expand, so this has to happen before the operator builds
+        # its ImplicitBody and registers the expansion matrix
+        import hac26.field as _field
+        _field.SH_DEGREE = a.sh_degree
+        print(f"  dh band limit raised to degree {a.sh_degree}: "
+              f"{min((a.sh_degree + 1) ** 2, N_DIR)} degrees of freedom against g's "
+              f"{CODE_DIM - N_DIR}", flush=True)
     dev = a.device if torch.cuda.is_available() else "cpu"
     R = CYLINDER_R[a.model]
 
@@ -229,8 +248,14 @@ def main() -> None:
         # They are in different units, and one global RMS lets whichever block has the larger
         # gradient set the step for both -- which is how a run ends up at convexity 0.999
         # having "converged": the core absorbed the misfit and the amplitudes never moved.
+        blocks = ((slice(0, N_DIR), a.dh_weight), (slice(N_DIR, None), 1.0))
+        if a.alternate:
+            # block coordinate descent: the hull and the carving explain the same darkness,
+            # so moving both at once lets whichever has the larger gradient claim it. Holding
+            # one fixed forces the other to account for what is left.
+            blocks = (blocks[(it // a.alternate) % 2],)
         direction = torch.zeros_like(grad)
-        for sl, w in ((slice(0, N_DIR), a.dh_weight), (slice(N_DIR, None), 1.0)):
+        for sl, w in blocks:
             r = float(grad[sl].pow(2).mean().sqrt())
             if np.isfinite(r) and r > 0:
                 direction[sl] = -w * grad[sl] / r

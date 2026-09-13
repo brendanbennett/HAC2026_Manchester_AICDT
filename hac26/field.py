@@ -264,13 +264,14 @@ def dir_design(n: int = N_DIR) -> np.ndarray:
     return spherical_design(n)
 
 
-def _real_sh(x: np.ndarray, degree: int = SH_DEGREE) -> np.ndarray:
+def _real_sh(x: np.ndarray, degree: int | None = None) -> np.ndarray:
     """Real spherical harmonics up to `degree` at the unit vectors x, without normalisation.
 
     The basis is only used through a pseudo-inverse, which does not care how the columns are
     scaled. What matters is that the columns span exactly the harmonics of degree <= `degree`.
     """
     from scipy.special import lpmv
+    degree = SH_DEGREE if degree is None else degree
     x = np.asarray(x, dtype=np.float64)
     ct = np.clip(x[:, 2], -1.0, 1.0)
     ph = np.arctan2(x[:, 1], x[:, 0])
@@ -325,13 +326,20 @@ def support_resample(src: np.ndarray, dst: np.ndarray, k: int = 6) -> np.ndarray
     return W
 
 
-def sh_expand(src: np.ndarray, dst: np.ndarray, degree: int = SH_DEGREE) -> np.ndarray:
+def sh_expand(src: np.ndarray, dst: np.ndarray, degree: int | None = None) -> np.ndarray:
     """Matrix taking dh sampled on `src` directions to dh sampled on `dst` directions.
 
     `Y_dst @ pinv(Y_src)`. Because Y has only (degree+1)^2 columns, this is also the band
     limit: whatever is emitted on `src`, only its part of degree <= `degree` reaches h. So
     the band limit is built in rather than encouraged by a penalty.
+
+    `degree` defaults to the module-level SH_DEGREE, read at call time rather than bound at
+    definition time, so a caller can widen the band by setting `hac26.field.SH_DEGREE` before
+    building an ImplicitBody. Nothing else changes: `dh` is always N_DIR samples and CODE_DIM
+    does not depend on the degree, so a wider band costs no parameters anywhere -- it only
+    lets more of what `dh` already emits reach `h`.
     """
+    degree = SH_DEGREE if degree is None else degree
     y_src, y_dst = _real_sh(src, degree), _real_sh(dst, degree)
     return (y_dst @ np.linalg.pinv(y_src)).astype(np.float32)
 
