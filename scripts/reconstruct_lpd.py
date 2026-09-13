@@ -445,8 +445,49 @@ def consensus_bodies(occs: list, extent: float, radius: float, levels=CONSENSUS_
     return out
 
 
+def keep_largest_component(verts, faces, min_fraction: float):
+    """Drop every piece but the largest, when the largest is essentially the whole body.
+
+    A level set extracted from a noisy field comes out as the body plus a scatter of specks,
+    and a draw with a single speck is thrown away by the same rule that would throw away a
+    genuinely bilobed body. Measured over 48 draws of two models, the largest piece held
+    100.0% of the volume every time and the rest rounded to nought, and removing them changed
+    neither the volume nor the distance of the furthest vertex from the spin axis.
+
+    `min_fraction` is the guard against the case that measurement did not contain. Below it
+    the pieces are comparable, the body may really have two lobes, and the draw is left as it
+    is -- to be rejected by the usual gate rather than quietly amputated here.
+
+    Returns (verts, faces, n_pieces, largest_fraction); the mesh is unchanged when there is
+    one piece or when the largest falls short of min_fraction.
+    """
+    import trimesh                                   # as elsewhere in this file: a slow import
+    # Vertices have to be merged before the split, exactly as the diagnostic above does it.
+    # Unmerged, every triangle is its own component -- an STL round trip alone is enough to
+    # produce that -- and the split would disagree with the component count this repair is
+    # meant to answer to.
+    m = trimesh.Trimesh(np.asarray(verts), np.asarray(faces), process=True)
+    m.remove_unreferenced_vertices()
+    m.merge_vertices()
+    pieces = m.split(only_watertight=False)
+    if len(pieces) <= 1:
+        return verts, faces, len(pieces), 1.0
+    vols = [abs(float(q.volume)) for q in pieces]
+    total = sum(vols)
+    if total <= 0:
+        return verts, faces, len(pieces), float("nan")
+    k = int(np.argmax(vols))
+    frac = vols[k] / total
+    if frac < min_fraction:
+        return verts, faces, len(pieces), frac
+    big = pieces[k]
+    return (np.asarray(big.vertices, dtype=float), np.asarray(big.faces),
+            len(pieces), frac)
+
+
 def decode(op: CodeOperator, code, support, res=64, misfit_fn=None, snap: bool = False,
-           snap_planes: int = 12, snap_tol: float = 0.02, snap_min_frac: float = 0.02):
+           snap_planes: int = 12, snap_tol: float = 0.02, snap_min_frac: float = 0.02,
+           repair_components: float = 0.0):
     """Raw code -> posed mesh in the canonical frame as numpy arrays, with optional planar
     snapping. Returns (None, None, 0) if the extracted mesh is degenerate.
 
@@ -462,6 +503,21 @@ def decode(op: CodeOperator, code, support, res=64, misfit_fn=None, snap: bool =
     v, f = m[0], m[1]
     v = CodeOperator.canonical(v, f).cpu().numpy()
     f = f.cpu().numpy()
+    if repair_components > 0.0:
+        # before the misfit or any diagnostic is taken, so the body that is judged is the
+        # body that would be written
+        v2, f2, n_pieces, frac = keep_largest_component(v, f, repair_components)
+        if n_pieces > 1:
+            if v2 is not v:
+                import torch as _t
+                v2 = CodeOperator.canonical(_t.as_tensor(v2, dtype=_t.float32),
+                                            _t.as_tensor(f2)).numpy()
+                print(f"    repaired: {n_pieces} pieces, largest {100 * frac:.2f}% of the "
+                      f"volume, the rest dropped", flush=True)
+                v, f = v2, f2
+            else:
+                print(f"    left alone: {n_pieces} pieces, largest only "
+                      f"{100 * frac:.2f}% of the volume", flush=True)
     kept = 0
     planes = ransac_planes(v, f, n_planes=snap_planes, tol=snap_tol,
                            min_frac=snap_min_frac) if snap else []
@@ -511,6 +567,15 @@ def main():
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--snap", action="store_true",
                     help="enable RANSAC planar snapping postprocess")
+    ap.add_argument("--repair-components", type=float, default=0.0, metavar="FRACTION",
+                    help="when a draw extracts as several pieces and the largest holds at "
+                         "least this fraction of the volume, keep only that piece and drop "
+                         "the rest, so the draw is judged as the body it is rather than "
+                         "refused for the specks around it. 0 disables it. Below the "
+                         "fraction the pieces are comparable, which a bilobed body would "
+                         "also look like, so the draw is left alone and the usual gate "
+                         "refuses it. 0.98 is a reasonable setting: measured over 48 draws "
+                         "the largest piece held 100.0% of the volume every time.")
     ap.add_argument("--snap-planes", type=int, default=12)
     ap.add_argument("--snap-tol", type=float, default=0.02)
     ap.add_argument("--snap-min-frac", type=float, default=0.02)
@@ -637,7 +702,8 @@ def main():
     for i in range(a.samples):
         v, f, kept = decode(op, raw_codes[i], support, res=a.res, misfit_fn=misfit,
                             snap=a.snap, snap_planes=a.snap_planes,
-                            snap_tol=a.snap_tol, snap_min_frac=a.snap_min_frac)
+                            snap_tol=a.snap_tol, snap_min_frac=a.snap_min_frac,
+                            repair_components=a.repair_components)
         if v is None:
             print(f"  draw {i}: degenerate, dropped", flush=True); continue
         chi = misfit(v, f)                   # whitened RMS misfit of this draw, in sigmas
