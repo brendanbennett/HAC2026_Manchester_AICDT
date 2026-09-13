@@ -8,6 +8,7 @@
 #   make toolchain            # build nvdiffrast and the CUDA toolkit it compiles against
 #   make check                # what the venv actually has: python, torch, CUDA, nvdiffrast
 #   make test | test-fast | smoke | pipeline | data
+#   make submission           # the ten submitted STLs from models/, no training
 #
 # Every variable below can be overridden on the command line:
 #   make venv PY_VERSION=3.11 VENV=/scratch/hac26-venv EXTRAS=test
@@ -114,8 +115,8 @@ PIP_UNINSTALL := $(PY) -m pip uninstall -y
 endif
 
 .DEFAULT_GOAL := help
-.PHONY: help venv deps toolchain check test test-fast smoke pipeline data check-data \
-        clean distclean
+.PHONY: help venv deps toolchain check test test-fast smoke pipeline submission data \
+        check-data clean distclean
 
 help:
 	@awk '/^#/ {sub(/^# ?/, ""); print; next} {exit}' Makefile
@@ -256,6 +257,11 @@ smoke: venv
 
 pipeline: venv
 	VENV_DIR=$(abspath $(VENV)) scripts/run_remote_pipeline.sh
+
+# The submission itself: the ten reconstructions from the released data and the checkpoints
+# in models/, with no training. `make pipeline` is what produced those checkpoints.
+submission: venv
+	VENV_DIR=$(abspath $(VENV)) scripts/make_submission.sh
 
 clean:
 	rm -rf .pytest_cache hac26.egg-info

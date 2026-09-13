@@ -8,6 +8,31 @@ reduced to two numbers, summed intensity and lit-pixel count, giving 56 curves p
 Reconstructions are scored on voxel overlap with the true shape plus the distance between the
 boundary curves of 2D projections. `docs/challenge_info.md` has the rules.
 
+## Reproducing the submission
+
+The submitted reconstructions are `results/lpd/Asteroid01.stl` to `Asteroid10.stl`, in the
+pose the challenge asks for. To rebuild them from the released data:
+
+```
+make venv toolchain        # the environment and nvdiffrast; see "Install" below
+make data                  # the organisers' released data into dataset/raw
+make submission            # the ten reconstructions into results/lpd
+```
+
+`make submission` does no training. It reads the two trained checkpoints committed under
+`models/` -- `lpd_convex.pt`, the convex stage, and `lpd_flow.pt`, the flow that corrects it
+-- and reconstructs each model in turn, a few minutes each on one GPU. It needs a CUDA GPU
+and a working nvdiffrast; `make check` reports on both. Every mesh it writes is checked
+against the challenge's pose and bounding-cylinder requirements before it exits, by
+`hac26/submission.py`, which can also be run on its own:
+
+```
+PYTHONPATH=. python hac26/submission.py --dir results/lpd
+```
+
+Training those checkpoints is `make pipeline`, described under "Running the pipeline"; it
+takes days on a GPU and is not needed to reproduce the results above.
+
 ## Install
 
 `make` does the whole setup; `pyproject.toml` is the only dependency list.
