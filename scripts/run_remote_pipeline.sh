@@ -134,6 +134,20 @@ RECON_SNAP=${RECON_SNAP:-0}
 RECON_GUIDANCE_WAS_SET=${RECON_GUIDANCE+x}
 RECON_GUIDANCE=${RECON_GUIDANCE:-}
 RECON_GUIDANCE_SWEEP=${RECON_GUIDANCE_SWEEP:-1.0 1.5 2.0 3.0}
+# Whether to measure that weight rather than take the default. Off, because measuring it
+# costs FLOW_VAL_BODIES x |RECON_GUIDANCE_SWEEP| x RECON_SAMPLES draws -- 4096 at the
+# settings above, each about what one challenge body costs -- and decision_check.py writes
+# its one JSON at the end, so a run stopped by a wallclock keeps nothing. Left on by default
+# it is the stage a pipeline reaches after training and does not return from.
+#
+# Shrinking it instead was considered and rejected: about a quarter of draws survive the
+# single-component and finite-misfit gates, so a cut-down sweep separates the weights on a
+# handful of usable candidates, and decision_check itself reports that the weights are often
+# within 1e-3 of each other in mean Dice ("not a margin: leaving RECON_GUIDANCE alone is as
+# good"). An estimate that noisy would override a sound default on close to a coin flip.
+#
+# Set RUN_DECISION=1 with the compute to do it properly, or pass RECON_GUIDANCE directly.
+RUN_DECISION=${RUN_DECISION:-0}
 MEDOID_VOLUME_ONLY=${MEDOID_VOLUME_ONLY:-0}
 MEDOID_SIDE_POINTS=${MEDOID_SIDE_POINTS:-200000}
 MEDOID_SIDE_DIRS=${MEDOID_SIDE_DIRS:-36}
@@ -487,7 +501,7 @@ fi
 # Held-out corpus bodies are reconstructed as the challenge models will be, and every rule for
 # picking the answer is scored against their truth (see decision_check.py). The summary is in
 # logs/decision.log and runs/decision_check.json.
-if [ "$FLOW_VAL_BODIES" -gt 0 ]; then
+if [ "$RUN_DECISION" = "1" ] && [ "$FLOW_VAL_BODIES" -gt 0 ]; then
   run_stage decision runs/decision_check.json \
     $PY scripts/decision_check.py \
       --ckpt runs/lpd_flow.pt --corpus "$CORPUS_FILE" --val-bodies "$FLOW_VAL_BODIES" \
@@ -495,6 +509,8 @@ if [ "$FLOW_VAL_BODIES" -gt 0 ]; then
       --polish-steps "$RECON_POLISH_STEPS" --res "$RECON_RES" \
       --guidance $RECON_GUIDANCE_SWEEP \
       --side-points "$MEDOID_SIDE_POINTS" --out runs/decision_check.json
+elif [ "$FLOW_VAL_BODIES" -gt 0 ]; then
+  log "=== decision: skipped (RUN_DECISION=0; reconstruction uses RECON_GUIDANCE, default 1.0)"
 else
   log "=== decision: skipped (FLOW_VAL_BODIES=0)"
 fi
@@ -511,7 +527,13 @@ if [ -f runs/decision_check.json ]; then
 fi
 if [ -z "${RECON_GUIDANCE:-}" ]; then
   RECON_GUIDANCE=1.0
-  log "!!! reconstruct: no decision best guidance available; falling back to RECON_GUIDANCE=1.0"
+  if [ "$RUN_DECISION" = "1" ]; then
+    log "!!! reconstruct: the decision stage ran but named no weight; falling back to 1.0"
+  else
+    # Not a warning: with RUN_DECISION=0 this is the designed path, and one is the weight
+    # the flow was trained at (lpd_flow.LPDFlow.velocity).
+    log "=== reconstruct: guidance 1.0, the weight the flow was trained at (RUN_DECISION=0)"
+  fi
 fi
 
 # ---------------------------------------------------------------- 6. the convex starts
