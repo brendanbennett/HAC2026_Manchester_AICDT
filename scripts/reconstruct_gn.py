@@ -63,7 +63,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from hac26.conventions import CYLINDER_R, psi_grid                       # noqa: E402
 from hac26.data_io import held_out_geoms, load_inversion_curves   # noqa: E402
-from hac26.field import (CODE_DIM, EXTRACT_RES, N_NODES, N_RADIAL,       # noqa: E402
+from hac26.field import (CODE_DIM, EXTRACT_RES, N_DIR, N_NODES, N_RADIAL,  # noqa: E402
                          DepthSphere, depth_cap, node_kernel)
 from hac26.recon import fit_to_cylinder                                  # noqa: E402
 from hac26.solvers.gauss_newton import (AREA_WEIGHT, AREA_WINDOW,    # noqa: E402
@@ -125,6 +125,38 @@ MIN_CONVEX_SIGMAS = 6.5    # how badly the convex answer has to fit before a bod
                            # records the band and the one measurement that would replace it.
 
 
+def load_start_code(path: str, index: int | None) -> tuple:
+    """(support, g, label) from a reconstruct_lpd .codes.npz, to start the fit at that body.
+
+    The file holds every draw's code and the support they were all decoded against. The
+    solver's g is the carving on N_NODES directions and sits in the last N_NODES entries of a
+    code (see render(): `code[-N_NODES:] = g`), so the flow's carving transfers verbatim. The
+    leading N_DIR entries are the hull correction, which does not transfer: it is already in
+    the support this file carries.
+
+    `index` picks the draw. Left out, the sibling .json's chosen candidate is used, so the
+    default is the body the flow actually published rather than an arbitrary draw.
+    """
+    z = np.load(path)
+    codes, support = z["codes"], z["support"]
+    if index is None:
+        side = Path(path).with_suffix("").with_suffix(".json")
+        index = 0
+        if side.exists():
+            try:
+                index = int(json.loads(side.read_text()).get("candidate", 0))
+            except (ValueError, TypeError, json.JSONDecodeError):
+                index = 0
+    if not 0 <= index < len(codes):
+        raise SystemExit(f"{path} holds {len(codes)} draws; draw {index} was asked for")
+    code = np.asarray(codes[index], dtype=float)
+    dh, g = code[:N_DIR], code[-N_NODES:]
+    print(f"  starting from draw {index} of {path}: carving reaches {g.max():.3f}, "
+          f"hull correction {dh.min():+.3f}..{dh.max():+.3f}, "
+          f"base support {support.min():.3f}-{support.max():.3f}", flush=True)
+    return (torch.tensor(support, dtype=torch.float32), dh, g, f"{path}#draw{index}")
+
+
 def curve_index(weight: torch.Tensor, geoms) -> tuple:
     """(geometries, per-geometry curve mask) of the curves a fit uses, and the flat index of
     those curves in the operator's (G, 2, P) output."""
@@ -148,6 +180,19 @@ def main() -> None:
                     help=f"instrument file; by channel, {INSTRUMENT}")
     ap.add_argument("--support-from", default=None,
                     help="STL whose support is the base; by default the convex answer")
+    ap.add_argument("--code-from", default=None,
+                    help="a reconstruct_lpd <out>.codes.npz to START FROM, rather than from "
+                         "the convex answer. --support-from takes only the SUPPORT of a mesh, "
+                         "which is a max over vertices and therefore its convex hull, so it "
+                         "inherits a flow body's hull and throws away its carving. The "
+                         "carving is the last N_NODES entries of the flow's code -- the same "
+                         "slots this solver's own g occupies in render() -- so it can be "
+                         "carried over exactly. The base support is taken from the file too, "
+                         "which is the support the flow actually ran at rather than one "
+                         "re-derived from its meshed output.")
+    ap.add_argument("--code-index", type=int, default=None,
+                    help="which draw in --code-from to start from; by default the one that "
+                         "file's sibling .json chose as the answer, else draw 0")
     ap.add_argument("--phases", type=int, default=48)
     ap.add_argument("--export-phases", type=int, default=96,
                     help="phases the written body's misfits are measured at")
@@ -239,7 +284,11 @@ def main() -> None:
                       device=dev)
 
     sup_stl = a.support_from or str(answer_path(a.model))
-    support = support_from_convex(sup_stl)
+    start_dh = start_g = None
+    if a.code_from:
+        support, start_dh, start_g, sup_stl = load_start_code(a.code_from, a.code_index)
+    else:
+        support = support_from_convex(sup_stl)
 
     d = load_inversion_curves(a.data_dir, a.model, m=a.phases, channel=a.channel)
     if set(d["files"]) != {"intensity", "binary"}:
@@ -263,7 +312,14 @@ def main() -> None:
     fit_g, keep_fit = curve_index(weight, fit_geoms)
     data_fit = flat_curves(data[fit_g], keep_fit)
     scale_fit = np.repeat(scale[fit_g].numpy()[keep_fit.numpy()], data.shape[-1])
+    # The code every trial is built on. render() writes only the carving block, so anything
+    # the leading N_DIR entries should carry has to be put here. The support a flow body was
+    # decoded against is its CONVEX start, not its hull: the hull correction lives in dh, and
+    # leaving dh at zero would cut a carve sized for the corrected hull into the uncorrected
+    # one. That shrinks the body onto the volume floor and every trial step is then refused.
     zero_code = torch.zeros(CODE_DIM, device=dev)
+    if start_dh is not None:
+        zero_code[:N_DIR] = torch.tensor(start_dh, dtype=torch.float32, device=dev)
     floor = [0.0]           # set from the convex answer's own volume, once it is rendered
     refused_volume = [0]    # trials the floor turned away, counted here because this is where
                             # the reason is known: inside the solver a body under the floor is
@@ -406,14 +462,17 @@ def main() -> None:
                   flush=True)
             break
     skipped_depth, skipped_floor = st["skipped_depth"], st["skipped_floor"]
-    if not pool:
+    if not pool and start_g is None:
         raise SystemExit("no designed start is a body this model has room for; there is "
                          "nothing to rank and nothing to fit")
     pool.sort(key=lambda q: q["objective"])
     take = max(0, a.restarts - 1)
-    starts = ([(np.zeros(N_RADIAL), np.zeros(N_NODES))]
-              + [(q["c"], q["g"]) for q in pool[:take]])
-    recipes = [{"start": "convex answer"}] + [q["recipe"] for q in pool[:take]]
+    # The first start is the convex answer unless a body was handed in: then it is that
+    # body's own carving at c = 0, because the hull it came with is already the base support.
+    first = (np.zeros(N_RADIAL), np.zeros(N_NODES) if start_g is None else start_g)
+    starts = [first] + [(q["c"], q["g"]) for q in pool[:take]]
+    recipes = ([{"start": "convex answer" if start_g is None else f"body from {a.code_from}"}]
+               + [q["recipe"] for q in pool[:take]])
     kept_kinds = Counter(q["recipe"]["kind"] for q in pool[:take])
     print(f"  ranked {len(pool)} designed starts on one render each "
           f"({gate.renders - ranked_from} renders, {time.time() - t0:.0f}s); carrying "
