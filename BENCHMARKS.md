@@ -143,6 +143,43 @@ the only pipeline that beats the convex stage on the sawed-off cube (0.9342 vs 0
 through `dh` rather than through concavity. The carved bodies in the submission come from the
 earlier 800-body checkpoint, which is the only one that still carves.
 
+
+## Unfreezing the convex hull: tested, and it makes things worse
+
+The pipeline takes `h` from the convex stage and corrects it with `dh`, band-limited to
+spherical-harmonic degree 5 -- **36 degrees of freedom against the carver's 1728**. That 48x
+imbalance looks indefensible on a problem where two thirds of Mithra's error is convex-inversion
+error, and `field.py:396` says outright that `h_base` "is wrong in a direction that favours a
+convex answer". So the obvious fix is to give the hull real capacity and let it move.
+
+It was tested. `sh_expand` now reads `SH_DEGREE` at call time, so the band widens at **zero
+parameter cost** -- degree 10 gives 121 degrees of freedom, saturating at N_DIR = 128 by degree
+12. `scripts/reconstruct_map.py --sh-degree 10 --target-sigma 0.05` then runs the MAP fit with
+the wider band and, crucially, past the noise floor that stopped the first attempt at step 1.
+
+Model 3, from the convex start:
+
+| | chi | Dice | convexity |
+|---|---|---|---|
+| convex start | 1.242 | 0.6902 | 1.000 |
+| degree 5, 20 steps | 2.911 -> see model 2 below | | |
+| **degree 10, 20 steps** | **0.721** | **0.6694** | **0.999** |
+
+**A 42% improvement in misfit, a loss in Dice, and convexity unchanged at 0.999.** The wider
+hull correction absorbed the entire misfit and the carver never moved -- precisely the failure
+`reconstruct_map.py:227` names: "the core absorbed the misfit and the amplitudes never moved".
+Model 2 shows the same thing at degree 5: chi 4.442 -> 2.911, Dice 0.9200 -> 0.9143.
+
+**So the degree-5 band limit is protecting the pipeline, not starving it.** Given more freedom
+against this objective, the hull explains concavity-induced darkness as convex shape, which is
+the wrong direction. The capacity split is not the bug. The objective is, and no reallocation
+of degrees of freedom between two blocks fixes a loss whose minimum is in the wrong place.
+
+The one variant that is not answered by this is **block alternation** -- refining the hull
+holding the carving fixed, then the carving holding the hull fixed (`--alternate N`). That is
+the only mechanism that structurally prevents one block from absorbing the other's residual,
+and it is the last untested idea in this direction.
+
 ## What has been tried against the convex answer, and has failed
 
 Everything below beats the convex answer on *misfit* and loses to it on *Dice*, which is the

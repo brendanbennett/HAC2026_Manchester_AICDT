@@ -123,6 +123,21 @@ def main() -> None:
                          "where two thirds of the public-model error is convex-inversion "
                          "error. Costs no parameters: dh is N_DIR samples either way. "
                          "Saturates at N_DIR=128, reached at degree 12")
+    ap.add_argument("--target-sigma", type=float, default=TARGET_SIGMA,
+                    help="stop once the fit reaches this many sigma. The default 1.0 is the "
+                         "noise level, and it is why a MAP run does nothing: model 3's convex "
+                         "start is already at chi 1.242, so one step ends the run with the "
+                         "shape unchanged. Our forward-model error (eta ~ 0.12) sets that "
+                         "floor, so a convex body satisfies it. Push below it and the fit is "
+                         "chasing structure the noise floor was hiding -- some of it real "
+                         "shape, some of it our own renderer's error, which is why the bodies "
+                         "along the way are judged by an independent renderer rather than by "
+                         "this misfit")
+    ap.add_argument("--snapshot-every", type=int, default=0,
+                    help="write the body every N steps as <out>.stepNNN.stl, so the whole "
+                         "trajectory can be scored afterwards instead of trusting chi to "
+                         "pick. chi is anti-correlated with Dice on the public models, so the "
+                         "last iterate is not the one to keep")
     ap.add_argument("--alternate", type=int, default=0,
                     help="alternate between the two blocks every N steps instead of moving "
                          "both at once: refine the hull holding the carving fixed, then the "
@@ -234,7 +249,18 @@ def main() -> None:
                   + f"  dice {row.get('dice', float('nan')):.4f}"
                     f"  convexity {row.get('convexity', float('nan')):.3f}"
                     f"  step {step:.4f}  [{row['seconds']:.0f}s]", flush=True)
-        if it == a.steps or chi <= TARGET_SIGMA:
+        if a.snapshot_every and it and it % a.snapshot_every == 0 and a.out:
+            ms = op.mesh(support, code, res=EXPORT_RES)
+            if ms is not None:
+                vs = fit_to_cylinder(restore_constraints(
+                    CodeOperator.canonical(ms[0], ms[1]).cpu().numpy(), R), R)
+                snap = Path(a.out).with_suffix(f".step{it:04d}.stl")
+                snap.parent.mkdir(parents=True, exist_ok=True)
+                try:
+                    export_stl(snap, vs, ms[1].cpu().numpy())
+                except ValueError as exc:
+                    print(f"  step {it}: snapshot not a solid ({exc})", flush=True)
+        if it == a.steps or chi <= a.target_sigma:
             break
 
         _, grad = op.adjoint(support, code, R, cot_fn, geoms=fit_geoms)
@@ -263,16 +289,25 @@ def main() -> None:
             print("  the gradient vanished; stopping", flush=True)
             break
 
+        # Backtracking that can recover. The step only ever grows by STEP_GROW on success
+        # and halves on failure, so a run of failures collapses it -- and once it is at 1e-9
+        # eight more halvings are meaningless, which is how every arm "converged" at step
+        # 13-20 with the body barely moved. One restart from the full step before giving up
+        # tells a genuine local minimum apart from an exhausted step size.
         moved = False
-        for _ in range(MAX_HALVINGS):
-            trial = code + step * direction
-            J_t, chi_t = objective(trial)
-            if J_t < J:
-                code, J, chi = trial, J_t, chi_t
-                step *= STEP_GROW
-                moved = True
+        for attempt in range(2):
+            for _ in range(MAX_HALVINGS):
+                trial = code + step * direction
+                J_t, chi_t = objective(trial)
+                if J_t < J:
+                    code, J, chi = trial, J_t, chi_t
+                    step *= STEP_GROW
+                    moved = True
+                    break
+                step *= 0.5
+            if moved:
                 break
-            step *= 0.5
+            step = a.lr
         if not moved:
             print(f"  no step of size >= {step:.2e} lowers the objective; converged at "
                   f"step {it}", flush=True)

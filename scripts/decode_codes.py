@@ -49,6 +49,11 @@ def main():
                     help="drop the carving and keep the convex refinement")
     ap.add_argument("--zero-dh", action="store_true",
                     help="drop the convex refinement and keep the carving")
+    ap.add_argument("--all-draws", action="store_true",
+                    help="write every draw, not just the one the run answered with, as "
+                         "Asteroid<NN>.draw<K>.stl. The medoid rule picks among the draws by "
+                         "volume and side-view agreement, which has no connection to the "
+                         "data; this lets a referee pick instead")
     ap.add_argument("--res", type=int, default=64)
     ap.add_argument("--phases", type=int, default=48)
     ap.add_argument("--operator-res", type=int, default=64)
@@ -80,26 +85,33 @@ def main():
             k = int(meta["candidate"])
         k = min(k, len(codes) - 1)
 
-        code = torch.as_tensor(codes[k]).clone()
-        if a.zero_g:
-            code[-N_SITES:] = 0.0
-        if a.zero_dh:
-            code[:-N_SITES] = 0.0
-
         op = CodeOperator(inst, psi_grid(a.phases), res=a.operator_res, config=RENDER,
                           device=dev)
-        v, f, _ = decode(op, code.to(dev), support.to(dev), res=a.res)
-        if v is None:
-            print(f"model {M:2d}: the code decoded to nothing", flush=True)
-            continue
-        # canonical -> physical, xy only. `decode` leaves the body at r_xy ~ 1; the scorer
-        # compares it against a truth at the printed model's radius, so skipping this scores
-        # a body of the right shape at the wrong size.
-        v = fit_to_cylinder(v, CYLINDER_R[M])
-        info = export_stl(out / f"Asteroid{M:02d}.stl", v, f)
-        print(f"model {M:2d}: draw {k}, R = {CYLINDER_R[M]}, "
-              f"{info.get('faces', len(f))} faces, volume {info.get('volume', float('nan')):.3f}",
-              flush=True)
+        wanted = range(len(codes)) if a.all_draws else [k]
+        for j in wanted:
+            code = torch.as_tensor(codes[j]).clone()
+            if a.zero_g:
+                code[-N_SITES:] = 0.0
+            if a.zero_dh:
+                code[:-N_SITES] = 0.0
+            name = (f"Asteroid{M:02d}.draw{j}.stl" if a.all_draws
+                    else f"Asteroid{M:02d}.stl")
+            v, f, _ = decode(op, code.to(dev), support.to(dev), res=a.res)
+            if v is None:
+                print(f"model {M:2d} draw {j}: decoded to nothing", flush=True)
+                continue
+            # canonical -> physical, xy only. `decode` leaves the body at r_xy ~ 1; the
+            # scorer compares it against a truth at the printed model's radius, so skipping
+            # this scores a body of the right shape at the wrong size.
+            v = fit_to_cylinder(v, CYLINDER_R[M])
+            try:
+                info = export_stl(out / name, v, f)
+            except ValueError as exc:
+                print(f"model {M:2d} draw {j}: {exc}", flush=True)
+                continue
+            print(f"model {M:2d} draw {j}{' (answered)' if j == k else ''}: "
+                  f"{info.get('faces', len(f))} faces, "
+                  f"volume {info.get('volume', float('nan')):.3f}", flush=True)
 
 
 if __name__ == "__main__":
