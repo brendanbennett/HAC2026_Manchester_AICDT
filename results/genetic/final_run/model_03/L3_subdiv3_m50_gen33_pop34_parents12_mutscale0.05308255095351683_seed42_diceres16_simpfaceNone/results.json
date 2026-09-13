@@ -1,0 +1,92 @@
+{
+  "config": {
+    "L": 3,
+    "subdiv": 3,
+    "generations": 33,
+    "population_size": 34,
+    "parents": 12,
+    "m": 50,
+    "dice_resolution": 16,
+    "simplify_faces": null,
+    "mutation_scale": 0.05308255095351683,
+    "seed": 42,
+    "output_dir": "results/genetic/final_run_exact/model_03",
+    "model": 3,
+    "data_dir": "dataset/raw",
+    "initial_stl": "results/genetic/final_run_exact/start_meshes/Asteroid03_start.stl",
+    "mode": "surface",
+    "deform_width": 0.26629567554859473,
+    "n_cpts": 30,
+    "max_amp": 0.6150800970055766,
+    "mutation_decay": 0.9011938211791242,
+    "forward_model": "exact",
+    "calibration": "models/instrument_calibration.pt",
+    "exact_device": "cuda",
+    "exact_backend": null,
+    "exact_radiosity_faces": 600,
+    "exact_res": [
+      108,
+      192
+    ]
+  },
+  "checkpoints": {
+    "generation_0000": {
+      "dice_score": 0.6443381180223285,
+      "time_taken": 14.411546450981405,
+      "best_fitness": -44902.06741225029
+    },
+    "generation_0008": {
+      "dice_score": 0.5583103764921947,
+      "time_taken": 140.2299702449818,
+      "best_fitness": -15372.066757751589
+    },
+    "generation_0016": {
+      "dice_score": 0.5872420262664165,
+      "time_taken": 310.55310777798877,
+      "best_fitness": -9309.401602611295
+    },
+    "generation_0024": {
+      "dice_score": 0.5736738703339882,
+      "time_taken": 483.2736756920058,
+      "best_fitness": -8479.760919135122
+    },
+    "generation_0033": {
+      "dice_score": 0.5925233644859813,
+      "time_taken": 685.3223197039915,
+      "best_fitness": -7998.384106687618
+    }
+  },
+  "best_params": [
+    -0.2232638300461409,
+    0.21667339848015985,
+    -0.056551597580625564,
+    -0.25836218238886954,
+    -0.02567598186161527,
+    0.06968731411561577,
+    -0.10928519692098697,
+    -0.3188662924883661,
+    -0.19348416230039825,
+    0.040664369020965874,
+    -0.016046767520812716,
+    0.1945304939892894,
+    0.13522938631714662,
+    -0.06856923259588493,
+    -0.18350366880617328,
+    -0.19175661874402242,
+    -0.25012093715301714,
+    -0.1472515378804877,
+    -0.07127710753694784,
+    -0.23010216609210862,
+    -0.23456408110159974,
+    0.2061477156534827,
+    -0.3011866467656008,
+    0.0008216845775577679,
+    -0.1802209277228663,
+    -0.05053648406025986,
+    -0.0995844888845535,
+    0.2339838938857418,
+    -0.016045886177615664,
+    -0.16144315872286424
+  ],
+  "best_fitness": -7998.384106687618
+}

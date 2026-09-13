@@ -1,13 +1,13 @@
 {
-  "mean_dice": 0.7900792581441025,
+  "mean_dice": 0.872566582226777,
   "params": {
-    "population_size": 33,
-    "n_parents": 5,
-    "mutation_scale": 0.040946127612687726,
-    "n_generations": 134,
-    "mutation_decay": 0.9784193848438156,
-    "deform_width": 0.32834884594932734,
-    "max_amp": 0.34086465792497744,
-    "n_cpts": 19
+    "population_size": 34,
+    "n_parents": 12,
+    "mutation_scale": 0.05308255095351683,
+    "n_generations": 33,
+    "mutation_decay": 0.9011938211791242,
+    "deform_width": 0.26629567554859473,
+    "max_amp": 0.6150800970055766,
+    "n_cpts": 30
   }
 }

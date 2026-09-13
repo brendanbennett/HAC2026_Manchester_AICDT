@@ -1,0 +1,92 @@
+{
+  "config": {
+    "L": 3,
+    "subdiv": 3,
+    "generations": 33,
+    "population_size": 34,
+    "parents": 12,
+    "m": 50,
+    "dice_resolution": 16,
+    "simplify_faces": null,
+    "mutation_scale": 0.05308255095351683,
+    "seed": 42,
+    "output_dir": "results/genetic/final_run_exact/model_06",
+    "model": 6,
+    "data_dir": "dataset/raw",
+    "initial_stl": "results/genetic/final_run_exact/start_meshes/Asteroid06_start.stl",
+    "mode": "surface",
+    "deform_width": 0.26629567554859473,
+    "n_cpts": 30,
+    "max_amp": 0.6150800970055766,
+    "mutation_decay": 0.9011938211791242,
+    "forward_model": "exact",
+    "calibration": "models/instrument_calibration.pt",
+    "exact_device": "cuda",
+    "exact_backend": null,
+    "exact_radiosity_faces": 600,
+    "exact_res": [
+      108,
+      192
+    ]
+  },
+  "checkpoints": {
+    "generation_0000": {
+      "dice_score": null,
+      "time_taken": 16.85826368301059,
+      "best_fitness": -41955.17775440145
+    },
+    "generation_0008": {
+      "dice_score": null,
+      "time_taken": 149.2921428779955,
+      "best_fitness": -14790.085726031015
+    },
+    "generation_0016": {
+      "dice_score": null,
+      "time_taken": 314.1013701620104,
+      "best_fitness": -9271.707093450987
+    },
+    "generation_0024": {
+      "dice_score": null,
+      "time_taken": 505.09721198299667,
+      "best_fitness": -8301.7033448529
+    },
+    "generation_0033": {
+      "dice_score": null,
+      "time_taken": 735.6211434740108,
+      "best_fitness": -7983.172180225402
+    }
+  },
+  "best_params": [
+    -0.16524298844550026,
+    0.06573465620800384,
+    0.4389629637534462,
+    -0.14818628381136306,
+    0.07517848791202411,
+    0.16174261850604724,
+    -0.04358687900604275,
+    -0.1588727792490302,
+    0.04969658456038217,
+    0.032845844678771205,
+    -0.22156930369289798,
+    -0.11815819761475328,
+    -0.027287616715528255,
+    0.06101536733527182,
+    0.12581644488697163,
+    -0.18125215106775527,
+    -0.15149053069171667,
+    0.005221063249630309,
+    -0.19647210868132028,
+    -0.18930153133665154,
+    -0.2335474094072731,
+    0.021568657777850962,
+    -0.11784415100478175,
+    -0.19577623591490592,
+    -0.06906053715511058,
+    0.17823811960709218,
+    -0.09550151394344991,
+    -0.023650525665691993,
+    -0.15921124012876472,
+    0.22407916721813217
+  ],
+  "best_fitness": -7983.172180225402
+}
