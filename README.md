@@ -10,6 +10,11 @@ under the same geometries. Reconstructions are scored on voxel overlap with the 
 plus the distance between the boundary curves of 2D projections. `docs/challenge_info.md` has
 the rules.
 
+To check or rebuild the result rather than read about it, start at
+[REPRODUCE.md](REPRODUCE.md), or run `./reproduce.sh` for a summary of the three stages and
+what each costs. The rest of this file is the account of how the method works and why it is
+built the way it is.
+
 ## The submission
 
 The submitted bodies are `results/submission/Asteroid04.stl` to `Asteroid10.stl`. They are
