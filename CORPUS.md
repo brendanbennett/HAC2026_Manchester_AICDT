@@ -179,3 +179,21 @@ search, the GA branch, the widened `dh` band, block alternation, and the trainin
 loses.** The flow's convexity is not a defect. It is a load-bearing correction for a forward
 model that an independent renderer beats by 17x, and every attempt to remove that correction
 has cost score.
+
+## The eta sweep, completed: eta is not a lever at all
+
+| eta x | m1 | m2 | m3 | total |
+|---|---|---|---|---|
+| 0.25 | 1.8836 | 1.6828 | 1.5500 | **5.1164** |
+| 0.5 | 1.8697 | 1.5850 | 1.5113 | **4.9660** |
+| 1.0 (control) | 1.7352 | 1.7268 | 1.5501 | **5.0121** |
+| *rollout-trained checkpoints, any eta* | | | | **5.48 - 5.52** |
+
+The three arms span 0.15 with **no monotonic trend**. That is noise. Every rollout-trained
+checkpoint sits 0.4 - 0.5 above all of them. So the entire difference is the rollout phase and
+eta is not a lever on the score at all -- the apparent effect at 0.5 was one draw of a noisy
+process, and reading a trend from it would have been reading noise.
+
+The measurement that started this stands: Mithra's concavity signal is 0.078 and the injected
+model error is 0.119. The inference drawn from it -- that recovering the signal would help --
+is refuted twice over, by the score at every eta and by the absence of any trend across them.
