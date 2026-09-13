@@ -13,7 +13,10 @@ dataset/*
 
 # Working artefacts, rewritten by every run. Publish a validated one as a release
 # asset instead; the stable ones live in models/.
-runs/
+# No trailing slash: on the cluster the pipeline puts this on scratch and leaves a symlink
+# behind, and `runs/` matches only a real directory, so the symlink showed up as untracked
+# and one `git add -A` from being committed.
+runs
 
 # Written into the repo root by a run, not source.
 calibration.json
