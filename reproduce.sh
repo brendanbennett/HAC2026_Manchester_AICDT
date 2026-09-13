@@ -5,6 +5,7 @@
 #   ./reproduce.sh              what each stage costs, and what it needs
 #   ./reproduce.sh verify       check and re-score the shipped bodies   (CPU, minutes)
 #   ./reproduce.sh reconstruct  rebuild them from the shipped weights   (one GPU, hours)
+#   ./reproduce.sh submit       make those bodies the submission        (CPU, seconds)
 #   ./reproduce.sh train        rebuild the weights from the data       (one GPU, about a day)
 #
 # There is no cluster in any of this. Each stage is a loop over models in plain bash, so it
@@ -71,6 +72,11 @@ Stages, what they need, and roughly what they cost.
                 "Install" in README.md) and the three checkpoints under models/. Allow about
                 an hour and a half per model on an A100 -- most of it is the sampler, which
                 renders the body from every camera at each of its steps.
+
+  submit        Puts the flow's bodies into results/submission, preferring the newest run
+                and leaving a convex answer in place for any model the flow could not
+                answer, then checks every file. Copies nothing until all of them pass.
+                Seconds, no GPU. `reconstruct` does this for you at the end.
 
   train         Rebuilds the weights themselves, from the shape library up. This is
                 scripts/run_remote_pipeline.sh, which is resumable: every stage writes a
@@ -150,6 +156,9 @@ stage_reconstruct() {
     [ $rc -eq 0 ] || step "model $m produced no body (exit $rc); its convex answer stands"
   done
 
+  say "assembling the submission from what was produced"
+  $PY scripts/assemble_submission.py --from results/lpd-late results/lpd
+
   say "scoring what was produced"
   stage_verify
 }
@@ -164,8 +173,9 @@ stage_train() {
 
 case "${1:-}" in
   verify)      stage_verify ;;
+  submit)      need_python; $PY scripts/assemble_submission.py --from results/lpd-late results/lpd ;;
   reconstruct) stage_reconstruct ;;
   train)       shift; stage_train "$@" ;;
   ""|-h|--help|help) usage ;;
-  *) die "unknown stage '${1}'. One of: verify, reconstruct, train (no argument for help)." ;;
+  *) die "unknown stage '${1}'. One of: verify, reconstruct, submit, train (no argument for help)." ;;
 esac

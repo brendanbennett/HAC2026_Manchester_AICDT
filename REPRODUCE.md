@@ -17,6 +17,7 @@ which prints the three stages, what each needs, and what each costs. Then pick o
 | `./reproduce.sh verify` | checks and re-scores the bodies as shipped | CPU | minutes |
 | `./reproduce.sh reconstruct` | rebuilds them from the shipped weights | one GPU | about 1.5 h per model |
 | `./reproduce.sh train` | rebuilds the weights from the data | one GPU | about a day |
+| `./reproduce.sh submit` | puts those bodies into `results/submission` | CPU | seconds |
 
 `verify` is the one to run first. It reads only files already in the repository and the
 released data, so it settles what was submitted and what it scores before any GPU is
@@ -76,6 +77,24 @@ held-out bodies at each candidate weight and scores them against their known sha
 is off by default because at the settings it inherits it is 4096 reconstructions and writes
 nothing until the last of them. `RUN_DECISION=1` turns it on for anyone with the compute to
 run it at a size that means something.
+
+## What is submitted
+
+The submitted bodies are the end of the pipeline: for each scored model, the flow's
+reconstruction of it. `reproduce.sh reconstruct` writes them into `results/submission` when it
+finishes, and `reproduce.sh submit` does that step on its own if the reconstructions are
+already there.
+
+Where the flow produced nothing for a model -- see below -- that model's convex answer stays
+where it is rather than leaving a gap. `results/submission/provenance.json` records, per
+model, which directory its body came from and that file's sha256, so which bodies are flow
+reconstructions and which are convex answers is on the record rather than left to be inferred.
+Whatever was replaced is kept under `results/submission/convex-backup`.
+
+Nothing is copied until every chosen body has passed `scripts/check_submission.py`, which
+requires one watertight component of positive volume, consistent winding, the challenge pose,
+and a largest distance from the spin axis equal to the published bounding radius. A submission
+half replaced by files that do not pass would be worse than one not replaced at all.
 
 ## Models that produce nothing
 
