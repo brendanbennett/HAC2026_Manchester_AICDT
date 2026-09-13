@@ -33,6 +33,10 @@ PYTHONPATH=. python hac26/submission.py --dir results/lpd
 Training those checkpoints is `make pipeline`, described under "Running the pipeline"; it
 takes days on a GPU and is not needed to reproduce the results above.
 
+`docs/results.md` has what the submitted reconstructions score on the three public
+asteroids, against the convex stage alone as a baseline, and why the flow is the one
+submitted. `METHOD=convex make submission` builds that baseline into `results/convex`.
+
 ## Install
 
 `make` does the whole setup; `pyproject.toml` is the only dependency list.

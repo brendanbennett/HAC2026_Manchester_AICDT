@@ -6,23 +6,25 @@
 #
 #   ./scripts/make_submission.sh                   # the submitted reconstructions
 #   MODELS="1 2 3" ./scripts/make_submission.sh    # a subset
-#   METHOD=flow ./scripts/make_submission.sh       # the flow stage instead; see below
+#   METHOD=convex ./scripts/make_submission.sh     # the convex stage alone; see below
 #
-# Two methods live in this repository and the submitted one is the convex stage:
+# Two methods live in this repository and the submitted one is the flow:
 #
-#   convex   scripts/reconstruct.py with models/lpd_convex.pt. A learned primal-dual solver
-#            for the convex hull's support function. This is what is submitted.
+#   flow     scripts/reconstruct_lpd.py with models/lpd_flow.pt: a conditional flow that
+#            carves the convex stage's answer. It runs the convex stage first, because that
+#            answer's support function is the starting h it corrects. This is what is
+#            submitted.
 #
-#   flow     scripts/reconstruct_lpd.py with models/lpd_flow.pt, which carves the convex
-#            stage's answer using a conditional flow trained on a synthetic corpus. It is
-#            better than the convex stage on held-out corpus bodies and worse on the three
-#            public asteroids, so it is not what is submitted; see docs/results.md.
+#   convex   scripts/reconstruct.py with models/lpd_convex.pt alone. A learned primal-dual
+#            solver for the convex hull's support function, and the flow's starting point.
+#            It is the better answer on a body that is already nearly convex; see
+#            docs/results.md.
 #
 # What it needs:
 #
 #   dataset/raw                 the organisers' released data, as `make data` fetches it
 #   models/lpd_convex.pt        the convex stage, committed
-#   models/lpd_flow.pt          only for METHOD=flow
+#   models/lpd_flow.pt          the flow, committed
 #   a CUDA GPU and nvdiffrast   `make toolchain` builds it; `make check` reports on it
 #
 # A model already written is left alone, so an interrupted run resumes by being run again;
@@ -30,7 +32,7 @@
 set -uo pipefail
 cd "$(dirname "$0")/.."
 
-METHOD=${METHOD:-convex}
+METHOD=${METHOD:-flow}
 DATA_DIR=${DATA_DIR:-dataset/raw}
 CONVEX_CKPT=${CONVEX_CKPT:-models/lpd_convex.pt}
 FLOW_CKPT=${FLOW_CKPT:-models/lpd_flow.pt}
