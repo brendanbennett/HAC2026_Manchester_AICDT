@@ -1,6 +1,8 @@
 # Which directory is the submission
 
-**`SUBMISSION/`** — Asteroid04.stl … Asteroid10.stl. **This is the one to submit.**
+**The submission now lives at the top level of the repo: `submission/`** — Asteroid04.stl … Asteroid10.stl, with its own README.
+
+It used to sit here as `results/SUBMISSION/`; it was moved out so it is the first thing anyone sees.
 
 Scores **5.5632 / 6** on the public models with the organisers' own evaluation code, against
 **5.5442** for the convex stage. It is the only pipeline in this repo that beats convex.
@@ -31,7 +33,7 @@ and the method.
 
 | directory | what | ships? |
 |---|---|---|
-| **`SUBMISSION/`** | referee-selected, 5.5632 | **yes** |
+| **`../submission/`** | referee-selected, 5.5632 | **yes — at the repo root** |
 | `submission_convex_fallback/` | convex stage only, 5.5442 | no — the safe fallback, kept intact |
 | `convex/` | LPD convex stage, all ten | no — an input to the selection |
 | `flow_all/` | 800-body flow, all ten | no — the other input to the selection |

@@ -301,7 +301,7 @@ of which curves it is calibrated against or of anything the calibration can abso
 | models 1 and 3 only, **Blender** curves | 0.0372 | 0.0256 (blender) | 0.0667 (blender) |
 
 **What this means for a submission.** *(Superseded: see "The referee" above -- the submission is
-`results/SUBMISSION`, which beats convex at 5.5632 by choosing convex-or-carved per body with an
+`submission/`, which beats convex at 5.5632 by choosing convex-or-carved per body with an
 independent renderer. The paragraph below remains true about misfit-driven refinement, which is
 why the referee never descends the misfit -- it only ranks finished candidates.)*
 
